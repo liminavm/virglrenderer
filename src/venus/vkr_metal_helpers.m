@@ -133,7 +133,9 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
                                                             width:width
                                                            height:height
                                                         mipmapped:NO];
-      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+      /* PixelFormatView: scanout images are MUTABLE_FORMAT with a UNORM+sRGB view list. */
+      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
+                 MTLTextureUsagePixelFormatView;
       td.storageMode = MTLStorageModeShared;
       tex = [device newTextureWithDescriptor:td iosurface:io plane:0];
       if (!tex) {

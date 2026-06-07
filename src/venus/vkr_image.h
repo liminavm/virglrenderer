@@ -10,6 +10,11 @@
 
 struct vkr_image {
    struct vkr_object base;
+
+   /* gkvm tier-2 (crossing B/D): for a guest "external" scanout image on macOS, the
+    * struct vkr_mtl_iosurface that backs this VkImage (IOSurface-imported MTLTexture).
+    * NULL for ordinary images. Lets present resolve image -> IOSurface id. */
+   void *mtl_iosurface;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 

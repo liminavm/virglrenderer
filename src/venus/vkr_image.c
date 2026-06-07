@@ -8,10 +8,45 @@
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
 
+#ifdef __APPLE__
+#include "venus-protocol/vulkan_metal.h"
+#include "vkr_metal_helpers.h"
+
+/* MTLPixelFormat values (Metal/MTLPixelFormat.h) used for IOSurface backing. */
+#define GKVM_MTLPixelFormatRGBA8Unorm 70
+#define GKVM_MTLPixelFormatBGRA8Unorm 80
+
+/* Map a VkFormat to (MTLPixelFormat, IOSurface FourCC, bytes/pixel) for an IOSurface-backed
+ * scanout image. Returns false for formats we don't back (caller forwards unchanged). The
+ * UNORM base also serves its sRGB sibling (MUTABLE_FORMAT view list). */
+static bool
+gkvm_vkformat_to_iosurface(VkFormat fmt, uint32_t *mtl, uint32_t *fourcc, uint32_t *bpe)
+{
+   switch (fmt) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      *mtl = GKVM_MTLPixelFormatBGRA8Unorm;
+      *fourcc = (uint32_t)'BGRA';
+      *bpe = 4;
+      return true;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      *mtl = GKVM_MTLPixelFormatRGBA8Unorm;
+      *fourcc = (uint32_t)'RGBA';
+      *bpe = 4;
+      return true;
+   default:
+      return false;
+   }
+}
+#endif /* __APPLE__ */
+
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateImage *args)
 {
+   const VkImageCreateInfo *ci = args->pCreateInfo;
+
    /* XXX If VkExternalMemoryImageCreateInfo is chained by the app, all is
     * good.  If it is not chained, we might still bind an external memory to
     * the image, because vkr_dispatch_vkAllocateMemory makes any HOST_VISIBLE
@@ -31,13 +66,73 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
-   vkr_image_create_and_add(dispatch->data, args);
+#ifdef __APPLE__
+   /* gkvm fix A (tier-2 crossing B/D): MoltenVK can't honor a guest "external" image
+    * (VkExternalMemoryImageCreateInfo handleTypes != 0) — host vkCreateImage returns
+    * VK_ERROR_FEATURE_NOT_PRESENT (the #30 scanout failure). Back such an image with an
+    * IOSurface-imported MTLTexture instead: drop the external-memory info and chain a
+    * VkImportMetalTextureInfoEXT. The IOSurface is global, so the supervisor can present
+    * it zero-copy (resolve image -> id later). Only formats we can map are backed; others
+    * forward unchanged. */
+   struct vkr_mtl_iosurface *gkvm_surf = NULL;
+   VkImportMetalTextureInfoEXT gkvm_import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT,
+      .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+   };
+   if (ci && ci->pNext) {
+      VkBaseInStructure *prev = (VkBaseInStructure *)ci;
+      VkExternalMemoryImageCreateInfo *ext = NULL;
+      for (VkBaseInStructure *s = (VkBaseInStructure *)ci->pNext; s;
+           prev = s, s = (VkBaseInStructure *)s->pNext) {
+         if (s->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+            ext = (VkExternalMemoryImageCreateInfo *)s;
+            break;
+         }
+      }
+      uint32_t mtl, fourcc, bpe;
+      if (ext && ext->handleTypes &&
+          gkvm_vkformat_to_iosurface(ci->format, &mtl, &fourcc, &bpe)) {
+         struct vkr_device *dev = vkr_device_from_handle(args->device);
+         gkvm_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
+                                             ci->extent.height, mtl, fourcc, bpe);
+         if (gkvm_surf) {
+            prev->pNext = (const struct VkBaseInStructure *)ext->pNext; /* unlink ext */
+            gkvm_import.mtlTexture = gkvm_surf->mtl_texture;
+            gkvm_import.pNext = ci->pNext;
+            ((VkImageCreateInfo *)ci)->pNext = (const void *)&gkvm_import;
+         }
+      }
+   }
+#endif /* __APPLE__ */
+
+   struct vkr_image *gkvm_obj = vkr_image_create_and_add(dispatch->data, args);
+
+#ifdef __APPLE__
+   if (gkvm_surf) {
+      if (gkvm_obj && args->ret == VK_SUCCESS) {
+         gkvm_obj->mtl_iosurface = gkvm_surf;
+      } else {
+         vkr_mtl_iosurface_free(gkvm_surf);
+      }
+      vkr_log("IOSurface-backed scanout image %ux%u id=%u -> ret=%d", ci->extent.width,
+              ci->extent.height, gkvm_surf->id, args->ret);
+   }
+#else
+   (void)gkvm_obj;
+#endif
 }
 
 static void
 vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkDestroyImage *args)
 {
+#ifdef __APPLE__
+   struct vkr_image *obj = vkr_image_from_handle(args->image);
+   if (obj && obj->mtl_iosurface) {
+      vkr_mtl_iosurface_free(obj->mtl_iosurface);
+      obj->mtl_iosurface = NULL;
+   }
+#endif
    vkr_image_destroy_and_remove(dispatch->data, args);
 }
 
