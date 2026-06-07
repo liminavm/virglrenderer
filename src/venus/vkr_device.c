@@ -145,8 +145,24 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
       }
 
       ext_count = 0;
-      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++)
-         exts[ext_count++] = args->pCreateInfo->ppEnabledExtensionNames[i];
+      for (uint32_t i = 0; i < args->pCreateInfo->enabledExtensionCount; i++) {
+         const char *name = args->pCreateInfo->ppEnabledExtensionNames[i];
+#if defined(__APPLE__)
+         /* The guest Venus driver advertises several Linux/host-emulated device
+          * extensions that MoltenVK does not natively support. They are exposed
+          * to the guest for capability detection (and implemented by venus/vkr
+          * via the Metal path), but forwarding them to MoltenVK's vkCreateDevice
+          * fails with VK_ERROR_EXTENSION_NOT_PRESENT. Strip them from the host
+          * device-create list. (external_memory_fd / external_memory_dma_buf are
+          * re-appended below iff MoltenVK natively supports them.) */
+         if (!strcmp(name, "VK_KHR_external_memory_fd") ||
+             !strcmp(name, "VK_EXT_external_memory_dma_buf") ||
+             !strcmp(name, "VK_EXT_image_drm_format_modifier") ||
+             !strcmp(name, "VK_EXT_queue_family_foreign"))
+            continue;
+#endif
+         exts[ext_count++] = name;
+      }
 
       if (physical_dev->EXT_external_memory_metal)
          exts[ext_count++] = "VK_EXT_external_memory_metal";

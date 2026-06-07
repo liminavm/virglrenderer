@@ -1347,6 +1347,31 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
    return 0;
 }
 
+/* gkvm: thin shim over virgl_renderer_resource_map() that hands back the host map address as an
+ * integer. The gkvm worker's macOS blob path (rutabaga map_ptr -> libkrun resource_map_blob)
+ * needs the host pointer to hv_vm_map a venus blob into the guest; the krunkit fork exposed a
+ * cached res->map_ptr, which upstream replaced with the void**-returning resource_map(). We map
+ * on first call (resource_map caches it in res->mapped) and return res->mapped thereafter, so
+ * repeated calls are idempotent like the old accessor. */
+int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, uint64_t *map_ptr)
+{
+   TRACE_FUNC();
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res)
+      return -EINVAL;
+
+   if (!res->mapped) {
+      void *map = NULL;
+      uint64_t map_size = 0;
+      int ret = virgl_renderer_resource_map(res_handle, &map, &map_size);
+      if (ret)
+         return ret;
+   }
+
+   *map_ptr = (uint64_t)(uintptr_t)res->mapped;
+   return 0;
+}
+
 int virgl_renderer_resource_unmap(uint32_t res_handle)
 {
    TRACE_FUNC();
