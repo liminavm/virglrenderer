@@ -663,13 +663,24 @@ proxy_context_init(struct proxy_context *ctx, uint32_t ctx_flags)
       return false;
    }
 
-   const struct render_context_op_init_request req = {
+   struct render_context_op_init_request req = {
       .header.op = RENDER_CONTEXT_OP_INIT,
       .flags = ctx_flags,
       .shmem_size = ctx->shmem.size,
+      .same_process_fence_eventfd = -1,
    };
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   /* The render server runs as a thread in this process, sharing the fd table.
+    * Pass the fence eventfd BY VALUE rather than via SCM_RIGHTS: on macOS the
+    * eventfd is emulated with a kqueue, which sendmsg() refuses to transfer
+    * (EINVAL). The shmem fd still goes through SCM_RIGHTS (it is dmabuf/shm). */
+   req.same_process_fence_eventfd = ctx->sync_thread.fence_eventfd;
+   const int req_fds[1] = { ctx->shmem.fd };
+   const int req_fd_count = 1;
+#else
    const int req_fds[2] = { ctx->shmem.fd, ctx->sync_thread.fence_eventfd };
    const int req_fd_count = req_fds[1] >= 0 ? 2 : 1;
+#endif
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), req_fds,
                                            req_fd_count)) {
       proxy_log("failed to initialize context");

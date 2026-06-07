@@ -128,13 +128,19 @@ render_context_dispatch_init(struct render_context *ctx,
                              const int *fds,
                              int fd_count)
 {
-   if (fd_count != 1 && fd_count != 2)
-      return false;
-
    const struct render_context_op_init_request *req = &request->init;
    const int timeline_count = req->shmem_size / sizeof(*ctx->shmem_timelines);
    const int shmem_fd = fds[0];
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   /* eventfd passed by value (shared fd table) — see render_protocol.h. */
+   if (fd_count != 1)
+      return false;
+   const int fence_eventfd = req->same_process_fence_eventfd;
+#else
+   if (fd_count != 1 && fd_count != 2)
+      return false;
    const int fence_eventfd = fd_count == 2 ? fds[1] : -1;
+#endif
 
    void *shmem_ptr = mmap(NULL, req->shmem_size, PROT_WRITE, MAP_SHARED, shmem_fd, 0);
    if (shmem_ptr == MAP_FAILED)
@@ -258,8 +264,12 @@ render_context_fini(struct render_context *ctx)
    if (ctx->shmem_fd >= 0)
       close(ctx->shmem_fd);
 
+#ifndef ENABLE_SAME_PROCESS_RENDER_SERVER
+   /* In SAME_PROCESS mode fence_eventfd is the proxy's fd (passed by value, not
+    * dup'd) — it is owned and closed by the proxy side; don't double-close it. */
    if (ctx->fence_eventfd >= 0)
       close(ctx->fence_eventfd);
+#endif
 
    if (ctx->name)
       free(ctx->name);
