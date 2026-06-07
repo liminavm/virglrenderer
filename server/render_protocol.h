@@ -126,6 +126,10 @@ struct render_context_op_init_request {
    struct render_context_op_header header;
    uint32_t flags; /* VIRGL_RENDERER_CONTEXT_FLAG_*/
    size_t shmem_size;
+   /* In ENABLE_SAME_PROCESS_RENDER_SERVER mode the fence eventfd is passed BY
+    * VALUE here (the fd table is shared), because macOS emulates eventfd with a
+    * kqueue that sendmsg()/SCM_RIGHTS cannot transfer. -1 if none / not used. */
+   int same_process_fence_eventfd;
    /* followed by 1 shmem fd and optionally 1 eventfd */
 };
 
