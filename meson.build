@@ -384,6 +384,9 @@ if with_venus
          dependencies : [
             dependency('appleframeworks', modules: ['Metal'], required: true),
             dependency('appleframeworks', modules: ['Foundation'], required: true),
+            # IOSurface: zero-copy scanout present (gkvm tier-2 crossings B+D); see
+            # vkr_mtl_iosurface_alloc + docs/design/tier2-iosurface-zerocopy-present.md.
+            dependency('appleframeworks', modules: ['IOSurface'], required: true),
          ],
       )
    endif
