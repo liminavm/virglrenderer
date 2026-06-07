@@ -31,6 +31,13 @@
 #include <errno.h>
 #ifdef HAVE_EVENTFD_H
 #include <sys/eventfd.h>
+#elif defined(__APPLE__)
+/* macOS has no eventfd(); emulate it with a kqueue + EVFILT_USER (a single fd
+ * that is poll()-able, can be triggered from another thread/holder, drained,
+ * and passed via SCM_RIGHTS — verified). This is what makes the Venus proxy
+ * async-fence path work on macOS. */
+#include <sys/event.h>
+#include <sys/time.h>
 #endif
 #include <unistd.h>
 
@@ -88,7 +95,7 @@ bool equal_func(const void *key1, const void *key2)
 
 bool has_eventfd(void)
 {
-#ifdef HAVE_EVENTFD_H
+#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
    return true;
 #else
    return false;
@@ -99,6 +106,26 @@ int create_eventfd(unsigned int initval)
 {
 #ifdef HAVE_EVENTFD_H
    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
+#elif defined(__APPLE__)
+   /* kqueue with a single EVFILT_USER source. The kq fd is poll()-able for
+    * read when the source is triggered, drained by retrieving the event, and
+    * shared across dup()/SCM_RIGHTS (so the render-server thread can signal it).
+    * EV_CLEAR makes it edge-triggered: drained once retrieved. */
+   int kq = kqueue();
+   if (kq < 0)
+      return -1;
+   struct kevent kev;
+   EV_SET(&kev, 0, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+   if (kevent(kq, &kev, 1, NULL, 0, NULL) < 0) {
+      close(kq);
+      return -1;
+   }
+   /* initval > 0: pre-trigger so an initial wait wakes immediately. */
+   if (initval) {
+      EV_SET(&kev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+      kevent(kq, &kev, 1, NULL, 0, NULL);
+   }
+   return kq;
 #else
    (void)initval;
    return -1;
@@ -107,6 +134,14 @@ int create_eventfd(unsigned int initval)
 
 int write_eventfd(int fd, uint64_t val)
 {
+#if !defined(HAVE_EVENTFD_H) && defined(__APPLE__)
+   /* Trigger the EVFILT_USER source (coalescing, like eventfd's counter — the
+    * proxy reads the real seqno from shmem, so the value itself is unused). */
+   (void)val;
+   struct kevent kev;
+   EV_SET(&kev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+   return kevent(fd, &kev, 1, NULL, 0, NULL) < 0 ? -1 : 0;
+#else
    const char *buf = (const char *)&val;
    size_t count = sizeof(val);
    ssize_t ret = 0;
@@ -123,15 +158,26 @@ int write_eventfd(int fd, uint64_t val)
    }
 
    return count ? -1 : 0;
+#endif
 }
 
 void flush_eventfd(int fd)
 {
+#if !defined(HAVE_EVENTFD_H) && defined(__APPLE__)
+   /* Drain pending EVFILT_USER events (non-blocking) to clear readability. */
+   struct kevent evs[8];
+   const struct timespec zero = { 0, 0 };
+   int n;
+   do {
+      n = kevent(fd, NULL, 0, evs, 8, &zero);
+   } while (n == 8 || (n < 0 && errno == EINTR));
+#else
     ssize_t len;
     uint64_t value;
     do {
        len = read(fd, &value, sizeof(value));
     } while ((len == -1 && errno == EINTR) || len == sizeof(value));
+#endif
 }
 
 const struct log_levels_lut {
