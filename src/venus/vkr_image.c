@@ -80,12 +80,10 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
       .plane = VK_IMAGE_ASPECT_COLOR_BIT,
    };
    if (ci && ci->pNext) {
-      VkBaseInStructure *prev = (VkBaseInStructure *)ci;
-      VkExternalMemoryImageCreateInfo *ext = NULL;
-      for (VkBaseInStructure *s = (VkBaseInStructure *)ci->pNext; s;
-           prev = s, s = (VkBaseInStructure *)s->pNext) {
+      const VkExternalMemoryImageCreateInfo *ext = NULL;
+      for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext) {
          if (s->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
-            ext = (VkExternalMemoryImageCreateInfo *)s;
+            ext = (const VkExternalMemoryImageCreateInfo *)s;
             break;
          }
       }
@@ -96,10 +94,26 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          limina_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
                                              ci->extent.height, mtl, fourcc, bpe);
          if (limina_surf) {
-            prev->pNext = (const struct VkBaseInStructure *)ext->pNext; /* unlink ext */
+            VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
+            /* MoltenVK can't honor external-memory / dma_buf / DRM-format-modifier — an
+             * IOSurface-imported texture replaces all of them. Drop those structs and
+             * normalize DRM_FORMAT_MODIFIER tiling to OPTIMAL (the IOSurface is linear). */
+            VkBaseInStructure *prev = (VkBaseInStructure *)mci;
+            for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
+                 s = (VkBaseInStructure *)prev->pNext) {
+               const int t = (int)s->sType;
+               if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
+                   t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+                   t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+                  prev->pNext = s->pNext; /* unlink */
+               else
+                  prev = s;
+            }
+            if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+               mci->tiling = VK_IMAGE_TILING_OPTIMAL;
             limina_import.mtlTexture = limina_surf->mtl_texture;
-            limina_import.pNext = ci->pNext;
-            ((VkImageCreateInfo *)ci)->pNext = (const void *)&limina_import;
+            limina_import.pNext = mci->pNext;
+            mci->pNext = (const void *)&limina_import;
          }
       }
    }
