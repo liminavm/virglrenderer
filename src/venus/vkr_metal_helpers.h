@@ -8,6 +8,8 @@
 
 #include <stddef.h>
 
+#include <stdint.h>
+
 /*
  * Metal shared memory (opaque, allocated/freed in vkr_metal_helpers.m)
  */
@@ -16,6 +18,24 @@ struct vkr_mtl_shm {
    void *shm_ptr;
    size_t shm_size;
    void *mtl_buffer;
+};
+
+/*
+ * A GLOBAL IOSurface + an IOSurface-backed MTLTexture, for zero-copy scanout present
+ * (limina tier-2 crossings B+D — see docs/design/tier2-iosurface-zerocopy-present.md).
+ *
+ * The MTLTexture is imported into a venus VkImage (VkImportMetalTextureInfoEXT) so the
+ * guest renders straight into the IOSurface. The IOSurface is created kIOSurfaceIsGlobal
+ * so the limina supervisor process can IOSurfaceLookup(id) it for present (the existing
+ * limina-display "frame <id>" transport) with no copy.  Opaque; alloc/free in the .m.
+ */
+struct vkr_mtl_iosurface {
+   void *io_surface;    /* IOSurfaceRef (retained) */
+   void *mtl_texture;   /* id<MTLTexture> (retained), IOSurface-backed */
+   uint32_t id;         /* IOSurfaceGetID — the global id the supervisor looks up */
+   uint32_t width;
+   uint32_t height;
+   uint32_t bytes_per_row;
 };
 
 #ifdef __APPLE__
@@ -43,6 +63,23 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size);
 void
 vkr_mtl_shm_free(struct vkr_mtl_shm *shm);
 
+/* Allocate a GLOBAL IOSurface + an IOSurface-backed MTLTexture (StorageModeShared,
+ * usage ShaderRead|RenderTarget).  `mtl_pixel_format` is an MTLPixelFormat value,
+ * `iosurface_pixel_format` an IOSurface FourCC (e.g. 'BGRA'), `bytes_per_element` the
+ * pixel size.  Returns a populated vkr_mtl_iosurface (free with vkr_mtl_iosurface_free),
+ * or NULL on failure. */
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc(void *mtl_device,
+                        uint32_t width,
+                        uint32_t height,
+                        uint32_t mtl_pixel_format,
+                        uint32_t iosurface_pixel_format,
+                        uint32_t bytes_per_element);
+
+/* Release the IOSurface + MTLTexture and free the struct. */
+void
+vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
+
 #else /* !__APPLE__ */
 
 static inline void *
@@ -65,6 +102,29 @@ static inline void
 vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
 {
    (void)shm;
+}
+
+static inline struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc(void *mtl_device,
+                        uint32_t width,
+                        uint32_t height,
+                        uint32_t mtl_pixel_format,
+                        uint32_t iosurface_pixel_format,
+                        uint32_t bytes_per_element)
+{
+   (void)mtl_device;
+   (void)width;
+   (void)height;
+   (void)mtl_pixel_format;
+   (void)iosurface_pixel_format;
+   (void)bytes_per_element;
+   return NULL;
+}
+
+static inline void
+vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
+{
+   (void)surf;
 }
 
 #endif /* __APPLE__ */
