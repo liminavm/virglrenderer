@@ -432,6 +432,13 @@ VIRGL_EXPORT int virgl_renderer_resource_unmap(uint32_t res_handle);
 
 VIRGL_EXPORT int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint32_t *map_info);
 
+/* limina: return the host userspace address a resource is (or becomes) mapped at, as an
+ * integer. Maps the resource on first call via virgl_renderer_resource_map() and caches the
+ * result, so repeated calls are idempotent. This is the krunkit-era accessor the limina worker
+ * (rutabaga map_ptr -> libkrun resource_map_blob) uses on macOS to hv_vm_map a venus blob into
+ * the guest; upstream dropped it in favour of the void**-returning resource_map(). */
+VIRGL_EXPORT int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, uint64_t *map_ptr);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003
