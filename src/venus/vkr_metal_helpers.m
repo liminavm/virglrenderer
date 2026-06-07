@@ -8,6 +8,8 @@
 #include "vkr_common.h"
 
 #import <Metal/Metal.h>
+#import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -94,6 +96,78 @@ vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
    if (shm->shm_fd >= 0)
       close(shm->shm_fd);
    free(shm);
+}
+
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc(void *mtl_device,
+                        uint32_t width,
+                        uint32_t height,
+                        uint32_t mtl_pixel_format,
+                        uint32_t iosurface_pixel_format,
+                        uint32_t bytes_per_element)
+{
+   if (!mtl_device || !width || !height)
+      return NULL;
+
+   IOSurfaceRef io = NULL;
+   id<MTLTexture> tex = nil;
+
+   @autoreleasepool {
+      /* kIOSurfaceIsGlobal: the limina supervisor (a separate process) looks the surface
+       * up by IOSurfaceGetID for present — the existing limina-display transport. IOSurface
+       * picks/aligns bytesPerRow itself; the IOSurface-backed MTLTexture honors it. */
+      NSDictionary *props = @{
+         (id)kIOSurfaceWidth : @(width),
+         (id)kIOSurfaceHeight : @(height),
+         (id)kIOSurfaceBytesPerElement : @(bytes_per_element),
+         (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
+         (id)kIOSurfaceIsGlobal : @YES,
+      };
+      io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+      if (!io)
+         return NULL;
+
+      id<MTLDevice> device = (id<MTLDevice>)mtl_device;
+      MTLTextureDescriptor *td =
+         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)mtl_pixel_format
+                                                            width:width
+                                                           height:height
+                                                        mipmapped:NO];
+      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+      td.storageMode = MTLStorageModeShared;
+      tex = [device newTextureWithDescriptor:td iosurface:io plane:0];
+      if (!tex) {
+         CFRelease(io);
+         return NULL;
+      }
+   }
+
+   struct vkr_mtl_iosurface *surf = calloc(1, sizeof(*surf));
+   if (!surf) {
+      CFRelease(tex);
+      CFRelease(io);
+      return NULL;
+   }
+
+   surf->io_surface = (void *)io;  /* +1 from IOSurfaceCreate */
+   surf->mtl_texture = (void *)tex; /* +1 from -newTexture... */
+   surf->id = IOSurfaceGetID(io);
+   surf->width = width;
+   surf->height = height;
+   surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
+   return surf;
+}
+
+void
+vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
+{
+   if (!surf)
+      return;
+   if (surf->mtl_texture)
+      CFRelease(surf->mtl_texture);
+   if (surf->io_surface)
+      CFRelease(surf->io_surface);
+   free(surf);
 }
 
 #endif /* __APPLE__ */
