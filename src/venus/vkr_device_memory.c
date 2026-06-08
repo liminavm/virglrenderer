@@ -10,6 +10,7 @@
 #include "vn_protocol_renderer_transport.h"
 
 #include "vkr_device_memory_gen.h"
+#include "vkr_image.h" /* #30 Path A: vkr_image_from_handle for the dedicated scanout image */
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 
@@ -297,10 +298,39 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
-   struct vkr_mtl_shm *mtl_shm = NULL;
    VkExportMemoryAllocateInfo local_export_info;
-   VkImportMemoryMetalHandleInfoEXT local_metal_import;
 
+   /* macOS: use shared memory + Metal buffer for HOST_VISIBLE cross-process sharing. */
+   struct vkr_mtl_shm *mtl_shm = NULL;
+#ifdef __APPLE__
+   /* limina #30 Path A: the IOSurface of the fix-A scanout image this memory is dedicated to.
+    * The image renders into this IOSurface via VkImportMetalIOSurfaceInfoEXT (vkr_image.c);
+    * here it only marks the memory as needing an exportable mtl_shm blob carrier. NULL for
+    * non-scanout memory. */
+   struct vkr_mtl_iosurface *limina_scanout_surf = NULL;
+   VkImportMemoryMetalHandleInfoEXT local_metal_import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+   };
+
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+       physical_dev->EXT_external_memory_metal && !res_info) {
+      assert(!res_info);
+      mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
+      if (!mtl_shm) {
+         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+         return;
+      }
+
+      /* Chain Metal import into alloc_info */
+      local_metal_import.pNext = alloc_info->pNext;
+      local_metal_import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLBUFFER_BIT_EXT;
+      local_metal_import.handle = mtl_shm->mtl_buffer;
+      alloc_info->pNext = &local_metal_import;
+      alloc_info->allocationSize = mtl_shm->shm_size;
+
+      valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+   } else
+#endif /* __APPLE__ */
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
        * If the client driver is using external memory and requesting dma_buf, without
@@ -349,23 +379,6 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
                   align(alloc_info->allocationSize, getpagesize());
             }
          }
-      } else if (physical_dev->EXT_external_memory_metal) {
-         /* Allocate shm and wrap as a MTLBuffer for import. */
-         mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
-         if (!mtl_shm) {
-            args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
-            return;
-         }
-
-         local_metal_import = (VkImportMemoryMetalHandleInfoEXT){
-            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
-            .pNext = alloc_info->pNext,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLBUFFER_BIT_EXT,
-            .handle = mtl_shm->mtl_buffer,
-         };
-         alloc_info->pNext = &local_metal_import;
-         alloc_info->allocationSize = mtl_shm->shm_size;
-         valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
       } else if (physical_dev->EXT_external_memory_dma_buf) {
          /* Allocate dma_buf externally and force to import. */
          if (export_info) {
@@ -422,6 +435,45 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * side allocation -- NOT chained into alloc_info -- so the VkDeviceMemory stays a plain
     * device-local placeholder MoltenVK is happy with. (The host-visible mtl_shm path above
     * is untouched.) */
+   /* limina #30 (seated desktop): if this memory is the *dedicated* allocation for a fix-A
+    * scanout VkImage, the image is already IOSurface-backed via VkImportMetalIOSurfaceInfoEXT
+    * at image create (vkr_image.c) — MoltenVK's MVKImagePlane::getMTLTexture renders into the
+    * IOSurface (the `_image->_ioSurface` branch). We do NOT import the MTLTexture as this
+    * memory: that would take priority (the `dvcMem->_mtlTexture` branch) and use our texture
+    * verbatim, silently no-op'ing the render. We only need a real, exportable mtl_shm carrier
+    * so the guest can export this dedicated memory as the virtio-gpu scanout blob (present
+    * resolves resource -> memory -> IOSurface, see vkr_device_memory_export_blob); the
+    * carrier's bytes are never the scanout pixels. */
+   {
+      const VkMemoryDedicatedAllocateInfo *ded = vkr_find_struct(
+         alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      if (ded && ded->image != VK_NULL_HANDLE) {
+         struct vkr_image *img = vkr_image_from_handle(ded->image);
+         if (img && img->mtl_iosurface)
+            limina_scanout_surf = img->mtl_iosurface;
+      }
+   }
+   if (limina_scanout_surf && !mtl_shm) {
+      if (export_info) {
+         VkBaseInStructure *prev_of_export =
+            vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+         if (prev_of_export)
+            prev_of_export->pNext = export_info->pNext;
+         export_info = NULL;
+      }
+      valid_fd_types = 0;
+
+      /* Side carrier: a real fd for the blob export only (bytes unused for pixels). */
+      mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
+      if (!mtl_shm) {
+         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+         return;
+      }
+      vkr_log("limina: scanout memory -> mtl_shm carrier for blob export; image renders into its "
+              "IOSurface (id=%u) via useIOSurface",
+              ((struct vkr_mtl_iosurface *)limina_scanout_surf)->id);
+   }
+
    if (export_info && !mtl_shm &&
        (export_info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
@@ -463,6 +515,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->mtl_shm = mtl_shm;
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
+#ifdef __APPLE__
+   /* limina #30: link the scanout image's IOSurface onto this dedicated memory now, so
+    * vkr_device_memory_export_blob carries the id even before vkBindImageMemory2. */
+   if (limina_scanout_surf)
+      mem->mtl_iosurface = limina_scanout_surf;
+#endif
 }
 
 static void

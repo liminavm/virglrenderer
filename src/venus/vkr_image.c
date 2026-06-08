@@ -71,14 +71,20 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    /* limina fix A (tier-2 crossing B/D): MoltenVK can't honor a guest "external" image
     * (VkExternalMemoryImageCreateInfo handleTypes != 0) — host vkCreateImage returns
     * VK_ERROR_FEATURE_NOT_PRESENT (the #30 scanout failure). Back such an image with an
-    * IOSurface-imported MTLTexture instead: drop the external-memory info and chain a
-    * VkImportMetalTextureInfoEXT. The IOSurface is global, so the supervisor can present
-    * it zero-copy (resolve image -> id later). Only formats we can map are backed; others
-    * forward unchanged. */
+    * IOSurface instead, via VK_EXT_metal_objects: chain VkImportMetalIOSurfaceInfoEXT so
+    * MoltenVK calls MVKImage::useIOSurface() and builds the image's MTLTexture *from the
+    * IOSurface with its own correct descriptor* (MVKImagePlane::getMTLTexture, the
+    * `_image->_ioSurface` branch). This is more robust than importing a raw MTLTexture as the
+    * bound memory (the `dvcMem->_mtlTexture` branch): that path uses our texture verbatim and
+    * any usage/format mismatch silently no-ops the render, leaving the IOSurface untouched
+    * (proven: a magenta-prefilled scanout surface stayed pure magenta — the GPU never wrote
+    * it). The IOSurface is global, so the supervisor presents it zero-copy. The dedicated
+    * bound memory is still allocated (the guest binds it + exports it as the scanout blob) but
+    * its bytes are unused for pixels — getMTLTexture uses the IOSurface. Only formats we can
+    * map are backed; others forward unchanged. */
    struct vkr_mtl_iosurface *limina_surf = NULL;
-   VkImportMetalTextureInfoEXT limina_import = {
-      .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT,
-      .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+   VkImportMetalIOSurfaceInfoEXT limina_io_import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
    };
    if (ci && ci->pNext) {
       const VkExternalMemoryImageCreateInfo *ext = NULL;
@@ -96,9 +102,9 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                                              ci->extent.height, mtl, fourcc, bpe);
          if (limina_surf) {
             VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
-            /* MoltenVK can't honor external-memory / dma_buf / DRM-format-modifier — an
-             * IOSurface-imported texture replaces all of them. Drop those structs and
-             * normalize DRM_FORMAT_MODIFIER tiling to OPTIMAL (the IOSurface is linear). */
+            /* MoltenVK can't honor external-memory / dma_buf / DRM-format-modifier — the
+             * IOSurface replaces all of them. Drop those structs and normalize
+             * DRM_FORMAT_MODIFIER tiling to OPTIMAL. */
             VkBaseInStructure *prev = (VkBaseInStructure *)mci;
             for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
                  s = (VkBaseInStructure *)prev->pNext) {
@@ -112,9 +118,12 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
             }
             if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
                mci->tiling = VK_IMAGE_TILING_OPTIMAL;
-            limina_import.mtlTexture = limina_surf->mtl_texture;
-            limina_import.pNext = mci->pNext;
-            mci->pNext = (const void *)&limina_import;
+
+            /* Chain VkImportMetalIOSurfaceInfoEXT so MoltenVK backs this image with our global
+             * IOSurface (useIOSurface) — render lands in the surface, presented zero-copy. */
+            limina_io_import.ioSurface = (IOSurfaceRef)limina_surf->io_surface;
+            limina_io_import.pNext = mci->pNext;
+            mci->pNext = &limina_io_import;
          }
       }
    }
