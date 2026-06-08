@@ -1138,7 +1138,10 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    TRACE_FUNC();
    struct virgl_resource *res;
    struct virgl_context *ctx;
-   struct virgl_context_blob blob;
+   /* Zero-init: get_blob() only sets iosurface_id on the IOSurface-backed (macOS) path,
+    * so an uninitialized field would leave non-IOSurface resources with stack garbage that
+    * SET_SCANOUT_BLOB then misreads as a valid IOSurface id (gkvm tier-2 #30). */
+   struct virgl_context_blob blob = {0};
    bool has_host_storage;
    bool has_guest_storage;
    int ret;
@@ -1223,7 +1226,23 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
 
    res->map_info = blob.map_info;
    res->map_size = args->size;
+   res->iosurface_id = blob.iosurface_id;
 
+   return 0;
+}
+
+/* gkvm tier-2 (macOS): return the global IOSurface id backing a scanout resource, or 0 if
+ * the resource is not IOSurface-backed. libkrun's SET_SCANOUT_BLOB uses this to present the
+ * IOSurface zero-copy (worker and vkr are in the same process, so the id is a valid handle)
+ * instead of reading the resource's SHM carrier. Mirrors virgl_renderer_resource_get_map_ptr. */
+int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle, uint32_t *iosurface_id)
+{
+   TRACE_FUNC();
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res)
+      return -EINVAL;
+
+   *iosurface_id = res->iosurface_id;
    return 0;
 }
 

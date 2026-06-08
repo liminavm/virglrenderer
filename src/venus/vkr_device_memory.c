@@ -410,6 +410,47 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          valid_fd_types |= 1 << VIRGL_RESOURCE_FD_DMABUF;
    }
 
+#ifdef __APPLE__
+   /* gkvm #30 (seated desktop): mutter allocates the KMS scanout framebuffer's
+    * VkDeviceMemory with VkExportMemoryAllocateInfo(OPAQUE_FD/DMA_BUF), but MoltenVK
+    * cannot export device-local memory that way -> vkAllocateMemory fails with
+    * VK_ERROR_INITIALIZATION_FAILED, the object is never created, and the subsequent
+    * vkBindImageMemory2 hits "failed to look up object" -> CS fatal -> the venus context
+    * is destroyed -> gnome-shell crash-loops. The scanout VkImage is already backed by an
+    * IOSurface (fix A), so this memory only needs to be a valid placeholder bind target.
+    *
+    * Strip the unsupported export so the raw allocation succeeds, BUT give the memory an
+    * mtl_shm carrier so it is still exportable as a virtio-gpu blob: the guest exports this
+    * memory as the KMS scanout dmabuf, and that export crosses the render-server proxy
+    * socket, which needs a real fd (a non-exportable memory yields "proxy: invalid reply for
+    * blob N" -> context destroyed -> crash-loop). The SHM bytes are NOT the scanout pixels;
+    * present resolves resource -> memory -> the bound image's IOSurface (linked at
+    * vkBindImageMemory2, see vkr_image.c) and scans that out zero-copy. The carrier is a
+    * side allocation -- NOT chained into alloc_info -- so the VkDeviceMemory stays a plain
+    * device-local placeholder MoltenVK is happy with. (The host-visible mtl_shm path above
+    * is untouched.) */
+   if (export_info && !mtl_shm &&
+       (export_info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
+      VkBaseInStructure *prev_of_export =
+         vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+      if (prev_of_export) {
+         prev_of_export->pNext = export_info->pNext;
+         export_info = NULL;
+         valid_fd_types = 0;
+
+         mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
+         if (!mtl_shm) {
+            args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+            return;
+         }
+         vkr_log("gkvm: scanout memory -> stripped OPAQUE/DMA_BUF export, attached mtl_shm "
+                 "carrier (size=%llu); present uses the bound image's IOSurface",
+                 (unsigned long long)alloc_info->allocationSize);
+      }
+   }
+#endif
+
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
       if (local_import_info.fd >= 0)
@@ -558,6 +599,28 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       return false;
    }
 
+   /* macOS: a Metal-buffer-over-POSIX-shm carrier is always host-mappable shared memory, so
+    * it can back the blob regardless of the VkDeviceMemory's own property flags. This covers
+    * both the HOST_VISIBLE path and the device-local scanout carrier (gkvm #30): the latter
+    * is bound to an IOSurface-backed image and the SHM bytes are never the scanout pixels —
+    * present resolves resource -> memory -> IOSurface (vkr_device_memory_get_iosurface_id);
+    * the SHM only exists so the proxy/rutabaga resource creation has a real fd to pass. */
+   if (mem->mtl_shm && mem->mtl_shm->shm_fd >= 0) {
+      mem->exported = true;
+      *out_blob = (struct virgl_context_blob){
+         .type = VIRGL_RESOURCE_FD_SHM,
+         .u.fd = os_dupfd_cloexec(mem->mtl_shm->shm_fd),
+         .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
+      };
+#ifdef __APPLE__
+      /* Carry the bound scanout image's IOSurface id so SET_SCANOUT_BLOB presents it
+       * zero-copy instead of reading the SHM carrier (see vkr_image.c bind linkage). */
+      if (mem->mtl_iosurface)
+         out_blob->iosurface_id = ((const struct vkr_mtl_iosurface *)mem->mtl_iosurface)->id;
+#endif
+      return out_blob->u.fd >= 0;
+   }
+
    uint32_t map_info = VIRGL_RENDERER_MAP_CACHE_NONE;
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
       const bool visible = mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
@@ -571,16 +634,6 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       /* XXX guessed */
       map_info = (coherent && cached) ? VIRGL_RENDERER_MAP_CACHE_CACHED
                                       : VIRGL_RENDERER_MAP_CACHE_WC;
-   }
-
-   if (mem->mtl_shm && mem->mtl_shm->shm_fd >= 0) {
-      mem->exported = true;
-      *out_blob = (struct virgl_context_blob){
-         .type = VIRGL_RESOURCE_FD_SHM,
-         .u.fd = os_dupfd_cloexec(mem->mtl_shm->shm_fd),
-         .map_info = map_info,
-      };
-      return out_blob->u.fd >= 0;
    }
 
    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
