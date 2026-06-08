@@ -154,6 +154,10 @@ struct render_context_op_create_resource_reply {
    uint32_t map_info; /* VIRGL_RENDERER_MAP_* */
    /* vulkan_info is set if the fd_type is VIRGL_RESOURCE_FD_OPAQUE */
    struct virgl_resource_vulkan_info vulkan_info;
+   /* gkvm tier-2 (macOS): global IOSurface id backing this scanout blob, or 0. Threaded
+    * across the render-server boundary so SET_SCANOUT_BLOB can present it zero-copy; the
+    * IOSurface id is global (kIOSurfaceIsGlobal) and valid in any process. */
+   uint32_t iosurface_id;
    /* followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
 };
 

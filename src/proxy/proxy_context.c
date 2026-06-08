@@ -404,6 +404,9 @@ proxy_context_get_blob(struct virgl_context *base,
    blob->type = reply.fd_type;
    blob->u.fd = reply_fd;
    blob->map_info = reply.map_info;
+   /* gkvm tier-2 (macOS): carry the scanout IOSurface id reconstructed from the render-server
+    * reply so SET_SCANOUT_BLOB presents it zero-copy (0 on non-macOS / non-scanout blobs). */
+   blob->iosurface_id = reply.iosurface_id;
 
    if (reply.fd_type == VIRGL_RESOURCE_FD_OPAQUE)
       blob->vulkan_info = reply.vulkan_info;

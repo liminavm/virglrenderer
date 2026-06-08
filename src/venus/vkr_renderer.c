@@ -180,7 +180,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              enum virgl_resource_fd_type *out_fd_type,
                              int *out_res_fd,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info)
+                             struct virgl_resource_vulkan_info *out_vulkan_info,
+                             uint32_t *out_iosurface_id)
 {
    TRACE_FUNC();
 
@@ -201,6 +202,9 @@ vkr_renderer_create_resource(uint32_t ctx_id,
    *out_fd_type = blob.type;
    *out_res_fd = blob.u.fd;
    *out_map_info = blob.map_info;
+   /* gkvm tier-2 (macOS): carry the scanout IOSurface id across the render-server boundary
+    * so the proxy can rebuild it into virgl_context_blob for zero-copy SET_SCANOUT_BLOB. */
+   *out_iosurface_id = blob.iosurface_id;
 
    if (blob.type == VIRGL_RESOURCE_FD_OPAQUE) {
       assert(out_vulkan_info);
