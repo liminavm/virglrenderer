@@ -49,6 +49,11 @@ struct virgl_context_blob {
    uint32_t map_info;
 
    struct virgl_resource_vulkan_info vulkan_info;
+
+   /* limina tier-2 (macOS): global IOSurface id backing this blob's scanout image, or 0.
+    * Lets libkrun's SET_SCANOUT_BLOB present the IOSurface zero-copy (resolve via
+    * virgl_renderer_resource_get_iosurface_id) instead of reading the SHM carrier. */
+   uint32_t iosurface_id;
 };
 
 struct virgl_context;
