@@ -5,6 +5,7 @@
 
 #include "vkr_image.h"
 
+#include "vkr_device_memory.h"
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
 
@@ -220,6 +221,24 @@ vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+#ifdef __APPLE__
+   /* limina tier-2 (#30 seated scanout): when an IOSurface-backed (fix A) image is bound to a
+    * memory, record the IOSurface on the memory so the scanout present can resolve
+    * resource -> memory -> IOSurface id zero-copy (the memory is what the guest later
+    * exports as the KMS scanout blob; see tier2-iosurface-zerocopy-present.md part-(b)).
+    * Done BEFORE handle replacement so the venus object lookups still resolve. */
+   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+      const VkBindImageMemoryInfo *b = &args->pBindInfos[i];
+      struct vkr_image *img = vkr_image_from_handle(b->image);
+      struct vkr_device_memory *mem = vkr_device_memory_from_handle(b->memory);
+      if (img && img->mtl_iosurface && mem) {
+         mem->mtl_iosurface = img->mtl_iosurface;
+         vkr_log("limina: scanout bind image=%llu mem=%llu -> IOSurface linked",
+                 (unsigned long long)b->image, (unsigned long long)b->memory);
+      }
+   }
+#endif
 
    vn_replace_vkBindImageMemory2_args_handle(args);
    args->ret = vk->BindImageMemory2(args->device, args->bindInfoCount, args->pBindInfos);
