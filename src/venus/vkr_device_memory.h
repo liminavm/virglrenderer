@@ -30,6 +30,12 @@ struct vkr_device_memory {
    /* Metal buffer backed by POSIX shared memory */
    struct vkr_mtl_shm *mtl_shm;
 
+   /* limina tier-2 (macOS): borrowed ref to the global IOSurface backing the VkImage this
+    * memory is bound to (set at vkBindImageMemory2 from vkr_image.mtl_iosurface). Lets the
+    * scanout present resolve resource -> memory -> IOSurface id zero-copy. NOT owned here
+    * (the vkr_image owns/frees it); we only read its id. */
+   void *mtl_iosurface;
+
    uint64_t allocation_size;
    uint32_t memory_type_index;
 

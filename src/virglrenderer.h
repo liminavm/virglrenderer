@@ -439,6 +439,12 @@ VIRGL_EXPORT int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint3
  * the guest; upstream dropped it in favour of the void**-returning resource_map(). */
 VIRGL_EXPORT int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, uint64_t *map_ptr);
 
+/* limina tier-2 (macOS): return the global IOSurface id backing a scanout resource, or 0 if not
+ * IOSurface-backed. Used by libkrun's SET_SCANOUT_BLOB to present the IOSurface zero-copy
+ * (worker and vkr share a process). See docs/design/tier2-iosurface-zerocopy-present.md. */
+VIRGL_EXPORT int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle,
+                                                          uint32_t *iosurface_id);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003
