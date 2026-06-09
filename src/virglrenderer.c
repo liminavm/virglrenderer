@@ -1227,6 +1227,9 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    res->map_info = blob.map_info;
    res->map_size = args->size;
    res->iosurface_id = blob.iosurface_id;
+   /* limina tier-2 (macOS) #28: borrow MoltenVK's own mapping for a HOST_VISIBLE blob so the VMM
+    * hv_vm_maps the exact memory the GPU binds (one mapping, guest+GPU coherent). 0 = fd path. */
+   res->map_ptr = blob.map_ptr;
 
    return 0;
 }
@@ -1256,6 +1259,15 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!res || res->mapped)
       return -EINVAL;
+
+   /* limina #28: a HOST_VISIBLE venus blob borrows MoltenVK's own vkMapMemory pointer; hand it
+    * back directly (no mmap). Lifetime is owned by the VkDeviceMemory (unmapped in vkFreeMemory),
+    * so we do NOT cache it in res->mapped (which the fd paths munmap on unmap). */
+   if (res->map_ptr) {
+      *out_map = (void *)(uintptr_t)res->map_ptr;
+      *out_size = res->map_size;
+      return 0;
+   }
 
    if (res->pipe_resource) {
       ret = vrend_renderer_resource_map(res->pipe_resource, &map, &map_size);
@@ -1379,6 +1391,12 @@ int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, uint64_t *map_ptr)
    if (!res)
       return -EINVAL;
 
+   /* limina #28: HOST_VISIBLE venus blob — borrowed MoltenVK pointer, return it as-is. */
+   if (res->map_ptr) {
+      *map_ptr = res->map_ptr;
+      return 0;
+   }
+
    if (!res->mapped) {
       void *map = NULL;
       uint64_t map_size = 0;
@@ -1396,6 +1414,12 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
    TRACE_FUNC();
    int ret = 0;
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
+
+   /* limina #28: borrowed MoltenVK pointer (HOST_VISIBLE venus blob) — never cached in res->mapped
+    * and never munmap'd here; the VkDeviceMemory owns it and vkUnmapMemory's it in vkFreeMemory. */
+   if (res && res->map_ptr)
+      return 0;
+
    if (!res || !res->mapped)
       return -EINVAL;
 
@@ -1447,6 +1471,13 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_id);
    if (!res)
+      return -EINVAL;
+
+   /* limina #28: a HOST_VISIBLE venus blob is shared by pointer (map_ptr), has no fd, and must
+    * never be fd-exported. Bail before virgl_resource_export_fd, which for our OPAQUE_HANDLE
+    * vehicle would call the (absent) proxy-context export_fd callback and crash. rutabaga's
+    * create_blob calls export_blob(res).ok() unconditionally; returning -EINVAL => handle=None. */
+   if (res->map_ptr)
       return -EINVAL;
 
    switch (virgl_resource_export_fd(res, fd)) {

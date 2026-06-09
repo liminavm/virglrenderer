@@ -103,6 +103,12 @@ struct virgl_resource {
    void *mapped;
    bool mapped_from_pipe_resource;
 
+   /* limina tier-2 (macOS) #28: borrowed host VA of a HOST_VISIBLE venus blob (MoltenVK's own
+    * vkMapMemory pointer for the backing VkDeviceMemory). When non-zero, resource map/get_map_ptr
+    * return this directly (no mmap) and unmap is a no-op — the VkDeviceMemory owns the lifetime
+    * and vkUnmapMemory's it in vkFreeMemory. Set from virgl_context_blob.map_ptr at create. */
+   uint64_t map_ptr;
+
    struct virgl_resource_vulkan_info vulkan_info;
 
    /* limina tier-2 (macOS): global IOSurface id backing this scanout resource, or 0.

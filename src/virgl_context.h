@@ -48,6 +48,12 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
+   /* limina tier-2 (macOS) #28: for a HOST_VISIBLE blob, the host VA MoltenVK gave us for the
+    * backing VkDeviceMemory (vkMapMemory). When non-zero, the resource shares THIS pointer with
+    * the VMM (hv_vm_map) instead of an fd that gets a second, incoherent mmap. 0 = fd path.
+    * Mirrors the krunkit (slp) blob.map_ptr field that upstream 1.3.0 dropped. */
+   uint64_t map_ptr;
+
    struct virgl_resource_vulkan_info vulkan_info;
 
    /* limina tier-2 (macOS): global IOSurface id backing this blob's scanout image, or 0.

@@ -308,28 +308,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * here it only marks the memory as needing an exportable mtl_shm blob carrier. NULL for
     * non-scanout memory. */
    struct vkr_mtl_iosurface *limina_scanout_surf = NULL;
-   VkImportMemoryMetalHandleInfoEXT local_metal_import = {
-      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
-   };
 
-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-       physical_dev->EXT_external_memory_metal && !res_info) {
-      assert(!res_info);
-      mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
-      if (!mtl_shm) {
-         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
-         return;
-      }
-
-      /* Chain Metal import into alloc_info */
-      local_metal_import.pNext = alloc_info->pNext;
-      local_metal_import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLBUFFER_BIT_EXT;
-      local_metal_import.handle = mtl_shm->mtl_buffer;
-      alloc_info->pNext = &local_metal_import;
-      alloc_info->allocationSize = mtl_shm->shm_size;
-
-      valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
-   } else
+   /* limina #28: plain HOST_VISIBLE memory is NO LONGER backed by an imported mtl_shm carrier.
+    * The old path allocated a POSIX shm + Metal buffer (newBufferWithBytesNoCopy) and imported
+    * it as the VkDeviceMemory; the blob then exported the shm fd, which the VMM mmap'd a SECOND
+    * time for the guest. Guest CPU writes to that second mapping never reached the GPU's view of
+    * the first mapping — the #28 "venus renders black" data bug. Instead we let MoltenVK allocate
+    * its own Shared MTLBuffer and, in vkr_device_memory_export_blob, vkMapMemory it and share
+    * MoltenVK's own pointer with the VMM (one mapping, guest CPU + host GPU coherent — the slp /
+    * krunkit model). HOST_VISIBLE now falls through to the generic block below, which is a no-op
+    * on macOS (no dma_buf/opaque-fd/gbm/udmabuf), leaving valid_fd_types == 0 and mtl_shm NULL.
+    * The dedicated #30 scanout image still gets a carrier further down (limina_scanout_surf). */
 #endif /* __APPLE__ */
    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
       /* An implementation can support dma_buf import along with opaque fd export/import.
@@ -627,6 +616,12 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
+   /* limina #28: a HOST_VISIBLE blob shared MoltenVK's own vkMapMemory pointer (no mtl_shm carrier).
+    * We do NOT vkUnmapMemory it here: vkFreeMemory implicitly unmaps a mapped memory (Vulkan
+    * spec), and both teardown paths call FreeMemory. In the device-destroy path FreeMemory runs
+    * BEFORE this release (vkr_device.c) — an explicit unmap here would hit already-freed memory
+    * (a MoltenVK use-after-free / SIGSEGV). The borrowed pointer in the resource layer is only
+    * read while the guest holds the mapping; by free time the guest side is already gone. */
    vkr_mtl_shm_free(mem->mtl_shm);
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
@@ -719,6 +714,44 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       vulkan_info.allocation_size = mem->allocation_size;
       vulkan_info.memory_type_index = mem->memory_type_index;
    } else {
+#ifdef __APPLE__
+      /* limina #28: HOST_VISIBLE memory has no fd to export on macOS (MoltenVK uses Metal handles,
+       * not opaque/dma_buf fds), but it CAN be shared by pointer. vkMapMemory hands back
+       * mtlBuffer.contents — the exact bytes the GPU reads/writes — which we carry in
+       * blob.map_ptr; the VMM hv_vm_maps THAT pointer into the guest (one mapping, coherent).
+       * The mapping is owned by this VkDeviceMemory and released by vkUnmapMemory in
+       * vkr_device_memory_release (see mem->exported). This is the krunkit (slp) host-visible
+       * path; upstream 1.3.0 dropped the blob.map_ptr field, re-added in virgl_context.h. */
+      if (mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+         struct vn_device_proc_table *vk = &mem->device->proc_table;
+         void *ptr = NULL;
+         VkResult ret = vk->MapMemory(mem->device->base.handle.device,
+                                      mem->base.handle.device_memory, 0, mem->allocation_size, 0,
+                                      &ptr);
+         if (ret != VK_SUCCESS || !ptr) {
+            vkr_log("limina #28: host-visible vkMapMemory for blob export failed (vk ret %d)", ret);
+            return false;
+         }
+
+         mem->exported = true;
+         /* MoltenVK HOST_VISIBLE memory is a Shared MTLBuffer = write-back cacheable + coherent,
+          * so the guest maps it CACHED. Hardcode CACHED (never NONE) like the old mtl_shm carrier
+          * path: the computed `map_info` above is only set when blob_flags has USE_MAPPABLE, and a
+          * NONE map_info makes virgl_renderer_resource_get_map_info return -EINVAL, which the VMM
+          * (resource_map_blob -> rutabaga.map_info) reports as a failed guest vkMapMemory (#28). */
+         *out_blob = (struct virgl_context_blob){
+            /* OPAQUE_HANDLE: a no-fd resource vehicle (create_from_fd asserts fd>=0). The handle
+             * is never resolved — map/get_map_ptr short-circuit on blob.map_ptr. */
+            .type = VIRGL_RESOURCE_OPAQUE_HANDLE,
+            .u.opaque_handle = 0,
+            .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
+            .map_ptr = (uint64_t)(uintptr_t)ptr,
+         };
+         vkr_log("limina #28: host-visible blob via vkMapMemory ptr=%p size=%llu (no shm carrier)",
+                 ptr, (unsigned long long)mem->allocation_size);
+         return true;
+      }
+#endif
       vkr_log("mem is not exportable");
       return false;
    }
