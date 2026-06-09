@@ -227,12 +227,13 @@ render_state_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              uint32_t *out_map_info,
                              struct virgl_resource_vulkan_info *out_vulkan_info,
-                             uint32_t *out_iosurface_id)
+                             uint32_t *out_iosurface_id,
+                             uint64_t *out_map_ptr)
 {
    SCOPE_LOCK_RENDERER();
    return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
                                        out_fd_type, out_res_fd, out_map_info,
-                                       out_vulkan_info, out_iosurface_id);
+                                       out_vulkan_info, out_iosurface_id, out_map_ptr);
 }
 
 bool

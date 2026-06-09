@@ -63,7 +63,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              uint32_t *out_map_info,
                              struct virgl_resource_vulkan_info *out_vulkan_info,
-                             uint32_t *out_iosurface_id);
+                             uint32_t *out_iosurface_id,
+                             uint64_t *out_map_ptr);
 
 bool
 vkr_renderer_import_resource(uint32_t ctx_id,

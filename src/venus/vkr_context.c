@@ -332,6 +332,21 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
+#ifdef __APPLE__
+   /* limina #28: HOST_VISIBLE blob shares MoltenVK's own vkMapMemory pointer (blob.map_ptr) — no
+    * fd. Register the vkr_resource with no fd (FD_OPAQUE, fd=-1 → vkr_context_free_resource
+    * no-ops: not SHM, and u.fd < 0). The borrowed pointer rides on the virgl_resource via
+    * out_blob.map_ptr; the VkDeviceMemory owns/unmaps it (vkr_device_memory_release). */
+   if (blob.map_ptr) {
+      if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
+                                                VIRGL_RESOURCE_FD_OPAQUE, -1, NULL))
+         return false;
+
+      *out_blob = blob;
+      return true;
+   }
+#endif
+
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
