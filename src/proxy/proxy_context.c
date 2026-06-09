@@ -372,6 +372,21 @@ proxy_context_get_blob(struct virgl_context *base,
       return -1;
    }
 
+   /* gkvm tier-2 (macOS) #28: a HOST_VISIBLE blob is shared by pointer (MoltenVK's own
+    * vkMapMemory VA) with NO fd. The host VA is valid here because the render server is a
+    * thread in this process (ENABLE_SAME_PROCESS_RENDER_SERVER). Rebuild it as an OPAQUE_HANDLE
+    * blob carrying map_ptr; the VMM hv_vm_maps that pointer (virgl_renderer_resource_get_map_ptr
+    * short-circuits on map_ptr). No fd is expected in this reply. */
+   if (reply.map_ptr) {
+      blob->type = VIRGL_RESOURCE_OPAQUE_HANDLE;
+      blob->u.opaque_handle = 0;
+      blob->map_info = reply.map_info;
+      blob->map_ptr = reply.map_ptr;
+      blob->iosurface_id = reply.iosurface_id;
+      proxy_context_resource_add(ctx, res_id);
+      return 0;
+   }
+
    if (!reply_fd_count) {
       proxy_log("invalid reply for blob %" PRIu64, blob_id);
       return -1;

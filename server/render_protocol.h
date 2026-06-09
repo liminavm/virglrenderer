@@ -158,7 +158,13 @@ struct render_context_op_create_resource_reply {
     * across the render-server boundary so SET_SCANOUT_BLOB can present it zero-copy; the
     * IOSurface id is global (kIOSurfaceIsGlobal) and valid in any process. */
    uint32_t iosurface_id;
-   /* followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
+   /* gkvm tier-2 (macOS) #28: for a HOST_VISIBLE blob, the host VA of MoltenVK's own mapping
+    * (vkMapMemory). Non-zero => fd_type is FD_INVALID and NO fd accompanies this reply; the
+    * client shares this pointer with the VMM instead of mmap'ing an fd. Valid across the
+    * render-server boundary because the server is a thread in the same process (same address
+    * space) — ENABLE_SAME_PROCESS_RENDER_SERVER. 0 => normal fd path. */
+   uint64_t map_ptr;
+   /* followed by 1 fd if fd_type is not VIRGL_RESOURCE_FD_INVALID (i.e. unless map_ptr is set) */
 };
 
 /* Import a blob resource to the context

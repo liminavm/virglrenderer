@@ -112,8 +112,11 @@ render_context_dispatch_create_resource(struct render_context *ctx,
    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
                                           req->blob_size, req->blob_flags, &reply.fd_type,
                                           &res_fd, &reply.map_info, &reply.vulkan_info,
-                                          &reply.iosurface_id);
-   if (!ok)
+                                          &reply.iosurface_id, &reply.map_ptr);
+   /* gkvm tier-2 (macOS) #28: a HOST_VISIBLE blob is shared by pointer (map_ptr set, no fd) —
+    * fd_type is FD_INVALID. Send the reply without an fd (same-process thread server, so the
+    * host VA is valid in the client). The !ok path also has no fd. */
+   if (!ok || reply.map_ptr)
       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
 
    ok =

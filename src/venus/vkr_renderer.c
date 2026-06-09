@@ -181,7 +181,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              int *out_res_fd,
                              uint32_t *out_map_info,
                              struct virgl_resource_vulkan_info *out_vulkan_info,
-                             uint32_t *out_iosurface_id)
+                             uint32_t *out_iosurface_id,
+                             uint64_t *out_map_ptr)
 {
    TRACE_FUNC();
 
@@ -195,6 +196,18 @@ vkr_renderer_create_resource(uint32_t ctx_id,
    struct virgl_context_blob blob;
    if (!vkr_context_create_resource(ctx, res_id, blob_id, blob_size, blob_flags, &blob))
       return false;
+
+   /* gkvm tier-2 (macOS) #28: a HOST_VISIBLE blob is shared by pointer (OPAQUE_HANDLE +
+    * map_ptr, no fd) — see vkr_device_memory_export_blob. Carry map_ptr across the boundary
+    * (same-process thread server) and skip the fd; the caller sends an fd-less reply. */
+   *out_map_ptr = blob.map_ptr;
+   if (blob.map_ptr) {
+      *out_fd_type = VIRGL_RESOURCE_FD_INVALID;
+      *out_res_fd = -1;
+      *out_map_info = blob.map_info;
+      *out_iosurface_id = blob.iosurface_id;
+      return true;
+   }
 
    assert(blob.type == VIRGL_RESOURCE_FD_SHM || blob.type == VIRGL_RESOURCE_FD_DMABUF ||
           blob.type == VIRGL_RESOURCE_FD_OPAQUE);
