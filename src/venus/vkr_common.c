@@ -95,7 +95,21 @@ static const struct vn_info_extension_table vkr_extension_table = {
    /* promoted to VK_VERSION_1_4 */
    .KHR_dynamic_rendering_local_read = true,
    .KHR_global_priority = true,
+   /* limina (macOS only): DISABLED — MoltenVK's uint8->uint16 index-conversion compute
+    * pass had TWO bugs (root-caused 2026-06-10, see spikes/venus-draw-probe/u8test.c):
+    * (1) it maps the LEGAL index 255 to Metal's always-on restart sentinel 0xFFFF,
+    * corrupting restart-disabled draws — cogl's full 64-rect batches end at index 255,
+    * which is exactly the broken-shell symptom; (2) it wrote the converted indices at
+    * offset 0 of a pooled MTLBuffer suballocation while the draw read at _offset.
+    * Both are fixed in our MoltenVK fork (mvk-instrument.patch), but the hide stays as
+    * policy: zink's CPU uint8->uint16 fallback is free, while MoltenVK's conversion
+    * costs a render-pass split (tile store/reload) per bind, and stock MoltenVK builds
+    * out there still carry both bugs. */
+#ifdef __APPLE__
+   .KHR_index_type_uint8 = false,
+#else
    .KHR_index_type_uint8 = true,
+#endif
    .KHR_line_rasterization = true,
    .KHR_load_store_op_none = true,
    .KHR_maintenance5 = true,
@@ -172,7 +186,11 @@ static const struct vn_info_extension_table vkr_extension_table = {
    .EXT_image_drm_format_modifier = true,
    .EXT_image_sliced_view_of_3d = true,
    .EXT_image_view_min_lod = true,
+#ifdef __APPLE__
+   .EXT_index_type_uint8 = false, /* limina: see KHR_index_type_uint8 above (MoltenVK uint8 conv bug) */
+#else
    .EXT_index_type_uint8 = true,
+#endif
    .EXT_legacy_dithering = true,
    .EXT_legacy_vertex_attributes = true,
    .EXT_line_rasterization = true,
