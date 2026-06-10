@@ -308,6 +308,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * here it only marks the memory as needing an exportable mtl_shm blob carrier. NULL for
     * non-scanout memory. */
    struct vkr_mtl_iosurface *gkvm_scanout_surf = NULL;
+   /* gkvm KK path: host-pointer import of the scanout IOSurface bytes (function scope —
+    * chained into alloc_info and must outlive the driver call). */
+   VkImportMemoryHostPointerInfoEXT gkvm_host_import = { 0 };
 
    /* gkvm #28: plain HOST_VISIBLE memory is NO LONGER backed by an imported mtl_shm carrier.
     * The old path allocated a POSIX shm + Metal buffer (newBufferWithBytesNoCopy) and imported
@@ -458,9 +461,34 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
          return;
       }
-      vkr_log("gkvm: scanout memory -> mtl_shm carrier for blob export; image renders into its "
-              "IOSurface (id=%u) via useIOSurface",
-              ((struct vkr_mtl_iosurface *)gkvm_scanout_surf)->id);
+
+      if (!physical_dev->EXT_metal_objects) {
+         /* KosmicKrisp: the image can't adopt the IOSurface via VK_EXT_metal_objects
+          * (vkr_image.c made it LINEAR instead) — back the memory itself with the
+          * IOSurface bytes via VK_EXT_external_memory_host. KK builds linear-image
+          * textures from the memory's MTLBuffer (newBufferWithBytesNoCopy over this
+          * pointer), so the render lands in the IOSurface. The pointer is page-aligned;
+          * the length passed to Metal must be page-aligned too, so round the allocation
+          * up to the IOSurface's own (page-rounded) alloc size. */
+         struct vkr_mtl_iosurface *gkvm_io =
+            (struct vkr_mtl_iosurface *)gkvm_scanout_surf;
+         gkvm_host_import.sType =
+            VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+         gkvm_host_import.handleType =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+         gkvm_host_import.pHostPointer = gkvm_io->base_addr;
+         gkvm_host_import.pNext = alloc_info->pNext;
+         alloc_info->pNext = &gkvm_host_import;
+         if (alloc_info->allocationSize <= gkvm_io->alloc_size)
+            alloc_info->allocationSize = gkvm_io->alloc_size;
+         vkr_log("gkvm: KK scanout memory <- host-pointer import of IOSurface id=%u "
+                 "(base=%p size=%" PRIu64 ")",
+                 gkvm_io->id, gkvm_io->base_addr, (uint64_t)gkvm_io->alloc_size);
+      } else {
+         vkr_log("gkvm: scanout memory -> mtl_shm carrier for blob export; image renders "
+                 "into its IOSurface (id=%u) via useIOSurface",
+                 ((struct vkr_mtl_iosurface *)gkvm_scanout_surf)->id);
+      }
    }
 
    if (export_info && !mtl_shm &&

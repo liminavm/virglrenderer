@@ -83,6 +83,11 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * its bytes are unused for pixels — getMTLTexture uses the IOSurface. Only formats we can
     * map are backed; others forward unchanged. */
    struct vkr_mtl_iosurface *gkvm_surf = NULL;
+   bool gkvm_kk_linear = false;
+   uint32_t gkvm_mtl = 0, gkvm_fourcc = 0, gkvm_bpe = 0;
+   /* Captured PRE-create: vkr_image_create_and_add replaces args->device with the raw
+    * driver handle, so vkr_device_from_handle(args->device) is INVALID afterwards. */
+   struct vkr_device *gkvm_dev = NULL;
    VkImportMetalIOSurfaceInfoEXT gkvm_io_import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
    };
@@ -94,36 +99,60 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
             break;
          }
       }
-      uint32_t mtl, fourcc, bpe;
-      if (ext && ext->handleTypes &&
-          gkvm_vkformat_to_iosurface(ci->format, &mtl, &fourcc, &bpe)) {
-         struct vkr_device *dev = vkr_device_from_handle(args->device);
-         gkvm_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
-                                             ci->extent.height, mtl, fourcc, bpe);
-         if (gkvm_surf) {
-            VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
-            /* MoltenVK can't honor external-memory / dma_buf / DRM-format-modifier — the
-             * IOSurface replaces all of them. Drop those structs and normalize
-             * DRM_FORMAT_MODIFIER tiling to OPTIMAL. */
-            VkBaseInStructure *prev = (VkBaseInStructure *)mci;
-            for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
-                 s = (VkBaseInStructure *)prev->pNext) {
-               const int t = (int)s->sType;
-               if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
-                   t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
-                   t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
-                  prev->pNext = s->pNext; /* unlink */
-               else
-                  prev = s;
-            }
-            if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-               mci->tiling = VK_IMAGE_TILING_OPTIMAL;
+      if (ext && ext->handleTypes) {
+         /* No macOS driver honors fd-flavored external images (MoltenVK tolerates the
+          * structs; KosmicKrisp rejects them at create) — vkr implements the export
+          * contract itself. ALWAYS drop the external-memory / DRM-format-modifier
+          * structs and normalize DRM_FORMAT_MODIFIER tiling to OPTIMAL; scanout-capable
+          * formats additionally get IOSurface backing below. */
+         VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
+         VkBaseInStructure *prev = (VkBaseInStructure *)mci;
+         for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
+              s = (VkBaseInStructure *)prev->pNext) {
+            const int t = (int)s->sType;
+            if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
+                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+               prev->pNext = s->pNext; /* unlink */
+            else
+               prev = s;
+         }
+         if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+            mci->tiling = VK_IMAGE_TILING_OPTIMAL;
 
-            /* Chain VkImportMetalIOSurfaceInfoEXT so MoltenVK backs this image with our global
-             * IOSurface (useIOSurface) — render lands in the surface, presented zero-copy. */
-            gkvm_io_import.ioSurface = (IOSurfaceRef)gkvm_surf->io_surface;
-            gkvm_io_import.pNext = mci->pNext;
-            mci->pNext = &gkvm_io_import;
+         if (gkvm_vkformat_to_iosurface(ci->format, &gkvm_mtl, &gkvm_fourcc, &gkvm_bpe)) {
+            struct vkr_device *dev = vkr_device_from_handle(args->device);
+            gkvm_dev = dev;
+            if (dev->physical_device->EXT_metal_objects) {
+               /* MoltenVK: chain VkImportMetalIOSurfaceInfoEXT so the driver backs this
+                * image with our global IOSurface (useIOSurface) — render lands in the
+                * surface, presented zero-copy. */
+               gkvm_surf =
+                  vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
+                                          ci->extent.height, gkvm_mtl, gkvm_fourcc,
+                                          gkvm_bpe, 0);
+               if (gkvm_surf) {
+                  gkvm_io_import.ioSurface = (IOSurfaceRef)gkvm_surf->io_surface;
+                  gkvm_io_import.pNext = mci->pNext;
+                  mci->pNext = &gkvm_io_import;
+               }
+            } else {
+               /* KosmicKrisp (no VK_EXT_metal_objects): force LINEAR tiling — KK creates
+                * linear-image MTLTextures from the bound memory's MTLBuffer, and the bound
+                * memory will be a host-pointer import of the IOSurface bytes
+                * (vkr_device_memory.c) — render lands in the surface, presented zero-copy.
+                * The IOSurface is allocated AFTER create, with the driver's linear rowPitch
+                * (vkGetImageSubresourceLayout). */
+               mci->tiling = VK_IMAGE_TILING_LINEAR;
+               /* INPUT_ATTACHMENT usage makes KK promote the image layout to
+                * 2DArray (vk_image_to_mtl_texture_type) — but Metal buffer-backed
+                * linear textures must be plain 2D, and a layout/texture array-ness
+                * mismatch makes render passes silently drop every draw (clears
+                * still land). zink only adds the bit speculatively (fb-fetch);
+                * scanout buffers are never fb-fetched. */
+               mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+               gkvm_kk_linear = true;
+            }
          }
       }
    }
@@ -140,6 +169,36 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
       }
       vkr_log("IOSurface-backed scanout image %ux%u id=%u -> ret=%d", ci->extent.width,
               ci->extent.height, gkvm_surf->id, args->ret);
+   } else if (gkvm_kk_linear && gkvm_dev && gkvm_obj && args->ret == VK_SUCCESS) {
+      /* KosmicKrisp path: image is LINEAR; allocate the IOSurface with the driver's
+       * rowPitch so the surface bytes can directly back the image memory. */
+      struct vkr_device *dev = gkvm_dev;
+      struct vn_device_proc_table *vk = &dev->proc_table;
+      VkImageSubresource subres = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      };
+      VkSubresourceLayout layout = { 0 };
+      vk->GetImageSubresourceLayout(dev->base.handle.device, gkvm_obj->base.handle.image,
+                                    &subres, &layout);
+      struct vkr_mtl_iosurface *gkvm_kk_surf = NULL;
+      if (layout.rowPitch && layout.rowPitch == (uint32_t)layout.rowPitch) {
+         gkvm_kk_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
+                                                ci->extent.height, gkvm_mtl, gkvm_fourcc,
+                                                gkvm_bpe, (uint32_t)layout.rowPitch);
+         /* If IOSurface overrode the pitch (alignment minimums), the bytes can't back the
+          * image — drop the surface rather than scan out sheared pixels. */
+         if (gkvm_kk_surf && gkvm_kk_surf->bytes_per_row != (uint32_t)layout.rowPitch) {
+            vkr_log("KK scanout: IOSurface pitch %u != image rowPitch %u — no zero-copy",
+                    gkvm_kk_surf->bytes_per_row, (uint32_t)layout.rowPitch);
+            vkr_mtl_iosurface_free(gkvm_kk_surf);
+            gkvm_kk_surf = NULL;
+         }
+      }
+      gkvm_obj->mtl_iosurface = gkvm_kk_surf;
+      vkr_log("KK linear scanout image %ux%u rowPitch=%u -> IOSurface id=%u bpr=%u",
+              ci->extent.width, ci->extent.height, (uint32_t)layout.rowPitch,
+              gkvm_kk_surf ? gkvm_kk_surf->id : 0,
+              gkvm_kk_surf ? gkvm_kk_surf->bytes_per_row : 0);
    }
 #else
    (void)gkvm_obj;
@@ -180,8 +239,30 @@ vkr_dispatch_vkGetImageMemoryRequirements2(
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+#ifdef __APPLE__
+   /* gkvm KK scanout: capture before vn_replace swaps in the raw driver handle. */
+   struct vkr_image *gkvm_img = args->pInfo ? vkr_image_from_handle(args->pInfo->image) : NULL;
+#endif
+
    vn_replace_vkGetImageMemoryRequirements2_args_handle(args);
    vk->GetImageMemoryRequirements2(args->device, args->pInfo, args->pMemoryRequirements);
+
+#ifdef __APPLE__
+   /* gkvm KK scanout: the IOSurface bytes back this image's memory via a host-pointer
+    * import at vkAllocateMemory — but that path can only find the image through
+    * VkMemoryDedicatedAllocateInfo. zink only chains it when the driver asks
+    * (prefers/requiresDedicatedAllocation, zink_resource.c), and KosmicKrisp doesn't.
+    * Force it for IOSurface-backed scanout images so the allocation is dedicated and
+    * the import can fire. */
+   if (gkvm_img && gkvm_img->mtl_iosurface && args->pMemoryRequirements) {
+      VkMemoryDedicatedRequirements *ded = vkr_find_struct(
+         args->pMemoryRequirements->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS);
+      if (ded) {
+         ded->prefersDedicatedAllocation = VK_TRUE;
+         ded->requiresDedicatedAllocation = VK_TRUE;
+      }
+   }
+#endif
 }
 
 static void

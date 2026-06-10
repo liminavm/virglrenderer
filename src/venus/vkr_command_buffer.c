@@ -145,6 +145,9 @@ static void
 vkr_dispatch_vkCmdBindPipeline(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCmdBindPipeline *args)
 {
+   if (getenv("GKVM_KK_RTLOG"))
+      vkr_log("[CMD] BindPipeline bp=%d pipeline=%p", args->pipelineBindPoint,
+              (void *)args->pipeline);
    VKR_CMD_CALL(CmdBindPipeline, args, args->pipelineBindPoint, args->pipeline);
 }
 
@@ -242,6 +245,8 @@ static void
 vkr_dispatch_vkCmdDraw(UNUSED struct vn_dispatch_context *dispatch,
                        struct vn_command_vkCmdDraw *args)
 {
+   if (getenv("GKVM_KK_RTLOG"))
+      vkr_log("[CMD] Draw count=%u", args->vertexCount);
    VKR_CMD_CALL(CmdDraw, args, args->vertexCount, args->instanceCount, args->firstVertex,
                 args->firstInstance);
 }
@@ -933,6 +938,10 @@ static void
 vkr_dispatch_vkCmdSetColorWriteMaskEXT(UNUSED struct vn_dispatch_context *dispatch,
                                        struct vn_command_vkCmdSetColorWriteMaskEXT *args)
 {
+   if (getenv("GKVM_KK_RTLOG"))
+      vkr_log("[CMD] SetColorWriteMaskEXT first=%u count=%u mask0=0x%x",
+              args->firstAttachment, args->attachmentCount,
+              args->attachmentCount && args->pColorWriteMasks ? args->pColorWriteMasks[0] : 0xdead);
    VKR_CMD_CALL(CmdSetColorWriteMaskEXT, args, args->firstAttachment,
                 args->attachmentCount, args->pColorWriteMasks);
 }
