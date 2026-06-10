@@ -120,10 +120,37 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   if (getenv("GKVM_KK_RTLOG"))
+   if (getenv("GKVM_KK_RTLOG")) {
       vkr_log("[CMD] CreateGraphicsPipelines count=%u ret=%d", args->createInfoCount,
               args->ret);
+      for (uint32_t i = 0; i < args->createInfoCount; i++) {
+         const VkGraphicsPipelineCreateInfo *gci = &args->pCreateInfos[i];
+         char dyn[256] = "";
+         if (gci->pDynamicState) {
+            int off = 0;
+            for (uint32_t j = 0; j < gci->pDynamicState->dynamicStateCount &&
+                                 off < (int)sizeof(dyn) - 16; j++)
+               off += snprintf(dyn + off, sizeof(dyn) - off, "%d,",
+                               (int)gci->pDynamicState->pDynamicStates[j]);
+         }
+         char wm[64] = "";
+         if (gci->pColorBlendState) {
+            int off = 0;
+            for (uint32_t j = 0; j < gci->pColorBlendState->attachmentCount &&
+                                 off < (int)sizeof(wm) - 4; j++)
+               off += snprintf(wm + off, sizeof(wm) - off, "%x,",
+                               gci->pColorBlendState->pAttachments[j].colorWriteMask);
+         }
+         vkr_log("[CMD]   gp[%u] stages=%u cb=%s(att wm=%s) dyn=[%s]", i,
+                 gci->stageCount, gci->pColorBlendState ? "Y" : "N", wm, dyn);
+      }
+   }
    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
+   if (getenv("GKVM_KK_RTLOG")) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++)
+         vkr_log("[CMD]   gp[%u] guest-handle=%p", i,
+                 (void *)(uintptr_t)args->pPipelines[i]);
+   }
 }
 
 static void
