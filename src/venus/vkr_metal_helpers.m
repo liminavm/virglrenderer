@@ -38,6 +38,17 @@ vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAd
    return (void *)device_info.mtlDevice;
 }
 
+void *
+vkr_metal_get_system_device(void)
+{
+   /* Fallback when the driver can't export its MTLDevice (KosmicKrisp has no
+    * VK_EXT_metal_objects). The mtl_device is only used for blob-export carriers
+    * (vkr_mtl_shm_alloc's no-copy MTLBuffer) and IOSurface allocation — Apple
+    * Silicon machines have a single GPU, so the system default device is the
+    * same device the driver renders on. */
+   return (void *)MTLCreateSystemDefaultDevice();
+}
+
 struct vkr_mtl_shm *
 vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
 {
@@ -104,7 +115,8 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
                         uint32_t height,
                         uint32_t mtl_pixel_format,
                         uint32_t iosurface_pixel_format,
-                        uint32_t bytes_per_element)
+                        uint32_t bytes_per_element,
+                        uint32_t bytes_per_row)
 {
    if (!mtl_device || !width || !height)
       return NULL;
@@ -115,14 +127,18 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    @autoreleasepool {
       /* kIOSurfaceIsGlobal: the limina supervisor (a separate process) looks the surface
        * up by IOSurfaceGetID for present — the existing limina-display transport. IOSurface
-       * picks/aligns bytesPerRow itself; the IOSurface-backed MTLTexture honors it. */
-      NSDictionary *props = @{
+       * picks/aligns bytesPerRow itself unless the caller forces one (bytes_per_row != 0,
+       * the KosmicKrisp linear-image path: the surface bytes back the image memory, so the
+       * pitch must equal the driver's linear rowPitch). */
+      NSMutableDictionary *props = [@{
          (id)kIOSurfaceWidth : @(width),
          (id)kIOSurfaceHeight : @(height),
          (id)kIOSurfaceBytesPerElement : @(bytes_per_element),
          (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
          (id)kIOSurfaceIsGlobal : @YES,
-      };
+      } mutableCopy];
+      if (bytes_per_row)
+         props[(id)kIOSurfaceBytesPerRow] = @(bytes_per_row);
       io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
       if (!io)
          return NULL;
@@ -157,6 +173,8 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    surf->width = width;
    surf->height = height;
    surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
+   surf->base_addr = IOSurfaceGetBaseAddress(io);
+   surf->alloc_size = IOSurfaceGetAllocSize(io);
    return surf;
 }
 
