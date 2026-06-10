@@ -473,6 +473,27 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
    if (proxy_context_resource_find(ctx, res_id))
       return;
 
+   /* limina tier-2 (macOS): a venus blob shared by pointer (#28 map_ptr, fd_type
+    * OPAQUE_HANDLE with no fd) is attachable fd-less — the server is a thread in this
+    * process, so the host VA crosses the protocol verbatim.  This is the compositor
+    * importing a client's window buffer (cross-context wl_buffer dmabuf). */
+   if (res->fd_type == VIRGL_RESOURCE_OPAQUE_HANDLE && res->map_ptr) {
+      const struct render_context_op_import_resource_request req = {
+         .header.op = RENDER_CONTEXT_OP_IMPORT_RESOURCE,
+         .res_id = res_id,
+         .fd_type = VIRGL_RESOURCE_FD_INVALID,
+         .size = res->map_size,
+         .iosurface_id = res->iosurface_id,
+         .map_ptr = res->map_ptr,
+      };
+      if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
+         proxy_log("failed to attach map_ptr res %d", res_id);
+         return;
+      }
+      proxy_context_resource_add(ctx, res_id);
+      return;
+   }
+
    /* The current render protocol only supports importing dma-buf, shm or pipe resource
     * that can be exported to dma-buf. A protocol change is needed when there exists use
     * case for importing external Vulkan opaque resource.
@@ -514,6 +535,10 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       .res_id = res_id,
       .fd_type = res_fd_type,
       .size = res_size,
+      /* limina tier-2 (macOS): SHM blobs of venus scanout memories are CARRIERS — the
+       * pixels live in the IOSurface; carry its id so imports alias the real bytes. */
+      .iosurface_id = res->iosurface_id,
+      .map_ptr = res->map_ptr,
    };
    if (!proxy_socket_send_request_with_fds(&ctx->socket, &req, sizeof(req), &res_fd, 1))
       proxy_log("failed to attach res %d", res_id);

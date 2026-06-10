@@ -190,4 +190,22 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
    free(surf);
 }
 
+void *
+vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
+{
+   IOSurfaceRef io = IOSurfaceLookup(id); /* +1 ref, surfaces are kIOSurfaceIsGlobal */
+   if (!io)
+      return NULL;
+   *out_base = IOSurfaceGetBaseAddress(io);
+   *out_alloc_size = IOSurfaceGetAllocSize(io);
+   return (void *)io;
+}
+
+void
+vkr_mtl_iosurface_release_ref(void *io_surface)
+{
+   if (io_surface)
+      CFRelease(io_surface);
+}
+
 #endif /* __APPLE__ */

@@ -32,6 +32,14 @@ struct vkr_resource {
    } u;
 
    size_t size;
+
+   /* limina tier-2 (macOS): for a cross-context import of a venus-exported blob, where
+    * the exporter's pixel bytes actually live — a GLOBAL IOSurface id (window buffers;
+    * the SHM above is only a carrier) and/or the exporter's host mapping (#28 map_ptr).
+    * vkAllocateMemory(VkImportMemoryResourceInfoMESA) host-pointer-imports these.
+    * 0 = not present. */
+   uint32_t iosurface_id;
+   uint64_t map_ptr;
 };
 
 enum vkr_context_validate_level {
@@ -139,7 +147,9 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint32_t res_id,
                             enum virgl_resource_fd_type fd_type,
                             int fd,
-                            uint64_t size);
+                            uint64_t size,
+                            uint32_t iosurface_id,
+                            uint64_t map_ptr);
 
 void
 vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id);

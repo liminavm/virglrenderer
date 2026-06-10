@@ -232,20 +232,27 @@ vkr_renderer_import_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              enum virgl_resource_fd_type fd_type,
                              int fd,
-                             uint64_t size)
+                             uint64_t size,
+                             uint32_t iosurface_id,
+                             uint64_t map_ptr)
 {
    TRACE_FUNC();
 
    assert(res_id);
-   assert(fd_type == VIRGL_RESOURCE_FD_DMABUF || fd_type == VIRGL_RESOURCE_FD_OPAQUE);
-   assert(fd >= 0);
+   /* limina tier-2 (macOS): SHM (carrier or plain) and fd-less map_ptr blobs are also
+    * importable cross-context — the pixel bytes are reached via iosurface_id/map_ptr. */
+   assert(fd_type == VIRGL_RESOURCE_FD_DMABUF || fd_type == VIRGL_RESOURCE_FD_OPAQUE ||
+          fd_type == VIRGL_RESOURCE_FD_SHM ||
+          (fd_type == VIRGL_RESOURCE_FD_INVALID && map_ptr));
+   assert(fd >= 0 || map_ptr);
    assert(size);
 
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
    if (!ctx)
       return false;
 
-   return vkr_context_import_resource(ctx, res_id, fd_type, fd, size);
+   return vkr_context_import_resource(ctx, res_id, fd_type, fd, size, iosurface_id,
+                                      map_ptr);
 }
 
 void

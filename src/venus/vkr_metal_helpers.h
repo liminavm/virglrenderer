@@ -90,6 +90,16 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
 void
 vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 
+/* Look up a GLOBAL IOSurface by id (cross-context import of a venus-exported window
+ * buffer: the importing VkDeviceMemory host-pointer-imports the exporter's pixel
+ * bytes).  Returns a RETAINED IOSurfaceRef (release with vkr_mtl_iosurface_release_ref)
+ * and its page-aligned base address + page-rounded alloc size, or NULL. */
+void *
+vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size);
+
+void
+vkr_mtl_iosurface_release_ref(void *io_surface);
+
 #else /* !__APPLE__ */
 
 static inline void *
@@ -143,6 +153,21 @@ static inline void
 vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
 {
    (void)surf;
+}
+
+static inline void *
+vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
+{
+   (void)id;
+   (void)out_base;
+   (void)out_alloc_size;
+   return NULL;
+}
+
+static inline void
+vkr_mtl_iosurface_release_ref(void *io_surface)
+{
+   (void)io_surface;
 }
 
 #endif /* __APPLE__ */

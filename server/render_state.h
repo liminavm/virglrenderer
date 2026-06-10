@@ -50,7 +50,9 @@ render_state_import_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              enum virgl_resource_fd_type fd_type,
                              int fd,
-                             uint64_t size);
+                             uint64_t size,
+                             uint32_t iosurface_id,
+                             uint64_t map_ptr);
 
 void
 render_state_destroy_resource(uint32_t ctx_id, uint32_t res_id);
