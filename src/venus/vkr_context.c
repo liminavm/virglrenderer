@@ -237,6 +237,8 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
    res->res_id = res_id;
    res->fd_type = fd_type;
    res->size = blob_size;
+   res->iosurface_id = 0;
+   res->map_ptr = 0;
 
    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
    assert(fd < 0 || !mmap_ptr);
@@ -342,6 +344,12 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
                                                 VIRGL_RESOURCE_FD_OPAQUE, -1, NULL))
          return false;
 
+      /* Self-imports (vkAllocateMemory with this res in the SAME ctx) resolve the
+       * bytes via these — u.fd is -1 here and useless. */
+      struct vkr_resource *gkvm_res = vkr_context_get_resource(ctx, res_id);
+      gkvm_res->map_ptr = (uintptr_t)blob.map_ptr;
+      gkvm_res->iosurface_id = blob.iosurface_id;
+
       *out_blob = blob;
       return true;
    }
@@ -367,6 +375,16 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       close(blob.u.fd);
       return false;
    }
+
+#ifdef __APPLE__
+   /* gkvm: SHM blobs of scanout memories are CARRIERS (pixels live in the IOSurface);
+    * record the id so a self-import of this resource aliases the real bytes. NOTE this
+    * resource's u.fd holds an fd, NOT a mapping — never read u.data on this path. */
+   if (blob.iosurface_id) {
+      struct vkr_resource *gkvm_res = vkr_context_get_resource(ctx, res_id);
+      gkvm_res->iosurface_id = blob.iosurface_id;
+   }
+#endif
 
    *out_blob = blob;
 
@@ -396,12 +414,25 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint32_t res_id,
                             enum virgl_resource_fd_type fd_type,
                             int fd,
-                            uint64_t size)
+                            uint64_t size,
+                            uint32_t iosurface_id,
+                            uint64_t map_ptr)
 {
+   bool ok;
    if (fd_type == VIRGL_RESOURCE_FD_SHM)
-      return vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
+      ok = vkr_context_import_resource_from_shm(ctx, res_id, size, fd);
+   else
+      ok = vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
 
-   return vkr_context_import_resource_internal(ctx, res_id, size, fd_type, fd, NULL);
+   /* gkvm tier-2 (macOS): remember where the exporter's pixel bytes live so memory
+    * imports can alias them (see struct vkr_resource). */
+   if (ok && (iosurface_id || map_ptr)) {
+      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
+      res->iosurface_id = iosurface_id;
+      res->map_ptr = map_ptr;
+   }
+
+   return ok;
 }
 
 void

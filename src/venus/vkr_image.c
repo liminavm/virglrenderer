@@ -105,11 +105,19 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
           * contract itself. ALWAYS drop the external-memory / DRM-format-modifier
           * structs and normalize DRM_FORMAT_MODIFIER tiling to OPTIMAL; scanout-capable
           * formats additionally get IOSurface backing below. */
+         /* An EXPLICIT modifier struct marks an IMPORT (zink passes the exporter's
+          * layout); the pixel bytes already live in the EXPORTER's IOSurface and the
+          * memory bind aliases them (vkr_device_memory.c host-pointer import) — do NOT
+          * allocate a fresh (wrong) IOSurface for such an image. Allocation-side
+          * creates use the modifier LIST form. */
+         bool gkvm_is_import = false;
          VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
          VkBaseInStructure *prev = (VkBaseInStructure *)mci;
          for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
               s = (VkBaseInStructure *)prev->pNext) {
             const int t = (int)s->sType;
+            if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+               gkvm_is_import = true;
             if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
                 t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
                 t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
@@ -123,7 +131,14 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          if (gkvm_vkformat_to_iosurface(ci->format, &gkvm_mtl, &gkvm_fourcc, &gkvm_bpe)) {
             struct vkr_device *dev = vkr_device_from_handle(args->device);
             gkvm_dev = dev;
-            if (dev->physical_device->EXT_metal_objects) {
+            if (gkvm_is_import) {
+               /* Import: keep KK's LINEAR/usage normalization below, skip IOSurface
+                * allocation (the bound memory aliases the exporter's bytes). */
+               if (!dev->physical_device->EXT_metal_objects) {
+                  mci->tiling = VK_IMAGE_TILING_LINEAR;
+                  mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+               }
+            } else if (dev->physical_device->EXT_metal_objects) {
                /* MoltenVK: chain VkImportMetalIOSurfaceInfoEXT so the driver backs this
                 * image with our global IOSurface (useIOSurface) — render lands in the
                 * surface, presented zero-copy. */

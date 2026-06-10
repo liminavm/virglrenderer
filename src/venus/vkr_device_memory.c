@@ -264,16 +264,89 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
    VkImportMemoryResourceInfoMESA *res_info = NULL;
+#ifdef __APPLE__
+   /* gkvm tier-2: cross-context import (compositor importing a client's wl_buffer
+    * dmabuf). macOS has no fd-flavored external memory; the exporter's pixel bytes
+    * live in a GLOBAL IOSurface (window buffers — the resource's SHM fd is only a
+    * carrier) or behind the #28 map_ptr / SHM mapping. Translate the import into
+    * VkImportMemoryHostPointerInfoEXT over those bytes (function scope — chained
+    * into alloc_info and must outlive the driver call). */
+   VkImportMemoryHostPointerInfoEXT gkvm_res_import = { 0 };
+   void *gkvm_imported_iosurface = NULL;
+   bool gkvm_res_imported = false;
+#endif
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
    if (prev_of_res_info) {
       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
+#ifdef __APPLE__
+      struct vkr_resource *gkvm_res = vkr_context_get_resource(ctx, res_info->resourceId);
+      if (gkvm_res) {
+         void *ptr = NULL;
+         uint64_t span = 0;
+         if (gkvm_res->iosurface_id) {
+            gkvm_imported_iosurface =
+               vkr_mtl_iosurface_lookup(gkvm_res->iosurface_id, &ptr, &span);
+            if (!gkvm_imported_iosurface)
+               vkr_log("gkvm: import res %u: IOSurface id=%u lookup failed",
+                       res_info->resourceId, gkvm_res->iosurface_id);
+         }
+         if (!ptr && gkvm_res->map_ptr) {
+            ptr = (void *)(uintptr_t)gkvm_res->map_ptr;
+            span = gkvm_res->size;
+         }
+         if (!ptr && gkvm_res->fd_type == VIRGL_RESOURCE_FD_SHM &&
+             (uintptr_t)gkvm_res->u.data >= 0x10000) {
+            /* Cross-context SHM imports store the server-side mmap in u.data; a
+             * SAME-context (export-side) SHM resource stores an fd NUMBER in the
+             * union instead — the plausibility check keeps us off it (those
+             * resolve via iosurface_id above). */
+            ptr = gkvm_res->u.data;
+            span = gkvm_res->size;
+         }
+         if (ptr) {
+            /* VK_EXT_external_memory_host needs page-aligned ptr + size multiple of
+             * minImportedHostPointerAlignment; blob sizes are guest-page (16K) multiples
+             * and IOSurface alloc sizes page-rounded already — round up defensively. */
+            const uint64_t page_size = getpagesize();
+            span = (span + page_size - 1) & ~(page_size - 1);
+            prev_of_res_info->pNext = res_info->pNext; /* unlink res_info */
+            gkvm_res_import.sType =
+               VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+            gkvm_res_import.handleType =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            gkvm_res_import.pHostPointer = ptr;
+            gkvm_res_import.pNext = alloc_info->pNext;
+            alloc_info->pNext = &gkvm_res_import;
+            if (alloc_info->allocationSize <= span)
+               alloc_info->allocationSize = span;
+            gkvm_res_imported = true;
+            vkr_log("gkvm: import res %u <- host-pointer (IOSurface id=%u base=%p "
+                    "size=%" PRIu64 ")",
+                    res_info->resourceId, gkvm_res->iosurface_id, ptr, span);
+         }
+      }
+      if (!gkvm_res_imported) {
+         if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+            /* loud: a silent error here corrupts the ring (the guest treats the alloc
+             * as async-success and the follow-up bind goes CS-fatal). */
+            vkr_log("gkvm: import res %u failed (fd_type=%d, no IOSurface/map_ptr/shm "
+                    "bytes) -> VK_ERROR_INVALID_EXTERNAL_HANDLE",
+                    res_info->resourceId,
+                    gkvm_res ? (int)gkvm_res->fd_type : -999);
+            args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+         }
+         prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_import_info;
+      }
+#else
       if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          return;
       }
 
       prev_of_res_info->pNext = (const struct VkBaseInStructure *)&local_import_info;
+#endif
    }
 
    VkExportMemoryAllocateInfo *export_info =
@@ -436,7 +509,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * so the guest can export this dedicated memory as the virtio-gpu scanout blob (present
     * resolves resource -> memory -> IOSurface, see vkr_device_memory_export_blob); the
     * carrier's bytes are never the scanout pixels. */
-   {
+   /* Imported memories (res_info) already alias the EXPORTER's bytes — never re-route
+    * them to the dedicated image's own (fresh, wrong) IOSurface. */
+   if (!res_info) {
       const VkMemoryDedicatedAllocateInfo *ded = vkr_find_struct(
          alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
       if (ded && ded->image != VK_NULL_HANDLE) {
@@ -520,6 +595,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       if (gbm_bo)
          vkr_gbm_bo_destroy(gbm_bo);
       vkr_mtl_shm_free(mtl_shm);
+#ifdef __APPLE__
+      vkr_mtl_iosurface_release_ref(gkvm_imported_iosurface);
+#endif
       return;
    }
 
@@ -537,6 +615,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * vkr_device_memory_export_blob carries the id even before vkBindImageMemory2. */
    if (gkvm_scanout_surf)
       mem->mtl_iosurface = gkvm_scanout_surf;
+   /* gkvm: hold the imported window buffer's IOSurface for this memory's lifetime. */
+   mem->imported_iosurface = gkvm_imported_iosurface;
 #endif
 }
 
@@ -651,6 +731,7 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
     * (a MoltenVK use-after-free / SIGSEGV). The borrowed pointer in the resource layer is only
     * read while the guest holds the mapping; by free time the guest side is already gone. */
    vkr_mtl_shm_free(mem->mtl_shm);
+   vkr_mtl_iosurface_release_ref(mem->imported_iosurface);
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
    if (mem->udmabuf_fd >= 0)
