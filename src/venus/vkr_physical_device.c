@@ -755,8 +755,51 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
+
+#ifdef __APPLE__
+   /* limina: fd-flavored external memory (OPAQUE_FD / DMA_BUF) is implemented by vkr
+    * ITSELF on macOS — IOSurface backing for scanout images (vkr_image.c) and mtl_shm
+    * carriers for blob export (vkr_device_memory.c) — never by the driver. MoltenVK
+    * happens to tolerate the external-image query; KosmicKrisp honestly rejects it
+    * (kk_image.c "unsupported VkExternalMemoryHandleTypeFlagBits") and the guest's
+    * whole winsys path dies. Answer the external part here: drop the external-image
+    * info from the driver query and synthesize the external properties in the reply. */
+   VkPhysicalDeviceExternalImageFormatInfo *limina_ext_info =
+      (VkPhysicalDeviceExternalImageFormatInfo *)vkr_find_struct(
+         args->pImageFormatInfo->pNext,
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   VkExternalMemoryHandleTypeFlagBits limina_ext_handle = 0;
+   if (limina_ext_info &&
+       (limina_ext_info->handleType & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
+      limina_ext_handle = limina_ext_info->handleType;
+      VkBaseOutStructure *limina_prev = vkr_find_prev_struct(
+         args->pImageFormatInfo,
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+      if (limina_prev)
+         limina_prev->pNext = (VkBaseOutStructure *)limina_ext_info->pNext;
+   }
+#endif
+
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+#ifdef __APPLE__
+   if (limina_ext_handle && args->ret == VK_SUCCESS) {
+      VkExternalImageFormatProperties *limina_ext_props =
+         (VkExternalImageFormatProperties *)vkr_find_struct(
+            args->pImageFormatProperties->pNext,
+            VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
+      if (limina_ext_props) {
+         limina_ext_props->externalMemoryProperties = (VkExternalMemoryProperties){
+            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                                      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+            .exportFromImportedHandleTypes = limina_ext_handle,
+            .compatibleHandleTypes = limina_ext_handle,
+         };
+      }
+   }
+#endif
 }
 
 static void
