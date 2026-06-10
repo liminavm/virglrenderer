@@ -85,16 +85,28 @@ render_context_dispatch_import_resource(struct render_context *ctx,
                                         const int *fds,
                                         int fd_count)
 {
+   const struct render_context_op_import_resource_request *req =
+      &request->import_resource;
+
+   /* limina tier-2 (macOS): a map_ptr blob (#28) attaches fd-less — the host VA is
+    * valid here (same-process thread server). */
+   if (req->fd_type == VIRGL_RESOURCE_FD_INVALID && req->map_ptr) {
+      if (fd_count != 0) {
+         render_log("unexpected %d fds with map_ptr resource attach", fd_count);
+         return false;
+      }
+      return render_state_import_resource(ctx->ctx_id, req->res_id, req->fd_type, -1,
+                                          req->size, req->iosurface_id, req->map_ptr);
+   }
+
    if (fd_count != 1) {
       render_log("failed to attach resource with fd_count %d", fd_count);
       return false;
    }
 
    /* classic 3d resource with valid size reuses the blob import path here */
-   const struct render_context_op_import_resource_request *req =
-      &request->import_resource;
    return render_state_import_resource(ctx->ctx_id, req->res_id, req->fd_type, fds[0],
-                                       req->size);
+                                       req->size, req->iosurface_id, req->map_ptr);
 }
 
 static bool

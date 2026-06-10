@@ -178,7 +178,16 @@ struct render_context_op_import_resource_request {
    uint32_t res_id;
    enum virgl_resource_fd_type fd_type;
    uint64_t size;
-   /* followed by 1 fd */
+   /* limina tier-2 (macOS): cross-context import of a venus-exported blob.  The blob's
+    * pixel bytes live in a GLOBAL IOSurface (window buffers) and/or behind a host VA
+    * (#28 map_ptr) — the SHM fd, when present, may be only a carrier whose bytes are
+    * NOT the pixels.  Carry both so vkAllocateMemory(VkImportMemoryResourceInfoMESA)
+    * can host-pointer-import the bytes the exporter's GPU actually writes.  map_ptr is
+    * valid across this boundary because the server is a thread in the same process
+    * (ENABLE_SAME_PROCESS_RENDER_SERVER).  0 = absent. */
+   uint32_t iosurface_id;
+   uint64_t map_ptr;
+   /* followed by 1 fd unless fd_type is VIRGL_RESOURCE_FD_INVALID (map_ptr set) */
 };
 
 /* Free a blob resource from the context
