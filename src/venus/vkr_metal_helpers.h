@@ -36,6 +36,8 @@ struct vkr_mtl_iosurface {
    uint32_t width;
    uint32_t height;
    uint32_t bytes_per_row;
+   void *base_addr;     /* IOSurfaceGetBaseAddress — page-aligned host pointer */
+   uint64_t alloc_size; /* IOSurfaceGetAllocSize */
 };
 
 #ifdef __APPLE__
@@ -52,6 +54,11 @@ struct vkr_mtl_iosurface {
 void *
 vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAddr);
 
+/* Fallback MTLDevice for drivers without VK_EXT_metal_objects (KosmicKrisp):
+ * MTLCreateSystemDefaultDevice — same physical GPU on Apple Silicon. */
+void *
+vkr_metal_get_system_device(void);
+
 /* Allocate Metal shared memory: create anonymous SHM file, mmap it,
  * wrap as MTLBuffer.  Returns a populated vkr_mtl_shm, or NULL on failure.
  * Caller must free with vkr_mtl_shm_free().
@@ -66,15 +73,18 @@ vkr_mtl_shm_free(struct vkr_mtl_shm *shm);
 /* Allocate a GLOBAL IOSurface + an IOSurface-backed MTLTexture (StorageModeShared,
  * usage ShaderRead|RenderTarget).  `mtl_pixel_format` is an MTLPixelFormat value,
  * `iosurface_pixel_format` an IOSurface FourCC (e.g. 'BGRA'), `bytes_per_element` the
- * pixel size.  Returns a populated vkr_mtl_iosurface (free with vkr_mtl_iosurface_free),
- * or NULL on failure. */
+ * pixel size.  `bytes_per_row` forces the IOSurface row pitch (0 = let IOSurface pick) —
+ * used to match a driver's linear-image rowPitch so the surface bytes can back the image
+ * memory directly (KosmicKrisp host-pointer import).  Returns a populated
+ * vkr_mtl_iosurface (free with vkr_mtl_iosurface_free), or NULL on failure. */
 struct vkr_mtl_iosurface *
 vkr_mtl_iosurface_alloc(void *mtl_device,
                         uint32_t width,
                         uint32_t height,
                         uint32_t mtl_pixel_format,
                         uint32_t iosurface_pixel_format,
-                        uint32_t bytes_per_element);
+                        uint32_t bytes_per_element,
+                        uint32_t bytes_per_row);
 
 /* Release the IOSurface + MTLTexture and free the struct. */
 void
@@ -87,6 +97,12 @@ vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAd
 {
    (void)vk_device;
    (void)GetDeviceProcAddr;
+   return NULL;
+}
+
+static inline void *
+vkr_metal_get_system_device(void)
+{
    return NULL;
 }
 
@@ -110,13 +126,15 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
                         uint32_t height,
                         uint32_t mtl_pixel_format,
                         uint32_t iosurface_pixel_format,
-                        uint32_t bytes_per_element)
+                        uint32_t bytes_per_element,
+                        uint32_t bytes_per_row)
 {
    (void)mtl_device;
    (void)width;
    (void)height;
    (void)mtl_pixel_format;
    (void)iosurface_pixel_format;
+   (void)bytes_per_row;
    (void)bytes_per_element;
    return NULL;
 }

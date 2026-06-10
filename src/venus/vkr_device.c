@@ -207,6 +207,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    if (physical_dev->EXT_external_memory_metal)
       dev->mtl_device =
          vkr_metal_get_device(dev->base.handle.device, vk->GetDeviceProcAddr);
+   /* KosmicKrisp has no VK_EXT_metal_objects to export its MTLDevice; the blob-export
+    * carriers and IOSurfaces only need *a* Metal device, and Apple Silicon has one GPU. */
+   if (!dev->mtl_device)
+      dev->mtl_device = vkr_metal_get_system_device();
 
    free(exts);
 
