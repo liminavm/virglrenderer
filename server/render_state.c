@@ -241,10 +241,13 @@ render_state_import_resource(uint32_t ctx_id,
                              uint32_t res_id,
                              enum virgl_resource_fd_type fd_type,
                              int fd,
-                             uint64_t size)
+                             uint64_t size,
+                             uint32_t iosurface_id,
+                             uint64_t map_ptr)
 {
    SCOPE_LOCK_RENDERER();
-   return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size);
+   return vkr_renderer_import_resource(ctx_id, res_id, fd_type, fd, size, iosurface_id,
+                                       map_ptr);
 }
 
 void

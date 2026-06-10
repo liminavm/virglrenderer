@@ -36,6 +36,11 @@ struct vkr_device_memory {
     * (the vkr_image owns/frees it); we only read its id. */
    void *mtl_iosurface;
 
+   /* limina tier-2 (macOS): RETAINED IOSurfaceRef of another context's window buffer this
+    * memory host-pointer-imported (cross-context wl_buffer import); the ref keeps the
+    * pixel bytes alive for this memory's lifetime. Released in vkr_device_memory_release. */
+   void *imported_iosurface;
+
    uint64_t allocation_size;
    uint32_t memory_type_index;
 
