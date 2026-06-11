@@ -11,6 +11,7 @@
 #include "vkr_context.h"
 #include "vkr_descriptor_set.h"
 #include "vkr_device_memory.h"
+#include "vkr_image.h"
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue.h"
@@ -327,6 +328,11 @@ vkr_device_object_destroy(struct vkr_context *ctx,
    switch (obj->type) {
    case VK_OBJECT_TYPE_DEVICE_MEMORY:
       vkr_device_memory_release((struct vkr_device_memory *)obj);
+      break;
+   case VK_OBJECT_TYPE_IMAGE:
+      /* limina: frees the backing IOSurface — guests that exit without
+       * vkDestroyImage leaked one IOSurface per winsys image here. */
+      vkr_image_release((struct vkr_image *)obj);
       break;
    case VK_OBJECT_TYPE_DESCRIPTOR_POOL:
       /* Destroying VkDescriptorPool frees all VkDescriptorSet allocated inside. */

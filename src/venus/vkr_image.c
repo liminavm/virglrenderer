@@ -220,17 +220,24 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
 #endif
 }
 
+void
+vkr_image_release(struct vkr_image *img)
+{
+#ifdef __APPLE__
+   if (img && img->mtl_iosurface) {
+      vkr_mtl_iosurface_free(img->mtl_iosurface);
+      img->mtl_iosurface = NULL;
+   }
+#else
+   (void)img;
+#endif
+}
+
 static void
 vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkDestroyImage *args)
 {
-#ifdef __APPLE__
-   struct vkr_image *obj = vkr_image_from_handle(args->image);
-   if (obj && obj->mtl_iosurface) {
-      vkr_mtl_iosurface_free(obj->mtl_iosurface);
-      obj->mtl_iosurface = NULL;
-   }
-#endif
+   vkr_image_release(vkr_image_from_handle(args->image));
    vkr_image_destroy_and_remove(dispatch->data, args);
 }
 
