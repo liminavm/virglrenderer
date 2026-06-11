@@ -35,6 +35,14 @@ VKR_DEFINE_OBJECT_CAST(sampler_ycbcr_conversion,
                        VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION,
                        VkSamplerYcbcrConversion)
 
+/* Release limina-side allocations hanging off the image (the backing IOSurface, if
+ * any). Must run on BOTH destroy paths: explicit vkDestroyImage AND device/context
+ * teardown of leftover objects (vkr_device_object_destroy) — guests that exit
+ * without destroying their objects (e.g. Firefox fast shutdown) otherwise leak one
+ * IOSurface per winsys image. No-op off-macOS / for images without a surface. */
+void
+vkr_image_release(struct vkr_image *img);
+
 void
 vkr_context_init_image_dispatch(struct vkr_context *ctx);
 
