@@ -764,12 +764,18 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
     * (kk_image.c "unsupported VkExternalMemoryHandleTypeFlagBits") and the guest's
     * whole winsys path dies. Answer the external part here: drop the external-image
     * info from the driver query and synthesize the external properties in the reply. */
+   /* KosmicKrisp only: on MoltenVK the synthesize newly opens the guest's
+    * winsys-modifier/dmabuf path (mutter dmabuf feedback, kopper swapchain
+    * modifiers), which 2026-06-10 crashed zink (update_swapchain NULL call) and
+    * mutter — MVK had always run that path wl_shm-style. Keep MVK at its
+    * known-good pre-synthesize behavior until its import side is built
+    * (vkUseIOSurfaceMVK at bind). */
    VkPhysicalDeviceExternalImageFormatInfo *limina_ext_info =
       (VkPhysicalDeviceExternalImageFormatInfo *)vkr_find_struct(
          args->pImageFormatInfo->pNext,
          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
    VkExternalMemoryHandleTypeFlagBits limina_ext_handle = 0;
-   if (limina_ext_info &&
+   if (limina_ext_info && !physical_dev->EXT_metal_objects &&
        (limina_ext_info->handleType & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
       limina_ext_handle = limina_ext_info->handleType;
