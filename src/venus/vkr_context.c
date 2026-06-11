@@ -135,12 +135,82 @@ vkr_context_init_proc_table(struct vkr_context *ctx)
    vn_util_init_global_proc_table(ctx->get_proc_addr, &ctx->proc_table);
 }
 
+/* gkvm (#8): phase-1 (ring barrier) release. The release that drops the count
+ * to zero means every ring has decoded past its registration point, so the
+ * frame's vkQueueSubmit reached the driver — submit phase-2 GPU syncs. */
+void
+vkr_gkvm_present_barrier_release(struct vkr_present_fence *pf)
+{
+   if (atomic_fetch_sub(&pf->pending, 1) != 1)
+      return;
+
+   struct vkr_context *ctx = pf->ctx;
+
+   /* collect the context's distinct queues (sync_queues maps ring_idx ->
+    * queue, indices from 1; a queue can appear under several indices) */
+   struct vkr_queue *queues[ARRAY_SIZE(ctx->sync_queues)];
+   uint32_t count = 0;
+   for (uint32_t i = 1; i < ARRAY_SIZE(ctx->sync_queues); i++) {
+      struct vkr_queue *q = ctx->sync_queues[i];
+      if (!q)
+         continue;
+      bool seen = false;
+      for (uint32_t j = 0; j < count; j++)
+         seen |= queues[j] == q;
+      if (!seen)
+         queues[count++] = q;
+   }
+
+   if (!count) {
+      /* nothing on the GPU — retire now */
+      ctx->retire_fence(ctx->ctx_id, VKR_GKVM_PRESENT_RING, pf->fence_id);
+      free(pf);
+      return;
+   }
+
+   /* sole owner here: re-arm the count for phase 2 */
+   atomic_store(&pf->pending, (int)count);
+   for (uint32_t i = 0; i < count; i++) {
+      if (!vkr_queue_sync_submit_present(queues[i], pf))
+         vkr_present_fence_release(pf);
+   }
+}
+
+/* gkvm (#8): entry point for a VMM-injected scanout-flush fence (reserved ring
+ * VKR_GKVM_PRESENT_RING). Registers a barrier on every ring, then GPU syncs on
+ * every queue; retire_fence fires with the same ring/fence_id when all pass. */
+static bool
+vkr_context_gkvm_present_fence(struct vkr_context *ctx, uint64_t fence_id)
+{
+   struct vkr_present_fence *pf = malloc(sizeof(*pf));
+   if (!pf)
+      return false;
+
+   pf->ctx = ctx;
+   pf->fence_id = fence_id;
+   atomic_init(&pf->pending, 1); /* registrar guard */
+
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
+      atomic_fetch_add(&pf->pending, 1);
+      vkr_ring_add_gkvm_barrier(ring, pf);
+   }
+   mtx_unlock(&ctx->ring_mutex);
+
+   vkr_gkvm_present_barrier_release(pf); /* drop the guard */
+   return true;
+}
+
 bool
 vkr_context_submit_fence(struct vkr_context *ctx,
                          uint32_t flags,
                          uint32_t ring_idx,
                          uint64_t fence_id)
 {
+   /* gkvm (#8): the reserved present ring takes the barrier+sync path */
+   if (ring_idx == VKR_GKVM_PRESENT_RING)
+      return vkr_context_gkvm_present_fence(ctx, fence_id);
+
    /* retire fence on cpu timeline directly */
    if (ring_idx == 0) {
       ctx->retire_fence(ctx->ctx_id, ring_idx, fence_id);

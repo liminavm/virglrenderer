@@ -102,6 +102,22 @@ struct vkr_ring {
    atomic_bool pending_notify;
    atomic_bool monitor;
    uint64_t virtqueue_seqno;
+
+   /* gkvm present-fence barriers (#8): each node waits for the ring thread to
+    * decode past `target` (the guest tail at registration), guaranteeing the
+    * frame's buffered commands — including its vkQueueSubmit — have executed
+    * on this ring. List guarded by `mutex`; the flag keeps the hot loop to one
+    * relaxed load when no barriers are pending. */
+   atomic_bool has_gkvm_barriers;
+   struct list_head gkvm_barriers;
+};
+
+struct vkr_present_fence;
+
+struct vkr_gkvm_barrier {
+   uint32_t target;
+   struct vkr_present_fence *pf;
+   struct list_head head;
 };
 
 struct vkr_ring *
@@ -129,6 +145,12 @@ vkr_ring_submit_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno);
 
 bool
 vkr_ring_wait_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno);
+
+/* gkvm (#8): register a present-fence barrier at the ring's current guest tail.
+ * Releases `pf` (barrier phase) once the ring thread decodes past it, or
+ * immediately if the ring is stopped or the node can't be allocated. */
+void
+vkr_ring_add_gkvm_barrier(struct vkr_ring *ring, struct vkr_present_fence *pf);
 
 static inline uint32_t
 vkr_ring_load_head(const struct vkr_ring *ring)

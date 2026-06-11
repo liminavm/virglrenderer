@@ -131,6 +131,12 @@ vkr_context_submit_fence(struct vkr_context *ctx,
                          uint32_t ring_idx,
                          uint64_t fence_id);
 
+/* gkvm (#8): release one phase-1 (ring barrier) reference on a present fence;
+ * the last release submits the phase-2 GPU syncs (or retires if idle). */
+struct vkr_present_fence;
+void
+vkr_gkvm_present_barrier_release(struct vkr_present_fence *pf);
+
 bool
 vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
 
