@@ -8,6 +8,21 @@
 
 #include "vkr_common.h"
 
+/* limina fence-accurate present (#8/#31): a host-injected fence submitted on the
+ * reserved VKR_LIMINA_PRESENT_RING when the VMM receives a scanout RESOURCE_FLUSH.
+ * It retires only after (a) every ring of the context has decoded past the
+ * commands buffered at injection time (so the frame's vkQueueSubmit reached the
+ * driver) and (b) a zero-command queue sync on each of the context's queues
+ * signals (true GPU completion). `pending` counts outstanding ring barriers
+ * during phase (a), then outstanding queue syncs during phase (b); whoever
+ * drops it to zero advances/retires.
+ */
+struct vkr_present_fence {
+   struct vkr_context *ctx;
+   uint64_t fence_id;
+   atomic_int pending;
+};
+
 struct vkr_queue_sync {
    VkFence fence;
    bool device_lost;
@@ -15,6 +30,10 @@ struct vkr_queue_sync {
    uint32_t flags;
    uint32_t ring_idx;
    uint64_t fence_id;
+
+   /* limina: non-NULL for a present-fence sync; retire decrements the present
+    * fence instead of calling retire_fence directly. */
+   struct vkr_present_fence *limina_present;
 
    struct list_head head;
 };
@@ -88,6 +107,17 @@ vkr_queue_create(struct vkr_context *ctx,
 
 void
 vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
+
+/* limina: release one reference on a present fence; the release that drops it to
+ * zero retires it toward the VMM (write_context_fence on VKR_LIMINA_PRESENT_RING)
+ * and frees it. */
+void
+vkr_present_fence_release(struct vkr_present_fence *pf);
+
+/* limina: submit a zero-command queue sync that releases `pf` when the GPU
+ * completes all work submitted to `queue` so far. */
+bool
+vkr_queue_sync_submit_present(struct vkr_queue *queue, struct vkr_present_fence *pf);
 
 bool
 vkr_queue_sync_submit(struct vkr_queue *queue,

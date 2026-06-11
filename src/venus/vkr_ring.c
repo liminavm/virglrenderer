@@ -145,6 +145,8 @@ vkr_ring_create(const struct vkr_ring_layout *layout,
    if (cnd_init(&ring->cond) != thrd_success)
       goto err_cond_init;
 
+   list_inithead(&ring->limina_barriers);
+
    return ring;
 
 err_cond_init:
@@ -245,6 +247,58 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
    return true;
 }
 
+/* limina (#8): fire present-fence barriers whose target the decode position has
+ * passed (or all of them on teardown). Runs on the ring thread, except the
+ * teardown sweep which runs wherever the thread exits. */
+static void
+vkr_ring_check_limina_barriers(struct vkr_ring *ring, bool fire_all)
+{
+   if (!atomic_load_explicit(&ring->has_limina_barriers, memory_order_acquire))
+      return;
+
+   struct list_head fired;
+   list_inithead(&fired);
+
+   mtx_lock(&ring->mutex);
+   list_for_each_entry_safe (struct vkr_limina_barrier, bar, &ring->limina_barriers, head) {
+      if (fire_all || vkr_seqno_ge(ring->buffer.cur, bar->target)) {
+         list_del(&bar->head);
+         list_addtail(&bar->head, &fired);
+      }
+   }
+   if (list_is_empty(&ring->limina_barriers))
+      atomic_store_explicit(&ring->has_limina_barriers, false, memory_order_release);
+   mtx_unlock(&ring->mutex);
+
+   list_for_each_entry_safe (struct vkr_limina_barrier, bar, &fired, head) {
+      vkr_limina_present_barrier_release(bar->pf);
+      free(bar);
+   }
+}
+
+void
+vkr_ring_add_limina_barrier(struct vkr_ring *ring, struct vkr_present_fence *pf)
+{
+   struct vkr_limina_barrier *bar = malloc(sizeof(*bar));
+   if (!bar || !ring->started) {
+      /* fall back to "already passed": weaker ordering beats a stuck frame */
+      free(bar);
+      vkr_limina_present_barrier_release(pf);
+      return;
+   }
+
+   bar->target = vkr_ring_load_tail(ring);
+   bar->pf = pf;
+
+   mtx_lock(&ring->mutex);
+   list_addtail(&bar->head, &ring->limina_barriers);
+   atomic_store_explicit(&ring->has_limina_barriers, true, memory_order_release);
+   mtx_unlock(&ring->mutex);
+
+   /* wake an idle ring thread so a quiescent ring fires the barrier promptly */
+   vkr_ring_notify(ring);
+}
+
 static int
 vkr_ring_thread(void *arg)
 {
@@ -268,6 +322,10 @@ vkr_ring_thread(void *arg)
    uint32_t relax_iter = 0;
    int ret = 0;
    while (ring->started) {
+      /* limina (#8): everything decoded so far has fully executed — fire any
+       * present-fence barriers the decode position has passed. */
+      vkr_ring_check_limina_barriers(ring, false);
+
       bool wait = false;
       if (vkr_ring_now() >= last_submit + ring->idle_timeout) {
          ring->pending_notify = false;
@@ -340,6 +398,10 @@ vkr_ring_thread(void *arg)
    }
 
 out:
+   /* limina (#8): fire every remaining barrier so present fences can't dangle
+    * past ring teardown (the frames present immediately — stale beats stuck). */
+   vkr_ring_check_limina_barriers(ring, true);
+
    if (ret < 0) {
       vkr_ring_set_status_bits(ring, VK_RING_STATUS_FATAL_BIT_MESA);
       vkr_context_on_ring_fatal(ctx);
