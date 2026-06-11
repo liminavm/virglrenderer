@@ -351,4 +351,11 @@ vkr_seqno_ge(uint32_t a, uint32_t b)
    return (a - b) <= INT32_MAX;
 }
 
+/* limina fence-accurate present (#8/#31): the reserved per-context fence ring the
+ * VMM injects scanout-flush fences on. It is the top timeline index (the proxy
+ * exposes 64); guests allocate queue ring indices from 1 upward, so a guest
+ * process would need 63 concurrent VkQueues to collide.
+ * vkr_context_submit_fence diverts this ring to the present-fence path. */
+#define VKR_LIMINA_PRESENT_RING 63
+
 #endif /* VKR_COMMON_H */
