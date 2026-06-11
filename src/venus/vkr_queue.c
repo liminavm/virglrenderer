@@ -55,6 +55,7 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
    sync->flags = fence_flags;
    sync->ring_idx = ring_idx;
    sync->fence_id = fence_id;
+   sync->limina_present = NULL;
 
    return sync;
 }
@@ -71,8 +72,58 @@ static inline void
 vkr_queue_sync_retire(struct vkr_queue *queue, struct vkr_queue_sync *sync)
 {
    TRACE_FUNC();
+   /* limina: a present-fence sync retires the shared present fence (refcounted
+    * across the context's queues), not a guest fence. */
+   if (sync->limina_present) {
+      vkr_present_fence_release(sync->limina_present);
+      vkr_device_free_queue_sync(queue->device, sync);
+      return;
+   }
    queue->context->retire_fence(queue->context->ctx_id, sync->ring_idx, sync->fence_id);
    vkr_device_free_queue_sync(queue->device, sync);
+}
+
+void
+vkr_present_fence_release(struct vkr_present_fence *pf)
+{
+   if (atomic_fetch_sub(&pf->pending, 1) != 1)
+      return;
+   struct vkr_context *ctx = pf->ctx;
+   ctx->retire_fence(ctx->ctx_id, VKR_LIMINA_PRESENT_RING, pf->fence_id);
+   free(pf);
+}
+
+bool
+vkr_queue_sync_submit_present(struct vkr_queue *queue, struct vkr_present_fence *pf)
+{
+   struct vkr_device *dev = queue->device;
+   struct vn_device_proc_table *vk = &dev->proc_table;
+
+   struct vkr_queue_sync *sync = vkr_device_alloc_queue_sync(
+      dev, VIRGL_RENDERER_FENCE_FLAG_MERGEABLE, VKR_LIMINA_PRESENT_RING, pf->fence_id);
+   if (!sync)
+      return false;
+   sync->limina_present = pf;
+
+   mtx_lock(&queue->vk_mutex);
+   VkResult result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, sync->fence);
+   mtx_unlock(&queue->vk_mutex);
+
+   if (result == VK_ERROR_DEVICE_LOST) {
+      sync->device_lost = true;
+   } else if (result != VK_SUCCESS) {
+      sync->limina_present = NULL;
+      vkr_device_free_queue_sync(dev, sync);
+      vkr_log("limina present sync submit failed (vk ret %d)", result);
+      return false;
+   }
+
+   mtx_lock(&queue->sync_thread.mutex);
+   list_addtail(&sync->head, &queue->sync_thread.syncs);
+   cnd_signal(&queue->sync_thread.cond);
+   mtx_unlock(&queue->sync_thread.mutex);
+
+   return true;
 }
 
 bool
