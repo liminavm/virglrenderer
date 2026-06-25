@@ -1249,6 +1249,34 @@ int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle, uint32_t *iosu
    return 0;
 }
 
+#ifdef __APPLE__
+/* Defined in venus/vkr_metal_helpers.m (forward-declared to avoid pulling the Vulkan-typed
+ * vkr_metal_helpers.h into this TU). */
+int vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height);
+#endif
+
+/* limina: copy a scanout resource's presented IOSurface into a CPU buffer (top-down BGRA,
+ * dst_stride bytes/row, height rows). The headless capture display sink uses this because venus
+ * scanout blobs have no CPU transfer_read — the frame only exists in the IOSurface's shared
+ * storage. Worker and vkr share a process, so res->iosurface_id resolves via vkr's registry.
+ * Returns 0 on success, -EINVAL if the resource is not IOSurface-backed or the read failed. */
+int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst, uint32_t dst_stride,
+                                           uint32_t height)
+{
+   TRACE_FUNC();
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->iosurface_id)
+      return -EINVAL;
+#ifdef __APPLE__
+   return vkr_mtl_iosurface_read(res->iosurface_id, dst, dst_stride, height) ? 0 : -EINVAL;
+#else
+   (void)dst;
+   (void)dst_stride;
+   (void)height;
+   return -EINVAL;
+#endif
+}
+
 int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
 {
    TRACE_FUNC();
