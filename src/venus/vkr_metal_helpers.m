@@ -381,4 +381,30 @@ vkr_mtl_iosurface_release_ref(void *io_surface)
       CFRelease(io_surface);
 }
 
+/* limina: copy a registered scanout IOSurface's pixels (top-down, the surface's native BGRA)
+ * into dst — `height` rows of min(dst_stride, surface bytesPerRow). The scanout textures are
+ * MTLStorageModeShared (CPU-visible), so the headless capture display sink — which has no
+ * zero-copy present_surface and no CPU transfer_read for venus blobs — reads the presented frame
+ * this way. IOSurfaceLock flushes the GPU's writes for a coherent read. Returns 1 on success. */
+int
+vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height)
+{
+   if (!dst || !dst_stride || !height)
+      return 0;
+   void *base = NULL;
+   uint64_t alloc_size = 0;
+   IOSurfaceRef io = (IOSurfaceRef)vkr_mtl_iosurface_lookup(id, &base, &alloc_size); /* +1 */
+   if (!io)
+      return 0;
+   IOSurfaceLock(io, kIOSurfaceLockReadOnly, NULL);
+   const uint8_t *src = (const uint8_t *)IOSurfaceGetBaseAddress(io);
+   size_t src_stride = (size_t)IOSurfaceGetBytesPerRow(io);
+   size_t row_bytes = (size_t)dst_stride < src_stride ? (size_t)dst_stride : src_stride;
+   for (uint32_t row = 0; row < height; row++)
+      memcpy((uint8_t *)dst + (size_t)row * dst_stride, src + (size_t)row * src_stride, row_bytes);
+   IOSurfaceUnlock(io, kIOSurfaceLockReadOnly, NULL);
+   vkr_mtl_iosurface_release_ref((void *)io); /* -1 */
+   return 1;
+}
+
 #endif /* __APPLE__ */

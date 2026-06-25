@@ -445,6 +445,13 @@ VIRGL_EXPORT int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, uint64
 VIRGL_EXPORT int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle,
                                                           uint32_t *iosurface_id);
 
+/* limina (macOS): copy a scanout resource's presented IOSurface into a CPU buffer (top-down BGRA,
+ * dst_stride bytes/row, height rows). The headless capture display sink uses this — venus scanout
+ * blobs have no CPU transfer_read, so the frame only lives in the IOSurface's shared storage.
+ * Returns 0 on success, -EINVAL if not IOSurface-backed or the read failed. */
+VIRGL_EXPORT int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst,
+                                                        uint32_t dst_stride, uint32_t height);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003

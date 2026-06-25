@@ -100,6 +100,13 @@ vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
 void
 vkr_mtl_iosurface_release_ref(void *io_surface);
 
+/* limina: copy a registered scanout IOSurface's pixels into dst (top-down native BGRA, `height`
+ * rows of min(dst_stride, surface bytesPerRow)). Used by the headless capture display sink, which
+ * has no zero-copy present and no CPU transfer_read for venus blobs. Returns 1 on success, 0 on
+ * failure (unknown id). */
+int
+vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height);
+
 #else /* !__APPLE__ */
 
 static inline void *
@@ -168,6 +175,16 @@ static inline void
 vkr_mtl_iosurface_release_ref(void *io_surface)
 {
    (void)io_surface;
+}
+
+static inline int
+vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height)
+{
+   (void)id;
+   (void)dst;
+   (void)dst_stride;
+   (void)height;
+   return 0;
 }
 
 #endif /* __APPLE__ */
