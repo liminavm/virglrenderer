@@ -11,13 +11,165 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <mach/mach.h>
+#include <pthread.h>
+#include <servers/bootstrap.h>
 
 #include "util/anon_file.h"
 #include "venus-protocol/vulkan_metal.h"
 
 #include "vkr_metal_helpers.h"
+
+/*
+ * limina: capability-scope the zero-copy scanout IOSurfaces.
+ *
+ * By default the scanout surfaces are created kIOSurfaceIsGlobal so the supervisor (a separate
+ * process) can IOSurfaceLookup(id) them for present. Global surfaces are readable by ANY same-user
+ * process (`iosdump <id>` dumps the guest screen), which Apple itself flags as insecure. When the
+ * supervisor exposes a surface-port receiver (env LIMINA_SURFACE_PORT_NAME, set by limina-vmm from
+ * --surface-port-name), we instead create the surfaces NON-global and hand each one's Mach port to
+ * the supervisor at alloc time — the exact bootstrap rendezvous + wire format used by the sw2d path
+ * in crates/limina-surfaceport. The supervisor then resolves the "frame <id>" transport from its
+ * Mach map, and no stranger can read the screen. LIMINA_GLOBAL_SCANOUT=1 forces the old global
+ * behaviour (so `iosdump` still works as a debug oracle).
+ *
+ * A small id->IOSurfaceRef registry replaces the cross-context global IOSurfaceLookup (which fails
+ * on non-global surfaces) for vkr_mtl_iosurface_lookup.
+ */
+
+/* Wire message: byte-for-byte the SendMsg in crates/limina-surfaceport (id in msgh_id, one
+ * MOVE_SEND port descriptor carrying the IOSurface Mach port). */
+typedef struct {
+   mach_msg_header_t header;
+   mach_msg_body_t body;
+   mach_msg_port_descriptor_t port;
+} limina_surface_msg_t;
+
+static pthread_mutex_t g_limina_lock = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableDictionaryRef g_limina_registry; /* id (CFNumber) -> IOSurfaceRef (retained) */
+static mach_port_t g_limina_supervisor = MACH_PORT_NULL;
+static int g_limina_state; /* 0 = not yet looked up, 1 = scoping on, -1 = global (off) */
+
+/* The supervisor's surface-port receiver, looked up once. MACH_PORT_NULL ⇒ no Mach present
+ * transport (no receiver name, or the lookup failed). NOTE: LIMINA_GLOBAL_SCANOUT does NOT
+ * disable this — the debug oracle marks surfaces global ADDITIVELY (see limina_mark_global)
+ * while keeping the scoped Mach present, so the venus desktop still displays under the flag
+ * (matching the sw2d WindowBackend, whose `also_global` is likewise additive). */
+static mach_port_t
+limina_supervisor_port(void)
+{
+   pthread_mutex_lock(&g_limina_lock);
+   if (g_limina_state == 0) {
+      g_limina_state = -1;
+      const char *name = getenv("LIMINA_SURFACE_PORT_NAME");
+      if (name && name[0]) {
+         mach_port_t sp = MACH_PORT_NULL;
+         if (bootstrap_look_up(bootstrap_port, name, &sp) == KERN_SUCCESS &&
+             sp != MACH_PORT_NULL) {
+            g_limina_supervisor = sp;
+            g_limina_state = 1;
+         }
+      }
+   }
+   mach_port_t ret = g_limina_state == 1 ? g_limina_supervisor : MACH_PORT_NULL;
+   pthread_mutex_unlock(&g_limina_lock);
+   return ret;
+}
+
+/* True when scanout surfaces should be handed over scoped (the supervisor receiver is reachable).
+ * Independent of the debug oracle: present is via the Mach port whenever a receiver exists. */
+static bool
+limina_scope_surfaces(void)
+{
+   return limina_supervisor_port() != MACH_PORT_NULL;
+}
+
+/* True when scanout surfaces must ALSO be marked kIOSurfaceIsGlobal — i.e. resolvable by any
+ * process via IOSurfaceLookup(id). Two cases: (1) the LIMINA_GLOBAL_SCANOUT debug oracle, so
+ * `iosdump` can read the venus screen by global id; (2) no supervisor receiver, where global is
+ * the only present transport. This is ADDITIVE to scoping — under the debug flag a surface is
+ * BOTH global (for iosdump) AND Mach-published (for the real present), so the desktop keeps
+ * displaying. Marking a surface global is intentionally insecure; it is a debug-only widening. */
+static bool
+limina_mark_global(void)
+{
+   return getenv("LIMINA_GLOBAL_SCANOUT") != NULL || limina_supervisor_port() == MACH_PORT_NULL;
+}
+
+static void
+limina_registry_insert(uint32_t id, IOSurfaceRef io)
+{
+   pthread_mutex_lock(&g_limina_lock);
+   if (!g_limina_registry) {
+      g_limina_registry =
+         CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+                                   &kCFTypeDictionaryValueCallBacks);
+   }
+   CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &id);
+   CFDictionarySetValue(g_limina_registry, key, io); /* retains io */
+   CFRelease(key);
+   pthread_mutex_unlock(&g_limina_lock);
+}
+
+static void
+limina_registry_remove(uint32_t id)
+{
+   pthread_mutex_lock(&g_limina_lock);
+   if (g_limina_registry) {
+      CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &id);
+      CFDictionaryRemoveValue(g_limina_registry, key); /* releases io */
+      CFRelease(key);
+   }
+   pthread_mutex_unlock(&g_limina_lock);
+}
+
+/* RETAINED IOSurfaceRef for a registered id, or NULL. */
+static IOSurfaceRef
+limina_registry_lookup(uint32_t id)
+{
+   IOSurfaceRef io = NULL;
+   pthread_mutex_lock(&g_limina_lock);
+   if (g_limina_registry) {
+      CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &id);
+      io = (IOSurfaceRef)CFDictionaryGetValue(g_limina_registry, key);
+      if (io)
+         CFRetain(io);
+      CFRelease(key);
+   }
+   pthread_mutex_unlock(&g_limina_lock);
+   return io;
+}
+
+/* Hand a non-global scanout surface to the supervisor by Mach port, keyed by its id. */
+static void
+limina_publish_surface(uint32_t id, IOSurfaceRef io)
+{
+   mach_port_t sup = limina_supervisor_port();
+   if (sup == MACH_PORT_NULL)
+      return;
+   mach_port_t port = IOSurfaceCreateMachPort(io); /* +1 send right */
+   if (port == MACH_PORT_NULL)
+      return;
+   limina_surface_msg_t msg;
+   memset(&msg, 0, sizeof(msg));
+   msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+   msg.header.msgh_size = sizeof(msg);
+   msg.header.msgh_remote_port = sup;
+   msg.header.msgh_id = (mach_msg_id_t)id;
+   msg.body.msgh_descriptor_count = 1;
+   msg.port.name = port;
+   msg.port.disposition = MACH_MSG_TYPE_MOVE_SEND;
+   msg.port.type = MACH_MSG_PORT_DESCRIPTOR;
+   kern_return_t kr = mach_msg(&msg.header, MACH_SEND_MSG, sizeof(msg), 0, MACH_PORT_NULL,
+                               MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+   if (kr != KERN_SUCCESS) {
+      /* MOVE_SEND only consumes the right on success; drop it otherwise. */
+      mach_port_deallocate(mach_task_self(), port);
+   }
+}
 
 void *
 vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAddr)
@@ -124,18 +276,26 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    IOSurfaceRef io = NULL;
    id<MTLTexture> tex = nil;
 
+   /* Scope (hand over by Mach port) whenever the supervisor exposes a receiver — the default,
+    * secure present path. SEPARATELY decide whether to ALSO mark the surface global: the
+    * LIMINA_GLOBAL_SCANOUT debug oracle or the no-receiver fallback. The two are independent, so
+    * under the debug flag a surface is both scoped-for-present AND global-for-iosdump. */
+   bool scope = limina_scope_surfaces();
+   bool mark_global = limina_mark_global();
+
    @autoreleasepool {
-      /* kIOSurfaceIsGlobal: the gkvm supervisor (a separate process) looks the surface
-       * up by IOSurfaceGetID for present — the existing gkvm-display transport. IOSurface
-       * picks/aligns bytesPerRow itself unless the caller forces one (bytes_per_row != 0,
-       * the KosmicKrisp linear-image path: the surface bytes back the image memory, so the
-       * pitch must equal the driver's linear rowPitch). */
+      /* kIOSurfaceIsGlobal: a global surface is looked up by IOSurfaceGetID for present (the
+       * legacy gkvm-display transport). When scoping, the surface is NON-global and its Mach
+       * port is handed to the supervisor below instead. IOSurface picks/aligns bytesPerRow
+       * itself unless the caller forces one (bytes_per_row != 0, the KosmicKrisp linear-image
+       * path: the surface bytes back the image memory, so the pitch must equal the driver's
+       * linear rowPitch). */
       NSMutableDictionary *props = [@{
          (id)kIOSurfaceWidth : @(width),
          (id)kIOSurfaceHeight : @(height),
          (id)kIOSurfaceBytesPerElement : @(bytes_per_element),
          (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
-         (id)kIOSurfaceIsGlobal : @YES,
+         (id)kIOSurfaceIsGlobal : @(mark_global),
       } mutableCopy];
       if (bytes_per_row)
          props[(id)kIOSurfaceBytesPerRow] = @(bytes_per_row);
@@ -175,6 +335,13 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
    surf->base_addr = IOSurfaceGetBaseAddress(io);
    surf->alloc_size = IOSurfaceGetAllocSize(io);
+
+   /* Scoped surfaces are non-global: register id->IOSurfaceRef so vkr_mtl_iosurface_lookup can
+    * still resolve them, and hand the Mach port to the supervisor for present. */
+   if (scope) {
+      limina_registry_insert(surf->id, io);
+      limina_publish_surface(surf->id, io);
+   }
    return surf;
 }
 
@@ -183,6 +350,8 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
 {
    if (!surf)
       return;
+   /* Drop the registry's retain before ours (no-op if the surface was global). */
+   limina_registry_remove(surf->id);
    if (surf->mtl_texture)
       CFRelease(surf->mtl_texture);
    if (surf->io_surface)
@@ -193,7 +362,11 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
 void *
 vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
 {
-   IOSurfaceRef io = IOSurfaceLookup(id); /* +1 ref, surfaces are kIOSurfaceIsGlobal */
+   /* Scoped surfaces are non-global → resolve via our registry; fall back to the global
+    * IOSurfaceLookup for the LIMINA_GLOBAL_SCANOUT / no-receiver path. Both return +1. */
+   IOSurfaceRef io = limina_registry_lookup(id);
+   if (!io)
+      io = IOSurfaceLookup(id);
    if (!io)
       return NULL;
    *out_base = IOSurfaceGetBaseAddress(io);
