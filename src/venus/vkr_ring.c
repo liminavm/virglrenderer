@@ -75,6 +75,27 @@ vkr_ring_load_tail(const struct vkr_ring *ring)
    return atomic_load_explicit(ring->control.tail, memory_order_acquire);
 }
 
+/* limina (idle-wakeups): seq_cst tail load for the idle/notify handshake ONLY.
+ *
+ * The handshake is a store-buffer (SB) litmus: the host stores the IDLE status bit then
+ * loads the tail; the guest (mesa vn_ring_submit) stores the tail then loads the status
+ * (seq_cst) and emits vkNotifyRingMESA iff it observes IDLE. A lost wakeup needs BOTH the
+ * host to miss the guest's tail AND the guest to miss the host's IDLE — which seq_cst on the
+ * host store (vkr_ring_set_status_bits) AND this load forbids: whichever seq_cst op the total
+ * order puts second observes the first (the guest's tail store is release but sequenced-before
+ * its seq_cst status load, so it inherits the ordering). The plain load_tail above is
+ * memory_order_acquire — correct and cheaper for the producer/consumer *data* path, but on
+ * weakly-ordered Apple Silicon an acquire load (LDAPR) can reorder ahead of the prior seq_cst
+ * IDLE store, reopening the SB race. That race — not #28 blob coherency, which is a GPU-write
+ * SLC artifact, whereas the IDLE bit is a host-CPU write to CPU-coherent memory — is the real
+ * cause of the missed-notify #30 hang the 2 ms poll used to paper over. Use seq_cst (LDAR) here
+ * so the handshake is race-free and the idle wait can block indefinitely (0 idle wakeups). */
+static uint32_t
+vkr_ring_load_tail_seqcst(const struct vkr_ring *ring)
+{
+   return atomic_load_explicit(ring->control.tail, memory_order_seq_cst);
+}
+
 static void
 vkr_ring_unset_status_bits(struct vkr_ring *ring, uint32_t mask)
 {
@@ -330,7 +351,10 @@ vkr_ring_thread(void *arg)
       if (vkr_ring_now() >= last_submit + ring->idle_timeout) {
          ring->pending_notify = false;
          vkr_ring_set_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
-         wait = ring->buffer.cur == vkr_ring_load_tail(ring);
+         /* seq_cst so this load is SC-ordered with the IDLE store above — closes the
+          * store-buffer race against the guest's store-tail/load-status notify handshake
+          * (see vkr_ring_load_tail_seqcst). */
+         wait = ring->buffer.cur == vkr_ring_load_tail_seqcst(ring);
          if (!wait)
             vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
       }
@@ -340,6 +364,12 @@ vkr_ring_thread(void *arg)
 
          mtx_lock(&ring->mutex);
          while (ring->started && !ring->pending_notify) {
+            /* limina (idle-wakeups): block indefinitely — the seq_cst IDLE-check handshake
+             * (vkr_ring_load_tail_seqcst) guarantees the guest observes the IDLE bit and
+             * emits vkNotifyRingMESA, so a quiescent ring parks here with 0 host wakeups
+             * (matches upstream). This reverts the #30 2 ms poll, which existed only to
+             * survive a "missed notify" that was really the store-buffer race the seq_cst
+             * load now closes — not the #28 blob coherency gap it was attributed to. */
             ret = cnd_wait(&ring->cond, &ring->mutex);
             if (ret != thrd_success) {
                vkr_log("%s: ring idle cnd_wait has failed(%d)", __func__, ret);
