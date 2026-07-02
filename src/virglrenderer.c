@@ -168,6 +168,15 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
    if (!res)
       return;
 
+   /* A resource destroyed while its VMM mapping is live leaked the mapping:
+    * virgl_resource_destroy_func() closes the fd and frees the struct but never
+    * munmaps res->mapped. Two such leaks per venus context (the instance ring +
+    * reply shmem blobs) exhaust the host address space after sustained use
+    * (mmap/CTX_CREATE start failing with ENOMEM). Unmap here so unref is safe
+    * regardless of whether the VMM balanced its map calls. */
+   if (res->mapped)
+      virgl_renderer_resource_unmap(res_handle);
+
    args.callback = detach_resource;
    args.data = res;
    virgl_context_foreach(&args);
