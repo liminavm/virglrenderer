@@ -12764,6 +12764,17 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
 
       if (vrend_state.inferred_gl_caching_type)
          caps->v2.capability_bits |= VIRGL_CAP_ARB_BUFFER_STORAGE;
+
+      /* zink is Mesa too, but its renderer string ("zink Vulkan ...") matches none of the
+       * heuristics above, leaving the caching type NONE — which propagates into every
+       * buffer's map_info and makes virgl_renderer_resource_get_map_info() (and thus any
+       * BLOB map of a vrend buffer) fail unconditionally. zink's memory comes from
+       * host-cache-coherent Vulkan allocations (HOST_VISIBLE|HOST_COHERENT), so CACHED is
+       * correct. Deliberately does NOT advertise VIRGL_CAP_ARB_BUFFER_STORAGE: that would
+       * switch guest Mesa onto persistent host-visible buffers wholesale, which stays off
+       * until validated on the baseline tier (limina). */
+      if (!vrend_state.inferred_gl_caching_type && strstr(renderer, "zink"))
+         vrend_state.inferred_gl_caching_type = VIRGL_RENDERER_MAP_CACHE_CACHED;
    }
 
 #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)
