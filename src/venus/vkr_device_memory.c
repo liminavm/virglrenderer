@@ -674,6 +674,58 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
       return;
    }
 
+#ifdef __APPLE__
+   /* macOS: virtio-gpu resources are IOSurface / host-memory / shm backed, NOT Linux dmabufs, so
+    * the dmabuf-only gate below would reject every resource here. The vkAllocateMemory import path
+    * (see the limina branch above) resolves such a resource to a host pointer and imports it as
+    * HOST_ALLOCATION_BIT_EXT — this property query MUST agree with that, or the guest's
+    * vkGetMemoryFdPropertiesKHR returns memoryTypeBits=0 (VK_ERROR_INVALID_EXTERNAL_HANDLE) for a
+    * buffer the very next vkAllocateMemory then imports and binds (the venus-bugs "#1" inconsistency
+    * the compositor hit). Mirror the import: resolve the host pointer and report the memory types
+    * VK_EXT_external_memory_host accepts for it. */
+   {
+      void *ptr = NULL;
+      uint64_t span = 0;
+      if (res->iosurface_id)
+         vkr_mtl_iosurface_lookup(res->iosurface_id, &ptr, &span);
+      if (!ptr && res->map_ptr)
+         ptr = (void *)(uintptr_t)res->map_ptr;
+      if (!ptr && res->fd_type == VIRGL_RESOURCE_FD_SHM && (uintptr_t)res->u.data >= 0x10000)
+         /* cross-context SHM stores the server-side mmap in u.data (same plausibility check the
+          * import branch uses to stay off a same-context resource's fd NUMBER). */
+         ptr = res->u.data;
+      (void)span;
+      if (ptr) {
+         /* Host-pointer-backed resource: report the host-visible memory types — the set a
+          * VK_EXT_external_memory_host / HOST_ALLOCATION_BIT_EXT import accepts (which is exactly
+          * how the vkAllocateMemory limina branch imports this resource). The guest intersects this
+          * with the image's own memory_type_bits, so the query now AGREES with the import that
+          * follows it. We compute it from the cached device memory properties rather than calling
+          * vkGetMemoryHostPointerPropertiesEXT, because VK_EXT_external_memory_host is not in the
+          * host device's enabled-extension list (KK accepts the import struct regardless), so
+          * vkGetDeviceProcAddr returns NULL for that entrypoint. */
+         const VkPhysicalDeviceMemoryProperties *mp = &dev->physical_device->memory_properties;
+         uint32_t host_visible_bits = 0;
+         for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
+            if (mp->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+               host_visible_bits |= (1u << i);
+         args->pMemoryResourceProperties->memoryTypeBits = host_visible_bits;
+         VkMemoryResourceAllocationSizePropertiesMESA *alloc_size_props =
+            vkr_find_struct(args->pMemoryResourceProperties->pNext,
+                            VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA);
+         if (alloc_size_props)
+            alloc_size_props->allocationSize = res->size;
+         args->ret = VK_SUCCESS;
+         vkr_log("limina: query res %u fd_type=%d -> host-visible memoryTypeBits=0x%x "
+                 "(IOSurface id=%u; dmabuf-only gate bypassed)",
+                 args->resourceId, (int)res->fd_type, host_visible_bits, res->iosurface_id);
+         return;
+      }
+      /* no host pointer resolved: fall through to the dmabuf path (a genuine dmabuf resource, e.g.
+       * the udmabuf debug allocator, still queries correctly). */
+   }
+#endif /* __APPLE__ */
+
    if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
       args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return;
