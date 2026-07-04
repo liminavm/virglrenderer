@@ -318,8 +318,13 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             limina_res_import.pHostPointer = ptr;
             limina_res_import.pNext = alloc_info->pNext;
             alloc_info->pNext = &limina_res_import;
-            if (alloc_info->allocationSize <= span)
-               alloc_info->allocationSize = span;
+            /* The host pointer backs exactly `span` bytes. allocationSize is
+             * guest-declared (venus); a value larger than the backing would make the
+             * imported VK_EXT_external_memory_host memory (and KK's
+             * newBufferWithBytesNoCopy over it) run past the allocation -> host OOB.
+             * Clamp to the backing in both directions: a smaller request still maps
+             * the whole page-rounded backing, a larger one is capped. */
+            alloc_info->allocationSize = span;
             limina_res_imported = true;
             vkr_log("limina: import res %u <- host-pointer (IOSurface id=%u base=%p "
                     "size=%" PRIu64 ")",
@@ -554,8 +559,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          limina_host_import.pHostPointer = limina_io->base_addr;
          limina_host_import.pNext = alloc_info->pNext;
          alloc_info->pNext = &limina_host_import;
-         if (alloc_info->allocationSize <= limina_io->alloc_size)
-            alloc_info->allocationSize = limina_io->alloc_size;
+         /* Clamp to the IOSurface's backing size: a guest-declared allocationSize
+          * larger than the backing would import past it (host OOB). See the matching
+          * clamp on the resource-import path above. */
+         alloc_info->allocationSize = limina_io->alloc_size;
          vkr_log("limina: KK scanout memory <- host-pointer import of IOSurface id=%u "
                  "(base=%p size=%" PRIu64 ")",
                  limina_io->id, limina_io->base_addr, (uint64_t)limina_io->alloc_size);
