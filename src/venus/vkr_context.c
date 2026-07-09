@@ -6,6 +6,9 @@
 #include "vkr_context.h"
 
 #include <sys/mman.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -650,12 +653,39 @@ vkr_context_ring_monitor_thread(void *arg)
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ringmon-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
 
+#ifdef __APPLE__
+   /* gkvm: the guest venus watchdog aborts the WHOLE guest process when an
+    * ALIVE stamp lands late (mesa clears the bit at wait start and re-checks
+    * ~3.48s later against our 3.0s period — ~480ms of worst-case slack). This
+    * thread's work is trivial; make sure the scheduler treats its deadline as
+    * user-critical so host memory pressure/thrash can't starve it. */
+   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
    struct timespec abs_ts;
    int ret = thrd_busy;
+   int64_t last_stamp_ns = 0;
    assert(ctx->ring_monitor.started);
    while (ctx->ring_monitor.started) {
       /* only notify at the configured rate, not faster. */
       if (ret == thrd_busy) {
+         /* gkvm: a stamp gap beyond period + 400ms can already exceed the
+          * guest watchdog's slack and abort the guest process; make every
+          * late stamp loud so the next dogfood incident is attributable
+          * (2026-07-09: three silent alive-expiry-suspected aborts). */
+         struct timespec mono;
+         if (!clock_gettime(CLOCK_MONOTONIC, &mono)) {
+            const int64_t now_ns = (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec;
+            const int64_t period_ns =
+               (int64_t)ctx->ring_monitor.report_period_us * 1000;
+            if (last_stamp_ns && now_ns - last_stamp_ns > period_ns + 400000000)
+               vkr_log_error("ringmon-%d: ALIVE stamp late: %" PRId64
+                             " ms since last (period %u ms) — guest venus "
+                             "watchdog may abort the guest process",
+                             ctx->ctx_id, (now_ns - last_stamp_ns) / 1000000,
+                             ctx->ring_monitor.report_period_us / 1000);
+            last_stamp_ns = now_ns;
+         }
          mtx_lock(&ctx->ring_mutex);
          list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
             if (ring->monitor)
