@@ -21,8 +21,14 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
 {
    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
    if (!res) {
-      vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
-      vkr_context_set_fatal(ctx);
+      /* NOT protocol corruption: guest CREATE_BLOB is fire-and-forget, so when the
+       * host fails a create (e.g. under memory pressure) the guest still holds a
+       * live-looking handle and legitimately imports the dead id (2026-07-09
+       * dogfood crash #1). Callers translate `false` into
+       * VK_ERROR_INVALID_EXTERNAL_HANDLE — recoverable, ring stays alive. */
+      vkr_log_error("failed to import resource: invalid res_id %u (returning "
+                    "VK_ERROR_INVALID_EXTERNAL_HANDLE, ring stays alive)",
+                    res_info->resourceId);
       return false;
    }
 
@@ -676,8 +682,14 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
 
    struct vkr_resource *res = vkr_context_get_resource(ctx, args->resourceId);
    if (!res) {
-      vkr_log("failed to query resource props: invalid res_id %u", args->resourceId);
-      vkr_context_set_fatal(ctx);
+      /* Same rationale as vkr_get_fd_info_from_resource_info: a dead resource id is
+       * a reachable runtime state (failed fire-and-forget CREATE_BLOB), not protocol
+       * corruption. Fail just this query; poisoning the ring here SIGABRTs the whole
+       * guest process (mesa vn_relax aborts on the FATAL bit). */
+      vkr_log_error("failed to query resource props: invalid res_id %u (returning "
+                    "VK_ERROR_INVALID_EXTERNAL_HANDLE, ring stays alive)",
+                    args->resourceId);
+      args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return;
    }
 

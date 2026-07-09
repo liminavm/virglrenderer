@@ -186,6 +186,11 @@ vkr_debug_init(void);
 void
 vkr_log(const char *fmt, ...);
 
+/* ERROR-level twin of vkr_log for events that must reach a production log
+ * (default deployments drop INFO): ring/context poisoning, aborts. */
+void
+vkr_log_error(const char *fmt, ...);
+
 static inline uint32_t
 vkr_api_version_cap_minor(uint32_t version, uint32_t cap)
 {
