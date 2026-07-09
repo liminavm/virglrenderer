@@ -170,11 +170,19 @@ vkr_context_get_resource(struct vkr_context *ctx, uint32_t res_id)
    return likely(entry) ? entry->data : NULL;
 }
 
+/* Poisoning the context kills the guest's venus ring: mesa aborts the whole
+ * guest process on the FATAL bit (vn_relax). Always name the site in the log
+ * at ERROR so a production deployment records WHICH handler poisoned the ring
+ * (2026-07-09 dogfood: three silent aborts, unattributable at default level). */
 static inline void
-vkr_context_set_fatal(struct vkr_context *ctx)
+vkr_context_set_fatal_at(struct vkr_context *ctx, const char *func, int line)
 {
+   if (!ctx->cs_fatal_error)
+      vkr_log_error("context %u: ring FATAL set at %s:%d", ctx->ctx_id, func, line);
    ctx->cs_fatal_error = true;
 }
+
+#define vkr_context_set_fatal(ctx) vkr_context_set_fatal_at((ctx), __func__, __LINE__)
 
 static inline bool
 vkr_context_get_fatal(struct vkr_context *ctx)
