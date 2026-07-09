@@ -98,10 +98,14 @@ vkr_cs_encoder_fini(struct vkr_cs_encoder *enc)
 }
 
 static inline void
-vkr_cs_encoder_set_fatal(const struct vkr_cs_encoder *enc)
+vkr_cs_encoder_set_fatal_at(const struct vkr_cs_encoder *enc, const char *func, int line)
 {
+   if (!*enc->fatal_error)
+      vkr_log_error("cs encoder: ring FATAL set at %s:%d", func, line);
    *enc->fatal_error = true;
 }
+
+#define vkr_cs_encoder_set_fatal(enc) vkr_cs_encoder_set_fatal_at((enc), __func__, __LINE__)
 
 void
 vkr_cs_encoder_set_stream_locked(struct vkr_cs_encoder *enc,
@@ -207,10 +211,14 @@ void
 vkr_cs_decoder_reset(struct vkr_cs_decoder *dec);
 
 static inline void
-vkr_cs_decoder_set_fatal(const struct vkr_cs_decoder *dec)
+vkr_cs_decoder_set_fatal_at(const struct vkr_cs_decoder *dec, const char *func, int line)
 {
+   if (!*((struct vkr_cs_decoder *)dec)->fatal_error)
+      vkr_log_error("cs decoder: ring FATAL set at %s:%d", func, line);
    *((struct vkr_cs_decoder *)dec)->fatal_error = true;
 }
+
+#define vkr_cs_decoder_set_fatal(dec) vkr_cs_decoder_set_fatal_at((dec), __func__, __LINE__)
 
 static inline bool
 vkr_cs_decoder_get_fatal(const struct vkr_cs_decoder *dec)

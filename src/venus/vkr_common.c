@@ -263,6 +263,16 @@ vkr_log(const char *fmt, ...)
 }
 
 void
+vkr_log_error(const char *fmt, ...)
+{
+   va_list va;
+
+   va_start(va, fmt);
+   virgl_prefixed_logv("vkr", VIRGL_LOG_LEVEL_ERROR, fmt, va);
+   va_end(va);
+}
+
+void
 vkr_extension_table_init(struct vn_info_extension_table *table,
                          const char *const *exts,
                          uint32_t count)
