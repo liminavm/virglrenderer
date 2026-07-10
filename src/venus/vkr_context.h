@@ -184,6 +184,16 @@ vkr_context_set_fatal_at(struct vkr_context *ctx, const char *func, int line)
 
 #define vkr_context_set_fatal(ctx) vkr_context_set_fatal_at((ctx), __func__, __LINE__)
 
+/* For paths where FATAL is the expected corollary of client teardown (kernel
+ * DRM-fd cleanup detaching a ring's backing after the client exited), not a
+ * defect: park the context without the ERROR-level site log. Callers log the
+ * specifics at INFO instead. */
+static inline void
+vkr_context_set_fatal_quiet(struct vkr_context *ctx)
+{
+   ctx->cs_fatal_error = true;
+}
+
 static inline bool
 vkr_context_get_fatal(struct vkr_context *ctx)
 {
