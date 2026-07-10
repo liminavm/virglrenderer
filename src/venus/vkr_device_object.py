@@ -171,6 +171,14 @@ vkr_{create_func_name}_create(
 
    /* handles in args are replaced */
    if (vkr_{create_func_name}_create_driver_handle(ctx, args, obj) != VK_SUCCESS) {{
+      /* Loud on purpose: venus guests submit most creations ASYNC and never
+       * read this reply. A host-side failure therefore leaves the guest with
+       * a ghost object id whose next use is a ring FATAL (a guest-process
+       * abort). This line is the only record of the actual cause. */
+      vkr_log_error("context %u: {create_cmd} failed host-side: %d "
+                    "(an async guest won't see this; the object id is now a "
+                    "ghost and its next use will ring-FATAL)",
+                    ctx->ctx_id, args->ret);
       free(obj);
       return NULL;
    }}
@@ -187,10 +195,19 @@ vkr_{create_func_name}_create_array(
    struct vn_command_{create_cmd} *args,
    struct object_array *arr)
 {{
-   if (vkr_{create_func_name}_init_array(ctx, args, arr) != VK_SUCCESS)
+   if (vkr_{create_func_name}_init_array(ctx, args, arr) != VK_SUCCESS) {{
+      vkr_log_error("context %u: {create_cmd} x%u failed host-side: %d "
+                    "(array init; async guests hold ghost ids after this)",
+                    ctx->ctx_id, (uint32_t)args->{create_count}, args->ret);
       return args->ret;
+   }}
 
    if (vkr_{create_func_name}_create_driver_handles(ctx, args, arr) < VK_SUCCESS) {{
+      /* Same rationale as the simple-object create: async guests never read
+       * this reply, so this line is the only record of the actual cause of
+       * the ring FATAL that follows when a ghost id gets used. */
+      vkr_log_error("context %u: {create_cmd} x%u failed host-side: %d",
+                    ctx->ctx_id, (uint32_t)args->{create_count}, args->ret);
       /* In case the client expects a reply, clear all returned handles to
        * VK_NULL_HANDLE.
        */
@@ -269,6 +286,9 @@ vkr_{create_func_name}_add_array(
 
       /* Individual pipelines may fail creation. */
       if (obj->base.handle.{vkr_type} == VK_NULL_HANDLE) {{
+         vkr_log_error("context %u: {create_cmd} element %u failed host-side "
+                       "(async guests hold a ghost pipeline id after this)",
+                       ctx->ctx_id, i);
          free(obj);
          arr->objects[i] = NULL;
          args_{create_objs}[i] = VK_NULL_HANDLE;

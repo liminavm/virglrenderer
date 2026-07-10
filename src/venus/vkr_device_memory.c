@@ -821,7 +821,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
     * to the same storage.
     */
    if (mem->exported) {
-      vkr_log("mem has been exported");
+      vkr_log_error("mem has been exported");
       return false;
    }
 
@@ -844,6 +844,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       if (mem->mtl_iosurface)
          out_blob->iosurface_id = ((const struct vkr_mtl_iosurface *)mem->mtl_iosurface)->id;
 #endif
+      if (out_blob->u.fd < 0)
+         vkr_log_error("mtl_shm carrier fd dup failed (%s)", strerror(errno));
       return out_blob->u.fd >= 0;
    }
 
@@ -853,7 +855,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       const bool coherent = mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
       const bool cached = mem->property_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
       if (!visible) {
-         vkr_log("mem cannot support mappable blob");
+         vkr_log_error("mem cannot support mappable blob");
          return false;
       }
 
@@ -869,7 +871,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    struct virgl_resource_vulkan_info vulkan_info;
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
       if (!can_export_dma_buf) {
-         vkr_log("mem cannot export to dma_buf for cross device blob sharing");
+         vkr_log_error("mem cannot export to dma_buf for cross device blob sharing");
          return false;
       }
       fd_type = VIRGL_RESOURCE_FD_DMABUF;
@@ -909,7 +911,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                                       mem->base.handle.device_memory, 0, mem->allocation_size, 0,
                                       &ptr);
          if (ret != VK_SUCCESS || !ptr) {
-            vkr_log("gkvm #28: host-visible vkMapMemory for blob export failed (vk ret %d)", ret);
+            vkr_log_error("gkvm #28: host-visible vkMapMemory for blob export failed (vk ret %d)", ret);
             return false;
          }
 
@@ -932,7 +934,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
          return true;
       }
 #endif
-      vkr_log("mem is not exportable");
+      vkr_log_error("mem is not exportable");
       return false;
    }
 
@@ -940,7 +942,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    if (mem->udmabuf_fd >= 0) {
       fd = os_dupfd_cloexec(mem->udmabuf_fd);
       if (fd < 0) {
-         vkr_log("mem udmabuf fd dup failed (%s)", strerror(errno));
+         vkr_log_error("mem udmabuf fd dup failed (%s)", strerror(errno));
          return false;
       }
    } else if (mem->gbm_bo) {
@@ -949,7 +951,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
       fd = vkr_gbm_bo_get_fd(mem->gbm_bo);
       if (fd < 0) {
-         vkr_log("mem gbm bo export failed (ret %d)", fd);
+         vkr_log_error("mem gbm bo export failed (ret %d)", fd);
          return false;
       }
    } else {
@@ -961,7 +963,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       };
       VkResult ret = vk->GetMemoryFdKHR(mem->device->base.handle.device, &fd_info, &fd);
       if (ret != VK_SUCCESS) {
-         vkr_log("mem fd export failed (vk ret %d)", ret);
+         vkr_log_error("mem fd export failed (vk ret %d)", ret);
          return false;
       }
    }
@@ -969,7 +971,7 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    if (fd_type == VIRGL_RESOURCE_FD_DMABUF) {
       const off_t dma_buf_size = lseek(fd, 0, SEEK_END);
       if (dma_buf_size < 0 || (uint64_t)dma_buf_size < blob_size) {
-         vkr_log("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
+         vkr_log_error("mem dma_buf_size %lld < blob_size %" PRIu64, (long long)dma_buf_size,
                  blob_size);
          close(fd);
          return false;
