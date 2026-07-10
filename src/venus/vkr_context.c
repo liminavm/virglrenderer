@@ -264,10 +264,12 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+   if (res->u_is_fd) {
+      if (res->u.fd >= 0)
+         close(res->u.fd);
+   } else {
       munmap(res->u.data, res->size);
-   else if (res->u.fd >= 0)
-      close(res->u.fd);
+   }
    free(res);
 }
 
@@ -317,10 +319,13 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
 
    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
    assert(fd < 0 || !mmap_ptr);
-   if (mmap_ptr)
+   if (mmap_ptr) {
+      res->u_is_fd = false;
       res->u.data = mmap_ptr;
-   else
+   } else {
+      res->u_is_fd = true;
       res->u.fd = fd;
+   }
 
    if (!vkr_context_add_resource(ctx, res)) {
       free(res);
@@ -829,6 +834,26 @@ vkr_context_destroy(struct vkr_context *ctx)
               vkr_context_get_name(ctx));
 
       vkr_instance_destroy(ctx, ctx->instance, false);
+   }
+
+   vkr_log("destroying context %u (%s): instance was %s, %u objects and %u resources "
+           "left in the tables",
+           ctx->ctx_id, vkr_context_get_name(ctx), ctx->instance ? "live" : "gone",
+           _mesa_hash_table_num_entries(ctx->object_table),
+           _mesa_hash_table_num_entries(ctx->resource_table));
+   /* Leak canary: with no live instance to sweep, anything still in the object table
+    * gets a bare free() below — its host-side allocations (mtl_shm carrier fd,
+    * IOSurface refs, gbm bo, udmabuf fd) leak. The worker is a long-lived singleton,
+    * so per-session leaks ratchet until EMFILE kills blob creation for every future
+    * context (2026-07-10 dogfood: 12k PSXSHM fds, fresh niri starved at login). */
+   hash_table_foreach (ctx->object_table, entry) {
+      const struct vkr_object *obj = entry->data;
+      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY &&
+          ((const struct vkr_device_memory *)obj)->mtl_shm) {
+         vkr_log_error("context %u: DEVICE_MEMORY id %" PRIu64 " still holds an mtl_shm "
+                       "carrier at context destroy — its shm fd is about to leak",
+                       ctx->ctx_id, (uint64_t)obj->id);
+      }
    }
 
    _mesa_hash_table_destroy(ctx->resource_table, vkr_context_free_resource);
