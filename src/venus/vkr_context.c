@@ -5,6 +5,8 @@
 
 #include "vkr_context.h"
 
+#include <errno.h>
+#include <string.h>
 #include <sys/mman.h>
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -364,11 +366,18 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
    const uint64_t alloc_size = (blob_size + page_size - 1) & ~(page_size - 1);
 
    int fd = os_create_anonymous_file(alloc_size, "vkr-shmem");
-   if (fd < 0)
+   if (fd < 0) {
+      vkr_log_error("context %u: CREATE_BLOB res %u: anonymous shm of %" PRIu64
+                    " bytes failed (%s) — guest holds a dead resource id",
+                    ctx->ctx_id, res_id, alloc_size, strerror(errno));
       return false;
+   }
 
    void *mmap_ptr = mmap(NULL, alloc_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
    if (mmap_ptr == MAP_FAILED) {
+      vkr_log_error("context %u: CREATE_BLOB res %u: mmap of %" PRIu64
+                    " bytes failed (%s) — guest holds a dead resource id",
+                    ctx->ctx_id, res_id, alloc_size, strerror(errno));
       close(fd);
       return false;
    }
@@ -400,12 +409,26 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    assert(!vkr_context_get_resource(ctx, res_id));
 
    struct vkr_device_memory *mem = vkr_context_get_object(ctx, blob_id);
-   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+   if (!mem || mem->base.type != VK_OBJECT_TYPE_DEVICE_MEMORY) {
+      /* The guest kernel treats CREATE_BLOB as fire-and-forget, so this error
+       * only reaches it as an async dmesg line — the guest process holds a
+       * live-looking handle to a resource that never existed. Name the cause
+       * here; the dead id will resurface downstream (map/props/import). */
+      vkr_log_error("context %u: CREATE_BLOB res %u: blob_id %" PRIu64
+                    " is not a live VkDeviceMemory (%s) — guest holds a dead "
+                    "resource id",
+                    ctx->ctx_id, res_id, blob_id, mem ? "wrong type" : "not found");
       return false;
+   }
 
    struct virgl_context_blob blob;
-   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+   if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob)) {
+      vkr_log_error("context %u: CREATE_BLOB res %u: export of VkDeviceMemory "
+                    "blob_id %" PRIu64 " failed (size %" PRIu64 " flags 0x%x) — "
+                    "guest holds a dead resource id",
+                    ctx->ctx_id, res_id, blob_id, blob_size, blob_flags);
       return false;
+   }
 
 #ifdef __APPLE__
    /* limina #28: HOST_VISIBLE blob shares MoltenVK's own vkMapMemory pointer (blob.map_ptr) — no

@@ -41,7 +41,7 @@ void
 vkr_cs_encoder_seek_stream_locked(struct vkr_cs_encoder *enc, size_t pos)
 {
    if (unlikely(!enc->stream.resource || pos > enc->stream.size)) {
-      vkr_log("failed to seek the reply stream to %zu", pos);
+      vkr_log_error("failed to seek the reply stream to %zu", pos);
       vkr_cs_encoder_set_fatal(enc);
       return;
    }
@@ -53,6 +53,8 @@ int
 vkr_cs_decoder_init(struct vkr_cs_decoder *dec, struct vkr_context *ctx)
 {
    memset(dec, 0, sizeof(*dec));
+   dec->ctx_id = ctx->ctx_id;
+   dec->ctx_name = ctx->debug_name;
    dec->fatal_error = &ctx->cs_fatal_error;
    dec->object_table = ctx->object_table;
    dec->object_mutex = &ctx->object_mutex;
