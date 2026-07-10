@@ -64,6 +64,12 @@ struct vkr_cs_decoder {
    const struct hash_table *object_table;
    mtx_t *object_mutex;
 
+   /* Attribution for FATAL logs: which guest context (and process, via its
+    * debug name) this decoder serves. ctx_name borrows ctx->debug_name, which
+    * outlives every decoder embedded in the context or its rings. */
+   uint32_t ctx_id;
+   const char *ctx_name;
+
    bool *fatal_error;
    struct vkr_cs_decoder_temp_pool temp_pool;
 
@@ -190,7 +196,7 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
    assert(val_size <= size);
 
    if (unlikely(size > (size_t)(enc->end - enc->cur))) {
-      vkr_log("failed to write the reply stream");
+      vkr_log_error("failed to write the reply stream");
       vkr_cs_encoder_set_fatal(enc);
       return;
    }
@@ -213,8 +219,10 @@ vkr_cs_decoder_reset(struct vkr_cs_decoder *dec);
 static inline void
 vkr_cs_decoder_set_fatal_at(const struct vkr_cs_decoder *dec, const char *func, int line)
 {
-   if (!*((struct vkr_cs_decoder *)dec)->fatal_error)
-      vkr_log_error("cs decoder: ring FATAL set at %s:%d", func, line);
+   if (!*((struct vkr_cs_decoder *)dec)->fatal_error) {
+      vkr_log_error("cs decoder: ring FATAL set at %s:%d (context %u [%s])", func, line,
+                    dec->ctx_id, dec->ctx_name ? dec->ctx_name : "?");
+   }
    *((struct vkr_cs_decoder *)dec)->fatal_error = true;
 }
 
@@ -278,7 +286,7 @@ vkr_cs_decoder_peek_internal(const struct vkr_cs_decoder *dec,
    assert(val_size <= size);
 
    if (unlikely(size > (size_t)(dec->end - dec->cur))) {
-      vkr_log("failed to peek %zu bytes", size);
+      vkr_log_error("failed to peek %zu bytes", size);
       vkr_cs_decoder_set_fatal(dec);
       memset(val, 0, val_size);
       return false;
@@ -322,10 +330,15 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
    obj = likely(entry) ? entry->data : NULL;
    mtx_unlock(dec->object_mutex);
    if (unlikely(!obj || obj->type != type)) {
+      /* ERROR, not INFO: this accompanies a ring FATAL, and the id + type are
+       * the attribution a production log needs. A miss here usually means a
+       * host-side create failed earlier on an async command, so the guest
+       * never learned (see the create-failure logging in vkr_device_object.py)
+       * — the 2026-07-10 dogfood poisons were exactly this shape. */
       if (obj)
-         vkr_log("object %" PRIu64 " has type %d, not %d", id, obj->type, type);
+         vkr_log_error("object %" PRIu64 " has type %d, not %d", id, obj->type, type);
       else
-         vkr_log("failed to look up object %" PRIu64 " of type %d", id, type);
+         vkr_log_error("failed to look up object %" PRIu64 " of type %d", id, type);
       vkr_cs_decoder_set_fatal(dec);
    }
 
@@ -349,7 +362,7 @@ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
 
    if (unlikely(size > (size_t)(pool->end - pool->cur))) {
       if (!vkr_cs_decoder_alloc_temp_internal(dec, size)) {
-         vkr_log("failed to suballocate %zu bytes from the temp pool", size);
+         vkr_log_error("failed to suballocate %zu bytes from the temp pool", size);
          vkr_cs_decoder_set_fatal(dec);
          return NULL;
       }
@@ -371,7 +384,7 @@ vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec, size_t size, size_t 
 {
    size_t alloc_size;
    if (unlikely(__builtin_mul_overflow(size, count, &alloc_size))) {
-      vkr_log("overflow in array allocation of %zu * %zu bytes", size, count);
+      vkr_log_error("overflow in array allocation of %zu * %zu bytes", size, count);
       vkr_cs_decoder_set_fatal(dec);
       return NULL;
    }
