@@ -301,12 +301,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             ptr = (void *)(uintptr_t)gkvm_res->map_ptr;
             span = gkvm_res->size;
          }
-         if (!ptr && gkvm_res->fd_type == VIRGL_RESOURCE_FD_SHM &&
-             (uintptr_t)gkvm_res->u.data >= 0x10000) {
+         if (!ptr && gkvm_res->fd_type == VIRGL_RESOURCE_FD_SHM && !gkvm_res->u_is_fd) {
             /* Cross-context SHM imports store the server-side mmap in u.data; a
-             * SAME-context (export-side) SHM resource stores an fd NUMBER in the
-             * union instead — the plausibility check keeps us off it (those
-             * resolve via iosurface_id above). */
+             * SAME-context (export-side) SHM carrier stores an owned fd in the
+             * union instead (u_is_fd) — those resolve via iosurface_id above. */
             ptr = gkvm_res->u.data;
             span = gkvm_res->size;
          }
@@ -709,9 +707,9 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
          vkr_mtl_iosurface_lookup(res->iosurface_id, &ptr, &span);
       if (!ptr && res->map_ptr)
          ptr = (void *)(uintptr_t)res->map_ptr;
-      if (!ptr && res->fd_type == VIRGL_RESOURCE_FD_SHM && (uintptr_t)res->u.data >= 0x10000)
-         /* cross-context SHM stores the server-side mmap in u.data (same plausibility check the
-          * import branch uses to stay off a same-context resource's fd NUMBER). */
+      if (!ptr && res->fd_type == VIRGL_RESOURCE_FD_SHM && !res->u_is_fd)
+         /* cross-context SHM stores the server-side mmap in u.data; a same-context
+          * carrier resource stores an owned fd instead (u_is_fd). */
          ptr = res->u.data;
       (void)span;
       if (ptr) {

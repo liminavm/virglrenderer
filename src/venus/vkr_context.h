@@ -24,10 +24,19 @@ struct vkr_resource {
 
    enum virgl_resource_fd_type fd_type;
 
+   /* Which union member is live. Upstream infers it from fd_type (SHM ⇒ data,
+    * dma_buf/opaque ⇒ fd), but the gkvm macOS carrier path breaks that mapping:
+    * an export-side mtl_shm carrier blob is FD_SHM *with an owned fd* (there is
+    * no server-side mmap of it). Inferring from fd_type made the free path
+    * munmap(u.data) — a garbage pointer that is really the fd — so the fd leaked,
+    * one per exported carrier blob, until the worker hit EMFILE (2026-07-10
+    * dogfood: 12k PSXSHM fds, login storm starved every new venus context). */
+   bool u_is_fd;
+
    union {
-      /* valid when fd_type is dma_buf or opaque */
+      /* valid when u_is_fd (dma_buf/opaque exports, or an FD_SHM mtl_shm carrier) */
       int fd;
-      /* valid when fd_type is shm */
+      /* valid when !u_is_fd (fd_type is shm and the server holds the mapping) */
       uint8_t *data;
    } u;
 
