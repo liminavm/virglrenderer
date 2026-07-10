@@ -515,15 +515,29 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
    if (!res)
       return;
 
-   if (!vkr_cs_encoder_check_stream(&ctx->encoder, res))
-      vkr_context_set_fatal(ctx);
+   /* A detach that yanks the reply stream or a live ring's backing is almost
+    * always kernel DRM-fd cleanup of an exited client — few clients destroy
+    * their VkInstance before exit, so the ring outlives its blob and this
+    * path fires on every venus client exit (2026-07-10 dogfood: all such
+    * events were session churn, zero guest crashes). Park the context with
+    * the quiet setter and log at INFO; the FATAL bit still stops the ring in
+    * case a live client really did detach its own load-bearing blob. */
+   if (!vkr_cs_encoder_check_stream(&ctx->encoder, res)) {
+      vkr_log("context %u: resource %u detached while backing the reply "
+              "stream (normal at client teardown); parking the context",
+              ctx->ctx_id, res_id);
+      vkr_context_set_fatal_quiet(ctx);
+   }
 
    mtx_lock(&ctx->ring_mutex);
    list_for_each_entry_safe (struct vkr_ring, ring, &ctx->rings, head) {
       if (ring->resource == res ||
           !vkr_cs_decoder_check_stream(&ring->decoder, res) ||
           !vkr_cs_encoder_check_stream(&ring->encoder, res)) {
-         vkr_context_set_fatal(ctx);
+         vkr_log("context %u: resource %u detached while backing a live ring "
+                 "(normal at client teardown); stopping the ring",
+                 ctx->ctx_id, res_id);
+         vkr_context_set_fatal_quiet(ctx);
 
          mtx_unlock(&ctx->ring_mutex);
          vkr_ring_stop(ring);
@@ -656,32 +670,45 @@ vkr_context_ring_monitor_thread(void *arg)
 #ifdef __APPLE__
    /* limina: the guest venus watchdog aborts the WHOLE guest process when an
     * ALIVE stamp lands late (mesa clears the bit at wait start and re-checks
-    * ~3.48s later against our 3.0s period — ~480ms of worst-case slack). This
-    * thread's work is trivial; make sure the scheduler treats its deadline as
-    * user-critical so host memory pressure/thrash can't starve it. */
+    * ~3.48s later). This thread's work is trivial; make sure the scheduler
+    * treats its deadline as user-critical so host memory pressure/thrash
+    * can't starve it. */
    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+
+   /* limina: stamp at 1/3 of the requested MAX reporting period (an upper
+    * bound per the protocol, so stamping more often is always compliant).
+    * mesa requests 3.0s and re-checks ~3.48s after clearing ALIVE — stamping
+    * at exactly the max leaves ~480ms of worst-case scheduler slack, and one
+    * late monitor wakeup aborts the guest process (observed 489ms late on a
+    * near-idle host, 2026-07-10, despite the QoS pin). Oversampling widens
+    * the tolerated lateness to ~2.5s for EVERY guest, stock mesa included,
+    * at the cost of a few extra atomic stores per second. */
+   const uint32_t stamp_period_us =
+      ctx->ring_monitor.report_period_us > 300000
+         ? ctx->ring_monitor.report_period_us / 3
+         : ctx->ring_monitor.report_period_us;
 
    struct timespec abs_ts;
    int ret = thrd_busy;
    int64_t last_stamp_ns = 0;
    assert(ctx->ring_monitor.started);
    while (ctx->ring_monitor.started) {
-      /* only notify at the configured rate, not faster. */
       if (ret == thrd_busy) {
-         /* limina: a stamp gap beyond period + 400ms can already exceed the
-          * guest watchdog's slack and abort the guest process; make every
-          * late stamp loud so the next dogfood incident is attributable
-          * (2026-07-09: three silent alive-expiry-suspected aborts). */
+         /* limina: a stamp gap beyond the REQUESTED period means the guest
+          * watchdog's contract was busted and it may abort the guest
+          * process; make that loud so the next dogfood incident is
+          * attributable (2026-07-09: three silent alive-expiry-suspected
+          * aborts). */
          struct timespec mono;
          if (!clock_gettime(CLOCK_MONOTONIC, &mono)) {
             const int64_t now_ns = (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec;
             const int64_t period_ns =
                (int64_t)ctx->ring_monitor.report_period_us * 1000;
-            if (last_stamp_ns && now_ns - last_stamp_ns > period_ns + 400000000)
+            if (last_stamp_ns && now_ns - last_stamp_ns > period_ns)
                vkr_log_error("ringmon-%d: ALIVE stamp late: %" PRId64
-                             " ms since last (period %u ms) — guest venus "
-                             "watchdog may abort the guest process",
+                             " ms since last (guest tolerates ~%u ms) — guest "
+                             "venus watchdog may abort the guest process",
                              ctx->ctx_id, (now_ns - last_stamp_ns) / 1000000,
                              ctx->ring_monitor.report_period_us / 1000);
             last_stamp_ns = now_ns;
@@ -697,10 +724,9 @@ vkr_context_ring_monitor_thread(void *arg)
          if (ret)
             break;
 
-         const uint32_t period_us = ctx->ring_monitor.report_period_us;
          const struct timespec rel_ts = {
-            .tv_sec = period_us / 1000000,
-            .tv_nsec = (period_us % 1000000) * 1000,
+            .tv_sec = stamp_period_us / 1000000,
+            .tv_nsec = (stamp_period_us % 1000000) * 1000,
          };
          abs_ts = timespec_add(abs_ts, rel_ts);
       } else if (ret)
