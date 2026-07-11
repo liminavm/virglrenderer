@@ -191,6 +191,22 @@ vkr_log(const char *fmt, ...);
 void
 vkr_log_error(const char *fmt, ...);
 
+/* limina: VKR_FD_TRACE=1 turns on per-event fd tracing (mtl_shm carrier
+ * alloc/free/dup sites log at ERROR so they reach the shipped log). Field
+ * attribution for fd ratchets: the 2026-07-11 dogfood worker sat at 14k+
+ * carrier fds from a dup site no local workload reproduced — flip this env
+ * on the deployed app and the next leaking phase names itself. */
+static inline bool
+vkr_fd_trace(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("VKR_FD_TRACE");
+      on = e && e[0] && strcmp(e, "0") != 0;
+   }
+   return on;
+}
+
 static inline uint32_t
 vkr_api_version_cap_minor(uint32_t version, uint32_t cap)
 {
