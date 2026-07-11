@@ -76,6 +76,18 @@ struct global_state {
 
 static struct global_state state;
 
+/* limina: VKR_FD_TRACE-gated teardown tracing (matches vkr_fd_trace()); attributes
+ * which teardown commands actually reach the renderer for the carrier-fd ratchet. */
+static bool virgl_fd_trace(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("VKR_FD_TRACE");
+      on = e && e[0] && strcmp(e, "0") != 0;
+   }
+   return on;
+}
+
 /* new API - just wrap internal API for now */
 
 static int virgl_renderer_resource_create_internal(struct virgl_renderer_resource_create_args *args,
@@ -165,6 +177,9 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    struct virgl_context_foreach_args args;
 
+   if (virgl_fd_trace())
+      virgl_error("[FDTRACE] resource_unref res=%u %s", res_handle,
+                  res ? "found" : "MISSING");
    if (!res)
       return;
 
@@ -292,6 +307,8 @@ int virgl_renderer_context_create(uint32_t handle, uint32_t nlen, const char *na
 void virgl_renderer_context_destroy(uint32_t handle)
 {
    TRACE_FUNC();
+   if (virgl_fd_trace())
+      virgl_error("[FDTRACE] context_destroy ctx=%u", handle);
    virgl_context_remove(handle);
 }
 
@@ -484,6 +501,9 @@ void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (virgl_fd_trace())
+      virgl_error("[FDTRACE] ctx_detach_resource ctx=%d res=%d%s%s", ctx_id,
+                  res_handle, ctx ? "" : " NO-CTX", res ? "" : " NO-RES");
    if (!ctx || !res)
       return;
    ctx->detach_resource(ctx, res);
