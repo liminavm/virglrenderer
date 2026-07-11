@@ -47,6 +47,9 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
    int fd = os_dupfd_cloexec(res->u.fd);
    if (fd < 0)
       return false;
+   if (vkr_fd_trace())
+      vkr_log_error("[FDTRACE] import_fd_info res=%u src_fd=%d dup=%d",
+                    res_info->resourceId, res->u.fd, fd);
 
    *out = (VkImportMemoryFdInfoKHR){
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
@@ -542,6 +545,13 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       /* Side carrier: a real fd for the blob export only (bytes unused for pixels). */
       mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
       if (!mtl_shm) {
+         /* Loud: the guest allocates async (vn_async_vkAllocateMemory), so this
+          * failure is invisible guest-side — it holds a GHOST memory object whose
+          * next use poisons the ring (2026-07-11 dogfood: two silent creates →
+          * decoder-lookup FATALs killed firefox and kitty). Name the failure. */
+         vkr_log_error("vkAllocateMemory: scanout mtl_shm carrier alloc failed "
+                       "(size=%" PRIu64 ", %s) — guest holds a ghost VkDeviceMemory",
+                       (uint64_t)alloc_info->allocationSize, strerror(errno));
          args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
          return;
       }
@@ -589,6 +599,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
          mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
          if (!mtl_shm) {
+            vkr_log_error("vkAllocateMemory: export mtl_shm carrier alloc failed "
+                          "(size=%" PRIu64 ", %s) — guest holds a ghost VkDeviceMemory",
+                          (uint64_t)alloc_info->allocationSize, strerror(errno));
             args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return;
          }
@@ -601,6 +614,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
    if (!mem) {
+      /* Hand-written dispatch — the 0029 generated-template create logging does
+       * not cover it, and the guest's create is async: log or the ghost is silent. */
+      vkr_log_error("vkAllocateMemory failed host-side: VkResult %d (size=%" PRIu64
+                    ", type %u) — guest holds a ghost VkDeviceMemory",
+                    args->ret, (uint64_t)alloc_info->allocationSize, mem_type_index);
       if (local_import_info.fd >= 0)
          close(local_import_info.fd);
       if (gbm_bo)
@@ -703,8 +721,15 @@ vkr_dispatch_vkGetMemoryResourcePropertiesMESA(
    {
       void *ptr = NULL;
       uint64_t span = 0;
-      if (res->iosurface_id)
-         vkr_mtl_iosurface_lookup(res->iosurface_id, &ptr, &span);
+      if (res->iosurface_id) {
+         /* lookup returns +1; this query only needs the base pointer, so drop the
+          * ref immediately — the IOSurface stays alive via the exporting memory's
+          * own retain. Keeping it leaked one CF ref + Mach right per query, and a
+          * compositor that re-queries per frame (uncached dmabuf import) ratchets
+          * the worker's port space for the whole session. */
+         void *io = vkr_mtl_iosurface_lookup(res->iosurface_id, &ptr, &span);
+         vkr_mtl_iosurface_release_ref(io);
+      }
       if (!ptr && res->map_ptr)
          ptr = (void *)(uintptr_t)res->map_ptr;
       if (!ptr && res->fd_type == VIRGL_RESOURCE_FD_SHM && !res->u_is_fd)
@@ -844,6 +869,9 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 #endif
       if (out_blob->u.fd < 0)
          vkr_log_error("mtl_shm carrier fd dup failed (%s)", strerror(errno));
+      else if (vkr_fd_trace())
+         vkr_log_error("[FDTRACE] export_blob carrier src_fd=%d dup=%d",
+                       mem->mtl_shm->shm_fd, out_blob->u.fd);
       return out_blob->u.fd >= 0;
    }
 
