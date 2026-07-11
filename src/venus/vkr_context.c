@@ -9,7 +9,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #ifdef __APPLE__
+#include <dirent.h>
 #include <pthread/qos.h>
+#include <sys/resource.h>
 #endif
 #include <sys/types.h>
 #include <unistd.h>
@@ -467,6 +469,9 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
          close(blob.u.fd);
          return false;
       }
+      if (vkr_fd_trace())
+         vkr_log_error("[FDTRACE] create_blob res=%u might_export src_fd=%d dup=%d",
+                       res_id, blob.u.fd, res_fd);
    }
 
    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, res_fd,
@@ -727,7 +732,14 @@ vkr_context_ring_monitor_thread(void *arg)
           * watchdog's contract was busted and it may abort the guest
           * process; make that loud so the next dogfood incident is
           * attributable (2026-07-09: three silent alive-expiry-suspected
-          * aborts). */
+          * aborts). Measure the gap at the STAMP itself — after the wake
+          * AND after ring_mutex is acquired — so time lost blocked on the
+          * lock is charged too, not just scheduler lateness. (2026-07-11:
+          * a clean alive-expiry abort left ZERO late lines because the gap
+          * was checked pre-lock and the next iteration never ran — the
+          * victim's teardown signals this thread awake to exit, silencing
+          * the one log that would have named the stall.) */
+         mtx_lock(&ctx->ring_mutex);
          struct timespec mono;
          if (!clock_gettime(CLOCK_MONOTONIC, &mono)) {
             const int64_t now_ns = (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec;
@@ -741,12 +753,44 @@ vkr_context_ring_monitor_thread(void *arg)
                              ctx->ring_monitor.report_period_us / 1000);
             last_stamp_ns = now_ns;
          }
-         mtx_lock(&ctx->ring_mutex);
          list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
             if (ring->monitor)
                vkr_ring_set_status_bits(ring, VK_RING_STATUS_ALIVE_BIT_MESA);
          }
          mtx_unlock(&ctx->ring_mutex);
+
+#ifdef __APPLE__
+         /* limina: fd-pressure canary. The worker is a long-lived singleton and a
+          * carrier-fd ratchet walks it to EMFILE, where every CREATE_BLOB dies and
+          * fresh guest sessions starve at bring-up (2026-07-10 incident; 2026-07-11:
+          * 14k+ fds from a still-unattributed dup site). Audit once a minute from
+          * whichever ring monitor gets here first and confess ABOVE 50% of the soft
+          * limit, so the wall is visible days before it hits. Benign data race on
+          * the timestamp: worst case two monitors audit the same minute. */
+         {
+            static int64_t last_audit_ns;
+            struct timespec am;
+            if (!clock_gettime(CLOCK_MONOTONIC, &am)) {
+               const int64_t now_ns = (int64_t)am.tv_sec * 1000000000 + am.tv_nsec;
+               if (now_ns - last_audit_ns > 60000000000ll) {
+                  last_audit_ns = now_ns;
+                  struct rlimit rl;
+                  DIR *d;
+                  if (!getrlimit(RLIMIT_NOFILE, &rl) && (d = opendir("/dev/fd"))) {
+                     long nfds = 0;
+                     while (readdir(d))
+                        nfds++;
+                     closedir(d);
+                     if (rl.rlim_cur && nfds > (long)(rl.rlim_cur / 2))
+                        vkr_log_error("fd audit: %ld open of %llu soft limit — a "
+                                      "carrier-fd ratchet is under way; relaunch "
+                                      "with VKR_FD_TRACE=1 to attribute it",
+                                      nfds, (unsigned long long)rl.rlim_cur);
+                  }
+               }
+            }
+         }
+#endif
 
          ret = clock_gettime(CLOCK_REALTIME, &abs_ts);
          if (ret)
@@ -764,6 +808,22 @@ vkr_context_ring_monitor_thread(void *arg)
       mtx_lock(&ctx->ring_monitor.mutex);
       ret = cnd_timedwait(&ctx->ring_monitor.cond, &ctx->ring_monitor.mutex, &abs_ts);
       mtx_unlock(&ctx->ring_monitor.mutex);
+   }
+
+   /* Exit-path confession: if this monitor is being torn down while its last
+    * stamp is already stale, say so — teardown after a guest abort is exactly
+    * when the in-loop check can no longer run, and a silent exit here is what
+    * made the 2026-07-11 class-2 incident unattributable host-side. */
+   struct timespec mono;
+   if (last_stamp_ns && !clock_gettime(CLOCK_MONOTONIC, &mono)) {
+      const int64_t now_ns = (int64_t)mono.tv_sec * 1000000000 + mono.tv_nsec;
+      const int64_t period_ns = (int64_t)ctx->ring_monitor.report_period_us * 1000;
+      if (now_ns - last_stamp_ns > period_ns)
+         vkr_log_error("ringmon-%d: exiting with a stale ALIVE stamp: %" PRId64
+                       " ms since last (guest tolerates ~%u ms) — if the guest "
+                       "aborted on expired ring alive status, this was why",
+                       ctx->ctx_id, (now_ns - last_stamp_ns) / 1000000,
+                       ctx->ring_monitor.report_period_us / 1000);
    }
 
    return ret;
