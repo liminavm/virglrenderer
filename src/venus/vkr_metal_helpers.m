@@ -244,6 +244,8 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
    shm->shm_ptr = shm_ptr;
    shm->shm_size = aligned_size;
    shm->mtl_buffer = (void *)buffer;
+   if (vkr_fd_trace())
+      vkr_log_error("[FDTRACE] shm_alloc fd=%d size=%zu", shm_fd, aligned_size);
    return shm;
 }
 
@@ -256,8 +258,11 @@ vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
       CFRelease(shm->mtl_buffer);
    if (shm->shm_ptr)
       munmap(shm->shm_ptr, shm->shm_size);
-   if (shm->shm_fd >= 0)
+   if (shm->shm_fd >= 0) {
+      if (vkr_fd_trace())
+         vkr_log_error("[FDTRACE] shm_free fd=%d", shm->shm_fd);
       close(shm->shm_fd);
+   }
    free(shm);
 }
 
