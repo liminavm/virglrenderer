@@ -266,6 +266,10 @@ static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
+   if (vkr_fd_trace())
+      vkr_log_error("[FDTRACE] vkr free_resource res=%u %s=%d", res->res_id,
+                    res->u_is_fd ? "fd" : "mapped size",
+                    res->u_is_fd ? res->u.fd : (int)res->size);
    if (res->u_is_fd) {
       if (res->u.fd >= 0)
          close(res->u.fd);
@@ -354,6 +358,16 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
       munmap(mmap_ptr, blob_size);
       return false;
    }
+
+   /* Import CONSUMES the fd on success, like the internal path consumes it by storing
+    * it in the vkr_resource. Only the mapping is kept here — an unclosed fd is a
+    * straight leak, one per cross-context attach of an SHM blob (the render-server
+    * dispatch only closes received fds on dispatch FAILURE). On a macOS host every
+    * exportable VkDeviceMemory is an SHM carrier, so compositor dmabuf-import churn
+    * ratchets the worker to RLIMIT_NOFILE (EMFILE) without this. */
+   if (vkr_fd_trace())
+      vkr_log_error("[FDTRACE] shm import res=%u consumed fd=%d", res_id, fd);
+   close(fd);
 
    return true;
 }
