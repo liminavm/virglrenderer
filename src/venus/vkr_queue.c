@@ -477,7 +477,12 @@ static void
 vkr_dispatch_vkCreateFence(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateFence *args)
 {
-   vkr_fence_create_and_add(dispatch->data, args);
+   /* limina P2.1: capture the vkr_device before create_and_add replaces the
+    * handles in args. */
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vkr_fence *obj = vkr_fence_create_and_add(dispatch->data, args);
+   if (obj)
+      obj->device = dev;
 }
 
 static void
@@ -551,7 +556,17 @@ static void
 vkr_dispatch_vkCreateSemaphore(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateSemaphore *args)
 {
-   vkr_semaphore_create_and_add(dispatch->data, args);
+   /* limina P2.1: capture device + timeline-ness before handles are replaced. */
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   const VkSemaphoreTypeCreateInfo *type_info = vkr_find_struct(
+      args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
+   const bool is_timeline =
+      type_info && type_info->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE;
+   struct vkr_semaphore *obj = vkr_semaphore_create_and_add(dispatch->data, args);
+   if (obj) {
+      obj->device = dev;
+      obj->limina_is_timeline = is_timeline;
+   }
 }
 
 static void
