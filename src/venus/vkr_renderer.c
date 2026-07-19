@@ -12,7 +12,9 @@
 #include "venus_hw.h"
 
 #include "vkr_context.h"
+#include "vkr_device.h"
 #include "vkr_device_memory.h"
+#include "vkr_queue.h"
 #include "vkr_ring.h"
 
 struct vkr_renderer_state {
@@ -492,6 +494,249 @@ vkr_renderer_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf, uin
    if (!mem)
       return false;
    return vkr_device_memory_content_copy(mem, (void *)buf, size, true);
+}
+
+/* --- gkvm P2.1: sync-object fast-forward across snapshot restore -----------
+ *
+ * Signal ops live in vkQueueSubmit (TRANSIENT — never journaled), so every
+ * replayed VkFence/VkSemaphore comes back in its freshly-created state while
+ * the resumed guest's belief (in guest RAM) reflects the pre-suspend epoch,
+ * where the quiesce guaranteed everything had retired. A post-resume wait
+ * rooted in that belief (mutter's vkWaitSemaphoreResourceMESA on its WSI
+ * semaphore was the observed wedge) blocks the ring thread forever — and with
+ * it the context worker and the whole proxy. Fast-forward at restore, before
+ * the rings start: timeline semaphores signal to the captured counter value,
+ * fences that were signaled at capture re-signal via an empty queue submit,
+ * and binary semaphores re-signal to their own pending point the same way. */
+
+#define VKR_SYNC_BLOB_MAGIC 0x4e595a4cu /* 'LZYN' LE */
+
+int
+vkr_renderer_sync_export(uint32_t ctx_id, void **out_buf, size_t *out_size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return -1;
+
+   mtx_lock(&ctx->object_mutex);
+   const uint32_t cap = _mesa_hash_table_num_entries(ctx->object_table);
+   /* entry: u64 id, u32 kind (0=fence, 2=timeline sem), u32 signaled, u64 value */
+   const size_t entry_size = 8 + 4 + 4 + 8;
+   uint8_t *buf = malloc(8 + (size_t)cap * entry_size);
+   uint32_t n = 0;
+   if (buf) {
+      uint8_t *p = buf + 8;
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         uint32_t kind;
+         uint32_t signaled = 0;
+         uint64_t value = 0;
+         if (obj->type == VK_OBJECT_TYPE_FENCE) {
+            struct vkr_fence *fence = (struct vkr_fence *)obj;
+            if (!fence->device)
+               continue;
+            struct vn_device_proc_table *vk = &fence->device->proc_table;
+            kind = 0;
+            signaled = vk->GetFenceStatus(fence->device->base.handle.device,
+                                          obj->handle.fence) == VK_SUCCESS;
+         } else if (obj->type == VK_OBJECT_TYPE_SEMAPHORE) {
+            struct vkr_semaphore *sem = (struct vkr_semaphore *)obj;
+            if (!sem->device || !sem->gkvm_is_timeline)
+               continue; /* binary semaphores need no captured state */
+            struct vn_device_proc_table *vk = &sem->device->proc_table;
+            kind = 2;
+            if (vk->GetSemaphoreCounterValue(sem->device->base.handle.device,
+                                             obj->handle.semaphore,
+                                             &value) != VK_SUCCESS)
+               continue;
+         } else {
+            continue;
+         }
+         memcpy(p, &obj->id, 8);
+         memcpy(p + 8, &kind, 4);
+         memcpy(p + 12, &signaled, 4);
+         memcpy(p + 16, &value, 8);
+         p += entry_size;
+         n++;
+      }
+      const uint32_t magic = VKR_SYNC_BLOB_MAGIC;
+      memcpy(buf, &magic, 4);
+      memcpy(buf + 4, &n, 4);
+      *out_size = 8 + (size_t)n * entry_size;
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   if (!buf)
+      return -1;
+   *out_buf = buf;
+   return 0;
+}
+
+static struct vkr_queue *
+vkr_device_first_queue(struct vkr_device *dev)
+{
+   if (list_is_empty(&dev->queues))
+      return NULL;
+   return list_first_entry(&dev->queues, struct vkr_queue, base.track_head);
+}
+
+/* Empty submit signaling `sem` (binary) and/or `fence`, on the device's first
+ * queue. The submit's execution is what flips the underlying kk timeline /
+ * MTLSharedEvent, exactly as a real signal would. */
+static bool
+vkr_sync_fast_forward_submit(struct vkr_device *dev, VkSemaphore sem, VkFence fence)
+{
+   struct vkr_queue *queue = vkr_device_first_queue(dev);
+   if (!queue)
+      return false;
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   const VkSubmitInfo submit = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .signalSemaphoreCount = sem != VK_NULL_HANDLE ? 1u : 0u,
+      .pSignalSemaphores = sem != VK_NULL_HANDLE ? &sem : NULL,
+   };
+   mtx_lock(&queue->vk_mutex);
+   VkResult ret =
+      vk->QueueSubmit(queue->base.handle.queue, 1, &submit, fence);
+   mtx_unlock(&queue->vk_mutex);
+   return ret == VK_SUCCESS;
+}
+
+int
+vkr_renderer_sync_restore(uint32_t ctx_id, const void *data, size_t size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || size < 8)
+      return -1;
+
+   const uint8_t *buf = data;
+   uint32_t magic, count;
+   memcpy(&magic, buf, 4);
+   memcpy(&count, buf + 4, 4);
+   const size_t entry_size = 8 + 4 + 4 + 8;
+   if (magic != VKR_SYNC_BLOB_MAGIC || size < 8 + (size_t)count * entry_size)
+      return -1;
+
+   uint32_t applied = 0, missing = 0, failed = 0, binaries = 0;
+   struct vkr_device *touched[16];
+   uint32_t n_touched = 0;
+
+   /* Captured state: fences + timeline semaphores. */
+   for (uint32_t i = 0; i < count; i++) {
+      const uint8_t *p = buf + 8 + (size_t)i * entry_size;
+      uint64_t id, value;
+      uint32_t kind, signaled;
+      memcpy(&id, p, 8);
+      memcpy(&kind, p + 8, 4);
+      memcpy(&signaled, p + 12, 4);
+      memcpy(&value, p + 16, 8);
+
+      mtx_lock(&ctx->object_mutex);
+      const struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &id);
+      struct vkr_object *obj = entry ? entry->data : NULL;
+      mtx_unlock(&ctx->object_mutex);
+      if (!obj) {
+         missing++; /* its create was pruned/dropped — nothing waits on it */
+         continue;
+      }
+
+      if (kind == 0 && obj->type == VK_OBJECT_TYPE_FENCE) {
+         struct vkr_fence *fence = (struct vkr_fence *)obj;
+         if (!signaled || !fence->device)
+            continue;
+         struct vn_device_proc_table *vk = &fence->device->proc_table;
+         if (vk->GetFenceStatus(fence->device->base.handle.device,
+                                obj->handle.fence) == VK_SUCCESS)
+            continue; /* already signaled */
+         if (vkr_sync_fast_forward_submit(fence->device, VK_NULL_HANDLE,
+                                          obj->handle.fence))
+            applied++;
+         else
+            failed++;
+         if (n_touched < ARRAY_SIZE(touched))
+            touched[n_touched++] = fence->device;
+      } else if (kind == 2 && obj->type == VK_OBJECT_TYPE_SEMAPHORE) {
+         struct vkr_semaphore *sem = (struct vkr_semaphore *)obj;
+         if (!sem->device)
+            continue;
+         struct vn_device_proc_table *vk = &sem->device->proc_table;
+         uint64_t cur = 0;
+         if (vk->GetSemaphoreCounterValue(sem->device->base.handle.device,
+                                          obj->handle.semaphore,
+                                          &cur) != VK_SUCCESS ||
+             cur >= value)
+            continue;
+         const VkSemaphoreSignalInfo info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            .semaphore = obj->handle.semaphore,
+            .value = value,
+         };
+         if (vk->SignalSemaphore(sem->device->base.handle.device, &info) ==
+             VK_SUCCESS)
+            applied++;
+         else
+            failed++;
+      }
+   }
+
+   /* Binary semaphores carry no wire value: re-signal each to its own pending
+    * point via an empty submit. Every replayed binary is unsignaled (signals
+    * are TRANSIENT), so the extra signal is valid. */
+   struct vkr_object **bins = NULL;
+   uint32_t n_bins = 0, cap_bins = 0;
+   mtx_lock(&ctx->object_mutex);
+   hash_table_foreach (ctx->object_table, entry) {
+      struct vkr_object *obj = entry->data;
+      if (obj->type != VK_OBJECT_TYPE_SEMAPHORE)
+         continue;
+      struct vkr_semaphore *sem = (struct vkr_semaphore *)obj;
+      if (sem->gkvm_is_timeline || !sem->device)
+         continue;
+      if (n_bins == cap_bins) {
+         cap_bins = cap_bins ? cap_bins * 2 : 64;
+         struct vkr_object **grown = realloc(bins, cap_bins * sizeof(*bins));
+         if (!grown)
+            break;
+         bins = grown;
+      }
+      bins[n_bins++] = obj;
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   for (uint32_t i = 0; i < n_bins; i++) {
+      struct vkr_semaphore *sem = (struct vkr_semaphore *)bins[i];
+      if (vkr_sync_fast_forward_submit(sem->device, bins[i]->handle.semaphore,
+                                       VK_NULL_HANDLE)) {
+         binaries++;
+         if (n_touched < ARRAY_SIZE(touched))
+            touched[n_touched++] = sem->device;
+      } else {
+         failed++;
+      }
+   }
+   free(bins);
+
+   /* Let the fast-forward submits fully retire before the guest thaws, so no
+    * later guest op (vkResetFences, a re-signal) can race them. */
+   for (uint32_t i = 0; i < n_touched; i++) {
+      bool seen = false;
+      for (uint32_t j = 0; j < i; j++)
+         seen |= touched[j] == touched[i];
+      if (seen)
+         continue;
+      struct vkr_queue *queue = vkr_device_first_queue(touched[i]);
+      if (queue) {
+         struct vn_device_proc_table *vk = &touched[i]->proc_table;
+         mtx_lock(&queue->vk_mutex);
+         vk->QueueWaitIdle(queue->base.handle.queue);
+         mtx_unlock(&queue->vk_mutex);
+      }
+   }
+
+   vkr_log("gkvm sync fast-forward ctx %u: %u captured applied, %u binary "
+           "semaphores re-signaled, %u missing, %u failed",
+           ctx_id, applied, binaries, missing, failed);
+   return failed ? -1 : 0;
 }
 
 bool

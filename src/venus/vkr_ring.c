@@ -153,8 +153,12 @@ vkr_ring_create(const struct vkr_ring_layout *layout,
    /* gkvm snapshot-replay: resume the read cursor at the restored head (the
     * quiesce drained the ring, so head == tail; the thread then simply waits
     * for the resumed guest's next submission) */
-   if (ctx->replaying)
+   if (ctx->replaying) {
       ring->buffer.cur = *ring->control.head;
+      vkr_log("gkvm ring replay-create ctx %u: head=%u tail=%u status=0x%x cur=%u",
+              ctx->ctx_id, *ring->control.head, *ring->control.tail,
+              *ring->control.status, ring->buffer.cur);
+   }
 
    ring->cmd = malloc(ring->buffer.size);
    if (!ring->cmd)

@@ -492,6 +492,19 @@ VIRGL_EXPORT int virgl_renderer_limina_replay_end(uint32_t ctx_id);
  * bytes included). At restore, write AFTER the context's wire journal has
  * replayed (the allocs must exist) and BEFORE replay_end (rings consume parked
  * commands the moment they start). Same-process render server only. */
+/* gkvm snapshot-replay P2.1: sync-object fast-forward. Signal ops are queue
+ * submits (TRANSIENT, never journaled), so replayed fences/semaphores come back
+ * freshly-created while the resumed guest's belief reflects the quiesced
+ * pre-suspend epoch (everything retired). Export captures fence status +
+ * timeline counter values as an opaque malloc'd blob (caller frees); restore
+ * re-applies it and re-signals every binary semaphore to its own pending point
+ * (empty queue submits + a queue drain). Restore after the wire journal, BEFORE
+ * replay_end. */
+VIRGL_EXPORT int virgl_renderer_limina_sync_export(uint32_t ctx_id, void **out_buf,
+                                                   uint64_t *out_size);
+VIRGL_EXPORT int virgl_renderer_limina_sync_restore(uint32_t ctx_id, const void *data,
+                                                    uint64_t size);
+
 VIRGL_EXPORT int virgl_renderer_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs,
                                                      uint32_t *out_count);
 VIRGL_EXPORT int virgl_renderer_limina_memory_read(uint32_t ctx_id, uint64_t mem_id,

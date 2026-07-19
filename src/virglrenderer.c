@@ -1322,6 +1322,8 @@ bool render_state_limina_replay_ring_cmd(uint32_t ctx_id,
 bool render_state_limina_replay_end(uint32_t ctx_id);
 int render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs,
                                       uint32_t *out_count);
+int render_state_limina_sync_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+int render_state_limina_sync_restore(uint32_t ctx_id, const void *data, size_t size);
 bool render_state_limina_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf,
                                      uint64_t size);
 bool render_state_limina_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf,
@@ -1440,6 +1442,37 @@ int virgl_renderer_limina_replay_end(uint32_t ctx_id)
       return render_state_limina_replay_end(ctx_id) ? 0 : -EINVAL;
 #endif
    (void)ctx_id;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_sync_export(uint32_t ctx_id, void **out_buf, uint64_t *out_size)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized) {
+      size_t size = 0;
+      if (render_state_limina_sync_export(ctx_id, out_buf, &size))
+         return -EINVAL;
+      *out_size = size;
+      return 0;
+   }
+#endif
+   (void)ctx_id;
+   (void)out_buf;
+   (void)out_size;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_sync_restore(uint32_t ctx_id, const void *data, uint64_t size)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_sync_restore(ctx_id, data, size);
+#endif
+   (void)ctx_id;
+   (void)data;
+   (void)size;
    return -ENOTSUP;
 }
 

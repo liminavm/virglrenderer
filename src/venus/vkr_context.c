@@ -655,9 +655,37 @@ vkr_context_wait_ring_seqno(struct vkr_context *ctx,
    mtx_lock(&ctx->wait_ring.mutex);
    ctx->wait_ring.id = ring->id;
    ctx->wait_ring.seqno = ring_seqno;
+   /* gkvm M9.3 diagnostics: a wait that BLOCKS for long parked a restored
+    * session forever once (the guest asked for a seqno the recreated ring
+    * never reached, wedging the context worker and with it the whole proxy).
+    * Name the numbers after ~500 ms so the next wedge is diagnosable from the
+    * log alone — but never log on the hot path: this dispatch runs per
+    * exported frame sync fd (vn_create_sync_file), hundreds of times a second
+    * on a busy compositor, and an unconditional log here IS a frame stutter. */
+   bool logged = false;
    while (!vkr_context_get_fatal(ctx) && ok &&
           !vkr_seqno_ge(vkr_ring_load_head(ring), ring_seqno)) {
-      ok = cnd_wait(&ctx->wait_ring.cond, &ctx->wait_ring.mutex) == thrd_success;
+      if (!logged) {
+         struct timespec ts;
+         timespec_get(&ts, TIME_UTC);
+         ts.tv_nsec += 500 * 1000 * 1000;
+         if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+         }
+         const int ret = cnd_timedwait(&ctx->wait_ring.cond, &ctx->wait_ring.mutex, &ts);
+         if (ret == thrd_timeout) {
+            vkr_log("wait_ring_seqno STUCK >500ms ctx %u ring %" PRIu64
+                    ": want=%" PRIu64 " head=%u tail=%u status=0x%x",
+                    ctx->ctx_id, ring->id, ring_seqno, vkr_ring_load_head(ring),
+                    *ring->control.tail, *ring->control.status);
+            logged = true;
+         } else if (ret != thrd_success) {
+            ok = false;
+         }
+      } else {
+         ok = cnd_wait(&ctx->wait_ring.cond, &ctx->wait_ring.mutex) == thrd_success;
+      }
    }
    ctx->wait_ring.id = 0;
    mtx_unlock(&ctx->wait_ring.mutex);

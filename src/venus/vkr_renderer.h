@@ -84,6 +84,19 @@ vkr_renderer_replay_end(uint32_t ctx_id);
  * malloc'd array of (object id, allocation size) u64 pairs for every live
  * capturable VkDeviceMemory in the context (caller frees); read/write copy the
  * memory's bytes out of / into its host mapping. */
+/* gkvm snapshot-replay P2.1: sync-object fast-forward. Export captures every
+ * fence's signaled state + every timeline semaphore's counter value into an
+ * opaque malloc'd blob (caller frees); restore re-applies it to the replayed
+ * objects and re-signals every binary semaphore to its own pending point via
+ * empty queue submits. Call restore after the context's wire journal has
+ * replayed and BEFORE replay_end (a started ring may immediately consume a
+ * guest wait rooted in the pre-suspend epoch). */
+int
+vkr_renderer_sync_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+
+int
+vkr_renderer_sync_restore(uint32_t ctx_id, const void *data, size_t size);
+
 int
 vkr_renderer_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count);
 
