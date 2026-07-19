@@ -1308,8 +1308,17 @@ int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst, uint3
 
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
 /* Defined in server/render_state.c (compiled into the lib in thread render-server
- * mode; server/ is not on the include path for this TU, hence the local decl). */
+ * mode; server/ is not on the include path for this TU, hence the local decls). */
 void render_state_limina_dump_state(void);
+bool render_state_limina_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+uint64_t render_state_limina_journal_seq(uint32_t ctx_id);
+bool render_state_limina_replay_begin(uint32_t ctx_id);
+bool render_state_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size);
+bool render_state_limina_replay_ring_cmd(uint32_t ctx_id,
+                                         uint64_t ring_id,
+                                         void *cmd,
+                                         uint32_t size);
+bool render_state_limina_replay_end(uint32_t ctx_id);
 #endif
 
 /* limina M9.3 diagnostics: log the live venus (vkr) context table — per context:
@@ -1330,6 +1339,89 @@ void virgl_renderer_limina_dump_state(void)
 #else
    virgl_info("[GPUTRACE] vkr state: unavailable (out-of-process render server)\n");
 #endif
+}
+
+/* limina snapshot-replay (limina M9.3 P1): venus journal export + replay. Same
+ * availability rules as the state dump above — same-process render server only.
+ * See vkr_renderer.h for the replay contract (replay buffers must be mutable;
+ * one journal entry per submit/ring_cmd call). */
+
+int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf, uint64_t *out_size)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized) {
+      size_t size = 0;
+      if (!render_state_limina_journal_export(ctx_id, out_buf, &size))
+         return -EINVAL;
+      *out_size = size;
+      return 0;
+   }
+#endif
+   (void)ctx_id;
+   (void)out_buf;
+   (void)out_size;
+   return -ENOTSUP;
+}
+
+uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_journal_seq(ctx_id);
+#endif
+   (void)ctx_id;
+   return 0;
+}
+
+int virgl_renderer_limina_replay_begin(uint32_t ctx_id)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_replay_begin(ctx_id) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_replay_submit(ctx_id, cmd, size) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   (void)cmd;
+   (void)size;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_replay_ring_cmd(uint32_t ctx_id,
+                                          uint64_t ring_id,
+                                          void *cmd,
+                                          uint32_t size)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_replay_ring_cmd(ctx_id, ring_id, cmd, size) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   (void)ring_id;
+   (void)cmd;
+   (void)size;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_replay_end(uint32_t ctx_id)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_replay_end(ctx_id) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   return -ENOTSUP;
 }
 
 int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
