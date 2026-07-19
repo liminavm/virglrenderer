@@ -104,6 +104,28 @@ vkr_journal_note_free(struct vkr_context *ctx,
 void
 vkr_journal_get_stats(struct vkr_journal *j, struct vkr_journal_stats *out);
 
+/* Serialized journal format (P1 snapshot section):
+ *   u32 magic 'VKJR', u32 version=1, u32 entry_count, u32 reserved
+ *   per entry: u64 seq, u32 cmd_type, u8 klass, u8 pad[3],
+ *              u64 ring_key (ring-scoped entries: the ring id; else 0),
+ *              u32 size, bytes (4-aligned)
+ * Replay contract: entries with ring_key != 0 must be dispatched on that ring's
+ * decoder before the ring thread starts; everything else goes through
+ * vkr_context_submit_cmd in seq order. */
+#define VKR_JOURNAL_EXPORT_MAGIC 0x524a4b56u /* 'VKJR' LE */
+#define VKR_JOURNAL_EXPORT_VERSION 1u
+
+/* entry klass values as serialized (mirrors the internal enum) */
+#define VKR_JOURNAL_KLASS_RING_STREAM 8u
+
+/* malloc()s the serialized live journal into *out_buf; caller frees */
+bool
+vkr_journal_export(struct vkr_journal *j, void **out_buf, size_t *out_size);
+
+/* current sequence watermark (the libkrun-layer cross-journal fence stamp) */
+uint64_t
+vkr_journal_seq(struct vkr_journal *j);
+
 /* defined in vkr_renderer.c; declared here (not vkr_renderer.h) because that
  * header is consumed by non-Vulkan TUs that lack VkObjectType */
 const char *

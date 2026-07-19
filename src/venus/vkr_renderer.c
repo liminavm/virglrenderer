@@ -12,6 +12,7 @@
 #include "venus_hw.h"
 
 #include "vkr_context.h"
+#include "vkr_ring.h"
 
 struct vkr_renderer_state {
    const struct vkr_renderer_callbacks *cbs;
@@ -302,6 +303,130 @@ vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
       return false;
 
    return vkr_context_submit_cmd(ctx, cmd, size);
+}
+
+/* --- limina snapshot-replay (limina M9.3 P1) --------------------------------
+ *
+ * Export a context's re-creation journal for the snapshot file, and replay a
+ * saved journal into a freshly-created context at restore. Replay strips each
+ * command's VK_COMMAND_GENERATE_REPLY_BIT (the guest consumed the original
+ * replies pre-suspend; re-emitting them would corrupt the restored reply
+ * stream), routes ring-scoped stream state onto the (not-yet-started) target
+ * ring's decoder, and starts every deferred ring at replay_end. */
+
+bool
+vkr_renderer_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || !ctx->journal)
+      return false;
+   return vkr_journal_export(ctx->journal, out_buf, out_size);
+}
+
+uint64_t
+vkr_renderer_journal_seq(uint32_t ctx_id)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || !ctx->journal)
+      return 0;
+   return vkr_journal_seq(ctx->journal);
+}
+
+bool
+vkr_renderer_replay_begin(uint32_t ctx_id)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+   ctx->replaying = true;
+   return true;
+}
+
+/* clear VK_COMMAND_GENERATE_REPLY_BIT_EXT in the (single) command's flags word
+ * at wire offset 4; the buffer is caller-owned and mutable by contract */
+static bool
+vkr_replay_strip_reply(void *cmd, uint32_t size)
+{
+   if (size < 8)
+      return false;
+   uint32_t flags;
+   memcpy(&flags, (uint8_t *)cmd + 4, sizeof(flags));
+   flags &= ~(uint32_t)VK_COMMAND_GENERATE_REPLY_BIT_EXT;
+   memcpy((uint8_t *)cmd + 4, &flags, sizeof(flags));
+   return true;
+}
+
+/* A replayed entry can legitimately fail: a retained state-mutating command (e.g.
+ * vkUpdateDescriptorSets) may reference an object destroyed before the snapshot —
+ * its create was pruned, so the lookup misses and trips the context FATAL. The
+ * pre-suspend dset slot held a dangling reference (garbage-if-accessed); dropping
+ * the write leaves the slot unwritten (also garbage-if-accessed) — semantically
+ * equivalent. FATAL is sticky by design for live traffic, but during replay it
+ * must not cascade to every later entry: clear it and let the caller count. */
+static bool
+vkr_replay_recover_fatal(struct vkr_context *ctx)
+{
+   if (!ctx->cs_fatal_error)
+      return false;
+   vkr_log("replay: entry failed (stale reference?); clearing FATAL, continuing");
+   ctx->cs_fatal_error = false;
+   return true;
+}
+
+bool
+vkr_renderer_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || !vkr_replay_strip_reply(cmd, size))
+      return false;
+   bool ok = vkr_context_submit_cmd(ctx, cmd, size);
+   if (!ok && ctx->replaying)
+      vkr_replay_recover_fatal(ctx);
+   return ok;
+}
+
+bool
+vkr_renderer_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id, void *cmd, uint32_t size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || !vkr_replay_strip_reply(cmd, size))
+      return false;
+
+   struct vkr_ring *target = NULL;
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
+      if (ring->id == ring_id) {
+         target = ring;
+         break;
+      }
+   }
+   mtx_unlock(&ctx->ring_mutex);
+   if (!target) {
+      vkr_log("replay_ring_cmd: no ring %" PRIu64 " in ctx %u", ring_id, ctx_id);
+      return false;
+   }
+   bool ok = vkr_ring_replay_cmd(target, cmd, size);
+   if (!ok && ctx->replaying)
+      vkr_replay_recover_fatal(ctx);
+   return ok;
+}
+
+bool
+vkr_renderer_replay_end(uint32_t ctx_id)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+
+   mtx_lock(&ctx->ring_mutex);
+   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
+      if (!atomic_load(&ring->started))
+         vkr_ring_start(ring);
+   }
+   mtx_unlock(&ctx->ring_mutex);
+
+   ctx->replaying = false;
+   return true;
 }
 
 bool

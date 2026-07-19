@@ -137,6 +137,11 @@ vkr_ring_stop(struct vkr_ring *ring);
 void
 vkr_ring_notify(struct vkr_ring *ring);
 
+/* limina snapshot-replay: decode a journal entry on a NOT-YET-STARTED ring's
+ * decoder (per-decoder reply-stream state re-establishment) */
+bool
+vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size);
+
 bool
 vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val);
 

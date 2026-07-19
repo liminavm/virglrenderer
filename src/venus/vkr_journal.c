@@ -712,6 +712,83 @@ vkr_journal_get_stats(struct vkr_journal *j, struct vkr_journal_stats *out)
    mtx_unlock(&j->mutex);
 }
 
+uint64_t
+vkr_journal_seq(struct vkr_journal *j)
+{
+   mtx_lock(&j->mutex);
+   const uint64_t seq = j->seq_next - 1;
+   mtx_unlock(&j->mutex);
+   return seq;
+}
+
+bool
+vkr_journal_export(struct vkr_journal *j, void **out_buf, size_t *out_size)
+{
+   mtx_lock(&j->mutex);
+
+   size_t total = 4 * sizeof(uint32_t);
+   uint32_t count = 0;
+   list_for_each_entry (struct vkr_journal_entry, e, &j->entries, link) {
+      total += sizeof(uint64_t) + sizeof(uint32_t) + 4 + sizeof(uint64_t) +
+               sizeof(uint32_t) + ALIGN_POT((size_t)e->size, 4);
+      count++;
+   }
+
+   uint8_t *buf = malloc(total);
+   if (!buf) {
+      mtx_unlock(&j->mutex);
+      return false;
+   }
+
+   uint8_t *p = buf;
+#define VKR_JOURNAL_PUT(val)                                                             \
+   do {                                                                                  \
+      memcpy(p, &(val), sizeof(val));                                                    \
+      p += sizeof(val);                                                                  \
+   } while (0)
+   const uint32_t magic = VKR_JOURNAL_EXPORT_MAGIC;
+   const uint32_t version = VKR_JOURNAL_EXPORT_VERSION;
+   const uint32_t reserved = 0;
+   VKR_JOURNAL_PUT(magic);
+   VKR_JOURNAL_PUT(version);
+   VKR_JOURNAL_PUT(count);
+   VKR_JOURNAL_PUT(reserved);
+
+   list_for_each_entry (struct vkr_journal_entry, e, &j->entries, link) {
+      const uint32_t cmd_type = e->cmd_type;
+      const uint8_t klass = e->klass;
+      const uint8_t pad[3] = { 0 };
+      /* ring-scoped entries carry the ring id so the replayer can route them to
+       * that ring's decoder; everything else replays on the context decoder */
+      const uint64_t ring_key =
+         (e->klass == VKR_JOURNAL_RING_STREAM || e->klass == VKR_JOURNAL_RING_CREATE) &&
+               e->nkeys
+            ? e->refs[0].id
+            : 0;
+      const uint32_t size = e->size;
+      VKR_JOURNAL_PUT(e->seq);
+      VKR_JOURNAL_PUT(cmd_type);
+      VKR_JOURNAL_PUT(klass);
+      memcpy(p, pad, sizeof(pad));
+      p += sizeof(pad);
+      VKR_JOURNAL_PUT(ring_key);
+      VKR_JOURNAL_PUT(size);
+      memcpy(p, e->data, e->size);
+      p += e->size;
+      const size_t padding = ALIGN_POT((size_t)e->size, 4) - e->size;
+      memset(p, 0, padding);
+      p += padding;
+   }
+#undef VKR_JOURNAL_PUT
+
+   assert((size_t)(p - buf) == total);
+   mtx_unlock(&j->mutex);
+
+   *out_buf = buf;
+   *out_size = total;
+   return true;
+}
+
 void
 vkr_journal_dump(struct vkr_journal *j)
 {
