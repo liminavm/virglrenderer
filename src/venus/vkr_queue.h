@@ -72,11 +72,24 @@ VKR_DEFINE_OBJECT_CAST(queue, VK_OBJECT_TYPE_QUEUE, VkQueue)
 
 struct vkr_fence {
    struct vkr_object base;
+
+   /* limina snapshot-replay P2.1 (sync fast-forward): owning device, set at
+    * create. Signal ops are queue submits (TRANSIENT, never replayed), so a
+    * replayed fence is always unsignaled; the restore fast-forwards it to the
+    * captured state so post-resume guest waits rooted in the pre-suspend
+    * epoch complete. */
+   struct vkr_device *device;
 };
 VKR_DEFINE_OBJECT_CAST(fence, VK_OBJECT_TYPE_FENCE, VkFence)
 
 struct vkr_semaphore {
    struct vkr_object base;
+
+   /* limina snapshot-replay P2.1 (sync fast-forward): see vkr_fence. Timeline
+    * semaphores restore to the captured counter value; binary semaphores are
+    * re-signaled to their own (replayed) pending point. */
+   struct vkr_device *device;
+   bool limina_is_timeline;
 };
 VKR_DEFINE_OBJECT_CAST(semaphore, VK_OBJECT_TYPE_SEMAPHORE, VkSemaphore)
 

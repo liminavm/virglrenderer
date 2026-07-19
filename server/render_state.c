@@ -156,6 +156,24 @@ render_state_limina_replay_end(uint32_t ctx_id)
 }
 
 int
+render_state_limina_sync_export(uint32_t ctx_id, void **out_buf, size_t *out_size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return -1;
+   return vkr_renderer_sync_export(ctx_id, out_buf, out_size);
+}
+
+int
+render_state_limina_sync_restore(uint32_t ctx_id, const void *data, size_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return -1;
+   return vkr_renderer_sync_restore(ctx_id, data, size);
+}
+
+int
 render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count)
 {
    SCOPE_LOCK_RENDERER();
