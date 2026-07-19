@@ -260,7 +260,11 @@ vkr_dispatch_vkCreateRingMESA(struct vn_dispatch_context *dispatch,
       ring->prio = priority_info->priority;
    }
 
-   vkr_ring_start(ring);
+   /* gkvm snapshot-replay: during journal replay the ring must not start yet —
+    * its ring-scoped stream state replays on its idle decoder first, and
+    * replay_end starts every deferred ring (see vkr_renderer replay API). */
+   if (!ctx->replaying)
+      vkr_ring_start(ring);
 }
 
 static void

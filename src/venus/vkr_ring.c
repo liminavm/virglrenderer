@@ -42,7 +42,9 @@ vkr_ring_init_buffer(struct vkr_ring *ring, const struct vkr_ring_layout *layout
 }
 
 static bool
-vkr_ring_init_control(struct vkr_ring *ring, const struct vkr_ring_layout *layout)
+vkr_ring_init_control(struct vkr_ring *ring,
+                      const struct vkr_ring_layout *layout,
+                      bool replaying)
 {
    struct vkr_ring_control *ctrl = &ring->control;
 
@@ -50,8 +52,10 @@ vkr_ring_init_control(struct vkr_ring *ring, const struct vkr_ring_layout *layou
    ctrl->tail = get_resource_pointer(layout->resource, layout->tail.begin);
    ctrl->status = get_resource_pointer(layout->resource, layout->status.begin);
 
-   /* we will manage head and status, and we expect them to be 0 initially */
-   if (*ctrl->head || *ctrl->status)
+   /* we will manage head and status, and we expect them to be 0 initially —
+    * except at snapshot-replay (gkvm), where the control words hold the
+    * restored pre-suspend cursors and must be preserved, not rejected */
+   if (!replaying && (*ctrl->head || *ctrl->status))
       return false;
 
    return true;
@@ -140,11 +144,17 @@ vkr_ring_create(const struct vkr_ring_layout *layout,
 
    ring->resource = layout->resource;
 
-   if (!vkr_ring_init_control(ring, layout))
+   if (!vkr_ring_init_control(ring, layout, ctx->replaying))
       goto err_init_control;
 
    vkr_ring_init_buffer(ring, layout);
    vkr_ring_init_extra(ring, layout);
+
+   /* gkvm snapshot-replay: resume the read cursor at the restored head (the
+    * quiesce drained the ring, so head == tail; the thread then simply waits
+    * for the resumed guest's next submission) */
+   if (ctx->replaying)
+      ring->buffer.cur = *ring->control.head;
 
    ring->cmd = malloc(ring->buffer.size);
    if (!ring->cmd)
@@ -271,6 +281,32 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
 /* gkvm (#8): fire present-fence barriers whose target the decode position has
  * passed (or all of them on teardown). Runs on the ring thread, except the
  * teardown sweep which runs wherever the thread exits. */
+/* gkvm snapshot-replay: decode one journal-replayed command on this ring's
+ * decoder before the ring thread starts — ring-scoped state (the reply command
+ * stream set/seek) is per-decoder and must be re-established here, not on the
+ * context decoder. Safe only pre-start: nothing else touches the decoder. */
+bool
+vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size)
+{
+   assert(!ring->started);
+
+   struct vkr_cs_decoder *dec = &ring->decoder;
+   if (vkr_cs_decoder_get_fatal(dec))
+      return false;
+
+   vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+   while (vkr_cs_decoder_has_command(dec)) {
+      vn_dispatch_command(&ring->dispatch);
+      if (vkr_cs_decoder_get_fatal(dec)) {
+         vkr_log("ring_replay_cmd: vn_dispatch_command failed");
+         vkr_cs_decoder_reset(dec);
+         return false;
+      }
+   }
+   vkr_cs_decoder_reset(dec);
+   return true;
+}
+
 static void
 vkr_ring_check_gkvm_barriers(struct vkr_ring *ring, bool fire_all)
 {

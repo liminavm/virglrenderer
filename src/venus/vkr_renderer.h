@@ -53,6 +53,30 @@ vkr_renderer_dump_state(void);
 bool
 vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
 
+/* gkvm snapshot-replay (limina M9.3 P1). Export serializes the context's
+ * re-creation journal (format: vkr_journal.h). Replay: begin sets the
+ * replay-mode flag (rings create deferred/relaxed), submit feeds ONE journal
+ * entry (its reply flag is stripped in place — buffer must be mutable),
+ * ring_cmd routes a ring-scoped entry onto that not-yet-started ring's
+ * decoder, end starts every deferred ring and clears the mode. */
+bool
+vkr_renderer_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+
+uint64_t
+vkr_renderer_journal_seq(uint32_t ctx_id);
+
+bool
+vkr_renderer_replay_begin(uint32_t ctx_id);
+
+bool
+vkr_renderer_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size);
+
+bool
+vkr_renderer_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id, void *cmd, uint32_t size);
+
+bool
+vkr_renderer_replay_end(uint32_t ctx_id);
+
 bool
 vkr_renderer_submit_fence(uint32_t ctx_id,
                           uint32_t flags,

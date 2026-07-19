@@ -107,6 +107,12 @@ struct vkr_context {
     * disabled (VKR_JOURNAL=0) or after teardown starts */
    struct vkr_journal *journal;
 
+   /* gkvm: set between replay_begin/replay_end while the journal is replayed
+    * into a fresh renderer at snapshot restore. Relaxes ring creation (control
+    * words hold restored snapshot values, not zeros; ring threads start at
+    * replay_end so ring-scoped stream state can replay on their decoders). */
+   bool replaying;
+
    mtx_t resource_mutex;
    struct hash_table *resource_table;
 

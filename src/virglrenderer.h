@@ -457,6 +457,26 @@ VIRGL_EXPORT int virgl_renderer_resource_read_iosurface(uint32_t res_handle, voi
  * when venus/the renderer isn't initialized. */
 VIRGL_EXPORT void virgl_renderer_limina_dump_state(void);
 
+/* gkvm snapshot-replay (limina M9.3 P1): export a venus context's re-creation journal
+ * (serialized format: src/venus/vkr_journal.h; *out_buf is malloc'd, caller frees) and
+ * replay one into a freshly-created context at snapshot restore. Replay contract: call
+ * replay_begin after the context exists; feed ONE journal entry per replay_submit /
+ * replay_ring_cmd call in seq order (entries with a non-zero ring_key and the
+ * ring-stream klass go through replay_ring_cmd; buffers must be mutable — the reply
+ * flag is stripped in place); replay_end starts the deferred ring threads. Blob
+ * contents referenced by ring entries must be restored BEFORE their vkCreateRingMESA
+ * replays. journal_seq is the recording watermark used to order the VMM-side blob ops
+ * against the wire journal. Same-process render server only (-ENOTSUP otherwise). */
+VIRGL_EXPORT int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf,
+                                                      uint64_t *out_size);
+VIRGL_EXPORT uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id);
+VIRGL_EXPORT int virgl_renderer_limina_replay_begin(uint32_t ctx_id);
+VIRGL_EXPORT int virgl_renderer_limina_replay_submit(uint32_t ctx_id, void *cmd,
+                                                     uint32_t size);
+VIRGL_EXPORT int virgl_renderer_limina_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id,
+                                                       void *cmd, uint32_t size);
+VIRGL_EXPORT int virgl_renderer_limina_replay_end(uint32_t ctx_id);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003

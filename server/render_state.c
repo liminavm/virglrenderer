@@ -85,6 +85,67 @@ render_state_limina_dump_state(void)
    vkr_renderer_dump_state();
 }
 
+/* gkvm snapshot-replay (limina M9.3 P1): journal export + replay entry points,
+ * under the same renderer lock the normal submit path takes (render_state.c's
+ * submit is SCOPE_LOCK_RENDERER + vkr_renderer_submit_cmd). */
+
+bool
+render_state_limina_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_journal_export(ctx_id, out_buf, out_size);
+}
+
+uint64_t
+render_state_limina_journal_seq(uint32_t ctx_id)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return 0;
+   return vkr_renderer_journal_seq(ctx_id);
+}
+
+bool
+render_state_limina_replay_begin(uint32_t ctx_id)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_replay_begin(ctx_id);
+}
+
+bool
+render_state_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_replay_submit(ctx_id, cmd, size);
+}
+
+bool
+render_state_limina_replay_ring_cmd(uint32_t ctx_id,
+                                    uint64_t ring_id,
+                                    void *cmd,
+                                    uint32_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_replay_ring_cmd(ctx_id, ring_id, cmd, size);
+}
+
+bool
+render_state_limina_replay_end(uint32_t ctx_id)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_replay_end(ctx_id);
+}
+
 static struct render_context *
 render_state_lookup_context(uint32_t ctx_id)
 {
