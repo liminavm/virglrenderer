@@ -1306,6 +1306,32 @@ int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst, uint3
 #endif
 }
 
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+/* Defined in server/render_state.c (compiled into the lib in thread render-server
+ * mode; server/ is not on the include path for this TU, hence the local decl). */
+void render_state_limina_dump_state(void);
+#endif
+
+/* limina M9.3 diagnostics: log the live venus (vkr) context table — per context:
+ * rings, object counts by VkObjectType, resources, sync queues. Thread-safe (takes
+ * the render-server renderer lock). The libkrun gpu worker calls this on the first
+ * stale-context submission after a snapshot restore, and periodically under
+ * LIMINA_GPU_TRACE_VKR=1; the per-type object tally on a healthy session is the
+ * retain-and-replay bill of materials. */
+void virgl_renderer_limina_dump_state(void)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized) {
+      render_state_limina_dump_state();
+      return;
+   }
+   virgl_info("[GPUTRACE] vkr state: venus proxy not initialized\n");
+#else
+   virgl_info("[GPUTRACE] vkr state: unavailable (out-of-process render server)\n");
+#endif
+}
+
 int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *out_size)
 {
    TRACE_FUNC();

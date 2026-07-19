@@ -44,6 +44,12 @@ vkr_renderer_create_context(uint32_t ctx_id,
 void
 vkr_renderer_destroy_context(uint32_t ctx_id);
 
+/* limina M9.3 diagnostics: log the live context table (per context: rings, object
+ * counts by type, resources, sync queues). Caller must hold the render_state
+ * renderer lock — use render_state_limina_dump_state(). */
+void
+vkr_renderer_dump_state(void);
+
 bool
 vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
 
