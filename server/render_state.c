@@ -107,6 +107,15 @@ render_state_limina_journal_seq(uint32_t ctx_id)
    return vkr_renderer_journal_seq(ctx_id);
 }
 
+void
+render_state_limina_journal_unpin(uint32_t ctx_id, uint64_t key)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return;
+   vkr_renderer_journal_unpin(ctx_id, key);
+}
+
 bool
 render_state_limina_replay_begin(uint32_t ctx_id)
 {

@@ -332,6 +332,15 @@ vkr_renderer_journal_seq(uint32_t ctx_id)
    return vkr_journal_seq(ctx->journal);
 }
 
+void
+vkr_renderer_journal_unpin(uint32_t ctx_id, uint64_t key)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return;
+   vkr_journal_unpin_key(ctx, key);
+}
+
 bool
 vkr_renderer_replay_begin(uint32_t ctx_id)
 {
