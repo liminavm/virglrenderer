@@ -46,6 +46,12 @@ bool
 render_state_limina_replay_end(uint32_t ctx_id);
 
 int
+render_state_limina_sync_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+
+int
+render_state_limina_sync_restore(uint32_t ctx_id, const void *data, size_t size);
+
+int
 render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count);
 
 bool
