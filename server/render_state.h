@@ -45,6 +45,18 @@ render_state_limina_replay_ring_cmd(uint32_t ctx_id,
 bool
 render_state_limina_replay_end(uint32_t ctx_id);
 
+int
+render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count);
+
+bool
+render_state_limina_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf, uint64_t size);
+
+bool
+render_state_limina_memory_write(uint32_t ctx_id,
+                                 uint64_t mem_id,
+                                 const void *buf,
+                                 uint64_t size);
+
 bool
 render_state_create_context(struct render_context *ctx,
                             uint32_t flags,

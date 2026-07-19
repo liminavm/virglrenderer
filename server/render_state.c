@@ -155,6 +155,36 @@ render_state_limina_replay_end(uint32_t ctx_id)
    return vkr_renderer_replay_end(ctx_id);
 }
 
+int
+render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return -1;
+   return vkr_renderer_memory_census(ctx_id, out_pairs, out_count);
+}
+
+bool
+render_state_limina_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf, uint64_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_memory_read(ctx_id, mem_id, buf, size);
+}
+
+bool
+render_state_limina_memory_write(uint32_t ctx_id,
+                                 uint64_t mem_id,
+                                 const void *buf,
+                                 uint64_t size)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count)
+      return false;
+   return vkr_renderer_memory_write(ctx_id, mem_id, buf, size);
+}
+
 static struct render_context *
 render_state_lookup_context(uint32_t ctx_id)
 {
