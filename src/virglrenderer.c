@@ -1320,6 +1320,12 @@ bool render_state_limina_replay_ring_cmd(uint32_t ctx_id,
                                          void *cmd,
                                          uint32_t size);
 bool render_state_limina_replay_end(uint32_t ctx_id);
+int render_state_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs,
+                                      uint32_t *out_count);
+bool render_state_limina_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf,
+                                     uint64_t size);
+bool render_state_limina_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf,
+                                      uint64_t size);
 #endif
 
 /* limina M9.3 diagnostics: log the live venus (vkr) context table — per context:
@@ -1434,6 +1440,48 @@ int virgl_renderer_limina_replay_end(uint32_t ctx_id)
       return render_state_limina_replay_end(ctx_id) ? 0 : -EINVAL;
 #endif
    (void)ctx_id;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs,
+                                        uint32_t *out_count)
+{
+   TRACE_FUNC();
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_memory_census(ctx_id, out_pairs, out_count);
+#endif
+   (void)ctx_id;
+   (void)out_pairs;
+   (void)out_count;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf,
+                                      uint64_t size)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_memory_read(ctx_id, mem_id, buf, size) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   (void)mem_id;
+   (void)buf;
+   (void)size;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf,
+                                       uint64_t size)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized)
+      return render_state_limina_memory_write(ctx_id, mem_id, buf, size) ? 0 : -EINVAL;
+#endif
+   (void)ctx_id;
+   (void)mem_id;
+   (void)buf;
+   (void)size;
    return -ENOTSUP;
 }
 
