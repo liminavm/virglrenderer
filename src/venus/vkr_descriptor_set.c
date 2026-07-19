@@ -126,6 +126,25 @@ vkr_dispatch_vkFreeDescriptorSets(struct vn_dispatch_context *dispatch,
       return;
    }
 
+   /* limina journal: retain this (possibly partial) free keyed to the pool, with
+    * the freed guest ids as aux — replay must free the dead subset of a batch
+    * alloc so the id space evolves identically (pre-replace lookups) */
+   if (ctx->journal && args->descriptorSetCount) {
+      const struct vkr_descriptor_pool *jpool =
+         vkr_descriptor_pool_from_handle(args->descriptorPool);
+      uint64_t *ids = malloc(args->descriptorSetCount * sizeof(*ids));
+      if (ids) {
+         for (uint32_t i = 0; i < args->descriptorSetCount; i++) {
+            const struct vkr_descriptor_set *set =
+               vkr_descriptor_set_from_handle(args->pDescriptorSets[i]);
+            ids[i] = set ? set->base.id : 0;
+         }
+         vkr_journal_note_free(ctx, jpool ? jpool->base.id : 0, ids,
+                               args->descriptorSetCount);
+         free(ids);
+      }
+   }
+
    vkr_descriptor_set_destroy_driver_handles(ctx, args, &free_list);
    vkr_context_remove_objects(ctx, &free_list);
 
@@ -133,11 +152,30 @@ vkr_dispatch_vkFreeDescriptorSets(struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkUpdateDescriptorSets(struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkUpdateDescriptorSets *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* limina journal: key this update by every touched set (guest ids, pre-replace;
+    * note_keys dedupes — zink typically hits one set with many writes) */
+   for (uint32_t i = 0; i < args->descriptorWriteCount; i++) {
+      const struct vkr_descriptor_set *set =
+         vkr_descriptor_set_from_handle(args->pDescriptorWrites[i].dstSet);
+      if (set)
+         vkr_journal_note_keys(dispatch->data, &set->base.id, 1);
+   }
+   for (uint32_t i = 0; i < args->descriptorCopyCount; i++) {
+      const struct vkr_descriptor_set *dst =
+         vkr_descriptor_set_from_handle(args->pDescriptorCopies[i].dstSet);
+      const struct vkr_descriptor_set *src =
+         vkr_descriptor_set_from_handle(args->pDescriptorCopies[i].srcSet);
+      if (dst)
+         vkr_journal_note_keys(dispatch->data, &dst->base.id, 1);
+      if (src)
+         vkr_journal_note_keys(dispatch->data, &src->base.id, 1);
+   }
 
    vn_replace_vkUpdateDescriptorSets_args_handle(args);
    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,

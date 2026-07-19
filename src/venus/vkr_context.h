@@ -14,6 +14,7 @@
 #include "virgl_resource.h"
 
 #include "vkr_cs.h"
+#include "vkr_journal.h"
 
 /*
  * When vkr_context_create_resource or vkr_context_import_resource is called, a
@@ -101,6 +102,10 @@ struct vkr_context {
 
    mtx_t object_mutex;
    struct hash_table *object_table;
+
+   /* limina: snapshot-replay re-creation journal (vkr_journal.h); NULL when
+    * disabled (VKR_JOURNAL=0) or after teardown starts */
+   struct vkr_journal *journal;
 
    mtx_t resource_mutex;
    struct hash_table *resource_table;
@@ -249,6 +254,9 @@ vkr_context_add_object(struct vkr_context *ctx, struct vkr_object *obj)
    mtx_lock(&ctx->object_mutex);
    assert(!_mesa_hash_table_search(ctx->object_table, &obj->id));
    _mesa_hash_table_insert(ctx->object_table, &obj->id, obj);
+   /* limina journal: key the current command's entry by this id (TLS append;
+    * lock order here and in the remove hook: object_mutex -> journal mutex) */
+   vkr_journal_object_added(ctx, obj->id, obj->type);
    mtx_unlock(&ctx->object_mutex);
 }
 
@@ -256,6 +264,10 @@ static inline void
 vkr_context_remove_object_locked(struct vkr_context *ctx, struct vkr_object *obj)
 {
    assert(_mesa_hash_table_search(ctx->object_table, &obj->id));
+
+   /* limina journal: prune every retained entry keyed by this id (before the
+    * object is freed, while object_mutex still serializes id reuse) */
+   vkr_journal_object_removed(ctx, obj->id);
 
    struct hash_entry *entry = _mesa_hash_table_search(ctx->object_table, &obj->id);
    if (likely(entry)) {

@@ -903,6 +903,11 @@ vkr_context_destroy(struct vkr_context *ctx)
    if (ctx->ring_monitor.started)
       vkr_context_ring_monitor_fini(ctx);
 
+   /* limina journal: detach before the teardown sweeps below so their object
+    * removals skip pointless pruning (ring threads are already joined) */
+   struct vkr_journal *journal = ctx->journal;
+   ctx->journal = NULL;
+
    if (ctx->instance) {
       vkr_log("destroying context %d (%s) with a valid instance", ctx->ctx_id,
               vkr_context_get_name(ctx));
@@ -935,6 +940,8 @@ vkr_context_destroy(struct vkr_context *ctx)
 
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
    mtx_destroy(&ctx->object_mutex);
+
+   vkr_journal_destroy(journal);
 
    vkr_cs_encoder_fini(&ctx->encoder);
    vkr_cs_decoder_fini(&ctx->decoder);
@@ -1010,6 +1017,10 @@ vkr_context_create(uint32_t ctx_id,
    if (!ctx->object_table)
       goto err_ctx_object_table;
 
+   /* limina: snapshot-replay journal; best-effort (NULL disables recording) */
+   if (vkr_journal_enabled())
+      ctx->journal = vkr_journal_create(ctx_id);
+
    if (mtx_init(&ctx->resource_mutex, mtx_plain) != thrd_success)
       goto err_ctx_resource_mutex;
 
@@ -1043,6 +1054,7 @@ err_cs_decoder_init:
 err_ctx_resource_table:
    mtx_destroy(&ctx->resource_mutex);
 err_ctx_resource_mutex:
+   vkr_journal_destroy(ctx->journal);
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
 err_ctx_object_table:
    mtx_destroy(&ctx->object_mutex);

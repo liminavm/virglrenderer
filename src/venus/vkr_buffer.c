@@ -72,11 +72,16 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindBufferMemory(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkBindBufferMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* limina journal: key this bind by its buffer (guest id, pre-replace) */
+   const struct vkr_buffer *buf = vkr_buffer_from_handle(args->buffer);
+   if (buf)
+      vkr_journal_note_keys(dispatch->data, &buf->base.id, 1);
 
    vn_replace_vkBindBufferMemory_args_handle(args);
    args->ret =
@@ -84,11 +89,18 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkBindBufferMemory2 *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* limina journal: key this bind by its buffers (guest ids, pre-replace) */
+   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+      const struct vkr_buffer *buf = vkr_buffer_from_handle(args->pBindInfos[i].buffer);
+      if (buf)
+         vkr_journal_note_keys(dispatch->data, &buf->base.id, 1);
+   }
 
    vn_replace_vkBindBufferMemory2_args_handle(args);
    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
