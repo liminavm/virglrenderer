@@ -14,6 +14,11 @@ render_state_init(uint32_t init_flags);
 void
 render_state_fini(void);
 
+/* limina M9.3 diagnostics: thread-safe vkr context-table dump (takes the
+ * renderer lock; no-op log line when the renderer isn't initialized). */
+void
+render_state_limina_dump_state(void);
+
 bool
 render_state_create_context(struct render_context *ctx,
                             uint32_t flags,

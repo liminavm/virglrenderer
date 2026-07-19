@@ -70,6 +70,21 @@ render_state_unlock(mtx_t **mtx)
 
 #endif /* ENABLE_RENDER_SERVER_WORKER_THREAD */
 
+/* limina M9.3 diagnostics: dump the vkr context table under the same lock
+ * discipline every other vkr entry point uses, so it is safe to call from any
+ * thread (in the same-process model, the VMM's gpu worker thread calls this
+ * through virgl_renderer_limina_dump_state()). */
+void
+render_state_limina_dump_state(void)
+{
+   SCOPE_LOCK_RENDERER();
+   if (!state.init_count) {
+      render_log("[GPUTRACE] vkr state: renderer not initialized");
+      return;
+   }
+   vkr_renderer_dump_state();
+}
+
 static struct render_context *
 render_state_lookup_context(uint32_t ctx_id)
 {
