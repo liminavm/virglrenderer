@@ -12,6 +12,7 @@
 #include "venus_hw.h"
 
 #include "vkr_context.h"
+#include "vkr_device_memory.h"
 #include "vkr_ring.h"
 
 struct vkr_renderer_state {
@@ -418,6 +419,79 @@ vkr_renderer_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id, void *cmd, uint3
    if (!ok && ctx->replaying)
       vkr_replay_recover_fatal(ctx);
    return ok;
+}
+
+int
+vkr_renderer_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return -1;
+
+   mtx_lock(&ctx->object_mutex);
+   const uint32_t cap = _mesa_hash_table_num_entries(ctx->object_table);
+   uint64_t *pairs = cap ? malloc((size_t)cap * 2 * sizeof(uint64_t)) : NULL;
+   uint32_t n = 0;
+   if (pairs) {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+            continue;
+         struct vkr_device_memory *mem = (struct vkr_device_memory *)obj;
+         if (!vkr_device_memory_capturable(mem))
+            continue;
+         pairs[2 * n] = obj->id;
+         pairs[2 * n + 1] = mem->allocation_size;
+         n++;
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   if (cap && !pairs)
+      return -1;
+   *out_pairs = pairs;
+   *out_count = n;
+   return 0;
+}
+
+static struct vkr_device_memory *
+vkr_renderer_lookup_memory(struct vkr_context *ctx, uint64_t mem_id)
+{
+   struct vkr_device_memory *mem = NULL;
+   mtx_lock(&ctx->object_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->object_table, &mem_id);
+   if (entry) {
+      struct vkr_object *obj = entry->data;
+      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
+         mem = (struct vkr_device_memory *)obj;
+   }
+   mtx_unlock(&ctx->object_mutex);
+   return mem;
+}
+
+bool
+vkr_renderer_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf, uint64_t size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+   struct vkr_device_memory *mem = vkr_renderer_lookup_memory(ctx, mem_id);
+   if (!mem)
+      return false;
+   return vkr_device_memory_content_copy(mem, buf, size, false);
+}
+
+bool
+vkr_renderer_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf, uint64_t size)
+{
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx)
+      return false;
+   struct vkr_device_memory *mem = vkr_renderer_lookup_memory(ctx, mem_id);
+   if (!mem)
+      return false;
+   return vkr_device_memory_content_copy(mem, (void *)buf, size, true);
 }
 
 bool

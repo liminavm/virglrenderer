@@ -649,6 +649,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->device = dev;
    mem->might_export = might_export;
    mem->gkvm_dedicated_id = gkvm_dedicated_id;
+   mem->gkvm_res_imported = res_info != NULL;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;
@@ -1030,5 +1031,52 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       .vulkan_info = vulkan_info,
    };
 
+   return true;
+}
+
+/* --- gkvm snapshot-replay P2: device-memory content capture ---------------- */
+
+bool
+vkr_device_memory_capturable(const struct vkr_device_memory *mem)
+{
+   /* #28 map_ptr blob: the export already vkMapMemory'd this memory and shared
+    * the pointer with the VMM — its bytes ARE the blob resource, captured by the
+    * VMM's mapped-blob path (and a second vkMapMemory would be invalid). */
+   if (mem->exported && !mem->mtl_shm)
+      return false;
+   /* Imports alias ANOTHER storage (the exporter's IOSurface / blob / shm
+    * bytes); capture/restore happens at the source. NOTE: the KK scanout
+    * host-pointer import of the memory's OWN dedicated image's IOSurface is
+    * not in this class — capturing it is exactly how the framebuffer pixels
+    * survive the restore. */
+   if (mem->imported_iosurface || mem->gkvm_res_imported)
+      return false;
+   return true;
+}
+
+bool
+vkr_device_memory_content_copy(struct vkr_device_memory *mem,
+                               void *buf,
+                               uint64_t size,
+                               bool to_mem)
+{
+   struct vkr_device *dev = mem->device;
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   const uint64_t n = size < mem->allocation_size ? size : mem->allocation_size;
+
+   void *ptr = NULL;
+   VkResult ret = vk->MapMemory(dev->base.handle.device,
+                                mem->base.handle.device_memory, 0, VK_WHOLE_SIZE,
+                                0, &ptr);
+   if (ret != VK_SUCCESS || !ptr) {
+      vkr_log("content: vkMapMemory failed for mem id %" PRIu64 " (vk ret %d)",
+              (uint64_t)mem->base.id, ret);
+      return false;
+   }
+   if (to_mem)
+      memcpy(ptr, buf, n);
+   else
+      memcpy(buf, ptr, n);
+   vk->UnmapMemory(dev->base.handle.device, mem->base.handle.device_memory);
    return true;
 }
