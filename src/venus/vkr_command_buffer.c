@@ -102,6 +102,25 @@ vkr_dispatch_vkFreeCommandBuffers(struct vn_dispatch_context *dispatch,
       return;
    }
 
+   /* gkvm journal: retain this (possibly partial) free keyed to the pool, with
+    * the freed guest ids as aux — replay must free the dead subset of a batch
+    * alloc so the id space evolves identically (pre-replace lookups) */
+   if (ctx->journal && args->commandBufferCount) {
+      const struct vkr_command_pool *jpool =
+         vkr_command_pool_from_handle(args->commandPool);
+      uint64_t *ids = malloc(args->commandBufferCount * sizeof(*ids));
+      if (ids) {
+         for (uint32_t i = 0; i < args->commandBufferCount; i++) {
+            const struct vkr_command_buffer *cmd =
+               vkr_command_buffer_from_handle(args->pCommandBuffers[i]);
+            ids[i] = cmd ? cmd->base.id : 0;
+         }
+         vkr_journal_note_free(ctx, jpool ? jpool->base.id : 0, ids,
+                               args->commandBufferCount);
+         free(ids);
+      }
+   }
+
    vkr_command_buffer_destroy_driver_handles(ctx, args, &free_list);
    vkr_context_remove_objects(ctx, &free_list);
 }

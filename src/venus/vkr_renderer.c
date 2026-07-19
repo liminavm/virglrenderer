@@ -146,8 +146,9 @@ vkr_renderer_destroy_context(uint32_t ctx_id)
 }
 
 /* limina M9.3 diagnostics: short name for the object types a venus context holds,
- * so the per-context dump doubles as a retain-and-replay sizing measurement. */
-static const char *
+ * so the per-context dump doubles as a retain-and-replay sizing measurement.
+ * Non-static: the snapshot-replay journal census (vkr_journal.c) shares it. */
+const char *
 vkr_object_type_name(VkObjectType type)
 {
    switch (type) {
@@ -284,6 +285,10 @@ vkr_renderer_dump_state(void)
          }
          vkr_log("[GPUTRACE]     objects: %s", buf);
       }
+
+      /* gkvm journal census — cross-check its live-create tally against the
+       * object-table tally above (they must agree on a healthy context) */
+      vkr_journal_dump(ctx->journal);
    }
 }
 

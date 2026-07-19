@@ -316,11 +316,16 @@ vkr_dispatch_vkGetImageSparseMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkBindImageMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* gkvm journal: key this bind by its image (guest id, pre-replace) */
+   const struct vkr_image *img = vkr_image_from_handle(args->image);
+   if (img)
+      vkr_journal_note_keys(dispatch->data, &img->base.id, 1);
 
    vn_replace_vkBindImageMemory_args_handle(args);
    args->ret =
@@ -328,11 +333,18 @@ vkr_dispatch_vkBindImageMemory(UNUSED struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkBindImageMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindImageMemory2(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkBindImageMemory2 *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* gkvm journal: key this bind by its images (guest ids, pre-replace) */
+   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+      const struct vkr_image *jimg = vkr_image_from_handle(args->pBindInfos[i].image);
+      if (jimg)
+         vkr_journal_note_keys(dispatch->data, &jimg->base.id, 1);
+   }
 
 #ifdef __APPLE__
    /* gkvm tier-2 (#30 seated scanout): when an IOSurface-backed (fix A) image is bound to a

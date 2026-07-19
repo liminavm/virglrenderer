@@ -721,10 +721,17 @@ static void (*const vn_dispatch_table[346])(struct vn_dispatch_context *ctx, VkC
     [VK_COMMAND_TYPE_vkWriteResourceDescriptorMESA_EXT] = vn_dispatch_vkWriteResourceDescriptorMESA,
 };
 
+/* gkvm: snapshot-replay journal tee (vkr_journal.c) — captures each command's
+ * wire span [decoder cur at pre, cur at post) plus its object-table effects */
+void vkr_journal_pre_dispatch(struct vn_dispatch_context *ctx);
+void vkr_journal_post_dispatch(struct vn_dispatch_context *ctx, VkCommandTypeEXT cmd_type);
+
 static inline void vn_dispatch_command(struct vn_dispatch_context *ctx)
 {
     VkCommandTypeEXT cmd_type;
     VkCommandFlagsEXT cmd_flags;
+
+    vkr_journal_pre_dispatch(ctx);
 
     vn_decode_VkCommandTypeEXT(ctx->decoder, &cmd_type);
     vn_decode_VkFlags(ctx->decoder, &cmd_flags);
@@ -735,6 +742,8 @@ static inline void vn_dispatch_command(struct vn_dispatch_context *ctx)
         else
             vn_cs_decoder_set_fatal(ctx->decoder);
     }
+
+    vkr_journal_post_dispatch(ctx, cmd_type);
 
     if (vn_cs_decoder_get_fatal(ctx->decoder))
         vn_dispatch_debug_log(ctx, "%s resulted in CS error", vn_dispatch_command_name(cmd_type));
