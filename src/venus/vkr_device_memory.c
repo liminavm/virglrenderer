@@ -10,6 +10,7 @@
 #include "venus-protocol/vn_protocol_renderer_transport.h"
 
 #include "vkr_device_memory_gen.h"
+#include "vkr_buffer.h" /* gkvm: vkr_buffer_from_handle for the dedicated-alloc pin */
 #include "vkr_image.h" /* #30 Path A: vkr_image_from_handle for the dedicated scanout image */
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
@@ -367,6 +368,21 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    /* track if driver has requested export allocation */
    const bool might_export = export_info && export_info->handleTypes;
 
+   /* gkvm snapshot-replay: remember the dedicated object's guest id (handles are
+    * still pre-replace vkr objects here) — pinned with the memory if a blob
+    * resource is later created from it. */
+   uint64_t gkvm_dedicated_id = 0;
+   const VkMemoryDedicatedAllocateInfo *gkvm_dedicated = vkr_find_struct(
+      alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+   if (gkvm_dedicated) {
+      const struct vkr_buffer *dbuf = vkr_buffer_from_handle(gkvm_dedicated->buffer);
+      const struct vkr_image *dimg = vkr_image_from_handle(gkvm_dedicated->image);
+      if (dbuf)
+         gkvm_dedicated_id = dbuf->base.id;
+      else if (dimg)
+         gkvm_dedicated_id = dimg->base.id;
+   }
+
    /* XXX Force dma_buf/opaque fd export or gbm bo import until a new extension that
     * supports direct export from host visible memory
     *
@@ -632,6 +648,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
 
    mem->device = dev;
    mem->might_export = might_export;
+   mem->gkvm_dedicated_id = gkvm_dedicated_id;
    mem->property_flags = property_flags;
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;

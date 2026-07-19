@@ -470,6 +470,11 @@ VIRGL_EXPORT void virgl_renderer_limina_dump_state(void);
 VIRGL_EXPORT int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf,
                                                       uint64_t *out_size);
 VIRGL_EXPORT uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id);
+
+/* gkvm snapshot-replay: release the journal pin a blob create took on its
+ * backing VkDeviceMemory (+ dedicated object). Called at the GLOBAL virtio-gpu
+ * resource unref — a per-context detach must NOT unpin (cross-context shares). */
+VIRGL_EXPORT void virgl_renderer_limina_journal_unpin(uint32_t ctx_id, uint64_t key);
 VIRGL_EXPORT int virgl_renderer_limina_replay_begin(uint32_t ctx_id);
 VIRGL_EXPORT int virgl_renderer_limina_replay_submit(uint32_t ctx_id, void *cmd,
                                                      uint32_t size);

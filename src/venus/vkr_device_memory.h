@@ -18,6 +18,14 @@ struct vkr_device_memory {
 
    bool might_export;
 
+   /* gkvm snapshot-replay: guest id of the dedicated-alloc VkBuffer/VkImage this
+    * memory's vkAllocateMemory references (0 = none). A blob resource created
+    * from this memory pins it too: the alloc entry cannot REPLAY if its
+    * dedicated object's create entry was pruned at destroy — the lookup fails,
+    * the alloc drops, and the blob create finds no live memory (the run-25
+    * failure: pinning the alloc alone was not enough). */
+   uint64_t gkvm_dedicated_id;
+
    uint32_t property_flags;
    uint32_t valid_fd_types;
 

@@ -301,6 +301,10 @@ vkr_context_remove_resource(struct vkr_context *ctx, uint32_t res_id)
       _mesa_hash_table_remove(ctx->resource_table, entry);
    }
    mtx_unlock(&ctx->resource_mutex);
+   /* gkvm snapshot-replay: NO unpin here — this is a per-context DETACH, and a
+    * cross-context-shared blob (Xwayland window buffers) outlives the exporting
+    * context's attachment. The pin is released at the GLOBAL resource unref,
+    * driven by the libkrun rutabaga journal (virgl_renderer_limina_journal_unpin). */
 }
 
 static bool
@@ -466,6 +470,7 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       struct vkr_resource *gkvm_res = vkr_context_get_resource(ctx, res_id);
       gkvm_res->map_ptr = (uintptr_t)blob.map_ptr;
       gkvm_res->iosurface_id = blob.iosurface_id;
+      vkr_journal_pin_key(ctx, blob_id, mem->gkvm_dedicated_id);
 
       *out_blob = blob;
       return true;
@@ -505,6 +510,10 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
       gkvm_res->iosurface_id = blob.iosurface_id;
    }
 #endif
+
+   /* gkvm snapshot-replay: pin the backing memory's journal entries for this
+    * resource's lifetime (guest may free the memory while the blob lives) */
+   vkr_journal_pin_key(ctx, blob_id, mem->gkvm_dedicated_id);
 
    *out_blob = blob;
 

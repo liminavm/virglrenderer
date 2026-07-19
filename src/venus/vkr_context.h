@@ -50,6 +50,7 @@ struct vkr_resource {
     * 0 = not present. */
    uint32_t iosurface_id;
    uint64_t map_ptr;
+
 };
 
 enum vkr_context_validate_level {

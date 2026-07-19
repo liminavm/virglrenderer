@@ -88,6 +88,17 @@ vkr_journal_object_added(struct vkr_context *ctx, uint64_t id, VkObjectType type
 void
 vkr_journal_object_removed(struct vkr_context *ctx, uint64_t id);
 
+/* gkvm snapshot-replay: pin a key so its entries survive the object's death —
+ * used by blob resources created from a VkDeviceMemory (the guest may free the
+ * memory while the resource lives; replay still needs the alloc entry). The
+ * deferred prune fires at unpin (last pinning resource died). Pin returns false
+ * when there is nothing to pin (journal off / key never journaled). */
+bool
+vkr_journal_pin_key(struct vkr_context *ctx, uint64_t id, uint64_t dep_id);
+
+void
+vkr_journal_unpin_key(struct vkr_context *ctx, uint64_t id);
+
 /* in-handler key attribution for commands whose keys live in decoded args
  * (descriptor updates, memory binds); attaches to the current TLS frame */
 void

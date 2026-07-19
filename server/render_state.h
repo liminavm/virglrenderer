@@ -27,6 +27,9 @@ render_state_limina_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_
 uint64_t
 render_state_limina_journal_seq(uint32_t ctx_id);
 
+void
+render_state_limina_journal_unpin(uint32_t ctx_id, uint64_t key);
+
 bool
 render_state_limina_replay_begin(uint32_t ctx_id);
 
