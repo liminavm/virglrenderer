@@ -19,6 +19,29 @@ render_state_fini(void);
 void
 render_state_limina_dump_state(void);
 
+/* limina snapshot-replay (limina M9.3 P1): journal export + replay, all under
+ * the renderer lock. See vkr_renderer.c for the replay contract. */
+bool
+render_state_limina_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+
+uint64_t
+render_state_limina_journal_seq(uint32_t ctx_id);
+
+bool
+render_state_limina_replay_begin(uint32_t ctx_id);
+
+bool
+render_state_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size);
+
+bool
+render_state_limina_replay_ring_cmd(uint32_t ctx_id,
+                                    uint64_t ring_id,
+                                    void *cmd,
+                                    uint32_t size);
+
+bool
+render_state_limina_replay_end(uint32_t ctx_id);
+
 bool
 render_state_create_context(struct render_context *ctx,
                             uint32_t flags,
