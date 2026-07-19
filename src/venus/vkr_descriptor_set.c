@@ -5,7 +5,9 @@
 
 #include "vkr_descriptor_set.h"
 
+#include "vkr_buffer.h"
 #include "vkr_descriptor_set_gen.h"
+#include "vkr_image.h"
 
 static void
 vkr_dispatch_vkGetDescriptorSetLayoutSupport(
@@ -159,12 +161,60 @@ vkr_dispatch_vkUpdateDescriptorSets(struct vn_dispatch_context *dispatch,
    struct vn_device_proc_table *vk = &dev->proc_table;
 
    /* gkvm journal: key this update by every touched set (guest ids, pre-replace;
-    * note_keys dedupes — zink typically hits one set with many writes) */
+    * note_keys dedupes — zink typically hits one set with many writes) AND by every
+    * referenced view/sampler/buffer: a NOTED entry dies with its first dead key, so
+    * keying on the referenced objects prunes the entry the moment any of them is
+    * destroyed — exactly the entries that would otherwise pile up as stale writes
+    * and fail (noisily, recoverably) at replay (11k on a lived-in session). At
+    * replay one dead reference drops the whole entry anyway, so the eager prune is
+    * behavior-equivalent and keeps the journal lean. */
    for (uint32_t i = 0; i < args->descriptorWriteCount; i++) {
+      const VkWriteDescriptorSet *w = &args->pDescriptorWrites[i];
       const struct vkr_descriptor_set *set =
-         vkr_descriptor_set_from_handle(args->pDescriptorWrites[i].dstSet);
+         vkr_descriptor_set_from_handle(w->dstSet);
       if (set)
          vkr_journal_note_keys(dispatch->data, &set->base.id, 1);
+
+      switch (w->descriptorType) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         for (uint32_t k = 0; w->pImageInfo && k < w->descriptorCount; k++) {
+            const struct vkr_image_view *view =
+               vkr_image_view_from_handle(w->pImageInfo[k].imageView);
+            const struct vkr_sampler *sampler =
+               vkr_sampler_from_handle(w->pImageInfo[k].sampler);
+            if (view)
+               vkr_journal_note_keys(dispatch->data, &view->base.id, 1);
+            if (sampler)
+               vkr_journal_note_keys(dispatch->data, &sampler->base.id, 1);
+         }
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         for (uint32_t k = 0; w->pTexelBufferView && k < w->descriptorCount; k++) {
+            const struct vkr_buffer_view *bview =
+               vkr_buffer_view_from_handle(w->pTexelBufferView[k]);
+            if (bview)
+               vkr_journal_note_keys(dispatch->data, &bview->base.id, 1);
+         }
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+         for (uint32_t k = 0; w->pBufferInfo && k < w->descriptorCount; k++) {
+            const struct vkr_buffer *buf =
+               vkr_buffer_from_handle(w->pBufferInfo[k].buffer);
+            if (buf)
+               vkr_journal_note_keys(dispatch->data, &buf->base.id, 1);
+         }
+         break;
+      default:
+         break;
+      }
    }
    for (uint32_t i = 0; i < args->descriptorCopyCount; i++) {
       const struct vkr_descriptor_set *dst =
