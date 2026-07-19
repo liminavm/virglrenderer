@@ -65,6 +65,9 @@ vkr_renderer_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
 uint64_t
 vkr_renderer_journal_seq(uint32_t ctx_id);
 
+void
+vkr_renderer_journal_unpin(uint32_t ctx_id, uint64_t key);
+
 bool
 vkr_renderer_replay_begin(uint32_t ctx_id);
 

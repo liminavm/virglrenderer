@@ -43,9 +43,25 @@ enum vkr_journal_class {
 
 struct vkr_journal_entry;
 
+static bool
+vkr_journal_u64_append(uint64_t **arr, uint32_t *n, uint32_t *cap, uint64_t v);
+
 struct vkr_journal_keynode {
    uint64_t id;
    struct list_head refs; /* vkr_journal_keyref.link */
+   /* limina snapshot-replay: entry pinning. A blob resource created from a
+    * VkDeviceMemory pins the memory's key: the guest may vkFreeMemory while the
+    * resource lives on (Xwayland cross-context buffers), and replay still needs
+    * the alloc entry to re-create the memory BEFORE the blob create. While
+    * pinned, prune_key defers (prune_deferred) and the freeing command itself is
+    * retained keyed by this id — replay then re-runs alloc → blob create → free
+    * in original seq order, reproducing the live world. The deferred prune fires
+    * when the last pinning resource dies (vkr_journal_unpin_key). */
+   uint32_t pinned;
+   bool prune_deferred;
+   /* pinned alongside this key (the alloc's dedicated buffer/image), unpinned
+    * with it — the alloc entry cannot replay if the dedicated object is gone */
+   uint64_t dep_id;
 };
 
 struct vkr_journal_keyref {
@@ -97,6 +113,10 @@ struct vkr_journal_frame {
 
    uint64_t *noted;
    uint32_t nnoted, noted_cap;
+
+   /* keys whose prune this command deferred (pinned; see vkr_journal_keynode) */
+   uint64_t *deferred;
+   uint32_t ndeferred, deferred_cap;
 
    bool have_free;
    uint64_t free_pool;
@@ -291,6 +311,8 @@ vkr_journal_drop_on_key_locked(struct vkr_journal *j,
       return;
    struct vkr_journal_keynode *node = he->data;
 
+   /* a latest-wins drop is not a lifetime prune — it proceeds even on a pinned
+    * key (the superseding entry is already being inserted in our place) */
    list_for_each_entry_safe (struct vkr_journal_keyref, ref, &node->refs, link) {
       struct vkr_journal_entry *e = ref->entry;
       if ((e->klass & VKR_JOURNAL_CLASS_MASK) != klass)
@@ -408,6 +430,18 @@ vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
    }
    struct vkr_journal_keynode *node = he->data;
 
+   if (node->pinned) {
+      node->prune_deferred = true;
+      mtx_unlock(&j->mutex);
+      /* retain the pruning command (frame active ⇒ we are mid-dispatch of the
+       * free on this thread) so replay re-runs it after the blob create */
+      struct vkr_journal_frame *frame = vkr_journal_frame_cur;
+      if (frame && frame->j == j)
+         vkr_journal_u64_append(&frame->deferred, &frame->ndeferred,
+                                &frame->deferred_cap, id);
+      return;
+   }
+
    list_for_each_entry_safe (struct vkr_journal_keyref, ref, &node->refs, link) {
       struct vkr_journal_entry *e = ref->entry;
       if (ref->dead)
@@ -484,6 +518,7 @@ vkr_journal_frame_free(struct vkr_journal_frame *frame)
    free(frame->created);
    free(frame->created_types);
    free(frame->noted);
+   free(frame->deferred);
    free(frame->freed);
    free(frame);
 }
@@ -605,7 +640,18 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
          break;
       }
       default:
-         j->stats.transient_cmds++;
+         if (frame->ndeferred) {
+            /* this (otherwise transient) command pruned a pinned key — e.g.
+             * vkFreeMemory of a blob-exported memory. Retain it keyed by the
+             * pinned id: replay re-runs it after the blob create (its seq is
+             * greater than the blob's record fence), and the final prune at
+             * unpin kills it together with the alloc entry. */
+            vkr_journal_insert_locked(j, VKR_JOURNAL_NOTED, cmd_type, frame->start,
+                                      size, frame->deferred, NULL, frame->ndeferred,
+                                      NULL, 0);
+         } else {
+            j->stats.transient_cmds++;
+         }
          break;
       }
    }
@@ -654,6 +700,77 @@ vkr_journal_object_removed(struct vkr_context *ctx, uint64_t id)
    if (!j)
       return;
    vkr_journal_prune_key(j, id);
+}
+
+/* limina snapshot-replay: see the pin comment on vkr_journal_keynode. Returns
+ * false when there is nothing to pin (journal off, or the key was never
+ * journaled — then replay could not re-create the memory anyway). */
+static bool
+vkr_journal_pin_one_locked(struct vkr_journal *j, uint64_t id, uint64_t dep_id)
+{
+   struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
+   if (!he) {
+      vkr_log("journal: pin MISS key %" PRIu64 " (never journaled)", id);
+      return false;
+   }
+   struct vkr_journal_keynode *node = he->data;
+   node->pinned++;
+   if (dep_id)
+      node->dep_id = dep_id;
+   return true;
+}
+
+
+bool
+vkr_journal_pin_key(struct vkr_context *ctx, uint64_t id, uint64_t dep_id)
+{
+   struct vkr_journal *j = ctx->journal;
+   if (!j)
+      return false;
+
+   mtx_lock(&j->mutex);
+   const bool ok = vkr_journal_pin_one_locked(j, id, dep_id);
+   /* the dedicated object rides the memory's pin lifetime */
+   if (ok && dep_id)
+      vkr_journal_pin_one_locked(j, dep_id, 0);
+   mtx_unlock(&j->mutex);
+   return ok;
+}
+
+static void
+vkr_journal_unpin_one(struct vkr_journal *j, uint64_t id, uint64_t *out_dep)
+{
+   bool fire = false;
+   mtx_lock(&j->mutex);
+   struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
+   if (he) {
+      struct vkr_journal_keynode *node = he->data;
+      if (out_dep) {
+         *out_dep = node->dep_id;
+         node->dep_id = 0;
+      }
+      if (node->pinned && --node->pinned == 0 && node->prune_deferred)
+         fire = true;
+   } else if (out_dep) {
+      *out_dep = 0;
+   }
+   mtx_unlock(&j->mutex);
+
+   if (fire)
+      vkr_journal_prune_key(j, id);
+}
+
+void
+vkr_journal_unpin_key(struct vkr_context *ctx, uint64_t id)
+{
+   struct vkr_journal *j = ctx->journal;
+   if (!j)
+      return;
+
+   uint64_t dep_id = 0;
+   vkr_journal_unpin_one(j, id, &dep_id);
+   if (dep_id)
+      vkr_journal_unpin_one(j, dep_id, NULL);
 }
 
 /* --- in-handler attribution --- */
