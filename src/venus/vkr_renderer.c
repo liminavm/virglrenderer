@@ -5,6 +5,8 @@
 
 #include "vkr_common.h"
 
+#include <stdio.h>
+
 #include "venus-protocol/vn_protocol_renderer_info.h"
 #include "virtgpu_drm.h"
 #include "venus_hw.h"
@@ -141,6 +143,148 @@ vkr_renderer_destroy_context(uint32_t ctx_id)
 
    list_del(&ctx->head);
    vkr_context_destroy(ctx);
+}
+
+/* limina M9.3 diagnostics: short name for the object types a venus context holds,
+ * so the per-context dump doubles as a retain-and-replay sizing measurement. */
+static const char *
+vkr_object_type_name(VkObjectType type)
+{
+   switch (type) {
+   case VK_OBJECT_TYPE_INSTANCE:
+      return "instance";
+   case VK_OBJECT_TYPE_PHYSICAL_DEVICE:
+      return "phys_dev";
+   case VK_OBJECT_TYPE_DEVICE:
+      return "device";
+   case VK_OBJECT_TYPE_QUEUE:
+      return "queue";
+   case VK_OBJECT_TYPE_SEMAPHORE:
+      return "semaphore";
+   case VK_OBJECT_TYPE_COMMAND_BUFFER:
+      return "cmd_buf";
+   case VK_OBJECT_TYPE_FENCE:
+      return "fence";
+   case VK_OBJECT_TYPE_DEVICE_MEMORY:
+      return "memory";
+   case VK_OBJECT_TYPE_BUFFER:
+      return "buffer";
+   case VK_OBJECT_TYPE_IMAGE:
+      return "image";
+   case VK_OBJECT_TYPE_EVENT:
+      return "event";
+   case VK_OBJECT_TYPE_QUERY_POOL:
+      return "query_pool";
+   case VK_OBJECT_TYPE_BUFFER_VIEW:
+      return "buffer_view";
+   case VK_OBJECT_TYPE_IMAGE_VIEW:
+      return "image_view";
+   case VK_OBJECT_TYPE_SHADER_MODULE:
+      return "shader";
+   case VK_OBJECT_TYPE_PIPELINE_CACHE:
+      return "pipe_cache";
+   case VK_OBJECT_TYPE_PIPELINE_LAYOUT:
+      return "pipe_layout";
+   case VK_OBJECT_TYPE_RENDER_PASS:
+      return "render_pass";
+   case VK_OBJECT_TYPE_PIPELINE:
+      return "pipeline";
+   case VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT:
+      return "dset_layout";
+   case VK_OBJECT_TYPE_SAMPLER:
+      return "sampler";
+   case VK_OBJECT_TYPE_DESCRIPTOR_POOL:
+      return "dpool";
+   case VK_OBJECT_TYPE_DESCRIPTOR_SET:
+      return "dset";
+   case VK_OBJECT_TYPE_FRAMEBUFFER:
+      return "framebuffer";
+   case VK_OBJECT_TYPE_COMMAND_POOL:
+      return "cmd_pool";
+   case VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION:
+      return "ycbcr_conv";
+   case VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE:
+      return "dupdate_tmpl";
+   case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
+      return "accel_struct";
+   default:
+      return NULL;
+   }
+}
+
+void
+vkr_renderer_dump_state(void)
+{
+   /* Caller must hold the render_state renderer lock (SCOPE_LOCK_RENDERER), which
+    * serializes us against every other vkr entry point; the per-context mutexes
+    * below additionally cover tables their own worker threads mutate. */
+   unsigned n_ctx = list_length(&vkr_state.contexts);
+   vkr_log("[GPUTRACE] vkr state: %u context(s)", n_ctx);
+
+   list_for_each_entry (struct vkr_context, ctx, &vkr_state.contexts, head) {
+      mtx_lock(&ctx->ring_mutex);
+      unsigned rings = list_length(&ctx->rings);
+      mtx_unlock(&ctx->ring_mutex);
+
+      mtx_lock(&ctx->resource_mutex);
+      uint32_t resources = _mesa_hash_table_num_entries(ctx->resource_table);
+      mtx_unlock(&ctx->resource_mutex);
+
+      unsigned queues = 0;
+      for (unsigned i = 0; i < ARRAY_SIZE(ctx->sync_queues); i++) {
+         if (ctx->sync_queues[i])
+            queues++;
+      }
+
+      /* Tally the object table by type: this is what a seamless restore would have
+       * to re-create, so the breakdown is the replay's bill of materials. */
+      struct {
+         VkObjectType type;
+         uint32_t count;
+      } tally[48];
+      unsigned n_tally = 0;
+      uint32_t objects = 0;
+
+      mtx_lock(&ctx->object_mutex);
+      objects = _mesa_hash_table_num_entries(ctx->object_table);
+      hash_table_foreach (ctx->object_table, entry) {
+         const struct vkr_object *obj = entry->data;
+         unsigned i;
+         for (i = 0; i < n_tally; i++) {
+            if (tally[i].type == obj->type)
+               break;
+         }
+         if (i == n_tally && n_tally < ARRAY_SIZE(tally)) {
+            tally[n_tally].type = obj->type;
+            tally[n_tally].count = 0;
+            n_tally++;
+         }
+         if (i < ARRAY_SIZE(tally))
+            tally[i].count++;
+      }
+      mtx_unlock(&ctx->object_mutex);
+
+      vkr_log("[GPUTRACE]   ctx %u (%s): rings=%u objects=%" PRIu32
+              " resources=%" PRIu32 " sync_queues=%u",
+              ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "?", rings, objects,
+              resources, queues);
+
+      if (n_tally) {
+         char buf[512];
+         int len = 0;
+         for (unsigned i = 0; i < n_tally && len < (int)sizeof(buf) - 32; i++) {
+            const char *name = vkr_object_type_name(tally[i].type);
+            if (name) {
+               len += snprintf(buf + len, sizeof(buf) - len, "%s%s=%" PRIu32,
+                               i ? " " : "", name, tally[i].count);
+            } else {
+               len += snprintf(buf + len, sizeof(buf) - len, "%stype%u=%" PRIu32,
+                               i ? " " : "", tally[i].type, tally[i].count);
+            }
+         }
+         vkr_log("[GPUTRACE]     objects: %s", buf);
+      }
+   }
 }
 
 bool

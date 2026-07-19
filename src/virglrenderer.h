@@ -452,6 +452,11 @@ VIRGL_EXPORT int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle,
 VIRGL_EXPORT int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst,
                                                         uint32_t dst_stride, uint32_t height);
 
+/* limina M9.3 diagnostics: log the live venus (vkr) context table — per context: rings,
+ * object counts by VkObjectType, resources, sync queues. Thread-safe; a no-op log line
+ * when venus/the renderer isn't initialized. */
+VIRGL_EXPORT void virgl_renderer_limina_dump_state(void);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003
