@@ -53,6 +53,12 @@ struct vkr_device_memory {
    uint32_t memory_type_index;
 
    bool exported;
+
+   /* limina snapshot-replay P2: this memory was created by importing a virgl
+    * resource's bytes (VkImportMemoryResourceInfoMESA) — it aliases ANOTHER
+    * storage (the exporter's IOSurface / blob / shm bytes), so content
+    * capture/restore happens at the source, never here. */
+   bool limina_res_imported;
 };
 VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
 
@@ -67,5 +73,21 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                               uint64_t blob_size,
                               uint32_t blob_flags,
                               struct virgl_context_blob *out_blob);
+
+/* limina snapshot-replay P2: whether this memory's bytes must be captured by the
+ * snapshot (vs. being covered elsewhere: map_ptr blobs by the VMM's mapped-blob
+ * capture, imports by their exporting storage). */
+bool
+vkr_device_memory_capturable(const struct vkr_device_memory *mem);
+
+/* limina snapshot-replay P2: copy min(size, allocation_size) bytes between `buf`
+ * and the memory's host mapping (vkMapMemory/vkUnmapMemory round-trip; KK/UMA
+ * memory is always host-visible — the placement heap's CPU alias, so raw image
+ * bytes included). to_mem=false reads (capture), to_mem=true writes (restore). */
+bool
+vkr_device_memory_content_copy(struct vkr_device_memory *mem,
+                               void *buf,
+                               uint64_t size,
+                               bool to_mem);
 
 #endif /* VKR_DEVICE_MEMORY_H */

@@ -482,6 +482,23 @@ VIRGL_EXPORT int virgl_renderer_limina_replay_ring_cmd(uint32_t ctx_id, uint64_t
                                                        void *cmd, uint32_t size);
 VIRGL_EXPORT int virgl_renderer_limina_replay_end(uint32_t ctx_id);
 
+/* limina snapshot-replay P2: full device-memory content capture. Census returns a
+ * malloc'd array of 2*count u64s — (VkDeviceMemory object id, allocation size)
+ * pairs — for every live capturable memory in the venus context (caller frees).
+ * "Capturable" excludes map_ptr-exported blobs (covered by the VMM's mapped-blob
+ * capture, and already host-mapped) and resource-imports (they alias another
+ * storage). read/write copy min(size, allocation size) bytes out of / into the
+ * memory's host mapping (KK/UMA: the placement heap's CPU alias — raw image
+ * bytes included). At restore, write AFTER the context's wire journal has
+ * replayed (the allocs must exist) and BEFORE replay_end (rings consume parked
+ * commands the moment they start). Same-process render server only. */
+VIRGL_EXPORT int virgl_renderer_limina_memory_census(uint32_t ctx_id, uint64_t **out_pairs,
+                                                     uint32_t *out_count);
+VIRGL_EXPORT int virgl_renderer_limina_memory_read(uint32_t ctx_id, uint64_t mem_id,
+                                                   void *buf, uint64_t size);
+VIRGL_EXPORT int virgl_renderer_limina_memory_write(uint32_t ctx_id, uint64_t mem_id,
+                                                    const void *buf, uint64_t size);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003

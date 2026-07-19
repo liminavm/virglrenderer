@@ -80,6 +80,19 @@ vkr_renderer_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id, void *cmd, uint3
 bool
 vkr_renderer_replay_end(uint32_t ctx_id);
 
+/* limina snapshot-replay P2: device-memory content capture. Census returns a
+ * malloc'd array of (object id, allocation size) u64 pairs for every live
+ * capturable VkDeviceMemory in the context (caller frees); read/write copy the
+ * memory's bytes out of / into its host mapping. */
+int
+vkr_renderer_memory_census(uint32_t ctx_id, uint64_t **out_pairs, uint32_t *out_count);
+
+bool
+vkr_renderer_memory_read(uint32_t ctx_id, uint64_t mem_id, void *buf, uint64_t size);
+
+bool
+vkr_renderer_memory_write(uint32_t ctx_id, uint64_t mem_id, const void *buf, uint64_t size);
+
 bool
 vkr_renderer_submit_fence(uint32_t ctx_id,
                           uint32_t flags,
