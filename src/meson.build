@@ -75,6 +75,7 @@ venus_sources = [
    'venus/vkr_host_copy.c',
    'venus/vkr_image.c',
    'venus/vkr_instance.c',
+   'venus/vkr_journal.c',
    'venus/vkr_library.c',
    'venus/vkr_physical_device.c',
    'venus/vkr_pipeline.c',
