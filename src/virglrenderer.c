@@ -1311,6 +1311,7 @@ int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst, uint3
  * mode; server/ is not on the include path for this TU, hence the local decls). */
 void render_state_limina_dump_state(void);
 bool render_state_limina_journal_export(uint32_t ctx_id, void **out_buf, size_t *out_size);
+void render_state_limina_journal_unpin(uint32_t ctx_id, uint64_t key);
 uint64_t render_state_limina_journal_seq(uint32_t ctx_id);
 bool render_state_limina_replay_begin(uint32_t ctx_id);
 bool render_state_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size);
@@ -1372,6 +1373,18 @@ uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
 #endif
    (void)ctx_id;
    return 0;
+}
+
+void virgl_renderer_limina_journal_unpin(uint32_t ctx_id, uint64_t key)
+{
+#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
+   if (state.proxy_initialized) {
+      render_state_limina_journal_unpin(ctx_id, key);
+      return;
+   }
+#endif
+   (void)ctx_id;
+   (void)key;
 }
 
 int virgl_renderer_limina_replay_begin(uint32_t ctx_id)
