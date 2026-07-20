@@ -87,6 +87,15 @@ struct vkr_journal_entry {
    uint32_t naux;
    uint64_t *aux; /* FREE: the freed ids, for serialization-time validation */
 
+   /* limina snapshot-replay: create-arg closure (the 2026-07-20 vkmark crash).
+    * A CREATE's wire args may reference objects the guest legally destroys
+    * while the created object lives on — pipeline←shader modules/layout is
+    * the canonical case. Their creates must stay replayable, so a CREATE
+    * entry pins every object id its decode looked up; the pins drop when
+    * THIS entry dies. See vkr_journal_note_lookup / vkr_journal_pin_refs. */
+   uint32_t npinned;
+   uint64_t *pinned_refs;
+
    struct list_head link; /* global order */
 };
 
@@ -113,6 +122,12 @@ struct vkr_journal_frame {
 
    uint64_t *noted;
    uint32_t nnoted, noted_cap;
+
+   /* every object id the decoder successfully looked up while dispatching this
+    * command (vkr_journal_note_lookup from vkr_cs_decoder_lookup_object) — the
+    * create-arg dependencies when the command turns out to be a CREATE */
+   uint64_t *refs;
+   uint32_t nrefs, refs_cap;
 
    /* keys whose prune this command deferred (pinned; see vkr_journal_keynode) */
    uint64_t *deferred;
@@ -235,16 +250,37 @@ vkr_journal_entry_free_data(struct vkr_journal_entry *e)
    free(e->refs);
    free(e->key_types);
    free(e->aux);
+   free(e->pinned_refs);
    free(e);
 }
 
+/* prune ids queued by unpin-drains during a kill sweep — processed iteratively
+ * by the sweep's owner (never recursively: a fired prune kills more entries,
+ * possibly on keynode lists an outer loop is iterating) */
+struct vkr_journal_fires {
+   uint64_t *ids;
+   uint32_t n, cap;
+};
+
 /* unlink from the global list and from every keynode; keynodes emptied by this
- * removal are freed, except `keep` (the node the caller is iterating) */
+ * removal are freed, except `keep` (the node the caller is iterating). Unpins
+ * the entry's create-arg refs; a pin draining to zero with a deferred prune
+ * queues that prune on `fires` (NULL only at whole-journal teardown). */
 static void
 vkr_journal_entry_kill_locked(struct vkr_journal *j,
                               struct vkr_journal_entry *e,
-                              struct vkr_journal_keynode *keep)
+                              struct vkr_journal_keynode *keep,
+                              struct vkr_journal_fires *fires)
 {
+   for (uint32_t i = 0; i < e->npinned; i++) {
+      struct hash_entry *he = _mesa_hash_table_search(j->keys, &e->pinned_refs[i]);
+      if (!he)
+         continue;
+      struct vkr_journal_keynode *node = he->data;
+      if (node->pinned && --node->pinned == 0 && node->prune_deferred && fires)
+         vkr_journal_u64_append(&fires->ids, &fires->n, &fires->cap, node->id);
+   }
+
    for (uint32_t i = 0; i < e->nkeys; i++) {
       struct vkr_journal_keyref *ref = &e->refs[i];
       struct vkr_journal_keynode *node = ref->node;
@@ -299,6 +335,11 @@ vkr_journal_keynode_get_locked(struct vkr_journal *j, uint64_t id)
    return node;
 }
 
+/* process prune ids queued by unpin-drains (see vkr_journal_fires); each fired
+ * prune may kill entries whose unpins queue further ids — loop until drained */
+static void
+vkr_journal_prune_fires_locked(struct vkr_journal *j, struct vkr_journal_fires *fires);
+
 /* drop existing entries on key `id` that `pred`-match (RESETS_PRIOR, latest-wins) */
 static void
 vkr_journal_drop_on_key_locked(struct vkr_journal *j,
@@ -310,6 +351,7 @@ vkr_journal_drop_on_key_locked(struct vkr_journal *j,
    if (!he)
       return;
    struct vkr_journal_keynode *node = he->data;
+   struct vkr_journal_fires fires = { 0 };
 
    /* a latest-wins drop is not a lifetime prune — it proceeds even on a pinned
     * key (the superseding entry is already being inserted in our place) */
@@ -319,7 +361,7 @@ vkr_journal_drop_on_key_locked(struct vkr_journal *j,
          continue;
       if (match_cmd_type >= 0 && e->cmd_type != match_cmd_type)
          continue;
-      vkr_journal_entry_kill_locked(j, e, node);
+      vkr_journal_entry_kill_locked(j, e, node, &fires);
    }
 
    if (list_is_empty(&node->refs)) {
@@ -328,9 +370,12 @@ vkr_journal_drop_on_key_locked(struct vkr_journal *j,
          _mesa_hash_table_remove(j->keys, he2);
       free(node);
    }
+
+   vkr_journal_prune_fires_locked(j, &fires);
+   free(fires.ids);
 }
 
-static void
+static struct vkr_journal_entry *
 vkr_journal_insert_locked(struct vkr_journal *j,
                           uint8_t klass_flags,
                           VkCommandTypeEXT cmd_type,
@@ -346,7 +391,7 @@ vkr_journal_insert_locked(struct vkr_journal *j,
 
    struct vkr_journal_entry *e = calloc(1, sizeof(*e));
    if (!e)
-      return;
+      return NULL;
    e->seq = j->seq_next++;
    e->cmd_type = cmd_type;
    e->klass = klass;
@@ -354,7 +399,7 @@ vkr_journal_insert_locked(struct vkr_journal *j,
    e->data = malloc(size);
    if (!e->data) {
       free(e);
-      return;
+      return NULL;
    }
    memcpy(e->data, data, size);
 
@@ -362,7 +407,7 @@ vkr_journal_insert_locked(struct vkr_journal *j,
       e->refs = calloc(nkeys, sizeof(*e->refs));
       if (!e->refs) {
          vkr_journal_entry_free_data(e);
-         return;
+         return NULL;
       }
       if (key_types) {
          e->key_types = malloc(nkeys * sizeof(*e->key_types));
@@ -416,30 +461,71 @@ vkr_journal_insert_locked(struct vkr_journal *j,
       j->stats.recorded_ring++;
       break;
    }
+   return e;
 }
 
+/* limina snapshot-replay create-arg closure: pin every object id this CREATE's
+ * decode looked up (its wire-arg dependencies — modules, layouts, pools, the
+ * device …), so their create entries stay replayable even if the guest legally
+ * destroys them while the created object lives. The pins drop when this entry
+ * dies (vkr_journal_entry_kill_locked). Self-created ids are skipped; a ref
+ * with no keynode (its create was never journaled) is counted and skipped —
+ * replay could not have re-created it before this fix either. */
 static void
-vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
+vkr_journal_pin_refs_locked(struct vkr_journal *j,
+                            struct vkr_journal_entry *e,
+                            const struct vkr_journal_frame *frame)
 {
-   mtx_lock(&j->mutex);
+   if (!frame->nrefs)
+      return;
+   uint64_t *pins = malloc(frame->nrefs * sizeof(*pins));
+   if (!pins)
+      return; /* unpinned refs degrade to the pre-fix (drop-at-replay) behavior */
 
-   struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
-   if (!he) {
-      mtx_unlock(&j->mutex);
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < frame->nrefs; i++) {
+      const uint64_t id = frame->refs[i];
+      bool skip = false;
+      for (uint32_t k = 0; k < n && !skip; k++)
+         skip = pins[k] == id; /* dedupe (creates reference few distinct ids) */
+      for (uint32_t k = 0; k < frame->ncreated && !skip; k++)
+         skip = frame->created[k] == id;
+      if (skip)
+         continue;
+      struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
+      if (!he) {
+         j->stats.pin_ref_misses++;
+         continue;
+      }
+      ((struct vkr_journal_keynode *)he->data)->pinned++;
+      pins[n++] = id;
+   }
+
+   if (!n) {
+      free(pins);
       return;
    }
+   e->pinned_refs = pins;
+   e->npinned = n;
+   j->stats.pinned_refs += n;
+}
+
+/* the single-key prune body: kill (or defer, when pinned) the entries keyed by
+ * `id`, queueing any unpin-drained deferred prunes on `fires`. Returns true when
+ * the prune was DEFERRED (the key is pinned by a live create-arg reference). */
+static bool
+vkr_journal_prune_one_locked(struct vkr_journal *j,
+                             uint64_t id,
+                             struct vkr_journal_fires *fires)
+{
+   struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
+   if (!he)
+      return false;
    struct vkr_journal_keynode *node = he->data;
 
    if (node->pinned) {
       node->prune_deferred = true;
-      mtx_unlock(&j->mutex);
-      /* retain the pruning command (frame active ⇒ we are mid-dispatch of the
-       * free on this thread) so replay re-runs it after the blob create */
-      struct vkr_journal_frame *frame = vkr_journal_frame_cur;
-      if (frame && frame->j == j)
-         vkr_journal_u64_append(&frame->deferred, &frame->ndeferred,
-                                &frame->deferred_cap, id);
-      return;
+      return true;
    }
 
    list_for_each_entry_safe (struct vkr_journal_keyref, ref, &node->refs, link) {
@@ -454,7 +540,7 @@ vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
       const bool kill = (e->klass == VKR_JOURNAL_CREATE) ? e->keys_dead == e->nkeys
                                                          : true;
       if (kill)
-         vkr_journal_entry_kill_locked(j, e, node);
+         vkr_journal_entry_kill_locked(j, e, node, fires);
    }
 
    if (list_is_empty(&node->refs)) {
@@ -463,8 +549,37 @@ vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
          _mesa_hash_table_remove(j->keys, he2);
       free(node);
    }
+   return false;
+}
 
+static void
+vkr_journal_prune_fires_locked(struct vkr_journal *j, struct vkr_journal_fires *fires)
+{
+   /* fires only queue at pinned==0, so a fired prune can never re-defer; it can
+    * only kill further entries whose unpins append to the same list */
+   for (uint32_t i = 0; i < fires->n; i++)
+      vkr_journal_prune_one_locked(j, fires->ids[i], fires);
+}
+
+static void
+vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
+{
+   struct vkr_journal_fires fires = { 0 };
+
+   mtx_lock(&j->mutex);
+   const bool deferred = vkr_journal_prune_one_locked(j, id, &fires);
+   vkr_journal_prune_fires_locked(j, &fires);
    mtx_unlock(&j->mutex);
+   free(fires.ids);
+
+   if (deferred) {
+      /* retain the pruning command (frame active ⇒ we are mid-dispatch of the
+       * free on this thread) so replay re-runs it after the dependent create */
+      struct vkr_journal_frame *frame = vkr_journal_frame_cur;
+      if (frame && frame->j == j)
+         vkr_journal_u64_append(&frame->deferred, &frame->ndeferred,
+                                &frame->deferred_cap, id);
+   }
 }
 
 /* --- TLS frame helpers --- */
@@ -518,9 +633,23 @@ vkr_journal_frame_free(struct vkr_journal_frame *frame)
    free(frame->created);
    free(frame->created_types);
    free(frame->noted);
+   free(frame->refs);
    free(frame->deferred);
    free(frame->freed);
    free(frame);
+}
+
+/* limina snapshot-replay: called from vkr_cs_decoder_lookup_object on every
+ * SUCCESSFUL decode-time handle lookup. Outside a dispatch (no TLS frame, or
+ * journal off) it is a no-op; the noted ids only matter when the dispatched
+ * command turns out to be a CREATE (vkr_journal_pin_refs_locked). */
+void
+vkr_journal_note_lookup(uint64_t id)
+{
+   struct vkr_journal_frame *frame = vkr_journal_frame_cur;
+   if (!frame || !id)
+      return;
+   vkr_journal_u64_append(&frame->refs, &frame->nrefs, &frame->refs_cap, id);
 }
 
 /* wire peek: header is cmd_type (u32) + flags (u32); every handle a LE u64 */
@@ -579,10 +708,13 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
    mtx_lock(&j->mutex);
 
    if (frame->ncreated) {
-      /* effect-driven: this command built objects — retain keyed by them all */
-      vkr_journal_insert_locked(j, VKR_JOURNAL_CREATE, cmd_type, frame->start, size,
-                                frame->created, frame->created_types, frame->ncreated,
-                                NULL, 0);
+      /* effect-driven: this command built objects — retain keyed by them all,
+       * pinning the creates of every object its args reference (closure) */
+      struct vkr_journal_entry *e = vkr_journal_insert_locked(
+         j, VKR_JOURNAL_CREATE, cmd_type, frame->start, size, frame->created,
+         frame->created_types, frame->ncreated, NULL, 0);
+      if (e)
+         vkr_journal_pin_refs_locked(j, e, frame);
    } else {
       switch (klass) {
       case VKR_JOURNAL_RECORDING: {
@@ -921,11 +1053,12 @@ vkr_journal_dump(struct vkr_journal *j)
            "create=%" PRIu64 " recording=%" PRIu64 " noted=%" PRIu64 " ring=%" PRIu64
            " free=%" PRIu64 " pool_reset=%" PRIu64 "; pruned=%" PRIu64
            " transient=%" PRIu64 " orphan_adds=%" PRIu64 " dropped_fatal=%" PRIu64
-           " noted_multi_key=%" PRIu64,
+           " noted_multi_key=%" PRIu64 " pinned_refs=%" PRIu64 " pin_ref_misses=%" PRIu64,
            j->ctx_id, s->entries_live, s->bytes_live / 1024, s->recorded_creates,
            s->recorded_recordings, s->recorded_noted, s->recorded_ring,
            s->recorded_frees, s->recorded_pool_resets, s->pruned_entries,
-           s->transient_cmds, s->orphan_adds, s->dropped_fatal, s->noted_multi_key);
+           s->transient_cmds, s->orphan_adds, s->dropped_fatal, s->noted_multi_key,
+           s->pinned_refs, s->pin_ref_misses);
 
    /* live-create census by VkObjectType — cross-check against the context's
     * object-table tally in vkr_renderer_dump_state */
