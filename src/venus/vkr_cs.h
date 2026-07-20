@@ -15,6 +15,11 @@
  */
 #define VKR_CS_DECODER_TEMP_POOL_MAX_SIZE (1u * 1024 * 1024 * 1024)
 
+/* gkvm snapshot-replay: the journal's create-arg closure hook (vkr_journal.h);
+ * declared here so the inline lookup below can call it without an include cycle */
+void
+vkr_journal_note_lookup(uint64_t id);
+
 struct vkr_cs_encoder {
    bool *fatal_error;
 
@@ -340,6 +345,10 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
       else
          vkr_log_error("failed to look up object %" PRIu64 " of type %d", id, type);
       vkr_cs_decoder_set_fatal(dec);
+   } else {
+      /* gkvm snapshot-replay: feed the journal's create-arg closure — see
+       * vkr_journal_note_lookup (no-op outside a journal dispatch frame) */
+      vkr_journal_note_lookup(id);
    }
 
    return obj;
