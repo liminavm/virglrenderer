@@ -63,6 +63,8 @@ struct vkr_journal_stats {
    uint64_t orphan_adds;      /* object added outside any dispatch frame */
    uint64_t dropped_fatal;    /* frames dropped because the command failed */
    uint64_t noted_multi_key;  /* noted-mutate with >1 key (shared-prune risk) */
+   uint64_t pinned_refs;      /* create-arg refs pinned (closure; live total) */
+   uint64_t pin_ref_misses;   /* create-arg refs with no journaled create */
 };
 
 struct vkr_journal *
@@ -103,6 +105,14 @@ vkr_journal_unpin_key(struct vkr_context *ctx, uint64_t id);
  * (descriptor updates, memory binds); attaches to the current TLS frame */
 void
 vkr_journal_note_keys(struct vkr_context *ctx, const uint64_t *ids, uint32_t count);
+
+/* limina snapshot-replay create-arg closure: every successful decode-time handle
+ * lookup lands on the current TLS dispatch frame (no-op outside dispatch); a
+ * CREATE entry then pins the creates of every id its args referenced, so a
+ * referenced object's legal destroy (pipeline←shader module) cannot leave the
+ * CREATE unreplayable. Called from vkr_cs_decoder_lookup_object. */
+void
+vkr_journal_note_lookup(uint64_t id);
 
 /* in-handler attribution for partial frees: retained keyed to `pool_id`,
  * freed ids kept as aux data for serialization-time validation */
