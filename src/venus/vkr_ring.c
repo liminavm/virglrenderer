@@ -222,17 +222,60 @@ vkr_ring_now(void)
    return ns_per_sec * now.tv_sec + now.tv_nsec;
 }
 
+/* limina wake-trace (LIMINA_WAKE_TRACE=1): ring-thread wake accounting, ~5s cadence to
+ * stderr — how many timed poll sleeps the relax ladder burns, how often the poll window
+ * actually catches new work vs. the ring parking and resuming via doorbell. Used for
+ * host-wakeup attribution (limina docs/perf/overhead-inventory.md). Single ring thread
+ * per context; plain statics are fine for a diagnostic aggregate across rings. */
+static struct {
+   int enabled; /* -1 unknown, 0 off, 1 on */
+   uint64_t last_report_ns;
+   uint64_t sleeps;
+   uint64_t poll_resumes;
+   uint64_t parks;
+   uint64_t park_resumes;
+} vkr_ring_wake_trace = { .enabled = -1 };
+
+static void
+vkr_ring_wake_trace_add(uint64_t *counter)
+{
+   if (vkr_ring_wake_trace.enabled < 0)
+      vkr_ring_wake_trace.enabled = getenv("LIMINA_WAKE_TRACE") != NULL;
+   if (!vkr_ring_wake_trace.enabled)
+      return;
+   (*counter)++;
+   const uint64_t now = vkr_ring_now();
+   if (!vkr_ring_wake_trace.last_report_ns)
+      vkr_ring_wake_trace.last_report_ns = now;
+   const uint64_t elapsed = now - vkr_ring_wake_trace.last_report_ns;
+   if (elapsed >= 5000000000ull) {
+      const double secs = (double)elapsed / 1e9;
+      fprintf(stderr,
+              "[WAKETRACE vkr_ring] poll_sleeps=%.0f/s poll_resumes=%.0f/s parks=%.0f/s "
+              "park_resumes=%.0f/s\n",
+              (double)vkr_ring_wake_trace.sleeps / secs,
+              (double)vkr_ring_wake_trace.poll_resumes / secs,
+              (double)vkr_ring_wake_trace.parks / secs,
+              (double)vkr_ring_wake_trace.park_resumes / secs);
+      vkr_ring_wake_trace.sleeps = 0;
+      vkr_ring_wake_trace.poll_resumes = 0;
+      vkr_ring_wake_trace.parks = 0;
+      vkr_ring_wake_trace.park_resumes = 0;
+      vkr_ring_wake_trace.last_report_ns = now;
+   }
+}
+
 static void
 vkr_ring_relax(uint32_t *iter)
 {
    /* gkvm (host-wakeup trim): one sleep per backoff rung, quadrupling per CALL
     * (10, 40, 160, 640 us), instead of upstream's one-sleep-per-iteration ladder
     * (16 sleeps at 10 us, then 32 at 20 us, ...) which burned ~55 timed wakeups per
-    * 1 ms ring idle window — measured ~15.5k wakeups/s under a 60 fps venus
-    * workload, the single largest host-wakeup source in the VMM process.
-    * Quadrupling keeps the 10 us first rung (early pickup latency unchanged) while
-    * a full window walk is ~4 sleeps; worst-case in-window pickup stays at the
-    * 640 us cap the old ladder also reached. */
+    * 1 ms idle window — measured ~15.5k wakeups/s under a 60 fps venus workload,
+    * the single largest host-wakeup source. Quadrupling (vs doubling) keeps the
+    * 10 us first rung — early pickup latency unchanged — while a full window walk
+    * is ~4 sleeps; the worst-case in-window pickup stays at the 640 us cap the old
+    * ladder also reached. */
    const uint32_t busy_wait_order = 4;
    const uint32_t base_sleep_us = 10;
    const uint32_t max_sleep_us = 640;
@@ -242,6 +285,8 @@ vkr_ring_relax(uint32_t *iter)
       thrd_yield();
       return;
    }
+
+   vkr_ring_wake_trace_add(&vkr_ring_wake_trace.sleeps);
 
    const uint32_t rung = *iter - (1u << busy_wait_order);
    const uint32_t us = MIN2(base_sleep_us << MIN2(2 * rung, 16), max_sleep_us);
@@ -410,6 +455,7 @@ vkr_ring_thread(void *arg)
       if (wait) {
          TRACE_SCOPE("ring idle");
 
+         vkr_ring_wake_trace_add(&vkr_ring_wake_trace.parks);
          mtx_lock(&ring->mutex);
          while (ring->started && !ring->pending_notify) {
             /* gkvm (idle-wakeups): block indefinitely — the seq_cst IDLE-check handshake
@@ -431,12 +477,15 @@ vkr_ring_thread(void *arg)
          if (!ring->started)
             break;
 
+         vkr_ring_wake_trace_add(&vkr_ring_wake_trace.park_resumes);
          last_submit = vkr_ring_now();
          relax_iter = 0;
       }
 
       const uint32_t cmd_size = vkr_ring_load_tail(ring) - ring->buffer.cur;
       if (cmd_size) {
+         if (relax_iter >= (1u << 4))
+            vkr_ring_wake_trace_add(&vkr_ring_wake_trace.poll_resumes);
          if (cmd_size > ring->buffer.size) {
             vkr_log("%s: cmd_size(%u) > ring->buffer.size(%u)", __func__, cmd_size,
                     ring->buffer.size);
