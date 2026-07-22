@@ -110,6 +110,25 @@ struct vkr_ring {
     * relaxed load when no barriers are pending. */
    atomic_bool has_limina_barriers;
    struct list_head limina_barriers;
+
+   /* limina adaptive relax plateau depth (task #42): the warm-plateau length is chosen from a
+    * TIME-WEIGHTED profile of the ring's cadence over a sliding window. Per drain we measure the
+    * gap since the previous drain and, if it is "long" (>= long_idle threshold, a genuine vsync-
+    * like idle), add its DURATION to `relax_long_time_ns`. Once `window_ns` of wall-clock elapses
+    * we set `relax_coarsen` iff long-idle time was >= coarsen_pct% of the window, then reset.
+    *
+    * Why time-weighted, not gap-COUNT: a capped app spends the bulk of every frame idle in ONE
+    * long gap even if it also emits many sub-ms flushes/frame (firefox ~24), so the long gap
+    * dominates the TIME fraction (~84%) regardless of flush count => coarsen. A saturated latency-
+    * bound ring (uncapped vkmark) has only sporadic short stalls => tiny time fraction => stays
+    * responsive. A pure count-fraction would misread firefox as saturated and a single stray long
+    * gap could latch coarsening (the earlier 100 ms "saw one gap" bug); requiring a sustained TIME
+    * fraction fixes both and denies coarsening's own added latency any way to re-arm itself.
+    * Never affects when the ring parks (idle_timeout). */
+   uint64_t relax_last_drain_ns;
+   uint64_t relax_window_start_ns;
+   uint64_t relax_long_time_ns;
+   uint32_t relax_coarsen;
 };
 
 struct vkr_present_fence;
