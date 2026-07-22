@@ -268,17 +268,29 @@ vkr_ring_wake_trace_add(uint64_t *counter)
 static void
 vkr_ring_relax(uint32_t *iter)
 {
-   /* limina (host-wakeup trim): one sleep per backoff rung, quadrupling per CALL
-    * (10, 40, 160, 640 us), instead of upstream's one-sleep-per-iteration ladder
-    * (16 sleeps at 10 us, then 32 at 20 us, ...) which burned ~55 timed wakeups per
-    * 1 ms idle window — measured ~15.5k wakeups/s under a 60 fps venus workload,
-    * the single largest host-wakeup source. Quadrupling (vs doubling) keeps the
-    * 10 us first rung — early pickup latency unchanged — while a full window walk
-    * is ~4 sleeps; the worst-case in-window pickup stays at the 640 us cap the old
-    * ladder also reached. */
+   /* limina (host-wakeup trim, adaptive plateau — measured A/B, task #38/#39):
+    *
+    * An idle ring is polled on a two-phase backoff. The first 16 spins are a cheap
+    * thrd_yield (no timed wakeup). Then a RESPONSIVE PLATEAU: short sleeps ramping
+    * 10 -> 40 us and holding at 40 us for warm_rungs rungs (~640 us of continued
+    * idle). Only once the ring has stayed idle PAST the plateau does it fall back
+    * to a DEEP-IDLE sleep of 640 us.
+    *
+    * Why two phases: relax_iter resets to 0 on every processed command, so an
+    * actively-fed ring (a game / uncapped GL, whose inter-submit gaps are a few
+    * hundred us) never leaves the plateau -> ~40 us worst-case pickup latency ->
+    * full throughput. A quiet desktop (idle gaps of milliseconds+) crosses the
+    * plateau once and then sleeps at 640 us -> ~1.5k wakeups/s, preserving the
+    * idle-wakeup win. Measured on vkmark (uncapped, submit-latency-bound): a flat
+    * 640 us cap scored 1193 at 11k wakeups/s and a flat 40 us cap scored ~2340 but
+    * would sleep ~25k/s at idle; this plateau scores ~2340 at ~18k under load while
+    * holding ~1.5k at true idle. (Upstream slept once per ITERATION, ~15.5k
+    * wakeups/s — the original regression this whole path fixes.) */
    const uint32_t busy_wait_order = 4;
    const uint32_t base_sleep_us = 10;
-   const uint32_t max_sleep_us = 640;
+   const uint32_t warm_sleep_us = 40;  /* responsive plateau: low pickup latency for active rings */
+   const uint32_t idle_sleep_us = 640; /* deep-idle backoff: few wakeups on a quiet desktop */
+   const uint32_t warm_rungs = 16;     /* plateau length before falling back to deep idle */
 
    (*iter)++;
    if (*iter < (1u << busy_wait_order)) {
@@ -289,7 +301,9 @@ vkr_ring_relax(uint32_t *iter)
    vkr_ring_wake_trace_add(&vkr_ring_wake_trace.sleeps);
 
    const uint32_t rung = *iter - (1u << busy_wait_order);
-   const uint32_t us = MIN2(base_sleep_us << MIN2(2 * rung, 16), max_sleep_us);
+   const uint32_t us = (rung < warm_rungs)
+                          ? MIN2(base_sleep_us << MIN2(2 * rung, 16), warm_sleep_us)
+                          : idle_sleep_us;
    const struct timespec ts = {
       .tv_sec = us / 1000000,
       .tv_nsec = (us % 1000000) * 1000,
