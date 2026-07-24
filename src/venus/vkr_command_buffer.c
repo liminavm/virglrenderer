@@ -421,6 +421,25 @@ static void
 vkr_dispatch_vkCmdClearAttachments(UNUSED struct vn_dispatch_context *dispatch,
                                    struct vn_command_vkCmdClearAttachments *args)
 {
+   /* The guest command stream is untrusted. Drop zero-extent / zero-layer
+    * VkClearRects (invalid usage per VUID-vkCmdClearAttachments-rect-02682 /
+    * -02683): such a rect clears nothing, but passed through it can reach the
+    * host driver's clear meta-path and abort the render server (a degenerate
+    * rect trips vk_meta's setup_viewport_scissor assert / wraps its viewport
+    * math). Compact the decoded array in place; if nothing survives, skip the
+    * call entirely (clearing no rects is valid). */
+   VkClearRect *rects = (VkClearRect *)args->pRects;
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < args->rectCount; i++) {
+      if (rects[i].rect.extent.width == 0 || rects[i].rect.extent.height == 0 ||
+          rects[i].layerCount == 0)
+         continue;
+      rects[count++] = rects[i];
+   }
+   if (count == 0)
+      return;
+   args->rectCount = count;
+
    VKR_CMD_CALL(CmdClearAttachments, args, args->attachmentCount, args->pAttachments,
                 args->rectCount, args->pRects);
 }
