@@ -6,6 +6,7 @@
 #include "vkr_ring.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/resource.h>
 #include <time.h>
 
@@ -235,6 +236,89 @@ static struct {
    uint64_t parks;
    uint64_t park_resumes;
 } vkr_ring_wake_trace = { .enabled = -1 };
+
+/* limina wake-chain profile (LIMINA_RING_WAKE_PROFILE=1).
+ *
+ * A submit that lands on a parked ring has to walk: guest ioctl -> VM exit -> libkrun's gpu
+ * worker -> vkr_ring_notify's cnd_signal -> the ring thread waking out of cnd_wait -> decode.
+ * Guest-side measurement (gnome-shell-rs venus-cost.md §9.4) shows the first submit after an
+ * idle gap costing ~1 ms against ~0.05 ms back-to-back, growing with the length of the gap,
+ * and identical whether the guest thread spins or sleeps — i.e. the cost is host-side. This
+ * splits that interval into the two hops we can see from here:
+ *
+ *   signal->resume : cnd_signal to the ring thread actually running. Pure thread wake latency.
+ *   resume->decode : ring thread running to starting on the command.
+ *
+ * Cross-tabbed by how long the ring had been parked, because "grows with the gap" is the claim
+ * under test — an effect that is flat across buckets is not the one we are looking for.
+ *
+ * If both hops are small the cost is upstream of us (VM exit, or libkrun's gpu worker being
+ * slow to wake), and the next instrumentation goes there. */
+#define VKR_WAKE_BUCKETS 4
+static const char *const vkr_wake_bucket_name[VKR_WAKE_BUCKETS] = { "<1ms", "1-4ms", "4-16ms",
+                                                                    ">=16ms" };
+static struct {
+   int enabled; /* -1 unknown, 0 off, 1 on */
+   uint64_t last_report_ns;
+   struct {
+      uint64_t count;
+      uint64_t signal_sum, signal_max;
+      uint64_t decode_sum, decode_max;
+      uint64_t lost_signal; /* woke with no recorded cnd_signal (spurious/racy) */
+   } b[VKR_WAKE_BUCKETS];
+} vkr_ring_wake_profile = { .enabled = -1 };
+
+static bool
+vkr_ring_wake_profile_enabled(void)
+{
+   if (vkr_ring_wake_profile.enabled < 0)
+      vkr_ring_wake_profile.enabled = getenv("LIMINA_RING_WAKE_PROFILE") != NULL;
+   return vkr_ring_wake_profile.enabled > 0;
+}
+
+static void
+vkr_ring_wake_profile_add(uint64_t idle_ns, uint64_t signal_ns, uint64_t decode_ns, bool lost)
+{
+   unsigned i = idle_ns < 1000000ull      ? 0
+                : idle_ns < 4000000ull    ? 1
+                : idle_ns < 16000000ull   ? 2
+                                          : 3;
+   vkr_ring_wake_profile.b[i].count++;
+   if (lost) {
+      vkr_ring_wake_profile.b[i].lost_signal++;
+   } else {
+      vkr_ring_wake_profile.b[i].signal_sum += signal_ns;
+      if (signal_ns > vkr_ring_wake_profile.b[i].signal_max)
+         vkr_ring_wake_profile.b[i].signal_max = signal_ns;
+   }
+   vkr_ring_wake_profile.b[i].decode_sum += decode_ns;
+   if (decode_ns > vkr_ring_wake_profile.b[i].decode_max)
+      vkr_ring_wake_profile.b[i].decode_max = decode_ns;
+
+   const uint64_t now = vkr_ring_now();
+   if (!vkr_ring_wake_profile.last_report_ns)
+      vkr_ring_wake_profile.last_report_ns = now;
+   if (now - vkr_ring_wake_profile.last_report_ns < 5000000000ull)
+      return;
+
+   for (unsigned k = 0; k < VKR_WAKE_BUCKETS; k++) {
+      const uint64_t n = vkr_ring_wake_profile.b[k].count;
+      if (!n)
+         continue;
+      const uint64_t sn = n - vkr_ring_wake_profile.b[k].lost_signal;
+      fprintf(stderr,
+              "[RINGWAKE idle %-6s] n=%-5llu signal->resume avg %6.3f ms max %6.3f ms | "
+              "resume->decode avg %6.3f ms max %6.3f ms | lost_signal=%llu\n",
+              vkr_wake_bucket_name[k], (unsigned long long)n,
+              sn ? (double)vkr_ring_wake_profile.b[k].signal_sum / sn / 1e6 : 0.0,
+              (double)vkr_ring_wake_profile.b[k].signal_max / 1e6,
+              (double)vkr_ring_wake_profile.b[k].decode_sum / n / 1e6,
+              (double)vkr_ring_wake_profile.b[k].decode_max / 1e6,
+              (unsigned long long)vkr_ring_wake_profile.b[k].lost_signal);
+   }
+   memset(vkr_ring_wake_profile.b, 0, sizeof(vkr_ring_wake_profile.b));
+   vkr_ring_wake_profile.last_report_ns = now;
+}
 
 static void
 vkr_ring_wake_trace_add(uint64_t *counter)
@@ -544,6 +628,10 @@ vkr_ring_thread(void *arg)
 
          vkr_ring_wake_trace_add(&vkr_ring_wake_trace.parks);
          mtx_lock(&ring->mutex);
+         if (vkr_ring_wake_profile_enabled()) {
+            ring->wake_park_ns = vkr_ring_now();
+            ring->wake_signal_ns = 0;
+         }
          while (ring->started && !ring->pending_notify) {
             /* limina (idle-wakeups): block indefinitely — the seq_cst IDLE-check handshake
              * (vkr_ring_load_tail_seqcst) guarantees the guest observes the IDLE bit and
@@ -559,6 +647,9 @@ vkr_ring_thread(void *arg)
             }
          }
          vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
+         /* Still under the mutex: wake_signal_ns is written there too. */
+         if (vkr_ring_wake_profile_enabled())
+            ring->wake_resume_ns = vkr_ring_now();
          mtx_unlock(&ring->mutex);
 
          if (!ring->started)
@@ -583,6 +674,19 @@ vkr_ring_thread(void *arg)
                     ring->buffer.size);
             ret = -EINVAL;
             break;
+         }
+
+         /* limina wake-chain profile: this is the first command decoded after a park, so
+          * close out the sample here — the interval that matters ends when real work starts,
+          * not when the thread merely became runnable. One sample per park; wake_resume_ns is
+          * cleared so a busy ring's subsequent drains do not count. */
+         if (vkr_ring_wake_profile_enabled() && ring->wake_resume_ns) {
+            const uint64_t resume = ring->wake_resume_ns;
+            const bool lost = ring->wake_signal_ns == 0 || ring->wake_signal_ns < ring->wake_park_ns;
+            vkr_ring_wake_profile_add(resume - ring->wake_park_ns,
+                                      lost ? 0 : resume - ring->wake_signal_ns,
+                                      vkr_ring_now() - resume, lost);
+            ring->wake_resume_ns = 0;
          }
 
          const uint32_t ring_head = ring->buffer.cur;
@@ -664,6 +768,10 @@ vkr_ring_notify(struct vkr_ring *ring)
 {
    mtx_lock(&ring->mutex);
    ring->pending_notify = true;
+   /* limina wake-chain profile: stamp the signal so the ring thread can price its own wake.
+    * Under the mutex, so it cannot race the parked thread's read. */
+   if (vkr_ring_wake_profile_enabled())
+      ring->wake_signal_ns = vkr_ring_now();
    cnd_signal(&ring->cond);
    mtx_unlock(&ring->mutex);
 
