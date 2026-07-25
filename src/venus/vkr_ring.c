@@ -271,8 +271,12 @@ static struct {
 static bool
 vkr_ring_wake_profile_enabled(void)
 {
-   if (vkr_ring_wake_profile.enabled < 0)
-      vkr_ring_wake_profile.enabled = getenv("LIMINA_RING_WAKE_PROFILE") != NULL;
+   if (vkr_ring_wake_profile.enabled < 0) {
+      /* Value-aware, not merely present: the supervisor turns this on by default for the
+       * instrumented build, so "=0" has to be able to turn it back off. */
+      const char *v = getenv("LIMINA_RING_WAKE_PROFILE");
+      vkr_ring_wake_profile.enabled = v && strcmp(v, "0") != 0;
+   }
    return vkr_ring_wake_profile.enabled > 0;
 }
 
