@@ -103,6 +103,15 @@ struct vkr_ring {
    atomic_bool monitor;
    uint64_t virtqueue_seqno;
 
+   /* limina wake-chain profile (LIMINA_RING_WAKE_PROFILE=1). Timestamps of the hops a submit
+    * has to traverse when it lands on a PARKED ring, so the "first submit after an idle gap
+    * costs ~1 ms" effect can be attributed to a hop instead of guessed at. Written only while
+    * profiling is on; `wake_signal_ns` is set on the notifying thread (libkrun's gpu worker),
+    * the rest on the ring thread. */
+   uint64_t wake_park_ns;   /* ring entered cnd_wait */
+   uint64_t wake_signal_ns; /* vkr_ring_notify issued cnd_signal */
+   uint64_t wake_resume_ns; /* ring thread observed the wake and left the park loop */
+
    /* gkvm present-fence barriers (#8): each node waits for the ring thread to
     * decode past `target` (the guest tail at registration), guaranteeing the
     * frame's buffered commands — including its vkQueueSubmit — have executed
