@@ -682,7 +682,12 @@ vkr_ring_thread(void *arg)
           * cleared so a busy ring's subsequent drains do not count. */
          if (vkr_ring_wake_profile_enabled() && ring->wake_resume_ns) {
             const uint64_t resume = ring->wake_resume_ns;
-            const bool lost = ring->wake_signal_ns == 0 || ring->wake_signal_ns < ring->wake_park_ns;
+            /* A stamp outside [park, resume] did not belong to the wake we are closing out:
+             * either there was none (0), it predates the park, or vkr_ring_notify raced in
+             * after the thread was already running. The last case used to fall through to an
+             * unsigned `resume - signal` and print a 1.8e13 ms max. */
+            const bool lost = ring->wake_signal_ns < ring->wake_park_ns ||
+                              ring->wake_signal_ns > resume;
             vkr_ring_wake_profile_add(resume - ring->wake_park_ns,
                                       lost ? 0 : resume - ring->wake_signal_ns,
                                       vkr_ring_now() - resume, lost);
