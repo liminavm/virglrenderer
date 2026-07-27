@@ -140,6 +140,11 @@ struct vkr_journal {
    bool q_stop;
    uint64_t flush_gen_next;
    uint64_t flush_gen_done;
+   /* queue-depth gauge (under q_mutex): current + high-water. Depth at dump
+    * time should be ~0 (dump quiesces first) — the peak is the debug signal
+    * for backlog corner cases (producers outpacing the consumer). */
+   uint32_t q_depth;
+   uint32_t q_depth_peak;
 
    /* decode-thread stat bumps that must not take any lock */
    uint32_t transient_fast; /* p_atomic */
@@ -1285,6 +1290,7 @@ vkr_journal_thread(void *arg)
       struct vkr_journal_msg *m =
          list_first_entry(&j->q, struct vkr_journal_msg, link);
       list_del(&m->link);
+      j->q_depth--;
       mtx_unlock(&j->q_mutex);
 
       vkr_journal_msg_apply(j, m);
@@ -1307,6 +1313,8 @@ vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
    }
    mtx_lock(&j->q_mutex);
    list_addtail(&m->link, &j->q);
+   if (++j->q_depth > j->q_depth_peak)
+      j->q_depth_peak = j->q_depth;
    cnd_signal(&j->q_cond);
    mtx_unlock(&j->q_mutex);
 }
@@ -1326,6 +1334,8 @@ vkr_journal_quiesce(struct vkr_journal *j)
    m->flush_gen = ++j->flush_gen_next;
    const uint64_t gen = m->flush_gen;
    list_addtail(&m->link, &j->q);
+   if (++j->q_depth > j->q_depth_peak)
+      j->q_depth_peak = j->q_depth;
    cnd_signal(&j->q_cond);
    while (j->flush_gen_done < gen)
       cnd_wait(&j->flush_cond, &j->q_mutex);
@@ -1496,16 +1506,27 @@ vkr_journal_dump(struct vkr_journal *j)
    struct vkr_journal_stats merged = j->stats;
    vkr_journal_merge_fast_stats(j, &merged);
    const struct vkr_journal_stats *s = &merged;
+
+   uint32_t q_now = 0, q_peak = 0;
+   if (j->thread_live) {
+      mtx_lock(&j->q_mutex);
+      q_now = j->q_depth;
+      q_peak = j->q_depth_peak;
+      mtx_unlock(&j->q_mutex);
+   }
+
    vkr_log("journal ctx %u: %" PRIu64 " entries (%" PRIu64 " KiB) live; recorded "
            "create=%" PRIu64 " recording=%" PRIu64 " noted=%" PRIu64 " ring=%" PRIu64
            " free=%" PRIu64 " pool_reset=%" PRIu64 "; pruned=%" PRIu64
            " transient=%" PRIu64 " orphan_adds=%" PRIu64 " dropped_fatal=%" PRIu64
-           " noted_multi_key=%" PRIu64 " pinned_refs=%" PRIu64 " pin_ref_misses=%" PRIu64,
+           " noted_multi_key=%" PRIu64 " pinned_refs=%" PRIu64 " pin_ref_misses=%" PRIu64
+           " q_peak=%u q_now=%u dropped_oom=%u",
            j->ctx_id, s->entries_live, s->bytes_live / 1024, s->recorded_creates,
            s->recorded_recordings, s->recorded_noted, s->recorded_ring,
            s->recorded_frees, s->recorded_pool_resets, s->pruned_entries,
            s->transient_cmds, s->orphan_adds, s->dropped_fatal, s->noted_multi_key,
-           s->pinned_refs, s->pin_ref_misses);
+           s->pinned_refs, s->pin_ref_misses, q_peak, q_now,
+           p_atomic_read(&j->dropped_oom_fast));
 
    /* live-create census by VkObjectType — cross-check against the context's
     * object-table tally in vkr_renderer_dump_state */
