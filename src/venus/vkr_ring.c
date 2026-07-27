@@ -390,6 +390,31 @@ vkr_ring_relax(uint32_t *iter, uint32_t warm_rungs)
    const uint32_t warm_sleep_us = 40;  /* responsive plateau: low pickup latency for active rings */
    const uint32_t idle_sleep_us = 640; /* deep-idle backoff: few wakeups on a quiet desktop */
 
+   /* gkvm (2026-07-27, replay-regression A/B, ladder v2): a GRADUATED responsive ladder.
+    * Measured on the F44/4vCPU vehicle (vkmark 3-scene, dylib-swap A/B): shipping ladder
+    * 2148, relax fully OFF (upstream per-iteration) 2365 — ~10% headroom. A 10 us fine
+    * tier alone (v1) recovered only +2.7%: the bigger loss is the plateau's 640 us cliff —
+    * the responsive plateau used to coarsen to 40 us at ~120 us of idle and fall to 640 us
+    * at ~280 us, so any inter-submit gap in the 300-1000 us range (vkmark desktop-scene
+    * territory) paid up to 640 us of pickup error where upstream still polled at 20-40 us.
+    * v2 keeps one-sleep-per-rung (0041's wakeup economy) but grades the RESPONSIVE regime
+    * 12x10 -> 8x20 -> 8x40 -> hold 80 us, never sleeping coarser than 80 us before the
+    * time-based park at idle_timeout. Wakeups-under-load rise toward upstream's (bounded
+    * by command arrival — an interrupted sleep is work, not waste); TRUE idle is protected
+    * by the regime classifier exactly as before: the coarsened plateau (warm_rungs =
+    * warm_min) keeps the old 10 -> 40 -> 640 shape and parking is unchanged. */
+   static uint32_t fine_rungs = 12; /* 10 us rungs (first ~120 us of a gap) */
+   static uint32_t mid_rungs = 8;   /* then 20 us rungs (~280 us) */
+   static int fine_inited = 0;
+   if (!fine_inited) {
+      const char *e;
+      if ((e = getenv("LIMINA_RELAX_FINE_RUNGS")))
+         fine_rungs = (uint32_t)atoi(e);
+      if ((e = getenv("LIMINA_RELAX_MID_RUNGS")))
+         mid_rungs = (uint32_t)atoi(e);
+      fine_inited = 1;
+   }
+
    (*iter)++;
    if (*iter < (1u << busy_wait_order)) {
       thrd_yield();
@@ -399,9 +424,22 @@ vkr_ring_relax(uint32_t *iter, uint32_t warm_rungs)
    vkr_ring_wake_trace_add(&vkr_ring_wake_trace.sleeps);
 
    const uint32_t rung = *iter - (1u << busy_wait_order);
-   const uint32_t us = (rung < warm_rungs)
-                          ? MIN2(base_sleep_us << MIN2(2 * rung, 16), warm_sleep_us)
-                          : idle_sleep_us;
+   uint32_t us;
+   if (warm_rungs > fine_rungs) {
+      /* responsive regime: graduated, capped at 80 us until the park */
+      if (rung == 0 || rung < fine_rungs)
+         us = base_sleep_us;
+      else if (rung < fine_rungs + mid_rungs)
+         us = 20;
+      else if (rung < warm_rungs + mid_rungs)
+         us = warm_sleep_us;
+      else
+         us = 2 * warm_sleep_us;
+   } else {
+      /* coarsened (slack/idle) regime: the original 10 -> 40 -> 640 walk */
+      us = (rung < warm_rungs) ? (rung == 0 ? base_sleep_us : warm_sleep_us)
+                               : idle_sleep_us;
+   }
    const struct timespec ts = {
       .tv_sec = us / 1000000,
       .tv_nsec = (us % 1000000) * 1000,
