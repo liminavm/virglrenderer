@@ -155,15 +155,31 @@ vkr_journal_key_u64_equal(const void *key1, const void *key2)
    return *(const uint64_t *)key1 == *(const uint64_t *)key2;
 }
 
+/* gkvm (2026-07-27, decode-path cost attribution): VKR_JOURNAL=norecord keeps the
+ * journal alive but skips RECORDING-class retention (per-vkCmd* capture into live
+ * command buffers) — snapshot correctness is intentionally SACRIFICED in this mode
+ * (restored command buffers replay empty); it exists ONLY to measure how much of the
+ * journal's hot-path cost is the per-command recording lane. Not a shipping config. */
+static int
+vkr_journal_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *env = getenv("VKR_JOURNAL");
+      if (env && env[0] == '0')
+         mode = 0;
+      else if (env && !strcmp(env, "norecord"))
+         mode = 2;
+      else
+         mode = 1;
+   }
+   return mode;
+}
+
 bool
 vkr_journal_enabled(void)
 {
-   static int enabled = -1;
-   if (enabled < 0) {
-      const char *env = getenv("VKR_JOURNAL");
-      enabled = !(env && env[0] == '0');
-   }
-   return enabled;
+   return vkr_journal_mode() != 0;
 }
 
 /* --- classification table (built once; effect-driven classes override) --- */
@@ -704,6 +720,12 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
 
    const uint8_t klass_flags = vkr_journal_classify(cmd_type);
    const uint8_t klass = klass_flags & VKR_JOURNAL_CLASS_MASK;
+
+   /* attribution mode: drop the RECORDING lane before it touches the mutex */
+   if (klass == VKR_JOURNAL_RECORDING && !frame->ncreated && vkr_journal_mode() == 2) {
+      vkr_journal_frame_free(frame);
+      return;
+   }
 
    mtx_lock(&j->mutex);
 
