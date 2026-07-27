@@ -12,6 +12,8 @@
 #include <string.h>
 
 #define XXH_INLINE_ALL
+#include "util/u_atomic.h"
+#include "util/u_thread.h"
 #include "util/xxhash.h"
 
 #include "vkr_common.h"
@@ -42,9 +44,20 @@ enum vkr_journal_class {
 #define VKR_JOURNAL_CLASS_MASK 0x7f
 
 struct vkr_journal_entry;
+struct vkr_journal_msg;
 
 static bool
 vkr_journal_u64_append(uint64_t **arr, uint32_t *n, uint32_t *cap, uint64_t v);
+static int
+vkr_journal_thread(void *arg);
+static void
+vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m);
+static void
+vkr_journal_msg_apply(struct vkr_journal *j, struct vkr_journal_msg *m);
+static void
+vkr_journal_msg_free(struct vkr_journal_msg *m);
+static void
+vkr_journal_quiesce(struct vkr_journal *j);
 
 struct vkr_journal_keynode {
    uint64_t id;
@@ -106,6 +119,78 @@ struct vkr_journal {
    struct hash_table *keys; /* &keynode->id -> keynode */
    uint64_t seq_next;
    struct vkr_journal_stats stats;
+
+   /* limina (2026-07-27, two-lane journal): retention runs on a per-journal consumer
+    * thread, OFF the decode path. The decode threads (context + rings) only classify,
+    * copy the command payload once, and push a message; every hash/list/pin/prune walk
+    * happens here. Motivation: the compositor session correlated presentation misses
+    * with DRAW COUNT at fixed GPU time (present-misses.md §17.3, partial rho +0.807),
+    * and per-vkCmd retention on the decode thread is exactly a per-draw host cost.
+    * Ordering: every producer is serialized by the push mutex and messages are applied
+    * strictly in queue order, which preserves each decode thread's program order —
+    * cross-ring interleaving was arbitrary under the old shared mutex too. Sync
+    * readers (export/seq/stats/dump — snapshot-time, quiesced VM) drain the queue
+    * first via vkr_journal_quiesce(). */
+   mtx_t q_mutex;
+   cnd_t q_cond;
+   cnd_t flush_cond;
+   struct list_head q; /* vkr_journal_msg.link */
+   thrd_t thread;
+   bool thread_live;
+   bool q_stop;
+   uint64_t flush_gen_next;
+   uint64_t flush_gen_done;
+
+   /* decode-thread stat bumps that must not take any lock */
+   uint32_t transient_fast; /* p_atomic */
+   uint32_t orphan_adds_fast;
+   uint32_t dropped_fatal_fast;
+   uint32_t dropped_oom_fast;
+};
+
+enum vkr_journal_msg_type {
+   VKR_JOURNAL_MSG_INSERT = 0,
+   VKR_JOURNAL_MSG_PRUNE_KEY,
+   VKR_JOURNAL_MSG_PIN,
+   VKR_JOURNAL_MSG_UNPIN,
+   VKR_JOURNAL_MSG_FLUSH,
+};
+
+/* one captured command (or key op), produced on a decode thread, consumed in order
+ * by the journal thread. All pointer fields are OWNED by the message. */
+struct vkr_journal_msg {
+   struct list_head link;
+   uint8_t type;
+
+   /* INSERT */
+   uint8_t klass; /* insert class (already routed by the producer) */
+   uint16_t cmd_type;
+   uint32_t size;
+   uint8_t *data;
+   uint32_t nkeys;
+   uint64_t *keys;
+   VkObjectType *key_types; /* CREATE only */
+   uint32_t naux;
+   uint64_t *aux;
+   /* CREATE-closure pinning inputs (moved out of the dispatch frame; the
+    * created-id dedupe set is m->keys itself) */
+   uint32_t nrefs;
+   uint64_t *refs;
+   /* ids removed during the dispatch — pruned before the insert */
+   uint32_t nremoved;
+   uint64_t *removed;
+   /* drop-before-insert (RESETS_PRIOR begin/reset, RING_STREAM latest-wins) */
+   bool drop_first;
+   uint8_t drop_klass;
+   int32_t drop_cmd_type; /* -1 = any */
+   uint64_t drop_key;
+
+   /* PRUNE_KEY / PIN / UNPIN */
+   uint64_t id;
+   uint64_t dep_id;
+
+   /* FLUSH */
+   uint64_t flush_gen;
 };
 
 /* per-dispatch recording frame; a stack because vkExecuteCommandStreamsMESA
@@ -129,9 +214,12 @@ struct vkr_journal_frame {
    uint64_t *refs;
    uint32_t nrefs, refs_cap;
 
-   /* keys whose prune this command deferred (pinned; see vkr_journal_keynode) */
-   uint64_t *deferred;
-   uint32_t ndeferred, deferred_cap;
+   /* object ids removed during this dispatch (vkr_journal_object_removed);
+    * pruned by the consumer BEFORE the command's own insert. A prune the
+    * consumer defers (pinned key; see vkr_journal_keynode) retains this
+    * command NOTED-keyed by the pinned id — decided there, not here. */
+   uint64_t *removed;
+   uint32_t nremoved, removed_cap;
 
    bool have_free;
    uint64_t free_pool;
@@ -256,6 +344,18 @@ vkr_journal_create(uint32_t ctx_id)
    }
    j->seq_next = 1;
 
+   list_inithead(&j->q);
+   if (mtx_init(&j->q_mutex, mtx_plain) != thrd_success ||
+       cnd_init(&j->q_cond) != thrd_success || cnd_init(&j->flush_cond) != thrd_success ||
+       thrd_create(&j->thread, vkr_journal_thread, j) != thrd_success) {
+      /* no consumer: fall back to fully-synchronous application at push time
+       * (vkr_journal_push applies inline when !thread_live) — correct, just slow */
+      vkr_log("journal(ctx %u): consumer thread unavailable, applying inline",
+              ctx_id);
+   } else {
+      j->thread_live = true;
+   }
+
    return j;
 }
 
@@ -321,6 +421,23 @@ vkr_journal_destroy(struct vkr_journal *j)
 {
    if (!j)
       return;
+
+   if (j->thread_live) {
+      mtx_lock(&j->q_mutex);
+      j->q_stop = true;
+      cnd_signal(&j->q_cond);
+      mtx_unlock(&j->q_mutex);
+      thrd_join(j->thread, NULL);
+      /* consumer drained the queue before exiting; free anything left (it only
+       * leaves messages behind if it never ran) */
+      list_for_each_entry_safe (struct vkr_journal_msg, m, &j->q, link) {
+         list_del(&m->link);
+         vkr_journal_msg_free(m);
+      }
+      mtx_destroy(&j->q_mutex);
+      cnd_destroy(&j->q_cond);
+      cnd_destroy(&j->flush_cond);
+   }
 
    list_for_each_entry_safe (struct vkr_journal_entry, e, &j->entries, link) {
       list_del(&e->link);
@@ -405,6 +522,10 @@ vkr_journal_insert_locked(struct vkr_journal *j,
 {
    const uint8_t klass = klass_flags & VKR_JOURNAL_CLASS_MASK;
 
+   /* two-lane journal: `data`, `key_types` and `aux` arrive as OWNED buffers from the
+    * message (the producer already made the one payload copy on the decode thread);
+    * on success their ownership moves into the entry, on NULL return the caller keeps
+    * it (vkr_journal_msg_free). `keys` stays read-only. */
    struct vkr_journal_entry *e = calloc(1, sizeof(*e));
    if (!e)
       return NULL;
@@ -412,31 +533,20 @@ vkr_journal_insert_locked(struct vkr_journal *j,
    e->cmd_type = cmd_type;
    e->klass = klass;
    e->size = size;
-   e->data = malloc(size);
-   if (!e->data) {
-      free(e);
-      return NULL;
-   }
-   memcpy(e->data, data, size);
+   e->data = (uint8_t *)data;
 
    if (nkeys) {
       e->refs = calloc(nkeys, sizeof(*e->refs));
       if (!e->refs) {
-         vkr_journal_entry_free_data(e);
+         j->seq_next--;
+         free(e);
          return NULL;
       }
-      if (key_types) {
-         e->key_types = malloc(nkeys * sizeof(*e->key_types));
-         if (e->key_types)
-            memcpy(e->key_types, key_types, nkeys * sizeof(*e->key_types));
-      }
+      e->key_types = (VkObjectType *)key_types;
    }
    if (naux && aux) {
-      e->aux = malloc(naux * sizeof(*e->aux));
-      if (e->aux) {
-         memcpy(e->aux, aux, naux * sizeof(*e->aux));
-         e->naux = naux;
-      }
+      e->aux = (uint64_t *)aux;
+      e->naux = naux;
    }
 
    for (uint32_t i = 0; i < nkeys; i++) {
@@ -490,22 +600,25 @@ vkr_journal_insert_locked(struct vkr_journal *j,
 static void
 vkr_journal_pin_refs_locked(struct vkr_journal *j,
                             struct vkr_journal_entry *e,
-                            const struct vkr_journal_frame *frame)
+                            const uint64_t *refs,
+                            uint32_t nrefs,
+                            const uint64_t *created,
+                            uint32_t ncreated)
 {
-   if (!frame->nrefs)
+   if (!nrefs)
       return;
-   uint64_t *pins = malloc(frame->nrefs * sizeof(*pins));
+   uint64_t *pins = malloc(nrefs * sizeof(*pins));
    if (!pins)
       return; /* unpinned refs degrade to the pre-fix (drop-at-replay) behavior */
 
    uint32_t n = 0;
-   for (uint32_t i = 0; i < frame->nrefs; i++) {
-      const uint64_t id = frame->refs[i];
+   for (uint32_t i = 0; i < nrefs; i++) {
+      const uint64_t id = refs[i];
       bool skip = false;
       for (uint32_t k = 0; k < n && !skip; k++)
          skip = pins[k] == id; /* dedupe (creates reference few distinct ids) */
-      for (uint32_t k = 0; k < frame->ncreated && !skip; k++)
-         skip = frame->created[k] == id;
+      for (uint32_t k = 0; k < ncreated && !skip; k++)
+         skip = created[k] == id;
       if (skip)
          continue;
       struct hash_entry *he = _mesa_hash_table_search(j->keys, &id);
@@ -583,19 +696,10 @@ vkr_journal_prune_key(struct vkr_journal *j, uint64_t id)
    struct vkr_journal_fires fires = { 0 };
 
    mtx_lock(&j->mutex);
-   const bool deferred = vkr_journal_prune_one_locked(j, id, &fires);
+   vkr_journal_prune_one_locked(j, id, &fires);
    vkr_journal_prune_fires_locked(j, &fires);
    mtx_unlock(&j->mutex);
    free(fires.ids);
-
-   if (deferred) {
-      /* retain the pruning command (frame active ⇒ we are mid-dispatch of the
-       * free on this thread) so replay re-runs it after the dependent create */
-      struct vkr_journal_frame *frame = vkr_journal_frame_cur;
-      if (frame && frame->j == j)
-         vkr_journal_u64_append(&frame->deferred, &frame->ndeferred,
-                                &frame->deferred_cap, id);
-   }
 }
 
 /* --- TLS frame helpers --- */
@@ -624,6 +728,12 @@ vkr_journal_from_dispatch(struct vn_dispatch_context *dctx)
    return ctx ? ctx->journal : NULL;
 }
 
+/* two-lane journal: frames are REUSED via a per-thread freelist (chained through
+ * ->parent) so the per-command decode-path cost is pointer swaps, not calloc/free.
+ * Arrays keep their grown capacity across reuse; ownership-transferred arrays are
+ * nulled before the frame is pooled. */
+static _Thread_local struct vkr_journal_frame *vkr_journal_frame_pool;
+
 void
 vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
 {
@@ -631,7 +741,11 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
    if (!j)
       return;
 
-   struct vkr_journal_frame *frame = calloc(1, sizeof(*frame));
+   struct vkr_journal_frame *frame = vkr_journal_frame_pool;
+   if (frame)
+      vkr_journal_frame_pool = frame->parent;
+   else
+      frame = calloc(1, sizeof(*frame));
    if (!frame)
       return; /* post_dispatch tolerates a missing frame */
 
@@ -646,13 +760,20 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
 static void
 vkr_journal_frame_free(struct vkr_journal_frame *frame)
 {
-   free(frame->created);
-   free(frame->created_types);
-   free(frame->noted);
-   free(frame->refs);
-   free(frame->deferred);
-   free(frame->freed);
-   free(frame);
+   /* reset counters, keep array capacity, return to the per-thread pool */
+   frame->ncreated = 0;
+   frame->nnoted = 0;
+   frame->nrefs = 0;
+   frame->nremoved = 0;
+   frame->nfreed = 0;
+   frame->have_free = false;
+   frame->free_pool = 0;
+   frame->j = NULL;
+   frame->ctx = NULL;
+   frame->dctx = NULL;
+   frame->start = NULL;
+   frame->parent = vkr_journal_frame_pool;
+   vkr_journal_frame_pool = frame;
 }
 
 /* limina snapshot-replay: called from vkr_cs_decoder_lookup_object on every
@@ -694,6 +815,26 @@ vkr_journal_ring_id(struct vkr_context *ctx, struct vn_dispatch_context *dctx)
    return id;
 }
 
+/* hand a dropped frame's in-dispatch removals to the consumer anyway — the
+ * prunes must happen even when the command itself is not retained */
+static void
+vkr_journal_flush_removed(struct vkr_journal *j, struct vkr_journal_frame *frame)
+{
+   if (!frame->nremoved)
+      return;
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      return;
+   }
+   m->type = VKR_JOURNAL_MSG_PRUNE_KEY;
+   m->removed = frame->removed;
+   m->nremoved = frame->nremoved;
+   frame->removed = NULL;
+   frame->nremoved = frame->removed_cap = 0;
+   vkr_journal_push(j, m);
+}
+
 void
 vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd_type)
 {
@@ -710,9 +851,8 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
    const uint8_t *end = dec->cur;
 
    if (vkr_cs_decoder_get_fatal(dec) || end <= frame->start) {
-      mtx_lock(&j->mutex);
-      j->stats.dropped_fatal++;
-      mtx_unlock(&j->mutex);
+      p_atomic_inc(&j->dropped_fatal_fast);
+      vkr_journal_flush_removed(j, frame);
       vkr_journal_frame_free(frame);
       return;
    }
@@ -721,98 +861,172 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
    const uint8_t klass_flags = vkr_journal_classify(cmd_type);
    const uint8_t klass = klass_flags & VKR_JOURNAL_CLASS_MASK;
 
-   /* attribution mode: drop the RECORDING lane before it touches the mutex */
+   /* attribution mode: drop the RECORDING lane before any capture work */
    if (klass == VKR_JOURNAL_RECORDING && !frame->ncreated && vkr_journal_mode() == 2) {
+      vkr_journal_flush_removed(j, frame);
       vkr_journal_frame_free(frame);
       return;
    }
 
-   mtx_lock(&j->mutex);
+   /* two-lane journal, decode-thread lane: the fast path — the overwhelmingly common
+    * transient command retains nothing and touches NO lock, queue, or allocator. */
+   if (klass == VKR_JOURNAL_TRANSIENT && !frame->ncreated && !frame->nremoved) {
+      p_atomic_inc(&j->transient_fast);
+      vkr_journal_frame_free(frame);
+      return;
+   }
 
+   /* everything else: capture (one payload copy + ownership transfer of the frame's
+    * arrays) into a message; retention happens on the journal thread in queue order */
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      vkr_journal_frame_free(frame);
+      return;
+   }
+   m->type = VKR_JOURNAL_MSG_INSERT;
+   m->cmd_type = cmd_type;
+   m->size = size;
+   m->data = malloc(size);
+   if (!m->data) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      free(m);
+      vkr_journal_frame_free(frame);
+      return;
+   }
+   memcpy(m->data, frame->start, size);
+
+   bool retain = false;
    if (frame->ncreated) {
-      /* effect-driven: this command built objects — retain keyed by them all,
-       * pinning the creates of every object its args reference (closure) */
-      struct vkr_journal_entry *e = vkr_journal_insert_locked(
-         j, VKR_JOURNAL_CREATE, cmd_type, frame->start, size, frame->created,
-         frame->created_types, frame->ncreated, NULL, 0);
-      if (e)
-         vkr_journal_pin_refs_locked(j, e, frame);
+      /* effect-driven CREATE: keyed by every added id; the frame's created/refs
+       * arrays move into the message (created ids double as the pin-dedupe set) */
+      m->klass = VKR_JOURNAL_CREATE;
+      m->keys = frame->created;
+      m->key_types = frame->created_types;
+      m->nkeys = frame->ncreated;
+      m->refs = frame->refs;
+      m->nrefs = frame->nrefs;
+      frame->created = NULL;
+      frame->created_types = NULL;
+      frame->ncreated = frame->created_cap = 0;
+      frame->refs = NULL;
+      frame->nrefs = frame->refs_cap = 0;
+      retain = true;
    } else {
       switch (klass) {
       case VKR_JOURNAL_RECORDING: {
          uint64_t cmd_buf;
-         if (vkr_journal_peek_u64(frame->start, size, 8, &cmd_buf)) {
-            if (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR)
-               vkr_journal_drop_on_key_locked(j, cmd_buf, VKR_JOURNAL_RECORDING, -1);
-            vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size, &cmd_buf,
-                                      NULL, 1, NULL, 0);
+         if (vkr_journal_peek_u64(m->data, size, 8, &cmd_buf)) {
+            m->klass = klass;
+            m->keys = malloc(sizeof(*m->keys));
+            if (m->keys) {
+               m->keys[0] = cmd_buf;
+               m->nkeys = 1;
+               if (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR) {
+                  m->drop_first = true;
+                  m->drop_klass = VKR_JOURNAL_RECORDING;
+                  m->drop_cmd_type = -1;
+                  m->drop_key = cmd_buf;
+               }
+               retain = true;
+            }
          }
          break;
       }
       case VKR_JOURNAL_NOTED:
          if (frame->nnoted) {
-            if (frame->nnoted > 1)
-               j->stats.noted_multi_key++;
-            vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size,
-                                      frame->noted, NULL, frame->nnoted, NULL, 0);
+            m->klass = klass;
+            m->keys = frame->noted;
+            m->nkeys = frame->nnoted;
+            frame->noted = NULL;
+            frame->nnoted = frame->noted_cap = 0;
+            retain = true;
          }
          break;
       case VKR_JOURNAL_FREE:
-         if (frame->have_free)
-            vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size,
-                                      &frame->free_pool, NULL, 1, frame->freed,
-                                      frame->nfreed);
+         if (frame->have_free) {
+            m->klass = klass;
+            m->keys = malloc(sizeof(*m->keys));
+            if (m->keys) {
+               m->keys[0] = frame->free_pool;
+               m->nkeys = 1;
+               m->aux = frame->freed;
+               m->naux = frame->nfreed;
+               frame->freed = NULL;
+               frame->nfreed = frame->freed_cap = 0;
+               retain = true;
+            }
+         }
          break;
-      case VKR_JOURNAL_POOL_RESET: {
-         uint64_t pool;
-         if (vkr_journal_peek_u64(frame->start, size, 16, &pool))
-            vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size, &pool,
-                                      NULL, 1, NULL, 0);
-         break;
-      }
+      case VKR_JOURNAL_POOL_RESET:
       case VKR_JOURNAL_RING_CREATE: {
-         uint64_t ring;
-         if (vkr_journal_peek_u64(frame->start, size, 8, &ring))
-            vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size, &ring,
-                                      NULL, 1, NULL, 0);
+         uint64_t key;
+         const size_t off = (klass == VKR_JOURNAL_POOL_RESET) ? 16 : 8;
+         if (vkr_journal_peek_u64(m->data, size, off, &key)) {
+            m->klass = klass;
+            m->keys = malloc(sizeof(*m->keys));
+            if (m->keys) {
+               m->keys[0] = key;
+               m->nkeys = 1;
+               retain = true;
+            }
+         }
          break;
       }
       case VKR_JOURNAL_RING_DESTROY: {
          uint64_t ring;
-         mtx_unlock(&j->mutex);
-         if (vkr_journal_peek_u64(frame->start, size, 8, &ring))
-            vkr_journal_prune_key(j, ring);
-         goto out_free;
+         if (vkr_journal_peek_u64(m->data, size, 8, &ring)) {
+            m->type = VKR_JOURNAL_MSG_PRUNE_KEY;
+            m->id = ring;
+            free(m->data);
+            m->data = NULL;
+            m->size = 0;
+            retain = true;
+         }
+         break;
       }
       case VKR_JOURNAL_RING_STREAM: {
-         mtx_unlock(&j->mutex);
          const uint64_t ring = vkr_journal_ring_id(frame->ctx, dctx);
-         mtx_lock(&j->mutex);
-         vkr_journal_drop_on_key_locked(j, ring, VKR_JOURNAL_RING_STREAM, cmd_type);
-         vkr_journal_insert_locked(j, klass, cmd_type, frame->start, size, &ring, NULL,
-                                   1, NULL, 0);
+         m->klass = klass;
+         m->keys = malloc(sizeof(*m->keys));
+         if (m->keys) {
+            m->keys[0] = ring;
+            m->nkeys = 1;
+            m->drop_first = true;
+            m->drop_klass = VKR_JOURNAL_RING_STREAM;
+            m->drop_cmd_type = (int32_t)cmd_type;
+            m->drop_key = ring;
+            retain = true;
+         }
          break;
       }
       default:
-         if (frame->ndeferred) {
-            /* this (otherwise transient) command pruned a pinned key — e.g.
-             * vkFreeMemory of a blob-exported memory. Retain it keyed by the
-             * pinned id: replay re-runs it after the blob create (its seq is
-             * greater than the blob's record fence), and the final prune at
-             * unpin kills it together with the alloc entry. */
-            vkr_journal_insert_locked(j, VKR_JOURNAL_NOTED, cmd_type, frame->start,
-                                      size, frame->deferred, NULL, frame->ndeferred,
-                                      NULL, 0);
-         } else {
-            j->stats.transient_cmds++;
-         }
+         /* transient that removed objects (we're only here when nremoved != 0
+          * — see the fast path). Whether it is retained is the consumer's
+          * call: a prune deferred by a pin — e.g. vkFreeMemory of a
+          * blob-exported memory — retains this command NOTED-keyed by the
+          * pinned id, so replay re-runs it after the blob create and the
+          * final prune at unpin kills it together with the alloc entry. */
+         m->klass = VKR_JOURNAL_TRANSIENT;
          break;
       }
    }
 
-   mtx_unlock(&j->mutex);
+   /* in-dispatch object removals ride the same message; the consumer prunes
+    * them (in queue order, so after the creates they refer to) BEFORE the
+    * insert — matching the old in-dispatch prune timing */
+   if (frame->nremoved) {
+      m->removed = frame->removed;
+      m->nremoved = frame->nremoved;
+      frame->removed = NULL;
+      frame->nremoved = frame->removed_cap = 0;
+      retain = true;
+   }
 
-out_free:
+   if (retain)
+      vkr_journal_push(j, m);
+   else
+      vkr_journal_msg_free(m);
    vkr_journal_frame_free(frame);
 }
 
@@ -827,9 +1041,7 @@ vkr_journal_object_added(struct vkr_context *ctx, uint64_t id, VkObjectType type
 
    struct vkr_journal_frame *frame = vkr_journal_frame_cur;
    if (!frame || frame->j != j) {
-      mtx_lock(&j->mutex);
-      j->stats.orphan_adds++;
-      mtx_unlock(&j->mutex);
+      p_atomic_inc(&j->orphan_adds_fast);
       return;
    }
 
@@ -853,7 +1065,25 @@ vkr_journal_object_removed(struct vkr_context *ctx, uint64_t id)
    struct vkr_journal *j = ctx->journal;
    if (!j)
       return;
-   vkr_journal_prune_key(j, id);
+
+   /* mid-dispatch: just record the id in the frame — the prune rides the
+    * command's own message and runs on the consumer, in queue order (so
+    * after the queued create it refers to). No lock on the decode path. */
+   struct vkr_journal_frame *frame = vkr_journal_frame_cur;
+   if (frame && frame->j == j) {
+      vkr_journal_u64_append(&frame->removed, &frame->nremoved, &frame->removed_cap,
+                             id);
+      return;
+   }
+
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      return;
+   }
+   m->type = VKR_JOURNAL_MSG_PRUNE_KEY;
+   m->id = id;
+   vkr_journal_push(j, m);
 }
 
 /* limina snapshot-replay: see the pin comment on vkr_journal_keynode. Returns
@@ -882,13 +1112,19 @@ vkr_journal_pin_key(struct vkr_context *ctx, uint64_t id, uint64_t dep_id)
    if (!j)
       return false;
 
-   mtx_lock(&j->mutex);
-   const bool ok = vkr_journal_pin_one_locked(j, id, dep_id);
-   /* the dedicated object rides the memory's pin lifetime */
-   if (ok && dep_id)
-      vkr_journal_pin_one_locked(j, dep_id, 0);
-   mtx_unlock(&j->mutex);
-   return ok;
+   /* applied on the consumer in queue order — after the queued create of the
+    * pinned key. The return value only says "the pin is on its way" (both
+    * call sites ignore it); a pin MISS is logged by the consumer. */
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      return false;
+   }
+   m->type = VKR_JOURNAL_MSG_PIN;
+   m->id = id;
+   m->dep_id = dep_id;
+   vkr_journal_push(j, m);
+   return true;
 }
 
 static void
@@ -921,10 +1157,179 @@ vkr_journal_unpin_key(struct vkr_context *ctx, uint64_t id)
    if (!j)
       return;
 
-   uint64_t dep_id = 0;
-   vkr_journal_unpin_one(j, id, &dep_id);
-   if (dep_id)
-      vkr_journal_unpin_one(j, dep_id, NULL);
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m) {
+      p_atomic_inc(&j->dropped_oom_fast);
+      return;
+   }
+   m->type = VKR_JOURNAL_MSG_UNPIN;
+   m->id = id;
+   vkr_journal_push(j, m);
+}
+
+/* --- the consumer lane (two-lane journal) ------------------------------------------
+ * Everything below applies messages IN QUEUE ORDER on the journal thread; the only
+ * other holders of j->mutex are the quiesced snapshot-time readers. */
+
+static void
+vkr_journal_msg_free(struct vkr_journal_msg *m)
+{
+   free(m->data);
+   free(m->keys);
+   free(m->key_types);
+   free(m->aux);
+   free(m->refs);
+   free(m->removed);
+   free(m);
+}
+
+static void
+vkr_journal_msg_apply(struct vkr_journal *j, struct vkr_journal_msg *m)
+{
+   switch (m->type) {
+   case VKR_JOURNAL_MSG_INSERT: {
+      mtx_lock(&j->mutex);
+
+      /* in-dispatch removals first (the old code pruned them mid-dispatch,
+       * before the command's own retention). A prune deferred by a pin
+       * retains an otherwise-transient command keyed by the pinned id. */
+      uint64_t *def = NULL;
+      uint32_t ndef = 0, defcap = 0;
+      if (m->nremoved) {
+         struct vkr_journal_fires fires = { 0 };
+         for (uint32_t i = 0; i < m->nremoved; i++) {
+            if (vkr_journal_prune_one_locked(j, m->removed[i], &fires))
+               vkr_journal_u64_append(&def, &ndef, &defcap, m->removed[i]);
+         }
+         vkr_journal_prune_fires_locked(j, &fires);
+         free(fires.ids);
+      }
+      if (!m->nkeys && ndef && m->klass == VKR_JOURNAL_TRANSIENT) {
+         /* e.g. vkFreeMemory of a blob-exported memory: retain it so replay
+          * re-runs it after the blob create (its seq is greater than the
+          * blob's record fence); the final prune at unpin kills it together
+          * with the alloc entry */
+         m->klass = VKR_JOURNAL_NOTED;
+         m->keys = def;
+         m->nkeys = ndef;
+         def = NULL;
+      }
+      free(def);
+
+      if (m->drop_first)
+         vkr_journal_drop_on_key_locked(j, m->drop_key, m->drop_klass, m->drop_cmd_type);
+
+      if (m->nkeys) {
+         if (m->klass == VKR_JOURNAL_NOTED && m->nkeys > 1)
+            j->stats.noted_multi_key++;
+         struct vkr_journal_entry *e =
+            vkr_journal_insert_locked(j, m->klass, m->cmd_type, m->data, m->size,
+                                      m->keys, m->key_types, m->nkeys, m->aux, m->naux);
+         if (e) {
+            /* data/key_types/aux ownership moved into the entry */
+            m->data = NULL;
+            m->key_types = NULL;
+            m->aux = NULL;
+            if (m->nrefs)
+               vkr_journal_pin_refs_locked(j, e, m->refs, m->nrefs, m->keys, m->nkeys);
+         }
+      } else if (m->klass == VKR_JOURNAL_TRANSIENT) {
+         j->stats.transient_cmds++;
+      }
+
+      mtx_unlock(&j->mutex);
+      break;
+   }
+   case VKR_JOURNAL_MSG_PRUNE_KEY:
+      if (m->id)
+         vkr_journal_prune_key(j, m->id);
+      for (uint32_t i = 0; i < m->nremoved; i++)
+         vkr_journal_prune_key(j, m->removed[i]);
+      break;
+   case VKR_JOURNAL_MSG_PIN:
+      mtx_lock(&j->mutex);
+      if (vkr_journal_pin_one_locked(j, m->id, m->dep_id) && m->dep_id)
+         vkr_journal_pin_one_locked(j, m->dep_id, 0);
+      mtx_unlock(&j->mutex);
+      break;
+   case VKR_JOURNAL_MSG_UNPIN: {
+      uint64_t dep_id = 0;
+      vkr_journal_unpin_one(j, m->id, &dep_id);
+      if (dep_id)
+         vkr_journal_unpin_one(j, dep_id, NULL);
+      break;
+   }
+   case VKR_JOURNAL_MSG_FLUSH:
+      mtx_lock(&j->q_mutex);
+      j->flush_gen_done = m->flush_gen;
+      cnd_broadcast(&j->flush_cond);
+      mtx_unlock(&j->q_mutex);
+      break;
+   default:
+      break;
+   }
+}
+
+static int
+vkr_journal_thread(void *arg)
+{
+   struct vkr_journal *j = arg;
+   u_thread_setname("vkr-journal");
+
+   mtx_lock(&j->q_mutex);
+   while (true) {
+      while (list_is_empty(&j->q) && !j->q_stop)
+         cnd_wait(&j->q_cond, &j->q_mutex);
+      if (list_is_empty(&j->q) && j->q_stop)
+         break;
+      struct vkr_journal_msg *m =
+         list_first_entry(&j->q, struct vkr_journal_msg, link);
+      list_del(&m->link);
+      mtx_unlock(&j->q_mutex);
+
+      vkr_journal_msg_apply(j, m);
+      vkr_journal_msg_free(m);
+
+      mtx_lock(&j->q_mutex);
+   }
+   mtx_unlock(&j->q_mutex);
+   return 0;
+}
+
+static void
+vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
+{
+   if (!j->thread_live) {
+      /* no consumer (thread creation failed): apply inline, original behavior */
+      vkr_journal_msg_apply(j, m);
+      vkr_journal_msg_free(m);
+      return;
+   }
+   mtx_lock(&j->q_mutex);
+   list_addtail(&m->link, &j->q);
+   cnd_signal(&j->q_cond);
+   mtx_unlock(&j->q_mutex);
+}
+
+/* drain the queue: on return every message pushed before the call is applied.
+ * Callers are the snapshot-time readers (export/seq/stats/dump) on a quiesced VM. */
+static void
+vkr_journal_quiesce(struct vkr_journal *j)
+{
+   if (!j->thread_live)
+      return;
+   struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+   if (!m)
+      return;
+   m->type = VKR_JOURNAL_MSG_FLUSH;
+   mtx_lock(&j->q_mutex);
+   m->flush_gen = ++j->flush_gen_next;
+   const uint64_t gen = m->flush_gen;
+   list_addtail(&m->link, &j->q);
+   cnd_signal(&j->q_cond);
+   while (j->flush_gen_done < gen)
+      cnd_wait(&j->flush_cond, &j->q_mutex);
+   mtx_unlock(&j->q_mutex);
 }
 
 /* --- in-handler attribution --- */
@@ -975,17 +1380,33 @@ vkr_journal_note_free(struct vkr_context *ctx,
 
 /* --- stats / census --- */
 
+/* fold the decode-thread atomic counters into a stats copy */
+static void
+vkr_journal_merge_fast_stats(struct vkr_journal *j, struct vkr_journal_stats *out)
+{
+   out->transient_cmds += p_atomic_read(&j->transient_fast);
+   out->orphan_adds += p_atomic_read(&j->orphan_adds_fast);
+   out->dropped_fatal += p_atomic_read(&j->dropped_fatal_fast);
+   /* OOM-dropped messages have no dedicated stats field (the struct crosses
+    * into libkrun); count them with the fatal drops — both mean "a command
+    * the journal failed to consider" */
+   out->dropped_fatal += p_atomic_read(&j->dropped_oom_fast);
+}
+
 void
 vkr_journal_get_stats(struct vkr_journal *j, struct vkr_journal_stats *out)
 {
+   vkr_journal_quiesce(j);
    mtx_lock(&j->mutex);
    *out = j->stats;
    mtx_unlock(&j->mutex);
+   vkr_journal_merge_fast_stats(j, out);
 }
 
 uint64_t
 vkr_journal_seq(struct vkr_journal *j)
 {
+   vkr_journal_quiesce(j);
    mtx_lock(&j->mutex);
    const uint64_t seq = j->seq_next - 1;
    mtx_unlock(&j->mutex);
@@ -995,6 +1416,7 @@ vkr_journal_seq(struct vkr_journal *j)
 bool
 vkr_journal_export(struct vkr_journal *j, void **out_buf, size_t *out_size)
 {
+   vkr_journal_quiesce(j);
    mtx_lock(&j->mutex);
 
    size_t total = 4 * sizeof(uint32_t);
@@ -1068,9 +1490,12 @@ vkr_journal_dump(struct vkr_journal *j)
       return;
    }
 
+   vkr_journal_quiesce(j);
    mtx_lock(&j->mutex);
 
-   const struct vkr_journal_stats *s = &j->stats;
+   struct vkr_journal_stats merged = j->stats;
+   vkr_journal_merge_fast_stats(j, &merged);
+   const struct vkr_journal_stats *s = &merged;
    vkr_log("journal ctx %u: %" PRIu64 " entries (%" PRIu64 " KiB) live; recorded "
            "create=%" PRIu64 " recording=%" PRIu64 " noted=%" PRIu64 " ring=%" PRIu64
            " free=%" PRIu64 " pool_reset=%" PRIu64 "; pruned=%" PRIu64
