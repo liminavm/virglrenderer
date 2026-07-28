@@ -115,12 +115,12 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
    struct object_array arr;
 
    if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS) {
-      if (getenv("GKVM_KK_RTLOG"))
+      if (vkr_kk_rtlog())
          vkr_log("[CMD] CreateGraphicsPipelines FAILED ret=%d", args->ret);
       return;
    }
 
-   if (getenv("GKVM_KK_RTLOG")) {
+   if (vkr_kk_rtlog()) {
       vkr_log("[CMD] CreateGraphicsPipelines count=%u ret=%d", args->createInfoCount,
               args->ret);
       for (uint32_t i = 0; i < args->createInfoCount; i++) {
@@ -146,7 +146,7 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
       }
    }
    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
-   if (getenv("GKVM_KK_RTLOG")) {
+   if (vkr_kk_rtlog()) {
       for (uint32_t i = 0; i < args->createInfoCount; i++)
          vkr_log("[CMD]   gp[%u] guest-handle=%p", i,
                  (void *)(uintptr_t)args->pPipelines[i]);

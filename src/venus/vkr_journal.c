@@ -161,8 +161,17 @@ enum vkr_journal_msg_type {
    VKR_JOURNAL_MSG_FLUSH,
 };
 
+/* small-command payloads are captured into the message itself: the decode
+ * thread then allocates exactly ONE thing per retained command (the msg), and
+ * the long-term heap copy happens on the consumer (2026-07-28 drawstorm
+ * decomposition: the per-command malloc(data)+malloc(keys) pair was a top
+ * decode-lane cost at 20k cmds/frame). Covers every vkCmd* hot command;
+ * big payloads (multi-KB descriptor updates) keep the malloc path. */
+#define VKR_JOURNAL_INLINE_DATA 96
+
 /* one captured command (or key op), produced on a decode thread, consumed in order
- * by the journal thread. All pointer fields are OWNED by the message. */
+ * by the journal thread. All pointer fields are OWNED by the message, except
+ * data/keys when the corresponding *_inline flag says they point into the msg. */
 struct vkr_journal_msg {
    struct list_head link;
    uint8_t type;
@@ -172,8 +181,12 @@ struct vkr_journal_msg {
    uint16_t cmd_type;
    uint32_t size;
    uint8_t *data;
+   bool data_inline; /* data == inline_data (consumer materializes on insert) */
+   bool keys_inline; /* keys == &inline_key */
    uint32_t nkeys;
    uint64_t *keys;
+   uint64_t inline_key;
+   uint8_t inline_data[VKR_JOURNAL_INLINE_DATA];
    VkObjectType *key_types; /* CREATE only */
    uint32_t naux;
    uint64_t *aux;
@@ -235,6 +248,85 @@ struct vkr_journal_frame {
 };
 
 static _Thread_local struct vkr_journal_frame *vkr_journal_frame_cur;
+
+/* gkvm (2026-07-28, decode-lane batching): while a decode thread drains one
+ * ring/context command batch (vkr_ring_submit_cmd / vkr_context_submit_cmd),
+ * retained messages accumulate here and reach the consumer queue in ONE
+ * lock+signal at batch end, instead of a mutex round trip per command — at
+ * 20k cmds/frame the per-command push (lock, contended wake, signal) was a
+ * top decode-lane cost in the drawstorm decomposition. Program order within
+ * the thread is preserved (the batch splices in order); cross-thread order
+ * was arbitrary under per-command pushes too. The batch NEVER outlives the
+ * submit_cmd call (flushed on every exit path), so quiesce() — which runs on
+ * quiesced-VM readers only — still observes every message. */
+struct vkr_journal_batch {
+   struct vkr_journal *j;
+   struct list_head msgs;
+   uint32_t n;
+   int depth; /* active while > 0; defensive against nested submit paths */
+};
+static _Thread_local struct vkr_journal_batch vkr_journal_batch_tls;
+
+static void
+vkr_journal_push_now(struct vkr_journal *j, struct vkr_journal_msg *m);
+
+void
+vkr_journal_batch_begin(void)
+{
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   if (b->depth++ == 0) {
+      list_inithead(&b->msgs);
+      b->j = NULL;
+      b->n = 0;
+   }
+}
+
+/* splice the pending batch into j's queue NOW, keeping the batch scope open.
+ * Called whenever queue arrival order must catch up with program order — see
+ * vkr_journal_msg_batchable for why only RECORDING inserts may stay behind. */
+static void
+vkr_journal_batch_drain(struct vkr_journal *j)
+{
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   if (b->depth <= 0 || b->j != j || !b->n)
+      return;
+
+   if (!j->thread_live) {
+      /* no consumer: apply inline in order, mirroring vkr_journal_push */
+      list_for_each_entry_safe (struct vkr_journal_msg, m, &b->msgs, link) {
+         list_del(&m->link);
+         vkr_journal_msg_apply(j, m);
+         vkr_journal_msg_free(m);
+      }
+      b->n = 0;
+      return;
+   }
+
+   mtx_lock(&j->q_mutex);
+   list_splicetail(&b->msgs, &j->q);
+   j->q_depth += b->n;
+   if (j->q_depth > j->q_depth_peak)
+      j->q_depth_peak = j->q_depth;
+   cnd_signal(&j->q_cond);
+   mtx_unlock(&j->q_mutex);
+
+   list_inithead(&b->msgs);
+   b->n = 0;
+}
+
+void
+vkr_journal_batch_flush(void)
+{
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   assert(b->depth > 0);
+   if (--b->depth > 0)
+      return;
+
+   struct vkr_journal *j = b->j;
+   if (j)
+      vkr_journal_batch_drain(j);
+   b->j = NULL;
+}
 
 static uint32_t
 vkr_journal_hash_u64(const void *key)
@@ -742,6 +834,27 @@ static _Thread_local struct vkr_journal_frame *vkr_journal_frame_pool;
 void
 vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
 {
+   /* The incoming command's type sits at the decoder cursor (vn_dispatch_command
+    * decodes it right after this hook). If it is anything but a RECORDING
+    * command, drain this thread's batch BEFORE the dispatch starts: several
+    * non-recording commands block mid-dispatch (vkWaitRingSeqnoMESA and
+    * friends), and pending recording messages must not sit out a block — a
+    * snapshot export quiescing the VM at that moment would miss them (the
+    * gen-2 half of the 2026-07-28 suite failure). */
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   if (b->n) {
+      const struct vkr_cs_decoder *dec = (const struct vkr_cs_decoder *)dctx->decoder;
+      uint32_t next_type;
+      if (dec->cur + sizeof(next_type) > dec->end) {
+         vkr_journal_batch_drain(b->j);
+      } else {
+         memcpy(&next_type, dec->cur, sizeof(next_type));
+         if ((vkr_journal_classify((VkCommandTypeEXT)next_type) &
+              VKR_JOURNAL_CLASS_MASK) != VKR_JOURNAL_RECORDING)
+            vkr_journal_batch_drain(b->j);
+      }
+   }
+
    struct vkr_journal *j = vkr_journal_from_dispatch(dctx);
    if (!j)
       return;
@@ -892,12 +1005,18 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
    m->type = VKR_JOURNAL_MSG_INSERT;
    m->cmd_type = cmd_type;
    m->size = size;
-   m->data = malloc(size);
-   if (!m->data) {
-      p_atomic_inc(&j->dropped_oom_fast);
-      free(m);
-      vkr_journal_frame_free(frame);
-      return;
+   if (size <= VKR_JOURNAL_INLINE_DATA) {
+      /* every hot vkCmd* fits here; the consumer materializes the heap copy */
+      m->data = m->inline_data;
+      m->data_inline = true;
+   } else {
+      m->data = malloc(size);
+      if (!m->data) {
+         p_atomic_inc(&j->dropped_oom_fast);
+         free(m);
+         vkr_journal_frame_free(frame);
+         return;
+      }
    }
    memcpy(m->data, frame->start, size);
 
@@ -923,18 +1042,17 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
          uint64_t cmd_buf;
          if (vkr_journal_peek_u64(m->data, size, 8, &cmd_buf)) {
             m->klass = klass;
-            m->keys = malloc(sizeof(*m->keys));
-            if (m->keys) {
-               m->keys[0] = cmd_buf;
-               m->nkeys = 1;
-               if (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR) {
-                  m->drop_first = true;
-                  m->drop_klass = VKR_JOURNAL_RECORDING;
-                  m->drop_cmd_type = -1;
-                  m->drop_key = cmd_buf;
-               }
-               retain = true;
+            m->inline_key = cmd_buf;
+            m->keys = &m->inline_key;
+            m->keys_inline = true;
+            m->nkeys = 1;
+            if (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR) {
+               m->drop_first = true;
+               m->drop_klass = VKR_JOURNAL_RECORDING;
+               m->drop_cmd_type = -1;
+               m->drop_key = cmd_buf;
             }
+            retain = true;
          }
          break;
       }
@@ -951,16 +1069,15 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
       case VKR_JOURNAL_FREE:
          if (frame->have_free) {
             m->klass = klass;
-            m->keys = malloc(sizeof(*m->keys));
-            if (m->keys) {
-               m->keys[0] = frame->free_pool;
-               m->nkeys = 1;
-               m->aux = frame->freed;
-               m->naux = frame->nfreed;
-               frame->freed = NULL;
-               frame->nfreed = frame->freed_cap = 0;
-               retain = true;
-            }
+            m->inline_key = frame->free_pool;
+            m->keys = &m->inline_key;
+            m->keys_inline = true;
+            m->nkeys = 1;
+            m->aux = frame->freed;
+            m->naux = frame->nfreed;
+            frame->freed = NULL;
+            frame->nfreed = frame->freed_cap = 0;
+            retain = true;
          }
          break;
       case VKR_JOURNAL_POOL_RESET:
@@ -969,12 +1086,11 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
          const size_t off = (klass == VKR_JOURNAL_POOL_RESET) ? 16 : 8;
          if (vkr_journal_peek_u64(m->data, size, off, &key)) {
             m->klass = klass;
-            m->keys = malloc(sizeof(*m->keys));
-            if (m->keys) {
-               m->keys[0] = key;
-               m->nkeys = 1;
-               retain = true;
-            }
+            m->inline_key = key;
+            m->keys = &m->inline_key;
+            m->keys_inline = true;
+            m->nkeys = 1;
+            retain = true;
          }
          break;
       }
@@ -983,8 +1099,10 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
          if (vkr_journal_peek_u64(m->data, size, 8, &ring)) {
             m->type = VKR_JOURNAL_MSG_PRUNE_KEY;
             m->id = ring;
-            free(m->data);
+            if (!m->data_inline)
+               free(m->data);
             m->data = NULL;
+            m->data_inline = false;
             m->size = 0;
             retain = true;
          }
@@ -993,16 +1111,15 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
       case VKR_JOURNAL_RING_STREAM: {
          const uint64_t ring = vkr_journal_ring_id(frame->ctx, dctx);
          m->klass = klass;
-         m->keys = malloc(sizeof(*m->keys));
-         if (m->keys) {
-            m->keys[0] = ring;
-            m->nkeys = 1;
-            m->drop_first = true;
-            m->drop_klass = VKR_JOURNAL_RING_STREAM;
-            m->drop_cmd_type = (int32_t)cmd_type;
-            m->drop_key = ring;
-            retain = true;
-         }
+         m->inline_key = ring;
+         m->keys = &m->inline_key;
+         m->keys_inline = true;
+         m->nkeys = 1;
+         m->drop_first = true;
+         m->drop_klass = VKR_JOURNAL_RING_STREAM;
+         m->drop_cmd_type = (int32_t)cmd_type;
+         m->drop_key = ring;
+         retain = true;
          break;
       }
       default:
@@ -1179,8 +1296,10 @@ vkr_journal_unpin_key(struct vkr_context *ctx, uint64_t id)
 static void
 vkr_journal_msg_free(struct vkr_journal_msg *m)
 {
-   free(m->data);
-   free(m->keys);
+   if (!m->data_inline)
+      free(m->data);
+   if (!m->keys_inline)
+      free(m->keys);
    free(m->key_types);
    free(m->aux);
    free(m->refs);
@@ -1224,7 +1343,20 @@ vkr_journal_msg_apply(struct vkr_journal *j, struct vkr_journal_msg *m)
       if (m->drop_first)
          vkr_journal_drop_on_key_locked(j, m->drop_key, m->drop_klass, m->drop_cmd_type);
 
-      if (m->nkeys) {
+      /* an inline payload lives in the message; the entry needs its own heap
+       * copy (ownership of `data` moves in). Materializing HERE is the point:
+       * the malloc runs on the consumer, not the decode thread. */
+      if (m->nkeys && m->data_inline) {
+         uint8_t *heap = malloc(m->size);
+         if (heap) {
+            memcpy(heap, m->inline_data, m->size);
+            m->data = heap;
+            m->data_inline = false;
+         } else {
+            p_atomic_inc(&j->dropped_oom_fast);
+         }
+      }
+      if (m->nkeys && !m->data_inline) {
          if (m->klass == VKR_JOURNAL_NOTED && m->nkeys > 1)
             j->stats.noted_multi_key++;
          struct vkr_journal_entry *e =
@@ -1303,7 +1435,7 @@ vkr_journal_thread(void *arg)
 }
 
 static void
-vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
+vkr_journal_push_now(struct vkr_journal *j, struct vkr_journal_msg *m)
 {
    if (!j->thread_live) {
       /* no consumer (thread creation failed): apply inline, original behavior */
@@ -1317,6 +1449,53 @@ vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
       j->q_depth_peak = j->q_depth;
    cnd_signal(&j->q_cond);
    mtx_unlock(&j->q_mutex);
+}
+
+/* Only RECORDING-class inserts may sit in a batch. Everything else can carry a
+ * CROSS-THREAD causal edge that per-command pushes ordered by real time and a
+ * batch would reorder: a CREATE is pinned from the virtqueue worker the moment
+ * the guest learns the command was consumed (blob create against a fresh
+ * VkDeviceMemory), and a RING_CREATE decoded on the context thread starts a
+ * ring thread whose very first journaled command (reply-stream set) must land
+ * in the queue AFTER it — the 2026-07-28 suite caught exactly that: the
+ * RING_STREAM entry serialized with a smaller seq than its ring's create, and
+ * restore dropped it as unreplayable. RECORDING entries have no cross-thread
+ * dependents in valid usage (a command buffer cannot be recorded and consumed
+ * from two threads at once), so per-thread program order — which the batch
+ * preserves — is enough for them. */
+static bool
+vkr_journal_msg_batchable(const struct vkr_journal_msg *m)
+{
+   return m->type == VKR_JOURNAL_MSG_INSERT &&
+          (m->klass & VKR_JOURNAL_CLASS_MASK) == VKR_JOURNAL_RECORDING &&
+          !m->nremoved;
+}
+
+static void
+vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
+{
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   if (b->depth <= 0) {
+      vkr_journal_push_now(j, m);
+      return;
+   }
+
+   /* a different journal's message has no order contract with the batch, but
+    * flushing keeps this thread's queue arrivals in program order regardless */
+   if (b->n && b->j != j)
+      vkr_journal_batch_drain(b->j);
+
+   if (!vkr_journal_msg_batchable(m)) {
+      /* per-thread order: everything batched so far must reach the queue first */
+      if (b->n)
+         vkr_journal_batch_drain(b->j);
+      vkr_journal_push_now(j, m);
+      return;
+   }
+
+   b->j = j;
+   list_addtail(&m->link, &b->msgs);
+   b->n++;
 }
 
 /* drain the queue: on return every message pushed before the call is applied.
