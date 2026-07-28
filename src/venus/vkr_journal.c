@@ -159,6 +159,7 @@ enum vkr_journal_msg_type {
    VKR_JOURNAL_MSG_PIN,
    VKR_JOURNAL_MSG_UNPIN,
    VKR_JOURNAL_MSG_FLUSH,
+   VKR_JOURNAL_MSG_BLOCK, /* data = a block of vkr_journal_rec RECORDING captures */
 };
 
 /* small-command payloads are captured into the message itself: the decode
@@ -209,6 +210,9 @@ struct vkr_journal_msg {
 
    /* FLUSH */
    uint64_t flush_gen;
+
+   /* BLOCK (data/size = the block buffer, owned) */
+   uint32_t block_nrecs;
 };
 
 /* per-dispatch recording frame; a stack because vkExecuteCommandStreamsMESA
@@ -249,20 +253,46 @@ struct vkr_journal_frame {
 
 static _Thread_local struct vkr_journal_frame *vkr_journal_frame_cur;
 
-/* gkvm (2026-07-28, decode-lane batching): while a decode thread drains one
- * ring/context command batch (vkr_ring_submit_cmd / vkr_context_submit_cmd),
- * retained messages accumulate here and reach the consumer queue in ONE
- * lock+signal at batch end, instead of a mutex round trip per command — at
- * 20k cmds/frame the per-command push (lock, contended wake, signal) was a
- * top decode-lane cost in the drawstorm decomposition. Program order within
- * the thread is preserved (the batch splices in order); cross-thread order
- * was arbitrary under per-command pushes too. The batch NEVER outlives the
- * submit_cmd call (flushed on every exit path), so quiesce() — which runs on
- * quiesced-VM readers only — still observes every message. */
+/* gkvm (2026-07-28, decode-lane block batching): while a decode thread drains
+ * one ring/context command batch (vkr_ring_submit_cmd / vkr_context_submit_cmd),
+ * RECORDING captures append into a fixed-size linear block — no allocation, no
+ * lock, no message per command — and the whole block reaches the consumer as
+ * ONE message when it fills or when program order requires it. At 20k
+ * cmds/frame this replaces 20k calloc+lock round trips with ~5 of each.
+ *
+ * ORDERING (the load-bearing part, learned twice the hard way): the journal
+ * has one global apply order, and non-RECORDING messages carry cross-thread
+ * causal edges (a CREATE is pinned from the virtqueue worker the moment the
+ * guest sees it consumed; a RING_CREATE must be queue-visible before the new
+ * ring thread's first journaled command). So ONLY RECORDING captures may sit
+ * in the block; vkr_journal_push closes the block before queueing anything
+ * else, and vkr_journal_pre_dispatch closes it before any non-RECORDING
+ * command even starts dispatching (some block mid-dispatch —
+ * vkWaitRingSeqnoMESA — and pending captures must not sit out a block while a
+ * snapshot export could quiesce). RECORDING entries have no cross-thread
+ * dependents in valid usage (a command buffer cannot be recorded and consumed
+ * from two threads at once), so per-thread program order — which the block
+ * preserves — is enough for them.
+ *
+ * The block NEVER outlives the submit_cmd call (flushed on every exit path),
+ * so quiesce() — which runs on quiesced-VM readers only — still observes
+ * every capture. */
+#define VKR_JOURNAL_BLOCK_CAP (256u * 1024)
+
+/* one captured RECORDING command inside a block; payload follows, 8-aligned */
+struct vkr_journal_rec {
+   uint16_t cmd_type;
+   uint8_t flags; /* bit0: RESETS_PRIOR (drop the key's prior recording first) */
+   uint8_t pad0;
+   uint32_t size; /* payload bytes */
+   uint64_t key;  /* the command buffer id */
+};
+
 struct vkr_journal_batch {
-   struct vkr_journal *j;
-   struct list_head msgs;
-   uint32_t n;
+   struct vkr_journal *j; /* the block's journal (valid while block != NULL) */
+   uint8_t *block;
+   uint32_t block_used;
+   uint32_t block_nrecs;
    int depth; /* active while > 0; defensive against nested submit paths */
 };
 static _Thread_local struct vkr_journal_batch vkr_journal_batch_tls;
@@ -273,45 +303,81 @@ vkr_journal_push_now(struct vkr_journal *j, struct vkr_journal_msg *m);
 void
 vkr_journal_batch_begin(void)
 {
-   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
-   if (b->depth++ == 0) {
-      list_inithead(&b->msgs);
-      b->j = NULL;
-      b->n = 0;
-   }
+   vkr_journal_batch_tls.depth++;
 }
 
-/* splice the pending batch into j's queue NOW, keeping the batch scope open.
- * Called whenever queue arrival order must catch up with program order — see
- * vkr_journal_msg_batchable for why only RECORDING inserts may stay behind. */
+/* ship the pending block to its journal's queue NOW (one message), keeping the
+ * batch scope open. Called whenever queue arrival order must catch up with
+ * program order, and at batch end. */
 static void
-vkr_journal_batch_drain(struct vkr_journal *j)
+vkr_journal_batch_close_block(void)
 {
    struct vkr_journal_batch *b = &vkr_journal_batch_tls;
-   if (b->depth <= 0 || b->j != j || !b->n)
+   if (!b->block)
       return;
 
-   if (!j->thread_live) {
-      /* no consumer: apply inline in order, mirroring vkr_journal_push */
-      list_for_each_entry_safe (struct vkr_journal_msg, m, &b->msgs, link) {
-         list_del(&m->link);
-         vkr_journal_msg_apply(j, m);
-         vkr_journal_msg_free(m);
+   struct vkr_journal *j = b->j;
+   if (!b->block_nrecs) {
+      free(b->block);
+   } else {
+      struct vkr_journal_msg *m = calloc(1, sizeof(*m));
+      if (!m) {
+         p_atomic_inc(&j->dropped_oom_fast);
+         free(b->block);
+      } else {
+         m->type = VKR_JOURNAL_MSG_BLOCK;
+         m->data = b->block; /* owned; freed by vkr_journal_msg_free */
+         m->size = b->block_used;
+         m->block_nrecs = b->block_nrecs;
+         vkr_journal_push_now(j, m);
       }
-      b->n = 0;
-      return;
+   }
+   b->block = NULL;
+   b->block_used = 0;
+   b->block_nrecs = 0;
+   b->j = NULL;
+}
+
+/* append one RECORDING capture to the thread's block. False = caller must use
+ * the standalone-message path (outside a batch, oversized payload, or OOM). */
+static bool
+vkr_journal_block_append(struct vkr_journal *j,
+                         VkCommandTypeEXT cmd_type,
+                         uint8_t klass_flags,
+                         uint64_t key,
+                         const uint8_t *payload,
+                         size_t size)
+{
+   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
+   if (b->depth <= 0)
+      return false;
+
+   const size_t rec_size = sizeof(struct vkr_journal_rec) + ALIGN_POT(size, 8);
+   if (rec_size > VKR_JOURNAL_BLOCK_CAP)
+      return false;
+
+   /* a different journal's capture (rare) or a full block ships what's pending */
+   if (b->block && (b->j != j || b->block_used + rec_size > VKR_JOURNAL_BLOCK_CAP))
+      vkr_journal_batch_close_block();
+
+   if (!b->block) {
+      b->block = malloc(VKR_JOURNAL_BLOCK_CAP);
+      if (!b->block)
+         return false;
+      b->j = j;
    }
 
-   mtx_lock(&j->q_mutex);
-   list_splicetail(&b->msgs, &j->q);
-   j->q_depth += b->n;
-   if (j->q_depth > j->q_depth_peak)
-      j->q_depth_peak = j->q_depth;
-   cnd_signal(&j->q_cond);
-   mtx_unlock(&j->q_mutex);
-
-   list_inithead(&b->msgs);
-   b->n = 0;
+   const struct vkr_journal_rec rec = {
+      .cmd_type = (uint16_t)cmd_type,
+      .flags = (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR) ? 1 : 0,
+      .size = (uint32_t)size,
+      .key = key,
+   };
+   memcpy(b->block + b->block_used, &rec, sizeof(rec));
+   memcpy(b->block + b->block_used + sizeof(rec), payload, size);
+   b->block_used += rec_size;
+   b->block_nrecs++;
+   return true;
 }
 
 void
@@ -322,10 +388,7 @@ vkr_journal_batch_flush(void)
    if (--b->depth > 0)
       return;
 
-   struct vkr_journal *j = b->j;
-   if (j)
-      vkr_journal_batch_drain(j);
-   b->j = NULL;
+   vkr_journal_batch_close_block();
 }
 
 static uint32_t
@@ -836,22 +899,21 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
 {
    /* The incoming command's type sits at the decoder cursor (vn_dispatch_command
     * decodes it right after this hook). If it is anything but a RECORDING
-    * command, drain this thread's batch BEFORE the dispatch starts: several
-    * non-recording commands block mid-dispatch (vkWaitRingSeqnoMESA and
-    * friends), and pending recording messages must not sit out a block — a
-    * snapshot export quiescing the VM at that moment would miss them (the
-    * gen-2 half of the 2026-07-28 suite failure). */
+    * command, ship this thread's pending block BEFORE the dispatch starts:
+    * several non-recording commands block mid-dispatch (vkWaitRingSeqnoMESA and
+    * friends), and pending captures must not sit out a block — a snapshot
+    * export quiescing the VM at that moment would miss them. */
    struct vkr_journal_batch *b = &vkr_journal_batch_tls;
-   if (b->n) {
+   if (b->block_nrecs) {
       const struct vkr_cs_decoder *dec = (const struct vkr_cs_decoder *)dctx->decoder;
       uint32_t next_type;
       if (dec->cur + sizeof(next_type) > dec->end) {
-         vkr_journal_batch_drain(b->j);
+         vkr_journal_batch_close_block();
       } else {
          memcpy(&next_type, dec->cur, sizeof(next_type));
          if ((vkr_journal_classify((VkCommandTypeEXT)next_type) &
               VKR_JOURNAL_CLASS_MASK) != VKR_JOURNAL_RECORDING)
-            vkr_journal_batch_drain(b->j);
+            vkr_journal_batch_close_block();
       }
    }
 
@@ -992,6 +1054,19 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
       p_atomic_inc(&j->transient_fast);
       vkr_journal_frame_free(frame);
       return;
+   }
+
+   /* hot lane: a pure RECORDING capture (no object-table effects) appends into
+    * the thread's block — one memcpy, no allocation, no lock. Falls through to
+    * the message path outside a batch, on an oversized payload, or on OOM. */
+   if (klass == VKR_JOURNAL_RECORDING && !frame->ncreated && !frame->nremoved) {
+      uint64_t cmd_buf;
+      if (vkr_journal_peek_u64(frame->start, size, 8, &cmd_buf) &&
+          vkr_journal_block_append(j, cmd_type, klass_flags, cmd_buf, frame->start,
+                                   size)) {
+         vkr_journal_frame_free(frame);
+         return;
+      }
    }
 
    /* everything else: capture (one payload copy + ownership transfer of the frame's
@@ -1402,6 +1477,43 @@ vkr_journal_msg_apply(struct vkr_journal *j, struct vkr_journal_msg *m)
       cnd_broadcast(&j->flush_cond);
       mtx_unlock(&j->q_mutex);
       break;
+   case VKR_JOURNAL_MSG_BLOCK: {
+      /* a batch of pure RECORDING captures from one decode thread, in program
+       * order; one j->mutex hold for the whole block. Each record replicates
+       * the standalone RECORDING insert: drop-prior on Begin/Reset, then an
+       * entry with its own heap copy of the payload. */
+      mtx_lock(&j->mutex);
+      const uint8_t *cur = m->data;
+      const uint8_t *end = m->data + m->size;
+      for (uint32_t i = 0; i < m->block_nrecs; i++) {
+         struct vkr_journal_rec rec;
+         if (cur + sizeof(rec) > end)
+            break; /* corrupt block; producer is in-process, so never expected */
+         memcpy(&rec, cur, sizeof(rec));
+         const uint8_t *payload = cur + sizeof(rec);
+         cur = payload + ALIGN_POT((size_t)rec.size, 8);
+         if (cur > end)
+            break;
+
+         if (rec.flags & 1)
+            vkr_journal_drop_on_key_locked(j, rec.key, VKR_JOURNAL_RECORDING, -1);
+
+         uint8_t *data = malloc(rec.size);
+         if (!data) {
+            p_atomic_inc(&j->dropped_oom_fast);
+            continue;
+         }
+         memcpy(data, payload, rec.size);
+         const uint64_t key = rec.key;
+         struct vkr_journal_entry *e =
+            vkr_journal_insert_locked(j, VKR_JOURNAL_RECORDING, rec.cmd_type, data,
+                                      rec.size, &key, NULL, 1, NULL, 0);
+         if (!e)
+            free(data);
+      }
+      mtx_unlock(&j->mutex);
+      break;
+   }
    default:
       break;
    }
@@ -1419,14 +1531,20 @@ vkr_journal_thread(void *arg)
          cnd_wait(&j->q_cond, &j->q_mutex);
       if (list_is_empty(&j->q) && j->q_stop)
          break;
-      struct vkr_journal_msg *m =
-         list_first_entry(&j->q, struct vkr_journal_msg, link);
-      list_del(&m->link);
-      j->q_depth--;
+      /* batch-pop: take everything pending under one lock hold — the producers'
+       * push amortization is wasted if the consumer re-locks per message */
+      struct list_head pending;
+      list_inithead(&pending);
+      list_splicetail(&j->q, &pending);
+      list_inithead(&j->q);
+      j->q_depth = 0;
       mtx_unlock(&j->q_mutex);
 
-      vkr_journal_msg_apply(j, m);
-      vkr_journal_msg_free(m);
+      list_for_each_entry_safe (struct vkr_journal_msg, m, &pending, link) {
+         list_del(&m->link);
+         vkr_journal_msg_apply(j, m);
+         vkr_journal_msg_free(m);
+      }
 
       mtx_lock(&j->q_mutex);
    }
@@ -1451,51 +1569,14 @@ vkr_journal_push_now(struct vkr_journal *j, struct vkr_journal_msg *m)
    mtx_unlock(&j->q_mutex);
 }
 
-/* Only RECORDING-class inserts may sit in a batch. Everything else can carry a
- * CROSS-THREAD causal edge that per-command pushes ordered by real time and a
- * batch would reorder: a CREATE is pinned from the virtqueue worker the moment
- * the guest learns the command was consumed (blob create against a fresh
- * VkDeviceMemory), and a RING_CREATE decoded on the context thread starts a
- * ring thread whose very first journaled command (reply-stream set) must land
- * in the queue AFTER it — the 2026-07-28 suite caught exactly that: the
- * RING_STREAM entry serialized with a smaller seq than its ring's create, and
- * restore dropped it as unreplayable. RECORDING entries have no cross-thread
- * dependents in valid usage (a command buffer cannot be recorded and consumed
- * from two threads at once), so per-thread program order — which the batch
- * preserves — is enough for them. */
-static bool
-vkr_journal_msg_batchable(const struct vkr_journal_msg *m)
-{
-   return m->type == VKR_JOURNAL_MSG_INSERT &&
-          (m->klass & VKR_JOURNAL_CLASS_MASK) == VKR_JOURNAL_RECORDING &&
-          !m->nremoved;
-}
-
+/* every explicit message must reach the queue AFTER this thread's pending
+ * recording block (program order) — see the block-batching comment up top for
+ * why only RECORDING captures may stay behind */
 static void
 vkr_journal_push(struct vkr_journal *j, struct vkr_journal_msg *m)
 {
-   struct vkr_journal_batch *b = &vkr_journal_batch_tls;
-   if (b->depth <= 0) {
-      vkr_journal_push_now(j, m);
-      return;
-   }
-
-   /* a different journal's message has no order contract with the batch, but
-    * flushing keeps this thread's queue arrivals in program order regardless */
-   if (b->n && b->j != j)
-      vkr_journal_batch_drain(b->j);
-
-   if (!vkr_journal_msg_batchable(m)) {
-      /* per-thread order: everything batched so far must reach the queue first */
-      if (b->n)
-         vkr_journal_batch_drain(b->j);
-      vkr_journal_push_now(j, m);
-      return;
-   }
-
-   b->j = j;
-   list_addtail(&m->link, &b->msgs);
-   b->n++;
+   vkr_journal_batch_close_block();
+   vkr_journal_push_now(j, m);
 }
 
 /* drain the queue: on return every message pushed before the call is applied.
