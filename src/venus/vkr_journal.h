@@ -82,6 +82,16 @@ vkr_journal_enabled(void);
  * caller, vn_dispatch_command — its signature uses the protocol's
  * VkCommandTypeEXT, which plain vulkan.h consumers of this header lack. */
 
+/* decode-lane batching: bracket a ring/context command-batch drain so retained
+ * messages reach the consumer queue in one lock+signal per batch instead of
+ * one per command. Per-thread; MUST be balanced on every exit path (the batch
+ * never outlives the submit_cmd call). Nesting-safe (depth-counted). */
+void
+vkr_journal_batch_begin(void);
+
+void
+vkr_journal_batch_flush(void);
+
 /* object-table hooks — called from vkr_context_{add,remove}_object under
  * ctx->object_mutex; out-of-line so vkr_context.h needs no journal internals */
 void
