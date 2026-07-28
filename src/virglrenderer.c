@@ -130,6 +130,13 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
       return -ENOMEM;
 
    res->map_info = map_info;
+#ifdef __APPLE__
+   /* limina vrend zero-copy scanout: publish the display IOSurface id (0 when the
+    * resource is not IOSurface-backed) so virgl_renderer_resource_get_iosurface_id and
+    * the VMM's set_scanout resolution see vrend scanouts like venus blobs. */
+   res->iosurface_id =
+      vrend_renderer_resource_get_iosurface_id((struct vrend_resource *)pipe_res);
+#endif
 
    return 0;
 }
@@ -1276,6 +1283,27 @@ int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle, uint32_t *iosu
 
    *iosurface_id = res->iosurface_id;
    return 0;
+}
+
+/* limina vrend zero-copy scanout: blit a vrend scanout resource's current texture into
+ * its display IOSurface (GPU readpixels through the pinned PBO) and wait for completion.
+ * The VMM calls this on RESOURCE_FLUSH before presenting the surface id. Returns 0 on
+ * success, -EINVAL when the resource has no IOSurface (caller uses the readback path). */
+int virgl_renderer_resource_sync_iosurface(uint32_t res_handle)
+{
+   TRACE_FUNC();
+#ifdef __APPLE__
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->iosurface_id || !res->pipe_resource)
+      return -EINVAL;
+   return vrend_renderer_resource_sync_iosurface(
+             (struct vrend_resource *)res->pipe_resource) == 0
+             ? 0
+             : -EINVAL;
+#else
+   (void)res_handle;
+   return -EINVAL;
+#endif
 }
 
 #ifdef __APPLE__
