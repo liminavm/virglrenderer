@@ -527,11 +527,13 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
 
    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
 
+   vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(dec)) {
       vn_dispatch_command(&ring->dispatch);
       if (vkr_cs_decoder_get_fatal(dec)) {
          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
 
+         vkr_journal_batch_flush();
          vkr_cs_decoder_reset(dec);
          return false;
       }
@@ -541,6 +543,7 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
       vkr_ring_store_head(ring, cur_ring_head);
       vkr_context_on_ring_seqno_update(ring->dispatch.data, ring->id, cur_ring_head);
    }
+   vkr_journal_batch_flush();
 
    vkr_cs_decoder_reset(dec);
    return true;

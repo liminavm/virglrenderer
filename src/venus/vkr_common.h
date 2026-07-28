@@ -207,6 +207,20 @@ vkr_fd_trace(void)
    return on;
 }
 
+/* limina KK bring-up command tracing (LIMINA_KK_RTLOG). Cached: the raw getenv in
+ * the vkCmdDraw dispatch path cost ~11% of decode time at 20k cmds/frame
+ * (2026-07-28 drawstorm sample) — __findenv_locked per decoded draw. */
+static inline bool
+vkr_kk_rtlog(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("LIMINA_KK_RTLOG");
+      on = e && e[0] && strcmp(e, "0") != 0;
+   }
+   return on;
+}
+
 static inline uint32_t
 vkr_api_version_cap_minor(uint32_t version, uint32_t cap)
 {
