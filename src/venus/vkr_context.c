@@ -248,15 +248,18 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
 
    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
 
+   vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
       vn_dispatch_command(&ctx->dispatch);
       if (vkr_context_get_fatal(ctx)) {
          vkr_log("submit_cmd: vn_dispatch_command failed");
 
+         vkr_journal_batch_flush();
          vkr_cs_decoder_reset(&ctx->decoder);
          return false;
       }
    }
+   vkr_journal_batch_flush();
 
    vkr_cs_decoder_reset(&ctx->decoder);
    return true;
