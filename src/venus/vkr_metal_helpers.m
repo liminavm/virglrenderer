@@ -350,6 +350,70 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    return surf;
 }
 
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_plain(uint32_t width,
+                              uint32_t height,
+                              uint32_t iosurface_pixel_format,
+                              uint32_t bytes_per_element)
+{
+   if (!width || !height)
+      return NULL;
+
+   bool scope = limina_scope_surfaces();
+   bool mark_global = limina_mark_global();
+
+   IOSurfaceRef io = NULL;
+   @autoreleasepool {
+      NSDictionary *props = @{
+         (id)kIOSurfaceWidth : @(width),
+         (id)kIOSurfaceHeight : @(height),
+         (id)kIOSurfaceBytesPerElement : @(bytes_per_element),
+         (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
+         (id)kIOSurfaceIsGlobal : @(mark_global),
+      };
+      io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+   }
+   if (!io)
+      return NULL;
+
+   struct vkr_mtl_iosurface *surf = calloc(1, sizeof(*surf));
+   if (!surf) {
+      CFRelease(io);
+      return NULL;
+   }
+   surf->io_surface = (void *)io; /* +1 from IOSurfaceCreate */
+   surf->mtl_texture = NULL;
+   surf->id = IOSurfaceGetID(io);
+   surf->width = width;
+   surf->height = height;
+   surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
+   surf->base_addr = IOSurfaceGetBaseAddress(io);
+   surf->alloc_size = IOSurfaceGetAllocSize(io);
+
+   if (scope) {
+      limina_registry_insert(surf->id, io);
+      limina_publish_surface(surf->id, io);
+   }
+   return surf;
+}
+
+uint32_t
+vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf)
+{
+   return surf ? surf->id : 0;
+}
+
+void
+vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf,
+                             void **out_base,
+                             uint32_t *out_bytes_per_row,
+                             uint64_t *out_alloc_size)
+{
+   *out_base = surf ? surf->base_addr : NULL;
+   *out_bytes_per_row = surf ? surf->bytes_per_row : 0;
+   *out_alloc_size = surf ? surf->alloc_size : 0;
+}
+
 void
 vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
 {

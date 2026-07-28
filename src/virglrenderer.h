@@ -452,6 +452,13 @@ VIRGL_EXPORT int virgl_renderer_resource_get_iosurface_id(uint32_t res_handle,
 VIRGL_EXPORT int virgl_renderer_resource_read_iosurface(uint32_t res_handle, void *dst,
                                                         uint32_t dst_stride, uint32_t height);
 
+/* limina (macOS): blit a vrend scanout resource's current texture into its display IOSurface
+ * (GPU-side, via a pinned-memory PBO) and wait for completion — the zero-CPU present half of
+ * docs/design/vrend-iosurface-scanout.md. Call on RESOURCE_FLUSH before presenting the id from
+ * virgl_renderer_resource_get_iosurface_id. Returns 0 on success, -EINVAL when the resource has
+ * no IOSurface (fall back to transfer_read). */
+VIRGL_EXPORT int virgl_renderer_resource_sync_iosurface(uint32_t res_handle);
+
 /* limina M9.3 diagnostics: log the live venus (vkr) context table — per context: rings,
  * object counts by VkObjectType, resources, sync queues. Thread-safe; a no-op log line
  * when venus/the renderer isn't initialized. */

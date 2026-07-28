@@ -90,6 +90,27 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
 void
 vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 
+/* Allocate an IOSurface WITHOUT a Metal texture (mtl_texture = NULL) — same scoping,
+ * registry, and supervisor Mach-port publication as vkr_mtl_iosurface_alloc. Used by
+ * vrend's zero-copy scanout (docs/design/vrend-iosurface-scanout.md): the GL side reaches
+ * the pixels through a GL_AMD_pinned_memory PBO over base_addr, no Metal object needed.
+ * Free with vkr_mtl_iosurface_free. */
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_plain(uint32_t width,
+                              uint32_t height,
+                              uint32_t iosurface_pixel_format,
+                              uint32_t bytes_per_element);
+
+/* Field accessors for TUs that must not include this (Vulkan-typed) header — vrend
+ * forward-declares these instead. */
+uint32_t
+vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
+void
+vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf,
+                             void **out_base,
+                             uint32_t *out_bytes_per_row,
+                             uint64_t *out_alloc_size);
+
 /* Look up a GLOBAL IOSurface by id (cross-context import of a venus-exported window
  * buffer: the importing VkDeviceMemory host-pointer-imports the exporter's pixel
  * bytes).  Returns a RETAINED IOSurfaceRef (release with vkr_mtl_iosurface_release_ref)
