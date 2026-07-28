@@ -131,6 +131,7 @@ struct global_error_state {
 
 enum features_id
 {
+   feat_amd_pinned_memory,
    feat_arb_or_gles_ext_texture_buffer,
    feat_arb_robustness,
    feat_arb_buffer_storage,
@@ -244,6 +245,7 @@ static const  struct {
    const char *gl_ext[FEAT_MAX_EXTS];
    const char *log_name;
 } feature_list[] = {
+   FEAT(amd_pinned_memory, UNAVAIL, UNAVAIL, "GL_AMD_pinned_memory"),
    FEAT(arb_or_gles_ext_texture_buffer, 31, UNAVAIL, "GL_ARB_texture_buffer_object", "GL_EXT_texture_buffer", NULL),
    FEAT(arb_robustness, UNAVAIL, UNAVAIL,  "GL_ARB_robustness" ),
    FEAT(arb_buffer_storage, 44, UNAVAIL, "GL_ARB_buffer_storage", "GL_EXT_buffer_storage"),
@@ -8658,6 +8660,152 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
 #endif
 }
 
+#ifdef __APPLE__
+/* limina zero-copy scanout (docs/design/vrend-iosurface-scanout.md, plan A1).
+ * Allocation half: give a guest SCANOUT-bound 2D color texture a display IOSurface and
+ * a GL_AMD_pinned_memory PBO aliasing its bytes. The texture itself stays a normal GL
+ * texture; vrend_renderer_resource_sync_iosurface() blits into the surface on flush,
+ * and the VMM presents the surface id with no CPU pixel work. Any ineligible resource
+ * (format, target, multisample, missing extension) silently keeps the readback path —
+ * the fallback is never removed (two-tier rule). */
+
+#ifndef GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD
+#define GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD 0x9160
+#endif
+
+/* From vkr_metal_helpers (same library; forward-declared like vkr_mtl_iosurface_read in
+ * virglrenderer.c, to keep Vulkan headers out of vrend). */
+struct vkr_mtl_iosurface;
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_plain(uint32_t width, uint32_t height,
+                              uint32_t iosurface_pixel_format, uint32_t bytes_per_element);
+void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
+/* field accessors would drag the struct in; it is already public in the helpers header,
+ * but keep vrend decoupled with two tiny getters implemented in vkr_metal_helpers.m. */
+uint32_t vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
+void vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf, void **out_base,
+                                  uint32_t *out_bytes_per_row, uint64_t *out_alloc_size);
+
+static void vrend_resource_iosurface_init(struct vrend_resource *gr,
+                                          enum virgl_formats format)
+{
+   if (!(gr->base.bind & VIRGL_BIND_SCANOUT))
+      return;
+   if (gr->base.target != PIPE_TEXTURE_2D || gr->base.last_level != 0 ||
+       gr->base.nr_samples > 1 || gr->base.depth0 != 1)
+      return;
+   if (!has_feature(feat_amd_pinned_memory))
+      return;
+
+   /* Display byte order comes straight from glReadPixels: BGRA guest formats read as
+    * GL_BGRA_EXT (EXT_read_format_bgra, always exposed by Mesa on ES), RGBA as GL_RGBA.
+    * The IOSurface's own pixel format tells CoreAnimation the layout; the supervisor
+    * sets the surface as CALayer.contents and never touches bytes. */
+   uint32_t io_fourcc;
+   GLenum read_format;
+   switch (format) {
+   case VIRGL_FORMAT_B8G8R8A8_UNORM:
+   case VIRGL_FORMAT_B8G8R8X8_UNORM:
+      io_fourcc = 'BGRA';
+      read_format = GL_BGRA_EXT;
+      break;
+   case VIRGL_FORMAT_R8G8B8A8_UNORM:
+   case VIRGL_FORMAT_R8G8B8X8_UNORM:
+      io_fourcc = 'RGBA';
+      read_format = GL_RGBA;
+      break;
+   default:
+      return;
+   }
+
+   struct vkr_mtl_iosurface *surf =
+      vkr_mtl_iosurface_alloc_plain(gr->base.width0, gr->base.height0, io_fourcc, 4);
+   if (!surf)
+      return;
+
+   void *base = NULL;
+   uint32_t bpr = 0;
+   uint64_t alloc = 0;
+   vkr_mtl_iosurface_get_layout(surf, &base, &bpr, &alloc);
+
+   GLuint pbo = 0;
+   glGenBuffers(1, &pbo);
+   glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, pbo);
+   glBufferData(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, (GLsizeiptr)alloc, base,
+                GL_DYNAMIC_DRAW);
+   GLenum err = glGetError();
+   glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0);
+   if (err != GL_NO_ERROR) {
+      virgl_warn("iosurface scanout: pinned BufferData failed (0x%x), keeping readback\n",
+                 err);
+      glDeleteBuffers(1, &pbo);
+      vkr_mtl_iosurface_free(surf);
+      return;
+   }
+
+   gr->iosurface = surf;
+   gr->iosurf_pbo = pbo;
+   gr->iosurf_read_format = read_format;
+}
+
+uint32_t vrend_renderer_resource_get_iosurface_id(struct vrend_resource *res)
+{
+   if (!res || !res->iosurface)
+      return 0;
+   return vkr_mtl_iosurface_get_id(res->iosurface);
+}
+
+/* Blit the current texture contents into the resource's IOSurface (GPU-side readpixels
+ * into the pinned PBO) and wait for completion. Called by the VMM on RESOURCE_FLUSH,
+ * with the flush rect; the full scanout is read (GNOME flushes full-frame; partial
+ * rects still produce a correct full image). Returns 0 on success, -1 if the resource
+ * has no IOSurface (caller falls back to readback). Runs on ctx0. */
+int vrend_renderer_resource_sync_iosurface(struct vrend_resource *res)
+{
+   if (!res || !res->iosurface || !res->iosurf_pbo)
+      return -1;
+
+   vrend_hw_switch_context(vrend_state.ctx0, true);
+
+   void *base = NULL;
+   uint32_t bpr = 0;
+   uint64_t alloc = 0;
+   vkr_mtl_iosurface_get_layout(res->iosurface, &base, &bpr, &alloc);
+
+   GLuint fb_id;
+   glGenFramebuffers(1, &fb_id);
+   glBindFramebuffer(GL_FRAMEBUFFER, fb_id);
+   vrend_fb_bind_texture(res, 0, 0, 0);
+
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, res->iosurf_pbo);
+   glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(bpr / 4));
+   glPixelStorei(GL_PACK_ALIGNMENT, 4);
+   glReadPixels(0, 0, res->base.width0, res->base.height0, res->iosurf_read_format,
+                GL_UNSIGNED_BYTE, (void *)0);
+   GLenum err = glGetError();
+   glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   glDeleteFramebuffers(1, &fb_id);
+   if (err != GL_NO_ERROR) {
+      virgl_warn("iosurface scanout: glReadPixels 0x%x; dropping surface, readback takes over\n",
+                 err);
+      /* Poison the fast path so we do not warn per-frame; the resource keeps working
+       * through the readback fallback. */
+      glDeleteBuffers(1, &res->iosurf_pbo);
+      res->iosurf_pbo = 0;
+      vkr_mtl_iosurface_free(res->iosurface);
+      res->iosurface = NULL;
+      return -1;
+   }
+   /* Completion barrier: the present that follows reads the IOSurface bytes. Spike
+    * measured draw+read+finish at 0.65 ms/frame @2560x1440; fence-parked presents can
+    * replace this finish later without API changes. */
+   glFinish();
+   return 0;
+}
+#endif /* __APPLE__ */
+
 static int vrend_resource_alloc_texture(struct vrend_resource *gr,
                                         enum virgl_formats format,
                                         void *image_oes)
@@ -8676,6 +8824,9 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
    if (!image_oes) {
       vrend_resource_d3d_init(gr, format);
       vrend_resource_gbm_init(gr, format);
+#ifdef __APPLE__
+      vrend_resource_iosurface_init(gr, format);
+#endif
       if (gr->gbm_bo && !has_bit(gr->storage_bits, VREND_STORAGE_EGL_IMAGE))
          return 0;
 
@@ -8941,6 +9092,12 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
 #ifdef WIN32
    if (res->d3d_tex2d)
       res->d3d_tex2d->lpVtbl->Release(res->d3d_tex2d);
+#endif
+#ifdef __APPLE__
+   if (res->iosurf_pbo)
+      glDeleteBuffers(1, &res->iosurf_pbo);
+   if (res->iosurface)
+      vkr_mtl_iosurface_free(res->iosurface);
 #endif
    free(res);
 }
