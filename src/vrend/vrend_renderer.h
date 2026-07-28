@@ -107,6 +107,14 @@ struct vrend_resource {
 #ifdef WIN32
    ID3D11Texture2D *d3d_tex2d;
 #endif
+#ifdef __APPLE__
+   /* limina zero-copy scanout (docs/design/vrend-iosurface-scanout.md): SCANOUT-bound
+    * 2D textures get a display IOSurface + a GL_AMD_pinned_memory PBO over its bytes;
+    * vrend_renderer_resource_sync_iosurface() blits the texture into it on flush. */
+   void *iosurface;      /* struct vkr_mtl_iosurface *, owned */
+   GLuint iosurf_pbo;    /* pinned-memory PBO aliasing the IOSurface bytes */
+   GLenum iosurf_read_format; /* glReadPixels format producing display byte order */
+#endif
 
    uint64_t size;
    GLbitfield buffer_storage_flags;
@@ -629,6 +637,12 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                       const struct vrend_renderer_resource_set_type_args *args);
 
 uint32_t vrend_renderer_resource_get_map_info(struct pipe_resource *pres);
+
+#ifdef __APPLE__
+/* limina vrend zero-copy scanout (docs/design/vrend-iosurface-scanout.md). */
+uint32_t vrend_renderer_resource_get_iosurface_id(struct vrend_resource *res);
+int vrend_renderer_resource_sync_iosurface(struct vrend_resource *res);
+#endif
 
 int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t *out_size);
 
