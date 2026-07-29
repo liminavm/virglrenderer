@@ -103,6 +103,11 @@ struct vkr_context {
 
    mtx_t object_mutex;
    struct hash_table *object_table;
+   /* limina: table generation for the decoders' lock-free repeat-lookup cache
+    * (vkr_cs_decoder_lookup_object). Bumped under object_mutex on every
+    * insert/remove; read without the mutex on the lookup fast path, so the
+    * accesses go through p_atomic_*. */
+   uint64_t object_gen;
 
    /* gkvm: snapshot-replay re-creation journal (vkr_journal.h); NULL when
     * disabled (VKR_JOURNAL=0) or after teardown starts */
@@ -261,6 +266,7 @@ vkr_context_add_object(struct vkr_context *ctx, struct vkr_object *obj)
    mtx_lock(&ctx->object_mutex);
    assert(!_mesa_hash_table_search(ctx->object_table, &obj->id));
    _mesa_hash_table_insert(ctx->object_table, &obj->id, obj);
+   p_atomic_inc(&ctx->object_gen);
    /* gkvm journal: key the current command's entry by this id (TLS append;
     * lock order here and in the remove hook: object_mutex -> journal mutex) */
    vkr_journal_object_added(ctx, obj->id, obj->type);
@@ -280,6 +286,7 @@ vkr_context_remove_object_locked(struct vkr_context *ctx, struct vkr_object *obj
    if (likely(entry)) {
       vkr_context_free_object(entry);
       _mesa_hash_table_remove(ctx->object_table, entry);
+      p_atomic_inc(&ctx->object_gen);
    }
 }
 
