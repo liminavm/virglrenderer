@@ -7746,7 +7746,20 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
       vrend_state.use_external_blob = true;
 
 #ifdef HAVE_EPOXY_EGL_H
+#ifdef __APPLE__
+   /* limina: never use EGL_ANDROID_native_fence_sync fences on macOS. Mesa's EGL on
+    * zink advertises the extension, but exporting the sync-file fd
+    * (eglDupNativeFenceFDANDROID → zink fence_get_fd → vk_sync_binary_export_sync_file)
+    * falls back to a blocking wait-until-signaled on drivers without native sync_file
+    * support (KosmicKrisp), wedging the sync thread forever (observed: every ctx0
+    * fence parked behind an IOSurfaceSharedEvent wait that never signals, freezing a
+    * stock guest's GNOME session at its first fenced submission). The GLsync path
+    * (glClientWaitSync → zink_screen_timeline_wait) is the correct, tested wait on
+    * this stack, and nothing on macOS consumes the exported fd anyway. */
+   vrend_state.use_egl_fence = false;
+#else
    vrend_state.use_egl_fence = virgl_egl_supports_fences(egl);
+#endif
 #endif
 
    if (!vrend_check_no_error(vrend_state.ctx0)) {
