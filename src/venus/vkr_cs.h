@@ -65,9 +65,26 @@ struct vkr_cs_decoder_temp_pool {
    const uint8_t *end;
 };
 
+/* limina: per-decoder repeat-lookup cache size. 4 covers the hot recording
+ * pattern (command buffer + pipeline layout alternating per command, plus a
+ * pipeline / descriptor set in the mix) without a real search cost. */
+#define VKR_CS_LOOKUP_CACHE_SIZE 4
+
 struct vkr_cs_decoder {
    const struct hash_table *object_table;
    mtx_t *object_mutex;
+   /* limina: lock-free repeat-lookup cache (vkr_cs_decoder_lookup_object).
+    * Entries are trusted only while *object_gen still equals cache_gen, the
+    * generation captured under object_mutex when they were filled; every
+    * table insert/remove bumps the generation (vkr_context.h), so id reuse
+    * can never serve a stale object. */
+   const uint64_t *object_gen;
+   uint64_t cache_gen;
+   struct {
+      vkr_object_id id;
+      struct vkr_object *obj;
+   } lookup_cache[VKR_CS_LOOKUP_CACHE_SIZE];
+   uint32_t lookup_cache_next;
 
    /* Attribution for FATAL logs: which guest context (and process, via its
     * debug name) this decoder serves. ctx_name borrows ctx->debug_name, which
@@ -324,16 +341,52 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
                              vkr_object_id id,
                              VkObjectType type)
 {
-   struct vkr_object *obj;
+   struct vkr_cs_decoder *mut_dec = (struct vkr_cs_decoder *)dec;
+   struct vkr_object *obj = NULL;
 
    if (!id)
       return NULL;
 
-   mtx_lock(dec->object_mutex);
-   const struct hash_entry *entry =
-      _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
-   obj = likely(entry) ? entry->data : NULL;
-   mtx_unlock(dec->object_mutex);
+   /* limina: generation-checked fast path — a recording stream looks up the
+    * same command buffer (and usually the same layout) for every command, and
+    * taking the table mutex per handle was ~10% of the decode lane. A relaxed
+    * generation read is sufficient: any staleness only diverts us to the
+    * locked path, and a use of a just-created/just-reused id can only be
+    * decoded after the guest saw the create reply, whose ring transport
+    * orders the generation bump before the command bytes we are decoding. */
+   const uint64_t gen = p_atomic_read(dec->object_gen);
+   if (likely(gen == dec->cache_gen)) {
+      for (uint32_t i = 0; i < VKR_CS_LOOKUP_CACHE_SIZE; i++) {
+         if (dec->lookup_cache[i].id == id) {
+            obj = dec->lookup_cache[i].obj;
+            break;
+         }
+      }
+   }
+
+   if (!obj) {
+      mtx_lock(dec->object_mutex);
+      const struct hash_entry *entry =
+         _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
+      obj = likely(entry) ? entry->data : NULL;
+      /* the generation an entry is tagged with must never be newer than the
+       * lookup that produced it, so capture it while the mutex still
+       * excludes table mutations */
+      const uint64_t gen_locked = *dec->object_gen;
+      mtx_unlock(dec->object_mutex);
+
+      if (obj) {
+         if (mut_dec->cache_gen != gen_locked) {
+            memset(mut_dec->lookup_cache, 0, sizeof(mut_dec->lookup_cache));
+            mut_dec->lookup_cache_next = 0;
+            mut_dec->cache_gen = gen_locked;
+         }
+         const uint32_t slot = mut_dec->lookup_cache_next++ % VKR_CS_LOOKUP_CACHE_SIZE;
+         mut_dec->lookup_cache[slot].id = id;
+         mut_dec->lookup_cache[slot].obj = obj;
+      }
+   }
+
    if (unlikely(!obj || obj->type != type)) {
       /* ERROR, not INFO: this accompanies a ring FATAL, and the id + type are
        * the attribution a production log needs. A miss here usually means a

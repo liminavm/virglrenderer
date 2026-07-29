@@ -58,6 +58,7 @@ vkr_cs_decoder_init(struct vkr_cs_decoder *dec, struct vkr_context *ctx)
    dec->fatal_error = &ctx->cs_fatal_error;
    dec->object_table = ctx->object_table;
    dec->object_mutex = &ctx->object_mutex;
+   dec->object_gen = &ctx->object_gen;
    return mtx_init(&dec->resource_mutex, mtx_plain);
 }
 

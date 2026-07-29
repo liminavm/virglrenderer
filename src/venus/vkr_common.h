@@ -24,6 +24,7 @@
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/os_misc.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_pointer.h"
