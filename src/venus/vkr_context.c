@@ -646,6 +646,21 @@ vkr_context_on_ring_fatal(struct vkr_context *ctx)
    mtx_unlock(&ctx->wait_ring.mutex);
 }
 
+/* How long a ring wait may block before we name it in the log, in ms.
+ * `LIMINA_RING_WAIT_WARN_MS` lowers it so the slow-wait path — which is otherwise at the mercy of
+ * host load — can be exercised deterministically (set it to 1 and every wait takes it). */
+static long
+vkr_ring_wait_warn_ms(void)
+{
+   static long ms = -1;
+   if (unlikely(ms < 0)) {
+      const char *env = getenv("LIMINA_RING_WAIT_WARN_MS");
+      const long parsed = env ? atol(env) : 0;
+      ms = parsed > 0 ? parsed : 500;
+   }
+   return ms;
+}
+
 bool
 vkr_context_wait_ring_seqno(struct vkr_context *ctx,
                             struct vkr_ring *ring,
@@ -664,26 +679,39 @@ vkr_context_wait_ring_seqno(struct vkr_context *ctx,
     * Name the numbers after ~500 ms so the next wedge is diagnosable from the
     * log alone — but never log on the hot path: this dispatch runs per
     * exported frame sync fd (vn_create_sync_file), hundreds of times a second
-    * on a busy compositor, and an unconditional log here IS a frame stutter. */
+    * on a busy compositor, and an unconditional log here IS a frame stutter.
+    * The `logged` latch keeps it to at most one line per stalled wait, which is
+    * why it can afford to be ERROR-level: a wait this long is always abnormal,
+    * and at INFO it was invisible at the worker's default `warn`. */
+   const long warn_ms = vkr_ring_wait_warn_ms();
    bool logged = false;
    while (!vkr_context_get_fatal(ctx) && ok &&
           !vkr_seqno_ge(vkr_ring_load_head(ring), ring_seqno)) {
       if (!logged) {
          struct timespec ts;
          timespec_get(&ts, TIME_UTC);
-         ts.tv_nsec += 500 * 1000 * 1000;
-         if (ts.tv_nsec >= 1000000000) {
+         ts.tv_nsec += warn_ms * 1000 * 1000;
+         while (ts.tv_nsec >= 1000000000) {
             ts.tv_sec += 1;
             ts.tv_nsec -= 1000000000;
          }
          const int ret = cnd_timedwait(&ctx->wait_ring.cond, &ctx->wait_ring.mutex, &ts);
-         if (ret == thrd_timeout) {
-            vkr_log("wait_ring_seqno STUCK >500ms ctx %u ring %" PRIu64
-                    ": want=%" PRIu64 " head=%u tail=%u status=0x%x",
-                    ctx->ctx_id, ring->id, ring_seqno, vkr_ring_load_head(ring),
-                    *ring->control.tail, *ring->control.status);
+         /* A TIMEOUT IS NOT A FAILURE — it is the diagnostic firing, and the wait must go on.
+          * Test `thrd_busy`: the c11 shim maps ETIMEDOUT to it, NOT to thrd_timeout
+          * (`src/mesa/compat/c11/threads_posix.h`; the two are distinct enum values). Testing
+          * only thrd_timeout made this branch dead code and sent every slow wait to the `ok =
+          * false` arm below, which poisons the context — so a ring wait that merely took longer
+          * than the threshold killed the guest's Vulkan session. Both are accepted here so the
+          * code stays correct against a strictly-conforming C11 runtime too. */
+         if (ret == thrd_busy || ret == thrd_timeout) {
+            vkr_log_error("wait_ring_seqno STUCK >%ldms ctx %u ring %" PRIu64
+                          ": want=%" PRIu64 " head=%u tail=%u status=0x%x",
+                          warn_ms, ctx->ctx_id, ring->id, ring_seqno,
+                          vkr_ring_load_head(ring), *ring->control.tail,
+                          *ring->control.status);
             logged = true;
          } else if (ret != thrd_success) {
+            /* A real condvar error (never a timeout): the wait cannot be trusted. */
             ok = false;
          }
       } else {
