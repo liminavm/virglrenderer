@@ -134,25 +134,10 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          }
       }
       if (ext && ext->handleTypes) {
-         /* limina probe (2026-08-04): venus stamps renderer_handle_type here, so this is a
-          * direct read of WHICH branch of vn_physical_device_init_external_memory fired.
-          * DMA_BUF (0x200) => upstream's own branch (vkr advertises the extension) and
-          * mesa 0010(a) is dead code; OPAQUE_FD (0x2) => still 0010(a)'s else-if. */
-         static uint32_t limina_ht_seen;
-         if (!(limina_ht_seen & ext->handleTypes)) {
-            limina_ht_seen |= ext->handleTypes;
-            fprintf(stderr, "[LIMINA-VKR-HT] image external handleTypes=0x%x (%s%s)\n",
-                    ext->handleTypes,
-                    (ext->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
-                       ? "DMA_BUF " : "",
-                    (ext->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
-                       ? "OPAQUE_FD" : "");
-         }
-         /* No macOS driver honors fd-flavored external images (MoltenVK tolerates the
-          * structs; KosmicKrisp rejects them at create) — vkr implements the export
-          * contract itself. ALWAYS drop the external-memory / DRM-format-modifier
-          * structs and normalize DRM_FORMAT_MODIFIER tiling to OPTIMAL; scanout-capable
-          * formats additionally get IOSurface backing below. */
+         /* The external-memory struct never reaches the driver: the guest speaks
+          * dma-buf/fd handle types no macOS driver honors — vkr implements the
+          * export contract itself (IOSurface + host-pointer or MTLTEXTURE
+          * import at bind). */
          /* An EXPLICIT modifier struct marks an IMPORT (zink passes the exporter's
           * layout); the pixel bytes already live in the EXPORTER's IOSurface and the
           * memory bind aliases them (vkr_device_memory.c host-pointer import) — do NOT
@@ -161,15 +146,22 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          bool limina_is_import = false;
          VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
          VkBaseInStructure *prev = (VkBaseInStructure *)mci;
-         /* LIMINA_VKR_KEEP_MODIFIER_STRUCTS=1 leaves the DRM-format-modifier structs
-          * chained (the external-memory one is still unlinked) — the A/B for whether
-          * this unlink is load-bearing against a host driver that never advertises
-          * VK_EXT_image_drm_format_modifier. */
-         static int limina_keep_structs = -1;
-         if (limina_keep_structs < 0) {
-            const char *e = getenv("LIMINA_VKR_KEEP_MODIFIER_STRUCTS");
-            limina_keep_structs = (e && *e == '1') ? 1 : 0;
-         }
+         /* KosmicKrisp natively implements VK_EXT_image_drm_format_modifier
+          * (LINEAR only) now, so a modifier-tiled create reaches the driver
+          * VERBATIM: modifier structs stay chained, the tiling stays
+          * DRM_FORMAT_MODIFIER_EXT, INPUT_ATTACHMENT stays (KK keeps linear
+          * images non-array), and KK answers the layout queries truthfully —
+          * the pitch the guest reads is the pitch the IOSurface below gets
+          * allocated with. The rewrite era (normalize-to-OPTIMAL + forced
+          * LINEAR + usage strip) survives only for MoltenVK and for drivers
+          * without the extension. Resolved PRE-create — args->device is
+          * replaced with the raw driver handle by create_and_add. */
+         struct vkr_device *limina_early_dev = vkr_device_from_handle(args->device);
+         const bool limina_native_mod =
+            limina_early_dev && limina_early_dev->physical_device &&
+            !limina_early_dev->physical_device->EXT_metal_objects &&
+            limina_early_dev->physical_device->EXT_image_drm_format_modifier &&
+            mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
          for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
               s = (VkBaseInStructure *)prev->pNext) {
             const int t = (int)s->sType;
@@ -178,70 +170,24 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
             if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
                limina_is_import = true;
-            /* limina probe (2026-08-04, task #19): WHAT the guest actually negotiates.
-             * mesa 0010(b) answers the modifier extension inside the guest and hardcodes
-             * a single LINEAR modifier, so the host never sees the negotiation — except
-             * here, where the chosen list/value rides in on the create. This is the
-             * measurement that decides whether KK needs to advertise one token or two. */
-            if (is_mod) {
-               static unsigned limina_mod_log;
-               if (limina_mod_log++ < 8) {
-                  if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) {
-                     const VkImageDrmFormatModifierListCreateInfoEXT *l = (void *)s;
-                     fprintf(stderr, "[LIMINA-VKRMODLIST] LIST count=%u:",
-                             l->drmFormatModifierCount);
-                     for (uint32_t i = 0; i < l->drmFormatModifierCount && i < 8; i++)
-                        fprintf(stderr, " 0x%llx",
-                                (unsigned long long)l->pDrmFormatModifiers[i]);
-                     fprintf(stderr, " (fmt=%u %ux%u usage=0x%x)\n", (unsigned)ci->format,
-                             ci->extent.width, ci->extent.height, ci->usage);
-                  } else {
-                     const VkImageDrmFormatModifierExplicitCreateInfoEXT *e = (void *)s;
-                     fprintf(stderr,
-                             "[LIMINA-VKRMODLIST] EXPLICIT 0x%llx planes=%u pitch=%llu "
-                             "(fmt=%u %ux%u usage=0x%x)\n",
-                             (unsigned long long)e->drmFormatModifier,
-                             e->drmFormatModifierPlaneCount,
-                             e->pPlaneLayouts ? (unsigned long long)e->pPlaneLayouts[0].rowPitch
-                                              : 0ull,
-                             (unsigned)ci->format, ci->extent.width, ci->extent.height,
-                             ci->usage);
-                  }
-               }
-            }
             if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
-                (is_mod && !limina_keep_structs))
+                (is_mod && !limina_native_mod))
                prev->pNext = s->pNext; /* unlink */
             else
                prev = s;
          }
-         if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
-            /* limina probe (2026-08-04): count how often a guest image actually
-             * arrives with modifier tiling, i.e. how much of this normalization is
-             * live traffic vs MoltenVK-era dead code. */
-            static unsigned limina_mod_hits;
-            if (++limina_mod_hits <= 4 || (limina_mod_hits % 256) == 0)
-               fprintf(stderr, "[LIMINA-VKRMOD] modifier-tiled guest image #%u %s import=%d\n",
-                       limina_mod_hits, limina_is_import ? "EXPLICIT" : "LIST", limina_is_import);
-            /* LIMINA_VKR_KEEP_MODIFIER_TILING=1 leaves the modifier tiling in place so
-             * the image reaches KK as the guest asked — the A/B that tells us whether
-             * kk_image_layout's modifier carve-out is a live guard or dead code. */
-            static int limina_keep = -1;
-            if (limina_keep < 0) {
-               const char *e = getenv("LIMINA_VKR_KEEP_MODIFIER_TILING");
-               limina_keep = (e && *e == '1') ? 1 : 0;
-            }
-            if (!limina_keep)
-               mci->tiling = VK_IMAGE_TILING_OPTIMAL;
-         }
+         if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && !limina_native_mod)
+            mci->tiling = VK_IMAGE_TILING_OPTIMAL;
 
          if (limina_vkformat_to_iosurface(ci->format, &limina_mtl, &limina_fourcc, &limina_bpe)) {
             struct vkr_device *dev = vkr_device_from_handle(args->device);
             limina_dev = dev;
             if (limina_is_import) {
-               /* Import: keep KK's LINEAR/usage normalization below, skip IOSurface
-                * allocation (the bound memory aliases the exporter's bytes). */
-               if (!dev->physical_device->EXT_metal_objects) {
+               /* Import: skip IOSurface allocation (the bound memory aliases the
+                * exporter's bytes). Under the native modifier path the create is
+                * already verbatim — KK validates and adopts the exporter's
+                * EXPLICIT pitch itself. Otherwise keep the legacy rewrite. */
+               if (!dev->physical_device->EXT_metal_objects && !limina_native_mod) {
                   /* …unless the MTLTEXTURE path is on, in which case the bound memory is
                    * the exporter's TEXTURE, not its bytes. Forcing LINEAR here is what
                    * sheared every GTK4 window on 2026-08-04: the exporter wrote in the
@@ -271,24 +217,22 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                   limina_io_import.pNext = mci->pNext;
                   mci->pNext = &limina_io_import;
                }
+            } else if (limina_native_mod) {
+               /* KosmicKrisp with native VK_EXT_image_drm_format_modifier: the
+                * guest asked for a LINEAR-modifier image, and KK lays it out
+                * linear at its own truthful pitch — the layout the forced-LINEAR
+                * era manufactured, minus the lies. Reuse that era's post-create
+                * machinery below: query the pitch, allocate the IOSurface with
+                * exactly it, and the memory bind host-pointer-imports the bytes. */
+               limina_kk_linear = true;
             } else {
-               /* KosmicKrisp (no VK_EXT_metal_objects): force LINEAR tiling — KK creates
-                * linear-image MTLTextures from the bound memory's MTLBuffer, and the bound
-                * memory will be a host-pointer import of the IOSurface bytes
-                * (vkr_device_memory.c) — render lands in the surface, presented zero-copy.
-                * The IOSurface is allocated AFTER create, with the driver's linear rowPitch
-                * (vkGetImageSubresourceLayout). */
-               /* LIMINA_VKR_NO_KK_FORCE_LINEAR=1 leaves the guest's tiling alone, so the
-                * image reaches KK as it was asked for (modifier-tiled, if the guest said
-                * so) and kk_image_layout's carve-out becomes reachable. Costs zero-copy:
-                * without a defined linear rowPitch no IOSurface can alias the image
-                * memory, so the present path falls back to a readback blit. This is the
-                * A/B for "is the forced LINEAR still the only way to scan out on KK". */
-               static int limina_no_force = -1;
-               if (limina_no_force < 0) {
-                  const char *e = getenv("LIMINA_VKR_NO_KK_FORCE_LINEAR");
-                  limina_no_force = (e && *e == '1') ? 1 : 0;
-               }
+               /* KosmicKrisp (no VK_EXT_metal_objects), pre-modifier driver:
+                * force LINEAR tiling — KK creates linear-image MTLTextures from
+                * the bound memory's MTLBuffer, and the bound memory will be a
+                * host-pointer import of the IOSurface bytes (vkr_device_memory.c)
+                * — render lands in the surface, presented zero-copy. The
+                * IOSurface is allocated AFTER create, with the driver's linear
+                * rowPitch (vkGetImageSubresourceLayout). */
                /* LIMINA_KK_MTLTEXTURE_SCANOUT=1: the replacement for the forced LINEAR.
                 * KosmicKrisp now implements VK_EXT_external_memory_metal's MTLTEXTURE
                 * handle type, so instead of contorting the image into a linear layout
@@ -331,7 +275,7 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                }
                /* Fall back to forced LINEAR when the import path is off OR its IOSurface
                 * allocation failed — never leave the image with neither backing. */
-               if ((!limina_mtltex || !limina_surf) && !limina_no_force) {
+               if (!limina_mtltex || !limina_surf) {
                   mci->tiling = VK_IMAGE_TILING_LINEAR;
                   /* INPUT_ATTACHMENT usage makes KK promote the image layout to
                    * 2DArray (vk_image_to_mtl_texture_type) — but Metal buffer-backed
@@ -341,9 +285,6 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                    * scanout buffers are never fb-fetched. */
                   mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
                   limina_kk_linear = true;
-               } else {
-                  vkr_log("LIMINA-NOFORCE: leaving scanout image tiling=%d usage=0x%x",
-                          (int)mci->tiling, mci->usage);
                }
             }
          }
