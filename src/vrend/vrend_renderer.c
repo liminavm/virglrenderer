@@ -13604,14 +13604,43 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          .flags = 0,
       };
       struct vrend_resource *gr;
+      bool gkvm_placeholder = false;
 
-      if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF)
+      if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF) {
+#ifdef __APPLE__
+         /* gkvm: a venus-exported blob imported by a virgl-driver context — the
+          * compositor compositing a Vulkan client's wayland buffer. macOS has no
+          * dmabuf, so the fd_type can never be DMABUF here, and returning EINVAL
+          * poisons the compositor's context PERMANENTLY (every later SUBMIT_3D
+          * fails; reproduced 2026-08-04 with vkcube under a virgl gnome-shell —
+          * spikes/vrend-texture-corruption/). Type the resource as a PLACEHOLDER
+          * texture instead: every later reference to it stays valid GL and the
+          * context lives; only this buffer's CONTENTS are wrong (black) until a
+          * real IOSurface import path exists for vrend. */
+         static bool gkvm_warned;
+         if (!gkvm_warned) {
+            gkvm_warned = true;
+            virgl_warn("%s: untypeable blob res %u (fd_type %d, no dmabuf on "
+                       "macOS) — placeholder texture, contents will be wrong\n",
+                       __func__, res_id, res->fd_type);
+         }
+         gkvm_placeholder = true;
+#else
          return EINVAL;
+#endif
+      }
 
       gr = vrend_resource_create(&create_args);
       if (!gr)
          return ENOMEM;
 
+      if (gkvm_placeholder) {
+         int aret = vrend_resource_alloc_texture(gr, gr->base.format, NULL);
+         if (aret) {
+            FREE(gr);
+            return aret;
+         }
+      } else
 #ifdef HAVE_EPOXY_EGL_H
       if (egl) {
 #ifdef ENABLE_GBM
