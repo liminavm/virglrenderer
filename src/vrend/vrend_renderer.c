@@ -8690,13 +8690,23 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
 }
 
 #ifdef __APPLE__
-/* limina zero-copy scanout (docs/design/vrend-iosurface-scanout.md, plan A1).
- * Allocation half: give a guest SCANOUT-bound 2D color texture a display IOSurface and
- * a GL_AMD_pinned_memory PBO aliasing its bytes. The texture itself stays a normal GL
- * texture; vrend_renderer_resource_sync_iosurface() blits into the surface on flush,
- * and the VMM presents the surface id with no CPU pixel work. Any ineligible resource
- * (format, target, multisample, missing extension) silently keeps the readback path —
- * the fallback is never removed (two-tier rule). */
+/* limina zero-copy scanout (docs/design/vrend-iosurface-scanout.md).
+ * Allocation half. Two modes, best-effort in order:
+ *
+ * EGLImage mode (plan C, the default since 2026-08-04): the scanout texture's
+ * STORAGE is the display IOSurface, via the same EGL_IOSURFACE_LIMINA ->
+ * zink -> KK metal-handle chain the venus-blob import uses. vrend renders
+ * straight into the surface; sync is only a completion barrier. GPU writes,
+ * GLES GL_RGBA transfer uploads, and channel order are all probe-proven
+ * (spikes/vrend-iosurface/eglimport-probe.c: render-into + texsubimage).
+ *
+ * PBO mode (plan A1, the fallback): a normal GL texture plus a
+ * GL_AMD_pinned_memory PBO aliasing the surface bytes;
+ * vrend_renderer_resource_sync_iosurface() readpixels-blits on flush.
+ *
+ * Any ineligible resource (format, target, multisample, missing extension)
+ * silently keeps the CPU readback path — the fallback is never removed
+ * (two-tier rule). */
 
 #ifndef GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD
 #define GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD 0x9160
@@ -8712,6 +8722,7 @@ void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 /* field accessors would drag the struct in; it is already public in the helpers header,
  * but keep vrend decoupled with two tiny getters implemented in vkr_metal_helpers.m. */
 uint32_t vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
+void *vkr_mtl_iosurface_get_ref(const struct vkr_mtl_iosurface *surf);
 void vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf, void **out_base,
                                   uint32_t *out_bytes_per_row, uint64_t *out_alloc_size);
 /* Cross-context lookup of a venus-exported surface by id (+1 ref on success). */
@@ -8725,8 +8736,6 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
       return;
    if (gr->base.target != PIPE_TEXTURE_2D || gr->base.last_level != 0 ||
        gr->base.nr_samples > 1 || gr->base.depth0 != 1)
-      return;
-   if (!has_feature(feat_amd_pinned_memory))
       return;
 
    /* Display byte order comes straight from glReadPixels: BGRA guest formats read as
@@ -8754,6 +8763,35 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
       vkr_mtl_iosurface_alloc_plain(gr->base.width0, gr->base.height0, io_fourcc, 4);
    if (!surf)
       return;
+
+   /* EGLImage mode: make the IOSurface the texture's storage. On success
+    * alloc_texture continues into its image_oes branch with gr->egl_image
+    * and sync becomes a pure completion barrier. */
+   if (egl) {
+      void *img =
+         virgl_egl_image_from_iosurface(egl, vkr_mtl_iosurface_get_ref(surf));
+      if (img) {
+         gr->egl_image = img;
+         gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
+         gr->iosurface = surf;
+         gr->iosurf_pbo = 0;
+         virgl_warn("iosurface scanout: %ux%u %s EGL-backed (IOSurface id %u), "
+                    "renders land in the surface directly\n",
+                    gr->base.width0, gr->base.height0, util_format_name(format),
+                    vkr_mtl_iosurface_get_id(surf));
+         return;
+      }
+      virgl_warn("iosurface scanout: EGLImage refused (egl err 0x%x), trying "
+                 "pinned-PBO blit mode\n",
+                 virgl_egl_error_code(egl));
+   }
+
+   /* PBO mode (fallback): normal texture + pinned-memory PBO; sync readpixels
+    * into the surface bytes on flush. */
+   if (!has_feature(feat_amd_pinned_memory)) {
+      vkr_mtl_iosurface_free(surf);
+      return;
+   }
 
    void *base = NULL;
    uint32_t bpr = 0;
@@ -8794,8 +8832,16 @@ uint32_t vrend_renderer_resource_get_iosurface_id(struct vrend_resource *res)
  * has no IOSurface (caller falls back to readback). Runs on ctx0. */
 int vrend_renderer_resource_sync_iosurface(struct vrend_resource *res)
 {
-   if (!res || !res->iosurface || !res->iosurf_pbo)
+   if (!res || !res->iosurface)
       return -1;
+
+   /* EGLImage mode: the texture's storage IS the IOSurface — nothing to
+    * copy, only completion to guarantee before the present reads the bytes. */
+   if (!res->iosurf_pbo) {
+      vrend_hw_switch_context(vrend_state.ctx0, true);
+      glFinish();
+      return 0;
+   }
 
    vrend_hw_switch_context(vrend_state.ctx0, true);
 
@@ -9107,7 +9153,10 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       glDeleteMemoryObjectsEXT(1, &res->memobj);
    }
 
-#ifdef ENABLE_GBM
+/* limina: was #ifdef ENABLE_GBM, which is off on macOS — every destroyed
+ * EGLImage-backed resource (venus-blob imports, IOSurface scanouts) leaked
+ * its EGLImage and pinned the VkImage/MTLTexture/IOSurface behind it. */
+#ifdef HAVE_EPOXY_EGL_H
    if (res->egl_image) {
       virgl_egl_image_destroy(egl, res->egl_image);
       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {
