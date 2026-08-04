@@ -105,6 +105,8 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
  * forward-declares these instead. */
 uint32_t
 vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
+void *
+vkr_mtl_iosurface_get_ref(const struct vkr_mtl_iosurface *surf);
 void
 vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf,
                              void **out_base,
