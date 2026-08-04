@@ -30,6 +30,13 @@ struct vkr_physical_device {
 
    bool EXT_external_memory_metal;
    bool EXT_metal_objects;
+   /* Native (driver-advertised) support — KosmicKrisp has both since its
+    * LINEAR-only VK_EXT_image_drm_format_modifier landed; MoltenVK has
+    * neither. Gates whether vkr passes modifier structs/tiling through to the
+    * driver and whether the guest-enabled extension is forwarded at
+    * vkCreateDevice. */
+   bool EXT_image_drm_format_modifier;
+   bool EXT_queue_family_foreign;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;

@@ -288,6 +288,10 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          physical_dev->EXT_metal_objects = true;
       else if (!strcmp(props->extensionName, "VK_KHR_portability_subset"))
          physical_dev->KHR_portability_subset = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_image_drm_format_modifier"))
+         physical_dev->EXT_image_drm_format_modifier = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_queue_family_foreign"))
+         physical_dev->EXT_queue_family_foreign = true;
 
       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
       if (spec_ver) {
