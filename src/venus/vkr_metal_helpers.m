@@ -409,6 +409,14 @@ vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf)
    return surf ? surf->id : 0;
 }
 
+/* Raw IOSurfaceRef (borrowed, no ref transfer) — for vrend's EGLImage-backed
+ * scanout, which hands it to virgl_egl_image_from_iosurface. */
+void *
+vkr_mtl_iosurface_get_ref(const struct vkr_mtl_iosurface *surf)
+{
+   return surf ? surf->io_surface : NULL;
+}
+
 void
 vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf,
                              void **out_base,
