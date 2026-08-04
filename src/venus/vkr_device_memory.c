@@ -284,6 +284,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    VkImportMemoryHostPointerInfoEXT gkvm_res_import = { 0 };
    void *gkvm_imported_iosurface = NULL;
    bool gkvm_res_imported = false;
+   /* The IMPORT half of LIMINA_KK_MTLTEXTURE_SCANOUT: when the exporter backed its image
+    * with the IOSurface's MTLTexture, aliasing those bytes as a linear host pointer reads
+    * them at the WRONG layout and shears every row. Adopt the same texture instead. */
+   VkImportMemoryMetalHandleInfoEXT gkvm_metal_res_import = { 0 };
+   void *gkvm_imported_texture = NULL;
 #endif
    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
@@ -312,7 +317,42 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             ptr = gkvm_res->u.data;
             span = gkvm_res->size;
          }
-         if (ptr) {
+         /* LIMINA_KK_MTLTEXTURE_SCANOUT=1, import half. The exporter's image adopted this
+          * IOSurface's MTLTexture verbatim, so its contents are in the texture's layout,
+          * not a linear rowPitch — the importer has to adopt the same object or it reads
+          * sheared rows. Requires a DEDICATED import (KK advertises the MTLTEXTURE handle
+          * type as DEDICATED_ONLY), whose image also tells us the exact pixel format. */
+         static int gkvm_mtltex_imp = -1;
+         if (gkvm_mtltex_imp < 0) {
+            const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
+            gkvm_mtltex_imp = (e && *e == '1') ? 1 : 0;
+         }
+         if (gkvm_mtltex_imp && gkvm_imported_iosurface && dev->mtl_device) {
+            const VkMemoryDedicatedAllocateInfo *ded = vkr_find_struct(
+               alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+            const struct vkr_image *dimg =
+               ded ? vkr_image_from_handle(ded->image) : NULL;
+            uint32_t mtl_fmt = 0;
+            if (dimg && gkvm_vkformat_to_mtl_exact((VkFormat)dimg->gkvm_vk_format, &mtl_fmt))
+               gkvm_imported_texture = vkr_mtl_texture_from_iosurface(
+                  dev->mtl_device, gkvm_imported_iosurface, mtl_fmt);
+            fprintf(stderr,
+                    "[LIMINA-VKR-MTLTEX] import res %u IOSurface id=%u dedicated=%d "
+                    "vkfmt=%u mtlfmt=%u -> tex=%p\n",
+                    res_info->resourceId, gkvm_res->iosurface_id, dimg ? 1 : 0,
+                    dimg ? dimg->gkvm_vk_format : 0, mtl_fmt, gkvm_imported_texture);
+         }
+         if (gkvm_imported_texture) {
+            prev_of_res_info->pNext = res_info->pNext; /* unlink res_info */
+            gkvm_metal_res_import.sType =
+               VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
+            gkvm_metal_res_import.handleType =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+            gkvm_metal_res_import.handle = gkvm_imported_texture;
+            gkvm_metal_res_import.pNext = alloc_info->pNext;
+            alloc_info->pNext = &gkvm_metal_res_import;
+            gkvm_res_imported = true;
+         } else if (ptr) {
             /* VK_EXT_external_memory_host needs page-aligned ptr + size multiple of
              * minImportedHostPointerAlignment; blob sizes are guest-page (16K) multiples
              * and IOSurface alloc sizes page-rounded already — round up defensively. */
@@ -412,6 +452,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    /* gkvm KK path: host-pointer import of the scanout IOSurface bytes (function scope —
     * chained into alloc_info and must outlive the driver call). */
    VkImportMemoryHostPointerInfoEXT gkvm_host_import = { 0 };
+   VkImportMemoryMetalHandleInfoEXT gkvm_metal_import = { 0 };
 
    /* gkvm #28: plain HOST_VISIBLE memory is NO LONGER backed by an imported mtl_shm carrier.
     * The old path allocated a POSIX shm + Metal buffer (newBufferWithBytesNoCopy) and imported
@@ -582,20 +623,51 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
           * up to the IOSurface's own (page-rounded) alloc size. */
          struct vkr_mtl_iosurface *gkvm_io =
             (struct vkr_mtl_iosurface *)gkvm_scanout_surf;
-         gkvm_host_import.sType =
-            VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
-         gkvm_host_import.handleType =
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-         gkvm_host_import.pHostPointer = gkvm_io->base_addr;
-         gkvm_host_import.pNext = alloc_info->pNext;
-         alloc_info->pNext = &gkvm_host_import;
-         /* Clamp to the IOSurface's backing size: a guest-declared allocationSize
-          * larger than the backing would import past it (host OOB). See the matching
-          * clamp on the resource-import path above. */
-         alloc_info->allocationSize = gkvm_io->alloc_size;
-         vkr_log("gkvm: KK scanout memory <- host-pointer import of IOSurface id=%u "
-                 "(base=%p size=%" PRIu64 ")",
-                 gkvm_io->id, gkvm_io->base_addr, (uint64_t)gkvm_io->alloc_size);
+
+         /* LIMINA_KK_MTLTEXTURE_SCANOUT=1 (paired with the same gate in vkr_image.c):
+          * hand KK the IOSurface's MTLTexture as the memory itself, via
+          * VK_EXT_external_memory_metal. The image bound to this memory adopts that
+          * texture verbatim, so the render lands in the IOSurface with no host-pointer
+          * aliasing and no rowPitch to match. KK validates the texture against the image
+          * at bind and FAILS LOUDLY on a mismatch — deliberately, because the failure
+          * mode this replaces is Metal silently no-op'ing the render (see the MoltenVK
+          * note in vkr_image.c). */
+         static int gkvm_mtltex = -1;
+         if (gkvm_mtltex < 0) {
+            const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
+            gkvm_mtltex = (e && *e == '1') ? 1 : 0;
+         }
+         if (gkvm_mtltex && gkvm_io->mtl_texture) {
+            gkvm_metal_import.sType =
+               VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
+            gkvm_metal_import.handleType =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
+            gkvm_metal_import.handle = gkvm_io->mtl_texture;
+            gkvm_metal_import.pNext = alloc_info->pNext;
+            alloc_info->pNext = &gkvm_metal_import;
+            fprintf(stderr,
+                    "[LIMINA-VKR-MTLTEX] scanout memory <- MTLTEXTURE import of IOSurface "
+                    "id=%u (tex=%p)\n",
+                    gkvm_io->id, gkvm_io->mtl_texture);
+            vkr_log("gkvm: KK scanout memory <- MTLTEXTURE import of IOSurface id=%u "
+                    "(tex=%p)",
+                    gkvm_io->id, gkvm_io->mtl_texture);
+         } else {
+            gkvm_host_import.sType =
+               VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+            gkvm_host_import.handleType =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            gkvm_host_import.pHostPointer = gkvm_io->base_addr;
+            gkvm_host_import.pNext = alloc_info->pNext;
+            alloc_info->pNext = &gkvm_host_import;
+            /* Clamp to the IOSurface's backing size: a guest-declared allocationSize
+             * larger than the backing would import past it (host OOB). See the matching
+             * clamp on the resource-import path above. */
+            alloc_info->allocationSize = gkvm_io->alloc_size;
+            vkr_log("gkvm: KK scanout memory <- host-pointer import of IOSurface id=%u "
+                    "(base=%p size=%" PRIu64 ")",
+                    gkvm_io->id, gkvm_io->base_addr, (uint64_t)gkvm_io->alloc_size);
+         }
       } else {
          vkr_log("gkvm: scanout memory -> mtl_shm carrier for blob export; image renders "
                  "into its IOSurface (id=%u) via useIOSurface",
@@ -606,6 +678,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    if (export_info && !mtl_shm &&
        (export_info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
+      const uint32_t gkvm_export_ht = export_info->handleTypes;
       VkBaseInStructure *prev_of_export =
          vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
       if (prev_of_export) {
@@ -624,6 +697,20 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
          vkr_log("gkvm: scanout memory -> stripped OPAQUE/DMA_BUF export, attached mtl_shm "
                  "carrier (size=%llu); present uses the bound image's IOSurface",
                  (unsigned long long)alloc_info->allocationSize);
+         /* limina probe (2026-08-04): WHICH handle type the guest asked to export tells
+          * us which venus branch chose renderer_handle_type. DMA_BUF => upstream's own
+          * branch fired (vkr now advertises the extension) and mesa 0010(a) is dead
+          * code; OPAQUE_FD => still 0010(a)'s else-if. */
+         static uint32_t gkvm_ht_seen;
+         if (!(gkvm_ht_seen & gkvm_export_ht)) {
+            gkvm_ht_seen |= gkvm_export_ht;
+            fprintf(stderr, "[LIMINA-VKR-HT] export handleTypes=0x%x (%s%s)\n",
+                    gkvm_export_ht,
+                    (gkvm_export_ht & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+                       ? "DMA_BUF " : "",
+                    (gkvm_export_ht & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+                       ? "OPAQUE_FD" : "");
+         }
       }
    }
 #endif
@@ -642,6 +729,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       vkr_mtl_shm_free(mtl_shm);
 #ifdef __APPLE__
       vkr_mtl_iosurface_release_ref(gkvm_imported_iosurface);
+      vkr_mtl_texture_release(gkvm_imported_texture);
 #endif
       return;
    }
@@ -664,6 +752,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       mem->mtl_iosurface = gkvm_scanout_surf;
    /* gkvm: hold the imported window buffer's IOSurface for this memory's lifetime. */
    mem->imported_iosurface = gkvm_imported_iosurface;
+   /* KosmicKrisp retains the adopted texture in kk_AllocateMemory, so our +1 from
+    * vkr_mtl_texture_from_iosurface has done its job — drop it. The surviving IOSurface
+    * reference above is what keeps the underlying storage alive either way. */
+   vkr_mtl_texture_release(gkvm_imported_texture);
 #endif
 }
 

@@ -15,8 +15,19 @@ struct vkr_image {
     * struct vkr_mtl_iosurface that backs this VkImage (IOSurface-imported MTLTexture).
     * NULL for ordinary images. Lets present resolve image -> IOSurface id. */
    void *mtl_iosurface;
+
+   /* gkvm: the VkFormat this image was created with. The MTLTEXTURE import path needs it
+    * at vkAllocateMemory time — the importing memory is DEDICATED_ONLY, so the dedicated
+    * image names the format the adopted MTLTexture must match EXACTLY (sRGB included). */
+   uint32_t gkvm_vk_format;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+
+/* gkvm: VkFormat -> MTLPixelFormat, preserving sRGB (unlike the IOSurface mapper, which
+ * folds onto the UNORM base). The MTLTEXTURE import path on both ends needs the exact
+ * format: KosmicKrisp's bind compares it verbatim. False for formats we don't back. */
+bool
+gkvm_vkformat_to_mtl_exact(VkFormat fmt, uint32_t *mtl);
 
 struct vkr_image_view {
    struct vkr_object base;
