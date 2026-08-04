@@ -80,11 +80,17 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
                                   const uint32_t *plane_offsets);
-void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);
-
 void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo);
 void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo, int plane);
 #endif
+
+#ifdef __APPLE__
+/* gkvm: EGLImage whose storage is an IOSurface (venus->vrend buffer import). */
+void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface);
+#endif
+/* Guard-free EGL; used by the GBM paths and the IOSurface import alike. */
+void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);
+uint32_t virgl_egl_error_code(struct virgl_egl *egl);
 
 bool virgl_egl_supports_fences(struct virgl_egl *egl);
 EGLSyncKHR virgl_egl_fence_create(struct virgl_egl *egl);

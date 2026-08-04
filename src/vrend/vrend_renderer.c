@@ -987,8 +987,18 @@ bool vrend_format_is_bgra(enum virgl_formats format) {
 static bool
 vrend_resource_resource_is_imported(const struct vrend_resource *res)
 {
+#ifdef __APPLE__
+   /* gkvm: on macOS the only EGL-image source is our IOSurface import
+    * (venus client buffers composited by vrend, no GBM in the build).
+    * zink backs those with real VkImages, so unlike the GBM/dmabuf world
+    * their BGR* sampling and rendering semantics are fully native
+    * (byte-order proven by spikes/vrend-iosurface/eglimport-probe.c); the
+    * imported-BGRA channel-swap compensation must not engage for them. */
+   return has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ);
+#else
    return has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE) ||
           has_bit(res->storage_bits, VREND_STORAGE_GL_MEMOBJ);
+#endif
 }
 
 static GLuint vrend_resource_get_internal_format_override(const struct vrend_resource *res)
@@ -998,6 +1008,11 @@ static GLuint vrend_resource_get_internal_format_override(const struct vrend_res
     * TODO: perhaps this can be generalized to all alpha-less formats?
     */
    const enum virgl_formats format = res->base.format;
+#ifdef __APPLE__
+   /* gkvm: the 24bpp override is a GBM-world quirk; our IOSurface-backed
+    * EGL images are always tightly-typed 32bpp textures. */
+   (void)format;
+#else
    if (has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE)) {
       switch (format) {
       case VIRGL_FORMAT_B8G8R8X8_UNORM:
@@ -1013,6 +1028,7 @@ static GLuint vrend_resource_get_internal_format_override(const struct vrend_res
          ;
       }
    }
+#endif
    return GL_NONE;
 }
 
@@ -8698,6 +8714,9 @@ void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 uint32_t vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
 void vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf, void **out_base,
                                   uint32_t *out_bytes_per_row, uint64_t *out_alloc_size);
+/* Cross-context lookup of a venus-exported surface by id (+1 ref on success). */
+void *vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size);
+void vkr_mtl_iosurface_release_ref(void *io_surface);
 
 static void vrend_resource_iosurface_init(struct vrend_resource *gr,
                                           enum virgl_formats format)
@@ -13613,17 +13632,10 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
           * dmabuf, so the fd_type can never be DMABUF here, and returning EINVAL
           * poisons the compositor's context PERMANENTLY (every later SUBMIT_3D
           * fails; reproduced 2026-08-04 with vkcube under a virgl gnome-shell —
-          * spikes/vrend-texture-corruption/). Type the resource as a PLACEHOLDER
-          * texture instead: every later reference to it stays valid GL and the
-          * context lives; only this buffer's CONTENTS are wrong (black) until a
-          * real IOSurface import path exists for vrend. */
-         static bool gkvm_warned;
-         if (!gkvm_warned) {
-            gkvm_warned = true;
-            virgl_warn("%s: untypeable blob res %u (fd_type %d, no dmabuf on "
-                       "macOS) — placeholder texture, contents will be wrong\n",
-                       __func__, res_id, res->fd_type);
-         }
+          * spikes/vrend-texture-corruption/). Take the gkvm path instead: adopt
+          * the blob's IOSurface as the texture's storage (the real, zero-copy
+          * import), or — if that refuses — a zeroed PLACEHOLDER texture, so
+          * every later reference stays valid GL and the context lives. */
          gkvm_placeholder = true;
 #else
          return EINVAL;
@@ -13635,10 +13647,81 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
          return ENOMEM;
 
       if (gkvm_placeholder) {
-         int aret = vrend_resource_alloc_texture(gr, gr->base.format, NULL);
-         if (aret) {
-            FREE(gr);
-            return aret;
+         /* The real import: a venus-exported blob carries its IOSurface id on
+          * the virgl_resource. Adopt the surface as this GL texture's storage
+          * via the EGL_IOSURFACE_LIMINA EGLImage target (zink -> KK metal
+          * handle) — the compositor then samples the client's actual pixels,
+          * zero-copy. Falls back to the plain placeholder (black contents)
+          * when the id is absent or any step refuses. */
+         bool gkvm_imported = false;
+#ifdef __APPLE__
+         if (res->iosurface_id && egl) {
+            const char *gkvm_fail_stage = "lookup";
+            void *ios_base = NULL;
+            uint64_t ios_size = 0;
+            void *ios =
+               vkr_mtl_iosurface_lookup(res->iosurface_id, &ios_base, &ios_size);
+            if (ios) {
+               gkvm_fail_stage = "egl-image";
+               void *ios_image = virgl_egl_image_from_iosurface(egl, ios);
+               if (ios_image) {
+                  gkvm_fail_stage = "alloc-texture";
+                  gr->egl_image = ios_image;
+                  gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
+                  int aret =
+                     vrend_resource_alloc_texture(gr, gr->base.format, ios_image);
+                  if (!aret) {
+                     gkvm_imported = true;
+                     /* warn level on purpose: adoptions are rare (one per
+                      * client buffer) and this is the one positive signal
+                      * that the zero-copy path engaged. */
+                     virgl_warn("%s: res %u adopted IOSurface id %u (%ux%u %s)\n",
+                                __func__, res_id, res->iosurface_id,
+                                args->width, args->height,
+                                util_format_name(gr->base.format));
+                  } else {
+                     virgl_egl_image_destroy(egl, ios_image);
+                     gr->egl_image = NULL;
+                     gr->storage_bits &= ~VREND_STORAGE_EGL_IMAGE;
+                  }
+               }
+               /* KK's adopted MTLTexture retains the surface; drop our +1. */
+               vkr_mtl_iosurface_release_ref(ios);
+            }
+            if (!gkvm_imported)
+               virgl_warn("%s: res %u IOSurface id %u import failed at %s "
+                          "(egl err 0x%x) — placeholder texture, contents "
+                          "will be wrong\n",
+                          __func__, res_id, res->iosurface_id, gkvm_fail_stage,
+                          virgl_egl_error_code(egl));
+         } else {
+            virgl_warn("%s: untypeable blob res %u (fd_type %d, %s) — "
+                       "placeholder texture, contents will be wrong\n",
+                       __func__, res_id, res->fd_type,
+                       res->iosurface_id ? "no EGL" : "no IOSurface id");
+         }
+#endif /* __APPLE__ */
+         if (!gkvm_imported) {
+            int aret = vrend_resource_alloc_texture(gr, gr->base.format, NULL);
+            if (aret) {
+               FREE(gr);
+               return aret;
+            }
+            /* glTexStorage contents are UNDEFINED — without this the
+             * placeholder shows stale GPU memory (garbage, and a cross-context
+             * info leak), not black. Zero it explicitly. */
+            const uint32_t gkvm_bpp = util_format_get_blocksize(gr->base.format);
+            void *gkvm_zeros =
+               calloc(1, (size_t)args->width * args->height * gkvm_bpp);
+            if (gkvm_zeros) {
+               glBindTexture(gr->target, gr->gl_id);
+               glTexSubImage2D(gr->target, 0, 0, 0, args->width, args->height,
+                               tex_conv_table[gr->base.format].glformat,
+                               tex_conv_table[gr->base.format].gltype,
+                               gkvm_zeros);
+               glBindTexture(gr->target, 0);
+               free(gkvm_zeros);
+            }
          }
       } else
 #ifdef HAVE_EPOXY_EGL_H
