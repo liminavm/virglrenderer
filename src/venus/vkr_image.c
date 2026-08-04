@@ -178,6 +178,37 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
             if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
                gkvm_is_import = true;
+            /* limina probe (2026-08-04, task #19): WHAT the guest actually negotiates.
+             * mesa 0010(b) answers the modifier extension inside the guest and hardcodes
+             * a single LINEAR modifier, so the host never sees the negotiation — except
+             * here, where the chosen list/value rides in on the create. This is the
+             * measurement that decides whether KK needs to advertise one token or two. */
+            if (is_mod) {
+               static unsigned gkvm_mod_log;
+               if (gkvm_mod_log++ < 8) {
+                  if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) {
+                     const VkImageDrmFormatModifierListCreateInfoEXT *l = (void *)s;
+                     fprintf(stderr, "[LIMINA-VKRMODLIST] LIST count=%u:",
+                             l->drmFormatModifierCount);
+                     for (uint32_t i = 0; i < l->drmFormatModifierCount && i < 8; i++)
+                        fprintf(stderr, " 0x%llx",
+                                (unsigned long long)l->pDrmFormatModifiers[i]);
+                     fprintf(stderr, " (fmt=%u %ux%u usage=0x%x)\n", (unsigned)ci->format,
+                             ci->extent.width, ci->extent.height, ci->usage);
+                  } else {
+                     const VkImageDrmFormatModifierExplicitCreateInfoEXT *e = (void *)s;
+                     fprintf(stderr,
+                             "[LIMINA-VKRMODLIST] EXPLICIT 0x%llx planes=%u pitch=%llu "
+                             "(fmt=%u %ux%u usage=0x%x)\n",
+                             (unsigned long long)e->drmFormatModifier,
+                             e->drmFormatModifierPlaneCount,
+                             e->pPlaneLayouts ? (unsigned long long)e->pPlaneLayouts[0].rowPitch
+                                              : 0ull,
+                             (unsigned)ci->format, ci->extent.width, ci->extent.height,
+                             ci->usage);
+                  }
+               }
+            }
             if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
                 (is_mod && !gkvm_keep_structs))
                prev->pNext = s->pNext; /* unlink */
