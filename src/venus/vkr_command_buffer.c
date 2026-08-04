@@ -426,13 +426,22 @@ vkr_dispatch_vkCmdClearAttachments(UNUSED struct vn_dispatch_context *dispatch,
     * -02683): such a rect clears nothing, but passed through it can reach the
     * host driver's clear meta-path and abort the render server (a degenerate
     * rect trips vk_meta's setup_viewport_scissor assert / wraps its viewport
-    * math). Compact the decoded array in place; if nothing survives, skip the
-    * call entirely (clearing no rects is valid). */
+    * math). Equally drop rects with a negative offset or an offset + extent
+    * overflowing int32 (the rect must lie within the render area, so both are
+    * invalid usage too): the signed offset wraps in the driver's unsigned rect
+    * math into an inverted or absurdly-huge rect — the same aborts (seen live
+    * 2026-08-04: a compositor's negative-offset rect killed the VM). Compact
+    * the decoded array in place; if nothing survives, skip the call entirely
+    * (clearing no rects is valid). */
    VkClearRect *rects = (VkClearRect *)args->pRects;
    uint32_t count = 0;
    for (uint32_t i = 0; i < args->rectCount; i++) {
       if (rects[i].rect.extent.width == 0 || rects[i].rect.extent.height == 0 ||
           rects[i].layerCount == 0)
+         continue;
+      if (rects[i].rect.offset.x < 0 || rects[i].rect.offset.y < 0 ||
+          (int64_t)rects[i].rect.offset.x + rects[i].rect.extent.width > INT32_MAX ||
+          (int64_t)rects[i].rect.offset.y + rects[i].rect.extent.height > INT32_MAX)
          continue;
       rects[count++] = rects[i];
    }
