@@ -15,7 +15,41 @@
 
 /* MTLPixelFormat values (Metal/MTLPixelFormat.h) used for IOSurface backing. */
 #define LIMINA_MTLPixelFormatRGBA8Unorm 70
+#define LIMINA_MTLPixelFormatRGBA8Unorm_sRGB 71
 #define LIMINA_MTLPixelFormatBGRA8Unorm 80
+#define LIMINA_MTLPixelFormatBGRA8Unorm_sRGB 81
+
+/* EXACT MTLPixelFormat for a VkFormat — sRGB stays sRGB.
+ *
+ * This is deliberately NOT what limina_vkformat_to_iosurface() returns. That one folds sRGB onto
+ * its UNORM base, which is right for the MoltenVK path (MVK builds its own view over the
+ * IOSurface, from the image's real format, via a MUTABLE_FORMAT view list). It is fatal for the
+ * MTLTEXTURE-import path, where KosmicKrisp adopts our texture *verbatim*: an sRGB image over an
+ * UNORM texture is a format mismatch that fails the bind — observed 2026-08-04, vkmark's
+ * R8G8B8A8_SRGB swapchain (image fmt 71 vs texture fmt 70). Writes through an sRGB texture also
+ * carry sRGB encoding, which is exactly what the guest asked for and what the forced-LINEAR path
+ * already did (KK built its own texture from the image's format). The IOSurface's fourcc is
+ * unchanged either way, so presentation is unaffected. */
+bool
+limina_vkformat_to_mtl_exact(VkFormat fmt, uint32_t *mtl)
+{
+   switch (fmt) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      *mtl = LIMINA_MTLPixelFormatBGRA8Unorm;
+      return true;
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      *mtl = LIMINA_MTLPixelFormatBGRA8Unorm_sRGB;
+      return true;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      *mtl = LIMINA_MTLPixelFormatRGBA8Unorm;
+      return true;
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      *mtl = LIMINA_MTLPixelFormatRGBA8Unorm_sRGB;
+      return true;
+   default:
+      return false;
+   }
+}
 
 /* Map a VkFormat to (MTLPixelFormat, IOSurface FourCC, bytes/pixel) for an IOSurface-backed
  * scanout image. Returns false for formats we don't back (caller forwards unchanged). The
@@ -100,6 +134,20 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          }
       }
       if (ext && ext->handleTypes) {
+         /* limina probe (2026-08-04): venus stamps renderer_handle_type here, so this is a
+          * direct read of WHICH branch of vn_physical_device_init_external_memory fired.
+          * DMA_BUF (0x200) => upstream's own branch (vkr advertises the extension) and
+          * mesa 0010(a) is dead code; OPAQUE_FD (0x2) => still 0010(a)'s else-if. */
+         static uint32_t limina_ht_seen;
+         if (!(limina_ht_seen & ext->handleTypes)) {
+            limina_ht_seen |= ext->handleTypes;
+            fprintf(stderr, "[LIMINA-VKR-HT] image external handleTypes=0x%x (%s%s)\n",
+                    ext->handleTypes,
+                    (ext->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+                       ? "DMA_BUF " : "",
+                    (ext->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+                       ? "OPAQUE_FD" : "");
+         }
          /* No macOS driver honors fd-flavored external images (MoltenVK tolerates the
           * structs; KosmicKrisp rejects them at create) — vkr implements the export
           * contract itself. ALWAYS drop the external-memory / DRM-format-modifier
@@ -113,20 +161,48 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
          bool limina_is_import = false;
          VkImageCreateInfo *mci = (VkImageCreateInfo *)ci;
          VkBaseInStructure *prev = (VkBaseInStructure *)mci;
+         /* LIMINA_VKR_KEEP_MODIFIER_STRUCTS=1 leaves the DRM-format-modifier structs
+          * chained (the external-memory one is still unlinked) — the A/B for whether
+          * this unlink is load-bearing against a host driver that never advertises
+          * VK_EXT_image_drm_format_modifier. */
+         static int limina_keep_structs = -1;
+         if (limina_keep_structs < 0) {
+            const char *e = getenv("LIMINA_VKR_KEEP_MODIFIER_STRUCTS");
+            limina_keep_structs = (e && *e == '1') ? 1 : 0;
+         }
          for (VkBaseInStructure *s = (VkBaseInStructure *)mci->pNext; s;
               s = (VkBaseInStructure *)prev->pNext) {
             const int t = (int)s->sType;
+            const bool is_mod =
+               t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
+               t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
             if (t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
                limina_is_import = true;
             if (t == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO ||
-                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT ||
-                t == VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+                (is_mod && !limina_keep_structs))
                prev->pNext = s->pNext; /* unlink */
             else
                prev = s;
          }
-         if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-            mci->tiling = VK_IMAGE_TILING_OPTIMAL;
+         if (mci->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+            /* limina probe (2026-08-04): count how often a guest image actually
+             * arrives with modifier tiling, i.e. how much of this normalization is
+             * live traffic vs MoltenVK-era dead code. */
+            static unsigned limina_mod_hits;
+            if (++limina_mod_hits <= 4 || (limina_mod_hits % 256) == 0)
+               fprintf(stderr, "[LIMINA-VKRMOD] modifier-tiled guest image #%u %s import=%d\n",
+                       limina_mod_hits, limina_is_import ? "EXPLICIT" : "LIST", limina_is_import);
+            /* LIMINA_VKR_KEEP_MODIFIER_TILING=1 leaves the modifier tiling in place so
+             * the image reaches KK as the guest asked — the A/B that tells us whether
+             * kk_image_layout's modifier carve-out is a live guard or dead code. */
+            static int limina_keep = -1;
+            if (limina_keep < 0) {
+               const char *e = getenv("LIMINA_VKR_KEEP_MODIFIER_TILING");
+               limina_keep = (e && *e == '1') ? 1 : 0;
+            }
+            if (!limina_keep)
+               mci->tiling = VK_IMAGE_TILING_OPTIMAL;
+         }
 
          if (limina_vkformat_to_iosurface(ci->format, &limina_mtl, &limina_fourcc, &limina_bpe)) {
             struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -135,7 +211,20 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                /* Import: keep KK's LINEAR/usage normalization below, skip IOSurface
                 * allocation (the bound memory aliases the exporter's bytes). */
                if (!dev->physical_device->EXT_metal_objects) {
-                  mci->tiling = VK_IMAGE_TILING_LINEAR;
+                  /* …unless the MTLTEXTURE path is on, in which case the bound memory is
+                   * the exporter's TEXTURE, not its bytes. Forcing LINEAR here is what
+                   * sheared every GTK4 window on 2026-08-04: the exporter wrote in the
+                   * texture's layout while this side declared a linear rowPitch. Stay
+                   * OPTIMAL so KK's bind can adopt the texture (it refuses LINEAR). */
+                  static int limina_mtltex_imp = -1;
+                  if (limina_mtltex_imp < 0) {
+                     const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
+                     limina_mtltex_imp = (e && *e == '1') ? 1 : 0;
+                  }
+                  if (limina_mtltex_imp)
+                     mci->tiling = VK_IMAGE_TILING_OPTIMAL;
+                  else
+                     mci->tiling = VK_IMAGE_TILING_LINEAR;
                   mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
                }
             } else if (dev->physical_device->EXT_metal_objects) {
@@ -158,15 +247,73 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                 * (vkr_device_memory.c) — render lands in the surface, presented zero-copy.
                 * The IOSurface is allocated AFTER create, with the driver's linear rowPitch
                 * (vkGetImageSubresourceLayout). */
-               mci->tiling = VK_IMAGE_TILING_LINEAR;
-               /* INPUT_ATTACHMENT usage makes KK promote the image layout to
-                * 2DArray (vk_image_to_mtl_texture_type) — but Metal buffer-backed
-                * linear textures must be plain 2D, and a layout/texture array-ness
-                * mismatch makes render passes silently drop every draw (clears
-                * still land). zink only adds the bit speculatively (fb-fetch);
-                * scanout buffers are never fb-fetched. */
-               mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-               limina_kk_linear = true;
+               /* LIMINA_VKR_NO_KK_FORCE_LINEAR=1 leaves the guest's tiling alone, so the
+                * image reaches KK as it was asked for (modifier-tiled, if the guest said
+                * so) and kk_image_layout's carve-out becomes reachable. Costs zero-copy:
+                * without a defined linear rowPitch no IOSurface can alias the image
+                * memory, so the present path falls back to a readback blit. This is the
+                * A/B for "is the forced LINEAR still the only way to scan out on KK". */
+               static int limina_no_force = -1;
+               if (limina_no_force < 0) {
+                  const char *e = getenv("LIMINA_VKR_NO_KK_FORCE_LINEAR");
+                  limina_no_force = (e && *e == '1') ? 1 : 0;
+               }
+               /* LIMINA_KK_MTLTEXTURE_SCANOUT=1: the replacement for the forced LINEAR.
+                * KosmicKrisp now implements VK_EXT_external_memory_metal's MTLTEXTURE
+                * handle type, so instead of contorting the image into a linear layout
+                * whose rowPitch an IOSurface can be made to match, we allocate the
+                * IOSurface up front and hand KK its texture as the image's memory
+                * (vkr_device_memory.c does the import). No pitch to match, so the
+                * "IOSurface pitch != image rowPitch -> no zero-copy" failure mode goes
+                * away, and the guest's own tiling survives. Kept behind a gate until it
+                * is measured against the forced-LINEAR path. */
+               static int limina_mtltex = -1;
+               if (limina_mtltex < 0) {
+                  const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
+                  limina_mtltex = (e && *e == '1') ? 1 : 0;
+               }
+               if (limina_mtltex) {
+                  /* OPTIMAL keeps kk_image_layout on the plain-2D, non-linear path that
+                   * matches an IOSurface-backed MTLTexture; INPUT_ATTACHMENT would push
+                   * the layout type to 2DArray and fail KK's bind-time type check. */
+                  mci->tiling = VK_IMAGE_TILING_OPTIMAL;
+                  mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+                  /* EXACT format, sRGB included — KK adopts this texture verbatim, so
+                   * the UNORM-base folding used for the MoltenVK path would fail the
+                   * bind on an sRGB image. */
+                  uint32_t limina_mtl_exact = limina_mtl;
+                  limina_vkformat_to_mtl_exact(ci->format, &limina_mtl_exact);
+                  limina_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
+                                                      ci->extent.height, limina_mtl_exact,
+                                                      limina_fourcc, limina_bpe, 0);
+                  fprintf(stderr,
+                          "[LIMINA-VKR-MTLTEX] KK MTLTEXTURE scanout %ux%u -> IOSurface "
+                          "id=%u tex=%p\n",
+                          ci->extent.width, ci->extent.height,
+                          limina_surf ? limina_surf->id : 0,
+                          limina_surf ? limina_surf->mtl_texture : NULL);
+                  vkr_log("limina: KK MTLTEXTURE scanout %ux%u -> IOSurface id=%u tex=%p",
+                          ci->extent.width, ci->extent.height,
+                          limina_surf ? limina_surf->id : 0,
+                          limina_surf ? limina_surf->mtl_texture : NULL);
+                  /* On failure fall through to the forced-LINEAR path below. */
+               }
+               /* Fall back to forced LINEAR when the import path is off OR its IOSurface
+                * allocation failed — never leave the image with neither backing. */
+               if ((!limina_mtltex || !limina_surf) && !limina_no_force) {
+                  mci->tiling = VK_IMAGE_TILING_LINEAR;
+                  /* INPUT_ATTACHMENT usage makes KK promote the image layout to
+                   * 2DArray (vk_image_to_mtl_texture_type) — but Metal buffer-backed
+                   * linear textures must be plain 2D, and a layout/texture array-ness
+                   * mismatch makes render passes silently drop every draw (clears
+                   * still land). zink only adds the bit speculatively (fb-fetch);
+                   * scanout buffers are never fb-fetched. */
+                  mci->usage &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+                  limina_kk_linear = true;
+               } else {
+                  vkr_log("LIMINA-NOFORCE: leaving scanout image tiling=%d usage=0x%x",
+                          (int)mci->tiling, mci->usage);
+               }
             }
          }
       }
@@ -176,6 +323,13 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    struct vkr_image *limina_obj = vkr_image_create_and_add(dispatch->data, args);
 
 #ifdef __APPLE__
+   /* Remember the create format for the MTLTEXTURE import path (vkr_device_memory.c):
+    * a dedicated import allocation names this image, and the adopted texture's pixel
+    * format has to match it exactly. Recorded for EVERY image — the import side has no
+    * other way back to the format, and the field is inert otherwise. */
+   if (limina_obj && ci)
+      limina_obj->limina_vk_format = (uint32_t)ci->format;
+
    if (limina_surf) {
       if (limina_obj && args->ret == VK_SUCCESS) {
          limina_obj->mtl_iosurface = limina_surf;

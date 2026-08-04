@@ -121,6 +121,16 @@ vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
 void
 vkr_mtl_iosurface_release_ref(void *io_surface);
 
+/* Create a RETAINED id<MTLTexture> over an EXISTING IOSurface (the import half of the
+ * MTLTEXTURE scanout path — the exporter's surface, looked up by id). The descriptor
+ * mirrors vkr_mtl_iosurface_alloc's, so KosmicKrisp's superset-usage / exact-format bind
+ * check passes. Release with vkr_mtl_texture_release. NULL on failure. */
+void *
+vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_pixel_format);
+
+void
+vkr_mtl_texture_release(void *mtl_texture);
+
 /* limina: copy a registered scanout IOSurface's pixels into dst (top-down native BGRA, `height`
  * rows of min(dst_stride, surface bytesPerRow)). Used by the headless capture display sink, which
  * has no zero-copy present and no CPU transfer_read for venus blobs. Returns 1 on success, 0 on
