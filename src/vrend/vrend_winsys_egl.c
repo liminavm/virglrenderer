@@ -839,11 +839,38 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                     attrs);
 }
 
+#endif
+
+#ifdef __APPLE__
+/* limina: EGLImage over an IOSurfaceRef, via the limina mesa EGL target
+ * (egl_dri2.c EGL_IOSURFACE_LIMINA — the value must match). The surface
+ * self-describes, so no attribs; the resulting image's storage IS the
+ * IOSurface (zink -> KosmicKrisp MTLTEXTURE metal-handle adoption), which is
+ * how vrend composites a venus client's window buffer with real pixels. */
+#define VIRGL_EGL_IOSURFACE_LIMINA 0x3B9A
+
+void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface)
+{
+   return (void *)eglCreateImageKHR(egl->egl_display,
+                                    EGL_NO_CONTEXT,
+                                    VIRGL_EGL_IOSURFACE_LIMINA,
+                                    (EGLClientBuffer)iosurface,
+                                    NULL);
+}
+#endif
+
+/* Guard-free EGL — needed by the ENABLE_GBM paths and the __APPLE__
+ * IOSurface import alike. */
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image)
 {
    eglDestroyImageKHR(egl->egl_display, image);
 }
-#endif
+
+/* limina: expose eglGetError to callers without EGL headers (vrend_renderer). */
+uint32_t virgl_egl_error_code(UNUSED struct virgl_egl *egl)
+{
+   return (uint32_t)eglGetError();
+}
 
 #ifdef ENABLE_GBM_ALLOCATION
 void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo)
