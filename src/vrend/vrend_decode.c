@@ -1607,8 +1607,18 @@ static int vrend_decode_pipe_resource_set_type(struct vrend_context *ctx, const 
       args.plane_count = (length - VIRGL_PIPE_RES_SET_TYPE_SIZE(0)) / 2;
 
    if (length != VIRGL_PIPE_RES_SET_TYPE_SIZE(args.plane_count) ||
-       !args.plane_count || args.plane_count > VIRGL_GBM_MAX_PLANES)
+       !args.plane_count || args.plane_count > VIRGL_GBM_MAX_PLANES) {
+      /* limina probe: which of the three conditions rejects the compositor's command?
+       * Rejecting here poisons the context permanently (all later SUBMIT_3D fail). */
+      fprintf(stderr,
+              "[LIMINA-SETTYPE] REJECT length=%u plane_count=%u expected_size=%u "
+              "size0=%u max_planes=%u (len_mismatch=%d zero_planes=%d too_many=%d)\n",
+              length, args.plane_count, VIRGL_PIPE_RES_SET_TYPE_SIZE(args.plane_count),
+              VIRGL_PIPE_RES_SET_TYPE_SIZE(0), VIRGL_GBM_MAX_PLANES,
+              length != VIRGL_PIPE_RES_SET_TYPE_SIZE(args.plane_count),
+              !args.plane_count, args.plane_count > VIRGL_GBM_MAX_PLANES);
       return EINVAL;
+   }
 
    res_id = get_buf_entry(buf, VIRGL_PIPE_RES_SET_TYPE_RES_HANDLE);
    args.format = get_buf_entry(buf, VIRGL_PIPE_RES_SET_TYPE_FORMAT);
