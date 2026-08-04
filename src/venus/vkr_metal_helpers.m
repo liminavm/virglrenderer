@@ -315,8 +315,14 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
                                                            height:height
                                                         mipmapped:NO];
       /* PixelFormatView: scanout images are MUTABLE_FORMAT with a UNORM+sRGB view list. */
-      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget |
-                 MTLTextureUsagePixelFormatView;
+      /* ShaderWrite is here for the MTLTEXTURE-import scanout path: KosmicKrisp derives
+       * a Metal usage mask from the guest's VkImageUsageFlags, and a scanout image that
+       * carries TRANSFER_DST or STORAGE maps to MTL_TEXTURE_USAGE_SHADER_WRITE. KK's bind
+       * requires the imported texture's usage to be a SUPERSET of the image's, so a
+       * missing bit fails the bind outright (by design — the alternative is Metal
+       * silently no-op'ing the render into this surface). Extra bits are harmless. */
+      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                 MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
       td.storageMode = MTLStorageModeShared;
       tex = [device newTextureWithDescriptor:td iosurface:io plane:0];
       if (!tex) {
@@ -441,6 +447,46 @@ vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
    *out_base = IOSurfaceGetBaseAddress(io);
    *out_alloc_size = IOSurfaceGetAllocSize(io);
    return (void *)io;
+}
+
+void *
+vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_pixel_format)
+{
+   if (!mtl_device || !io_surface)
+      return NULL;
+
+   IOSurfaceRef io = (IOSurfaceRef)io_surface;
+   id<MTLTexture> tex = nil;
+   @autoreleasepool {
+      /* The IMPORT half of the MTLTEXTURE scanout path: the exporter already backed its
+       * image with this IOSurface's texture, so the importer must adopt the SAME object
+       * rather than aliasing the bytes as a linear host pointer. A host-pointer import
+       * reads the surface at the importing image's own linear rowPitch, which is not the
+       * layout the exporter's texture writes — the mismatch shears every row (2026-08-04:
+       * every GTK4 window skewed while the compositor's own scanout, which has no guest
+       * importer, stayed correct).
+       *
+       * Descriptor must mirror vkr_mtl_iosurface_alloc's exactly: KosmicKrisp's bind
+       * demands the imported texture's usage be a SUPERSET of the image's, and an exact
+       * pixel-format match (sRGB included — see limina_vkformat_to_mtl_exact). */
+      MTLTextureDescriptor *td = [MTLTextureDescriptor
+         texture2DDescriptorWithPixelFormat:(MTLPixelFormat)mtl_pixel_format
+                                      width:IOSurfaceGetWidth(io)
+                                     height:IOSurfaceGetHeight(io)
+                                  mipmapped:NO];
+      td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+                 MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+      td.storageMode = MTLStorageModeShared;
+      tex = [(id<MTLDevice>)mtl_device newTextureWithDescriptor:td iosurface:io plane:0];
+   }
+   return (void *)tex; /* +1 from newTextureWithDescriptor (ARC-retained by the cast) */
+}
+
+void
+vkr_mtl_texture_release(void *mtl_texture)
+{
+   if (mtl_texture)
+      CFRelease(mtl_texture);
 }
 
 void
