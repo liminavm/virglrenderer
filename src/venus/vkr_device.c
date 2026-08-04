@@ -150,16 +150,21 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          const char *name = args->pCreateInfo->ppEnabledExtensionNames[i];
 #if defined(__APPLE__)
          /* The guest Venus driver advertises several Linux/host-emulated device
-          * extensions that MoltenVK does not natively support. They are exposed
-          * to the guest for capability detection (and implemented by venus/vkr
-          * via the Metal path), but forwarding them to MoltenVK's vkCreateDevice
-          * fails with VK_ERROR_EXTENSION_NOT_PRESENT. Strip them from the host
-          * device-create list. (external_memory_fd / external_memory_dma_buf are
-          * re-appended below iff MoltenVK natively supports them.) */
+          * extensions that the macOS driver may not natively support. They are
+          * exposed to the guest for capability detection (and implemented by
+          * venus/vkr via the Metal path), but forwarding an unsupported one to
+          * the host vkCreateDevice fails with VK_ERROR_EXTENSION_NOT_PRESENT.
+          * Strip exactly the ones the driver lacks — KosmicKrisp natively has
+          * image_drm_format_modifier and queue_family_foreign now, and those
+          * must reach it or the guest-visible extension is inert.
+          * (external_memory_fd / external_memory_dma_buf are re-appended below
+          * iff the driver natively supports them.) */
          if (!strcmp(name, "VK_KHR_external_memory_fd") ||
              !strcmp(name, "VK_EXT_external_memory_dma_buf") ||
-             !strcmp(name, "VK_EXT_image_drm_format_modifier") ||
-             !strcmp(name, "VK_EXT_queue_family_foreign"))
+             (!strcmp(name, "VK_EXT_image_drm_format_modifier") &&
+              !physical_dev->EXT_image_drm_format_modifier) ||
+             (!strcmp(name, "VK_EXT_queue_family_foreign") &&
+              !physical_dev->EXT_queue_family_foreign))
             continue;
 #endif
          exts[ext_count++] = name;
