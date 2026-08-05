@@ -56,4 +56,24 @@ vrend_journal_census(const struct vrend_journal *j, struct vrend_journal_census 
 void
 vrend_journal_dump(const struct vrend_journal *j);
 
+/* P1 snapshot export, in the SAME 'VKJR' v1 wire format vkr_journal_export
+ * emits — the libkrun consumer parses both identically and routes entries back
+ * through the context's submit path at restore. Entry mapping: cmd_type = the
+ * virgl command id, ring_key = 0 (classic has no rings), klass = 6 for creates
+ * (a dropped create is load-bearing and warns at replay) and 3 for latest-wins
+ * state (the benign stale-reference drop class). malloc'd; caller frees. */
+bool
+vrend_journal_export(const struct vrend_journal *j, void **out_buf, size_t *out_size);
+
+/* The journal's last-assigned sequence — the cross-layer fence stamped on a
+ * control-queue CREATE_BLOB so replay feeds the wire PIPE_RESOURCE_CREATE that
+ * defines its blob_id first. */
+uint64_t
+vrend_journal_seq(const struct vrend_journal *j);
+
+/* A blob resource's GLOBAL unref retires the wire PIPE_RESOURCE_CREATE that
+ * defined its blob_id (the classic analogue of the venus create-pin release). */
+void
+vrend_journal_unpin_blob(struct vrend_journal *j, uint64_t blob_id);
+
 #endif /* VREND_JOURNAL_H */

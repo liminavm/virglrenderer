@@ -1695,6 +1695,27 @@ void vrend_decode_journal_dump_ctx(struct virgl_context *ctx)
    vrend_journal_dump(dctx->journal);
 }
 
+/* limina P1 snapshot: the classic context's journal, for the FFI export path. */
+struct vrend_journal *vrend_decode_ctx_journal(struct virgl_context *ctx)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+   return dctx->journal;
+}
+
+/* limina P1 restore: feed one retained journal entry back through the normal
+ * submit path. A failed entry (a retained command referencing an object that
+ * died around the snapshot) must NOT poison the fresh context — in_error is
+ * sticky and gates every later draw, so clear it and let the replayer drop the
+ * entry and continue (the venus sticky-FATAL lesson, classic edition). */
+bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32_t size)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+   int ret = ctx->submit_cmd(ctx, cmd, size);
+   if (ret)
+      vrend_context_clear_error(dctx->grctx);
+   return ret == 0;
+}
+
 static void vrend_decode_ctx_attach_resource(struct virgl_context *ctx,
                                              struct virgl_resource *res)
 {

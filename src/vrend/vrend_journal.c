@@ -8,6 +8,7 @@
 
 #include "vrend_journal.h"
 
+#include <assert.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -354,6 +355,181 @@ vrend_journal_census(const struct vrend_journal *j, struct vrend_journal_census 
       return;
    }
    *out = j->census;
+}
+
+/* Same header + entry layout as vkr_journal_export ('VKJR' v1): the libkrun
+ * consumer must not care which journal produced the bytes. */
+#define VREND_JOURNAL_EXPORT_MAGIC 0x524a4b56u /* 'VKJR' LE */
+#define VREND_JOURNAL_EXPORT_VERSION 1u
+
+#define VREND_JOURNAL_KLASS_STATE 3u  /* benign drop (stale reference) */
+#define VREND_JOURNAL_KLASS_CREATE 6u /* load-bearing drop (warns at replay) */
+
+static uint32_t
+entry_klass(const struct vrend_journal_entry *e)
+{
+   switch (e->key.cmd) {
+   case VIRGL_CCMD_CREATE_OBJECT:
+   case VIRGL_CCMD_CREATE_SUB_CTX:
+   case VIRGL_CCMD_PIPE_RESOURCE_CREATE:
+      return VREND_JOURNAL_KLASS_CREATE;
+   default:
+      return VREND_JOURNAL_KLASS_STATE;
+   }
+}
+
+/* Sub-ctx scope: object/state entries live in the sub-context that was current
+ * when they recorded; these classes are context-global (or define subs) and
+ * must NOT be bracketed by a SET_SUB_CTX. */
+static bool
+entry_is_sub_scoped(const struct vrend_journal_entry *e)
+{
+   switch (e->key.cmd) {
+   case VIRGL_CCMD_CREATE_SUB_CTX:
+   case VIRGL_CCMD_SET_SUB_CTX:
+   case VIRGL_CCMD_SET_TWEAKS:
+   case VIRGL_CCMD_PIPE_RESOURCE_CREATE:
+   case VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE:
+      return false;
+   default:
+      return true;
+   }
+}
+
+/* The replay stream must re-establish each entry's owning sub-context: only the
+ * LATEST SET_SUB_CTX is retained (latest-wins), but entries under other subs
+ * still replay. The export walks in seq order and injects a synthesized
+ * SET_SUB_CTX at every sub transition. Seqs on synthesized entries duplicate
+ * their successor's — the replayer's `seq <= fence` walk needs monotone seqs,
+ * never unique ones. A real (retained) SET_SUB_CTX in the stream also switches
+ * the tracked sub, exactly like it will at replay. */
+struct vrend_journal_export_walk {
+   uint32_t cur_sub;
+   bool sub_known;
+};
+
+static bool
+export_needs_sub_switch(struct vrend_journal_export_walk *w,
+                        const struct vrend_journal_entry *e,
+                        uint32_t *out_sub)
+{
+   if (e->key.cmd == VIRGL_CCMD_SET_SUB_CTX) {
+      /* the retained latest-wins entry: replaying it switches the sub */
+      w->cur_sub = e->ndw > 1 ? e->data[1] : 0;
+      w->sub_known = true;
+      return false;
+   }
+   if (!entry_is_sub_scoped(e))
+      return false;
+   if (w->sub_known && w->cur_sub == e->key.sub_ctx)
+      return false;
+   w->cur_sub = e->key.sub_ctx;
+   w->sub_known = true;
+   *out_sub = e->key.sub_ctx;
+   return true;
+}
+
+bool
+vrend_journal_export(const struct vrend_journal *j, void **out_buf, size_t *out_size)
+{
+   if (!j)
+      return false;
+
+   const size_t entry_overhead = sizeof(uint64_t) + sizeof(uint32_t) + 4 +
+                                 sizeof(uint64_t) + sizeof(uint32_t);
+   const size_t set_sub_size = 2 * sizeof(uint32_t); /* header + sub id */
+
+   size_t total = 4 * sizeof(uint32_t);
+   uint32_t count = 0;
+   struct vrend_journal_export_walk cw = { 0, false };
+   list_for_each_entry (struct vrend_journal_entry, e, &j->entries, link) {
+      uint32_t sub;
+      if (export_needs_sub_switch(&cw, e, &sub)) {
+         total += entry_overhead + set_sub_size;
+         count++;
+      }
+      total += entry_overhead + ALIGN_POT((size_t)e->ndw * 4, 4);
+      count++;
+   }
+
+   uint8_t *buf = malloc(total);
+   if (!buf)
+      return false;
+
+   uint8_t *p = buf;
+#define VREND_JOURNAL_PUT(val)                                                           \
+   do {                                                                                  \
+      memcpy(p, &(val), sizeof(val));                                                    \
+      p += sizeof(val);                                                                  \
+   } while (0)
+   const uint32_t magic = VREND_JOURNAL_EXPORT_MAGIC;
+   const uint32_t version = VREND_JOURNAL_EXPORT_VERSION;
+   const uint32_t reserved = 0;
+   VREND_JOURNAL_PUT(magic);
+   VREND_JOURNAL_PUT(version);
+   VREND_JOURNAL_PUT(count);
+   VREND_JOURNAL_PUT(reserved);
+
+   struct vrend_journal_export_walk ww = { 0, false };
+   list_for_each_entry (struct vrend_journal_entry, e, &j->entries, link) {
+      const uint8_t pad[3] = { 0 };
+      const uint64_t ring_key = 0;
+      uint32_t sub;
+      if (export_needs_sub_switch(&ww, e, &sub)) {
+         const uint32_t cmd_type = VIRGL_CCMD_SET_SUB_CTX;
+         const uint8_t klass = VREND_JOURNAL_KLASS_STATE;
+         const uint32_t size = (uint32_t)set_sub_size;
+         const uint32_t set_sub_cmd[2] = { VIRGL_CMD0(VIRGL_CCMD_SET_SUB_CTX, 0, 1), sub };
+         VREND_JOURNAL_PUT(e->seq);
+         VREND_JOURNAL_PUT(cmd_type);
+         VREND_JOURNAL_PUT(klass);
+         memcpy(p, pad, sizeof(pad));
+         p += sizeof(pad);
+         VREND_JOURNAL_PUT(ring_key);
+         VREND_JOURNAL_PUT(size);
+         memcpy(p, set_sub_cmd, size);
+         p += size;
+      }
+      const uint32_t cmd_type = e->key.cmd;
+      const uint8_t klass = (uint8_t)entry_klass(e);
+      const uint32_t size = e->ndw * 4;
+      VREND_JOURNAL_PUT(e->seq);
+      VREND_JOURNAL_PUT(cmd_type);
+      VREND_JOURNAL_PUT(klass);
+      memcpy(p, pad, sizeof(pad));
+      p += sizeof(pad);
+      VREND_JOURNAL_PUT(ring_key);
+      VREND_JOURNAL_PUT(size);
+      memcpy(p, e->data, size);
+      p += size;
+   }
+#undef VREND_JOURNAL_PUT
+
+   assert((size_t)(p - buf) == total);
+   *out_buf = buf;
+   *out_size = total;
+   return true;
+}
+
+uint64_t
+vrend_journal_seq(const struct vrend_journal *j)
+{
+   return j ? j->seq_next - 1 : 0;
+}
+
+static bool
+pred_pipe_res(const struct vrend_journal_entry *e, uint32_t blob_lo, uint32_t unused)
+{
+   (void)unused;
+   return e->key.cmd == VIRGL_CCMD_PIPE_RESOURCE_CREATE && e->key.k1 == blob_lo;
+}
+
+void
+vrend_journal_unpin_blob(struct vrend_journal *j, uint64_t blob_id)
+{
+   if (!j)
+      return;
+   prune_matching(j, pred_pipe_res, (uint32_t)blob_id, 0);
 }
 
 void
