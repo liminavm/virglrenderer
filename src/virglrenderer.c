@@ -1364,18 +1364,34 @@ bool render_state_limina_memory_write(uint32_t ctx_id, uint64_t mem_id, const vo
  * stale-context submission after a snapshot restore, and periodically under
  * LIMINA_GPU_TRACE_VKR=1; the per-type object tally on a healthy session is the
  * retain-and-replay bill of materials. */
+static bool limina_dump_classic_ctx(struct virgl_context *ctx, UNUSED void *data)
+{
+   /* limina: classic contexts carry the vrend journal; venus/drm contexts are
+    * dumped by their own paths */
+   if (ctx->capset_id == VIRTGPU_DRM_CAPSET_VIRGL ||
+       ctx->capset_id == VIRTGPU_DRM_CAPSET_VIRGL2 || ctx->capset_id == 0)
+      vrend_decode_journal_dump_ctx(ctx);
+   return true;
+}
+
 void virgl_renderer_limina_dump_state(void)
 {
    TRACE_FUNC();
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
-   if (state.proxy_initialized) {
+   if (state.proxy_initialized)
       render_state_limina_dump_state();
-      return;
-   }
-   virgl_info("[GPUTRACE] vkr state: venus proxy not initialized\n");
+   else
+      virgl_info("[GPUTRACE] vkr state: venus proxy not initialized\n");
 #else
    virgl_info("[GPUTRACE] vkr state: unavailable (out-of-process render server)\n");
 #endif
+
+   /* limina: classic-vrend journal census, one line per live classic context */
+   const struct virgl_context_foreach_args args = {
+      .callback = limina_dump_classic_ctx,
+      .data = NULL,
+   };
+   virgl_context_foreach(&args);
 }
 
 /* limina snapshot-replay (limina M9.3 P1): venus journal export + replay. Same

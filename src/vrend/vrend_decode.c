@@ -35,6 +35,7 @@
 #include "virgl_context.h"
 #include "virgl_resource.h"
 #include "vrend_renderer.h"
+#include "vrend_journal.h"
 #include "vrend_object.h"
 #include "tgsi/tgsi_text.h"
 #include "vrend_debug.h"
@@ -54,6 +55,9 @@
 struct vrend_decode_ctx {
    struct virgl_context base;
    struct vrend_context *grctx;
+   /* limina: classic snapshot-replay re-creation journal (vrend_journal.h);
+    * NULL when disabled via VREND_JOURNAL=0 */
+   struct vrend_journal *journal;
 };
 
 static inline uint32_t get_buf_entry(const uint32_t *buf, uint32_t offset)
@@ -1668,6 +1672,8 @@ struct virgl_context *vrend_renderer_context_create(uint32_t handle,
                                    vrend_decode_ctx_fence_retire,
                                    dctx);
 
+   dctx->journal = vrend_journal_create(handle);
+
    return &dctx->base;
 }
 
@@ -1676,8 +1682,17 @@ static void vrend_decode_ctx_destroy(struct virgl_context *ctx)
    TRACE_FUNC();
    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
 
+   vrend_journal_destroy(dctx->journal);
    vrend_destroy_context(dctx->grctx);
    free(dctx);
+}
+
+/* limina: census dump for the classic journal, called from
+ * virgl_renderer_limina_dump_state's context walk. */
+void vrend_decode_journal_dump_ctx(struct virgl_context *ctx)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+   vrend_journal_dump(dctx->journal);
 }
 
 static void vrend_decode_ctx_attach_resource(struct virgl_context *ctx,
@@ -2115,6 +2130,11 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
             vrend_report_buffer_error(gdctx->grctx, *buf);
          return ret;
       }
+
+      /* limina: retain the durable subset for snapshot replay — only commands
+       * that dispatched successfully (mirrors the venus journal's on-success
+       * recording; a rejected command re-created no state worth replaying). */
+      vrend_journal_record(gdctx->journal, buf, len + 1);
    }
    return 0;
 }

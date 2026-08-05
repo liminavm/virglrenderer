@@ -37,6 +37,8 @@ vrend_sources = [
    'vrend/vrend_debug.c',
    'vrend/vrend_decode.c',
    'vrend/vrend_formats.c',
+   'vrend/vrend_journal.c',
+   'vrend/vrend_journal.h',
    'vrend/vrend_object.c',
    'vrend/vrend_renderer.c',
    'vrend/vrend_shader.c',

@@ -264,6 +264,9 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
 
 struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *debug_name);
 void vrend_destroy_context(struct vrend_context *ctx);
+/* limina: classic snapshot-replay journal census (vrend_decode.c) */
+void vrend_decode_journal_dump_ctx(struct virgl_context *ctx);
+
 struct virgl_context *vrend_renderer_context_create(uint32_t handle,
                                                     uint32_t nlen,
                                                     const char *name);
