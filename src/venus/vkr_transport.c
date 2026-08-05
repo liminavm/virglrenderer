@@ -80,7 +80,9 @@ vkr_dispatch_vkExecuteCommandStreamsMESA(
       }
 
       while (vkr_cs_decoder_has_command(dec)) {
+         vkr_journal_pre_dispatch(dispatch);
          vn_dispatch_command(dispatch);
+         vkr_journal_post_dispatch(dispatch);
          if (vkr_context_get_fatal(ctx))
             break;
       }
