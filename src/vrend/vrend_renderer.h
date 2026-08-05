@@ -271,6 +271,17 @@ struct vrend_journal *vrend_decode_ctx_journal(struct virgl_context *ctx);
 bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32_t size);
 /* limina P1: clear the sticky protocol-error flag after a dropped replay entry */
 void vrend_context_clear_error(struct vrend_context *ctx);
+/* limina P2: classic host-side content capture — read every GL-storage resource
+ * back into an opaque blob at snapshot / upload it back after the creates
+ * replay (vrend_renderer.c; virgl_context wrappers in vrend_decode.c). */
+int vrend_renderer_export_ctx_contents(struct vrend_context *ctx,
+                                       void **out_buf, size_t *out_size);
+int vrend_renderer_restore_ctx_contents(struct vrend_context *ctx,
+                                        const void *buf, size_t size);
+int vrend_decode_ctx_content_export(struct virgl_context *ctx,
+                                    void **out_buf, size_t *out_size);
+int vrend_decode_ctx_content_restore(struct virgl_context *ctx,
+                                     const void *buf, size_t size);
 
 struct virgl_context *vrend_renderer_context_create(uint32_t handle,
                                                     uint32_t nlen,

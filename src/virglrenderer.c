@@ -1455,6 +1455,31 @@ uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
    return 0;
 }
 
+int virgl_renderer_limina_classic_content_export(uint32_t ctx_id, void **out_buf,
+                                                 uint64_t *out_size)
+{
+   TRACE_FUNC();
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (!classic)
+      return -ENOENT;
+   size_t size = 0;
+   int ret = vrend_decode_ctx_content_export(classic, out_buf, &size);
+   if (ret)
+      return ret;
+   *out_size = size;
+   return 0;
+}
+
+int virgl_renderer_limina_classic_content_restore(uint32_t ctx_id, const void *buf,
+                                                  uint64_t size)
+{
+   TRACE_FUNC();
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (!classic)
+      return -ENOENT;
+   return vrend_decode_ctx_content_restore(classic, buf, size);
+}
+
 void virgl_renderer_limina_journal_unpin(uint32_t ctx_id, uint64_t key)
 {
    struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);

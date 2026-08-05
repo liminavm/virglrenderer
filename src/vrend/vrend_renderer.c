@@ -38,6 +38,7 @@
 #include "util/u_memory.h"
 #include "util/u_dual_blend.h"
 #include "util/hash_table.h"
+#include "util/u_hash_table.h"
 #include "util/ralloc.h"
 
 #include "util/u_thread.h"
@@ -10357,6 +10358,220 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
 
    return vrend_renderer_transfer_internal(ctx, res, info,
                                            transfer_mode);
+}
+
+/* -------- limina task #19 P2: classic host-side content capture -------- *
+ *
+ * The re-creation journal restores the STRUCTURE of a classic context, and
+ * the guest-shadow re-upload restores resources whose truth lives in guest
+ * pages — but a texture uploaded once at startup (icon atlas, glyph cache,
+ * shadow/corner masks) has its only copy in the host GL object, which dies
+ * with the renderer. Same gap venus P2 closed with VkDeviceMemory content
+ * capture. Capture = read every GL-storage resource back through the SAME
+ * transfer path the guest uses (formats/tiling handled); restore = the
+ * matching TO_HOST transfer after the creates replay.
+ *
+ * Blob layout (opaque to the consumer): u32 magic 'VRCC', u32 version, then
+ * per entry: u32 res_id, u32 level, u32 w, u32 h, u32 d, u32 size, bytes.
+ */
+
+#define VREND_CONTENT_MAGIC   0x43435256 /* 'VRCC' */
+#define VREND_CONTENT_VERSION 1u
+
+struct vrend_content_writer {
+   struct vrend_context *ctx;
+   uint8_t *buf;
+   size_t size;
+   size_t cap;
+   uint32_t entries;
+   uint32_t skipped;   /* readback attempted and failed */
+   uint32_t excluded;  /* multisample / guest-backed-only: nothing to capture */
+};
+
+static bool content_append(struct vrend_content_writer *w, const void *data, size_t len)
+{
+   if (w->size + len > w->cap) {
+      size_t cap = w->cap ? w->cap * 2 : 1 << 20;
+      while (cap < w->size + len)
+         cap *= 2;
+      uint8_t *nb = realloc(w->buf, cap);
+      if (!nb)
+         return false;
+      w->buf = nb;
+      w->cap = cap;
+   }
+   memcpy(w->buf + w->size, data, len);
+   w->size += len;
+   return true;
+}
+
+static void content_box_for_level(const struct vrend_resource *res, uint32_t level,
+                                  struct pipe_box *box)
+{
+   memset(box, 0, sizeof(*box));
+   box->width = u_minify(res->base.width0, level);
+   box->height = u_minify(res->base.height0, level);
+   if (res->base.target == PIPE_TEXTURE_3D)
+      box->depth = u_minify(res->base.depth0, level);
+   else if (res->base.array_size > 1)
+      box->depth = res->base.array_size;
+   else
+      box->depth = 1;
+}
+
+static uint64_t content_level_size(struct vrend_resource *res, uint32_t level,
+                                   struct pipe_box *box, struct vrend_transfer_info *info)
+{
+   uint32_t stride = util_format_get_stride(res->base.format,
+                                            u_minify(res->base.width0, level));
+   uint32_t layer_stride = util_format_get_2d_size(res->base.format, stride,
+                                                   u_minify(res->base.height0, level));
+   memset(info, 0, sizeof(*info));
+   info->level = level;
+   info->box = box;
+   return vrend_transfer_size(res, info, stride, layer_stride);
+}
+
+static enum pipe_error content_export_res(UNUSED void *key, void *value, void *data)
+{
+   struct vrend_content_writer *w = data;
+   struct vrend_resource *res = value;
+   uint32_t res_id = (uint32_t)(uintptr_t)key;
+
+   /* Multisample surfaces can't be read back (and are render targets the
+    * compositor regenerates); a resource whose ONLY storage is guest memory
+    * is already covered by the guest-RAM dump. */
+   if (res->base.nr_samples > 0) {
+      w->excluded++;
+      return PIPE_OK;
+   }
+   if (!has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE) &&
+       !has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER) &&
+       !has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) {
+      w->excluded++;
+      return PIPE_OK;
+   }
+   /* An immutable-storage buffer created without MAP_READ can't be mapped for
+    * readback — and the send path only LOGS that failure (returns 0), which
+    * would capture uninitialized bytes. */
+   if (has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER) &&
+       res->buffer_storage_flags && !(res->buffer_storage_flags & GL_MAP_READ_BIT)) {
+      w->excluded++;
+      return PIPE_OK;
+   }
+
+   uint32_t last_level =
+      (res->base.target == PIPE_BUFFER) ? 0 : res->base.last_level;
+   for (uint32_t level = 0; level <= last_level; level++) {
+      struct pipe_box box;
+      struct vrend_transfer_info info;
+      content_box_for_level(res, level, &box);
+      uint64_t size = content_level_size(res, level, &box, &info);
+      if (!size || size > UINT32_MAX) {
+         w->skipped++;
+         continue;
+      }
+      /* calloc, not malloc: a readback path that soft-fails (logs and returns
+       * 0) must yield deterministic zeros, never heap garbage. */
+      void *bytes = calloc(1, size);
+      if (!bytes) {
+         w->skipped++;
+         continue;
+      }
+      struct iovec iov = { .iov_base = bytes, .iov_len = size };
+      info.iovec = &iov;
+      info.iovec_cnt = 1;
+      info.synchronized = true;
+      if (vrend_renderer_transfer_internal(w->ctx, res, &info,
+                                           VIRGL_TRANSFER_FROM_HOST) != 0) {
+         free(bytes);
+         w->skipped++;
+         continue;
+      }
+      uint32_t hdr[6] = { res_id, level, (uint32_t)box.width, (uint32_t)box.height,
+                          (uint32_t)box.depth, (uint32_t)size };
+      if (!content_append(w, hdr, sizeof(hdr)) || !content_append(w, bytes, size)) {
+         free(bytes);
+         return PIPE_ERROR_OUT_OF_MEMORY;
+      }
+      free(bytes);
+      w->entries++;
+   }
+   return PIPE_OK;
+}
+
+int vrend_renderer_export_ctx_contents(struct vrend_context *ctx,
+                                       void **out_buf, size_t *out_size)
+{
+   struct vrend_content_writer w = { .ctx = ctx };
+   uint32_t head[2] = { VREND_CONTENT_MAGIC, VREND_CONTENT_VERSION };
+
+   if (!content_append(&w, head, sizeof(head)))
+      return -ENOMEM;
+   if (util_hash_table_foreach(ctx->res_hash, content_export_res, &w) != PIPE_OK) {
+      free(w.buf);
+      return -ENOMEM;
+   }
+   virgl_info("vrend content export ctx %d: %u entries (%zu bytes), "
+              "%u skipped, %u excluded\n",
+              ctx->ctx_id, w.entries, w.size, w.skipped, w.excluded);
+   *out_buf = w.buf;
+   *out_size = w.size;
+   return 0;
+}
+
+int vrend_renderer_restore_ctx_contents(struct vrend_context *ctx,
+                                        const void *buf, size_t size)
+{
+   const uint8_t *p = buf;
+   const uint8_t *end = p + size;
+   uint32_t restored = 0, dropped = 0;
+
+   if (size < 8 || ((const uint32_t *)buf)[0] != VREND_CONTENT_MAGIC ||
+       ((const uint32_t *)buf)[1] != VREND_CONTENT_VERSION)
+      return -EINVAL;
+   p += 8;
+   while (p + 24 <= end) {
+      uint32_t res_id, level, bw, bh, bd, sz;
+      memcpy(&res_id, p, 4);
+      memcpy(&level, p + 4, 4);
+      memcpy(&bw, p + 8, 4);
+      memcpy(&bh, p + 12, 4);
+      memcpy(&bd, p + 16, 4);
+      memcpy(&sz, p + 20, 4);
+      p += 24;
+      if (p + sz > end)
+         return -EINVAL;
+
+      struct vrend_resource *res = vrend_renderer_ctx_res_lookup(ctx, res_id);
+      if (!res) {
+         dropped++;
+         p += sz;
+         continue;
+      }
+      struct pipe_box box;
+      memset(&box, 0, sizeof(box));
+      box.width = bw;
+      box.height = bh;
+      box.depth = bd;
+      struct vrend_transfer_info info;
+      memset(&info, 0, sizeof(info));
+      info.level = level;
+      info.box = &box;
+      struct iovec iov = { .iov_base = (void *)p, .iov_len = sz };
+      info.iovec = &iov;
+      info.iovec_cnt = 1;
+      info.synchronized = true;
+      if (vrend_renderer_transfer_internal(ctx, res, &info,
+                                           VIRGL_TRANSFER_TO_HOST) != 0)
+         dropped++;
+      else
+         restored++;
+      p += sz;
+   }
+   virgl_info("vrend content restore ctx %d: %u restored, %u dropped\n",
+              ctx->ctx_id, restored, dropped);
+   return 0;
 }
 
 int vrend_renderer_transfer_pipe(struct pipe_resource *pres,
