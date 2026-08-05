@@ -19,7 +19,7 @@
 #include <servers/bootstrap.h>
 
 #include "util/anon_file.h"
-#include "venus-protocol/vulkan_metal.h"
+#include "vulkan/vulkan_metal.h"
 
 #include "vkr_metal_helpers.h"
 
