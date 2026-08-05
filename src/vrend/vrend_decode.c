@@ -1716,6 +1716,21 @@ bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32
    return ret == 0;
 }
 
+/* limina P2: classic content capture/restore, routed from the FFI. */
+int vrend_decode_ctx_content_export(struct virgl_context *ctx,
+                                    void **out_buf, size_t *out_size)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+   return vrend_renderer_export_ctx_contents(dctx->grctx, out_buf, out_size);
+}
+
+int vrend_decode_ctx_content_restore(struct virgl_context *ctx,
+                                     const void *buf, size_t size)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+   return vrend_renderer_restore_ctx_contents(dctx->grctx, buf, size);
+}
+
 static void vrend_decode_ctx_attach_resource(struct virgl_context *ctx,
                                              struct virgl_resource *res)
 {

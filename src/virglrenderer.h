@@ -519,6 +519,18 @@ VIRGL_EXPORT int virgl_renderer_limina_memory_read(uint32_t ctx_id, uint64_t mem
 VIRGL_EXPORT int virgl_renderer_limina_memory_write(uint32_t ctx_id, uint64_t mem_id,
                                                     const void *buf, uint64_t size);
 
+/* limina task #19 P2 (classic contexts only): host-side resource content
+ * capture — the classic analogue of the venus memory read/write pair. A
+ * texture uploaded once (icon atlas, glyph cache) has its only copy in the
+ * host GL object; the guest-shadow re-upload can't restore it. Export reads
+ * every GL-storage resource attached to the context back through the normal
+ * transfer path into one opaque malloc'd blob (caller frees); restore uploads
+ * it back AFTER the context's journal replay (creates must exist). */
+VIRGL_EXPORT int virgl_renderer_limina_classic_content_export(uint32_t ctx_id, void **out_buf,
+                                                              uint64_t *out_size);
+VIRGL_EXPORT int virgl_renderer_limina_classic_content_restore(uint32_t ctx_id,
+                                                               const void *buf, uint64_t size);
+
 #define VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF        0x0001
 #define VIRGL_RENDERER_BLOB_FD_TYPE_OPAQUE        0x0002
 #define VIRGL_RENDERER_BLOB_FD_TYPE_SHM           0x0003
