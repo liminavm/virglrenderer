@@ -266,6 +266,11 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
 void vrend_destroy_context(struct vrend_context *ctx);
 /* limina: classic snapshot-replay journal census (vrend_decode.c) */
 void vrend_decode_journal_dump_ctx(struct virgl_context *ctx);
+/* limina P1 snapshot-replay (vrend_decode.c): journal accessor + tolerant replay */
+struct vrend_journal *vrend_decode_ctx_journal(struct virgl_context *ctx);
+bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32_t size);
+/* limina P1: clear the sticky protocol-error flag after a dropped replay entry */
+void vrend_context_clear_error(struct vrend_context *ctx);
 
 struct virgl_context *vrend_renderer_context_create(uint32_t handle,
                                                     uint32_t nlen,

@@ -44,6 +44,7 @@
 #include "drm_renderer.h"
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
+#include "vrend/vrend_journal.h"
 #include "vrend/vrend_winsys.h"
 
 #ifndef WIN32
@@ -1397,11 +1398,35 @@ void virgl_renderer_limina_dump_state(void)
 /* limina snapshot-replay (limina M9.3 P1): venus journal export + replay. Same
  * availability rules as the state dump above — same-process render server only.
  * See vkr_renderer.h for the replay contract (replay buffers must be mutable;
- * one journal entry per submit/ring_cmd call). */
+ * one journal entry per submit/ring_cmd call).
+ *
+ * Task #19: every entry point routes by CONTEXT TYPE — classic (vrend) contexts
+ * carry their own re-creation journal (vrend_journal.h, same VKJR wire format),
+ * venus contexts keep the render_state/vkr path. Classic replay needs no
+ * begin/end brackets (no proxy thread, no ring state): they are no-op success. */
+
+static struct virgl_context *limina_classic_ctx_lookup(uint32_t ctx_id)
+{
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+   if (!ctx)
+      return NULL;
+   if (ctx->capset_id == VIRTGPU_DRM_CAPSET_VENUS ||
+       ctx->capset_id == VIRTGPU_DRM_CAPSET_DRM)
+      return NULL;
+   return ctx;
+}
 
 int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf, uint64_t *out_size)
 {
    TRACE_FUNC();
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (classic) {
+      size_t size = 0;
+      if (!vrend_journal_export(vrend_decode_ctx_journal(classic), out_buf, &size))
+         return -EINVAL;
+      *out_size = size;
+      return 0;
+   }
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized) {
       size_t size = 0;
@@ -1419,6 +1444,9 @@ int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf, uint64
 
 uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
 {
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (classic)
+      return vrend_journal_seq(vrend_decode_ctx_journal(classic));
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized)
       return render_state_limina_journal_seq(ctx_id);
@@ -1429,6 +1457,13 @@ uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
 
 void virgl_renderer_limina_journal_unpin(uint32_t ctx_id, uint64_t key)
 {
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (classic) {
+      /* the classic pin analogue: a blob's global unref retires the wire
+       * PIPE_RESOURCE_CREATE that defined its blob_id */
+      vrend_journal_unpin_blob(vrend_decode_ctx_journal(classic), key);
+      return;
+   }
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized) {
       render_state_limina_journal_unpin(ctx_id, key);
@@ -1442,6 +1477,8 @@ void virgl_renderer_limina_journal_unpin(uint32_t ctx_id, uint64_t key)
 int virgl_renderer_limina_replay_begin(uint32_t ctx_id)
 {
    TRACE_FUNC();
+   if (limina_classic_ctx_lookup(ctx_id))
+      return 0; /* classic: nothing async to wait for */
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized)
       return render_state_limina_replay_begin(ctx_id) ? 0 : -EINVAL;
@@ -1452,6 +1489,9 @@ int virgl_renderer_limina_replay_begin(uint32_t ctx_id)
 
 int virgl_renderer_limina_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size)
 {
+   struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
+   if (classic)
+      return vrend_decode_ctx_replay_submit(classic, cmd, size) ? 0 : -EINVAL;
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized)
       return render_state_limina_replay_submit(ctx_id, cmd, size) ? 0 : -EINVAL;
@@ -1481,6 +1521,8 @@ int virgl_renderer_limina_replay_ring_cmd(uint32_t ctx_id,
 int virgl_renderer_limina_replay_end(uint32_t ctx_id)
 {
    TRACE_FUNC();
+   if (limina_classic_ctx_lookup(ctx_id))
+      return 0; /* classic: no rings to start, nothing deferred */
 #ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
    if (state.proxy_initialized)
       return render_state_limina_replay_end(ctx_id) ? 0 : -EINVAL;

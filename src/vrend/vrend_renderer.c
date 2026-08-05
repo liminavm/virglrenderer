@@ -1157,6 +1157,15 @@ void vrend_report_context_error_internal(const char *fname, struct vrend_context
                value);
 }
 
+/* limina P1 snapshot-replay: in_error is sticky by design (a live guest that
+ * broke protocol stays broken), but a REPLAYED entry whose referent died around
+ * the snapshot is expected and droppable — the replayer clears the flag so one
+ * stale entry cannot gate every post-restore draw. */
+void vrend_context_clear_error(struct vrend_context *ctx)
+{
+   ctx->in_error = false;
+}
+
 #define CORE_PROFILE_WARN_NONE 0
 #define CORE_PROFILE_WARN_STIPPLE 1
 #define CORE_PROFILE_WARN_POLYGON_MODE 2
