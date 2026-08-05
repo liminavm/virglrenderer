@@ -222,6 +222,7 @@ struct vkr_journal_frame {
    struct vkr_context *ctx;
    struct vn_dispatch_context *dctx;
    const uint8_t *start;
+   uint32_t cmd_type; /* peeked from the wire in pre_dispatch */
 
    uint64_t *created;
    VkObjectType *created_types;
@@ -898,23 +899,28 @@ void
 vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
 {
    /* The incoming command's type sits at the decoder cursor (vn_dispatch_command
-    * decodes it right after this hook). If it is anything but a RECORDING
-    * command, ship this thread's pending block BEFORE the dispatch starts:
-    * several non-recording commands block mid-dispatch (vkWaitRingSeqnoMESA and
-    * friends), and pending captures must not sit out a block — a snapshot
-    * export quiescing the VM at that moment would miss them. */
+    * decodes it right after this hook) — peek it from the wire. Peeking here,
+    * rather than having the dispatcher pass it, keeps the generated
+    * venus-protocol headers stock: the tee brackets vn_dispatch_command at its
+    * call sites instead of patching the generated dispatch loop. A failed peek
+    * (truncated stream) stashes type 0; the dispatch then goes fatal and
+    * post_dispatch drops the frame before ever classifying it. */
+   const struct vkr_cs_decoder *dec = (const struct vkr_cs_decoder *)dctx->decoder;
+   uint32_t next_type = 0;
+   const bool have_type = dec->cur + sizeof(next_type) <= dec->end;
+   if (have_type)
+      memcpy(&next_type, dec->cur, sizeof(next_type));
+
+   /* If it is anything but a RECORDING command, ship this thread's pending
+    * block BEFORE the dispatch starts: several non-recording commands block
+    * mid-dispatch (vkWaitRingSeqnoMESA and friends), and pending captures must
+    * not sit out a block — a snapshot export quiescing the VM at that moment
+    * would miss them. */
    struct vkr_journal_batch *b = &vkr_journal_batch_tls;
    if (b->block_nrecs) {
-      const struct vkr_cs_decoder *dec = (const struct vkr_cs_decoder *)dctx->decoder;
-      uint32_t next_type;
-      if (dec->cur + sizeof(next_type) > dec->end) {
+      if (!have_type || (vkr_journal_classify((VkCommandTypeEXT)next_type) &
+                         VKR_JOURNAL_CLASS_MASK) != VKR_JOURNAL_RECORDING)
          vkr_journal_batch_close_block();
-      } else {
-         memcpy(&next_type, dec->cur, sizeof(next_type));
-         if ((vkr_journal_classify((VkCommandTypeEXT)next_type) &
-              VKR_JOURNAL_CLASS_MASK) != VKR_JOURNAL_RECORDING)
-            vkr_journal_batch_close_block();
-      }
    }
 
    struct vkr_journal *j = vkr_journal_from_dispatch(dctx);
@@ -933,6 +939,7 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
    frame->ctx = dctx->data;
    frame->dctx = dctx;
    frame->start = ((struct vkr_cs_decoder *)dctx->decoder)->cur;
+   frame->cmd_type = next_type;
    frame->parent = vkr_journal_frame_cur;
    vkr_journal_frame_cur = frame;
 }
@@ -952,6 +959,7 @@ vkr_journal_frame_free(struct vkr_journal_frame *frame)
    frame->ctx = NULL;
    frame->dctx = NULL;
    frame->start = NULL;
+   frame->cmd_type = 0;
    frame->parent = vkr_journal_frame_pool;
    vkr_journal_frame_pool = frame;
 }
@@ -1016,7 +1024,7 @@ vkr_journal_flush_removed(struct vkr_journal *j, struct vkr_journal_frame *frame
 }
 
 void
-vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd_type)
+vkr_journal_post_dispatch(struct vn_dispatch_context *dctx)
 {
    struct vkr_journal *j = vkr_journal_from_dispatch(dctx);
    if (!j)
@@ -1026,6 +1034,10 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx, VkCommandTypeEXT cmd
    if (!frame || frame->j != j)
       return; /* pre_dispatch OOM'd; nothing to pop */
    vkr_journal_frame_cur = frame->parent;
+
+   /* the wire type pre_dispatch peeked — identical to what the dispatcher
+    * decoded, since both read the same bytes */
+   const VkCommandTypeEXT cmd_type = (VkCommandTypeEXT)frame->cmd_type;
 
    struct vkr_cs_decoder *dec = (struct vkr_cs_decoder *)dctx->decoder;
    const uint8_t *end = dec->cur;

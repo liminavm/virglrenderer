@@ -529,7 +529,9 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
 
    vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(dec)) {
+      vkr_journal_pre_dispatch(&ring->dispatch);
       vn_dispatch_command(&ring->dispatch);
+      vkr_journal_post_dispatch(&ring->dispatch);
       if (vkr_cs_decoder_get_fatal(dec)) {
          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
 
@@ -567,7 +569,9 @@ vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size)
 
    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
    while (vkr_cs_decoder_has_command(dec)) {
+      vkr_journal_pre_dispatch(&ring->dispatch);
       vn_dispatch_command(&ring->dispatch);
+      vkr_journal_post_dispatch(&ring->dispatch);
       if (vkr_cs_decoder_get_fatal(dec)) {
          vkr_log("ring_replay_cmd: vn_dispatch_command failed");
          vkr_cs_decoder_reset(dec);
