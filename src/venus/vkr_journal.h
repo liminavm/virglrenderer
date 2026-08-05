@@ -77,10 +77,19 @@ vkr_journal_destroy(struct vkr_journal *j);
 bool
 vkr_journal_enabled(void);
 
-/* The dispatch tee (vkr_journal_pre_dispatch / vkr_journal_post_dispatch) is
- * declared in the generated vn_protocol_renderer_dispatches.h next to its one
- * caller, vn_dispatch_command — its signature uses the protocol's
- * VkCommandTypeEXT, which plain vulkan.h consumers of this header lack. */
+/* The dispatch tee: bracket EVERY vn_dispatch_command call with these (all
+ * four call sites — context submit, transport execute, ring submit, ring
+ * replay). Lives here, NOT in the generated venus-protocol headers, which must
+ * stay stock (they are a meson subproject at upstream tip); pre_dispatch peeks
+ * the command type from the decoder wire itself, so no protocol types appear
+ * in these signatures. */
+struct vn_dispatch_context;
+
+void
+vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx);
+
+void
+vkr_journal_post_dispatch(struct vn_dispatch_context *dctx);
 
 /* decode-lane batching: bracket a ring/context command-batch drain so retained
  * messages reach the consumer queue in one lock+signal per batch instead of
