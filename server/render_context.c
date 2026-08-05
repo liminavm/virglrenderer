@@ -89,10 +89,12 @@ render_context_dispatch_import_resource(struct render_context *ctx,
       &request->import_resource;
 
    /* gkvm tier-2 (macOS): a map_ptr blob (#28) attaches fd-less — the host VA is
-    * valid here (same-process thread server). */
-   if (req->fd_type == VIRGL_RESOURCE_FD_INVALID && req->map_ptr) {
+    * valid here (same-process thread server). Same for an IOSurface-backed classic
+    * pipe resource (scanout gbm buffer): the surface id alone reaches the bytes,
+    * size resolved at import from the surface. */
+   if (req->fd_type == VIRGL_RESOURCE_FD_INVALID && (req->map_ptr || req->iosurface_id)) {
       if (fd_count != 0) {
-         render_log("unexpected %d fds with map_ptr resource attach", fd_count);
+         render_log("unexpected %d fds with fd-less resource attach", fd_count);
          return false;
       }
       return render_state_import_resource(ctx->ctx_id, req->res_id, req->fd_type, -1,

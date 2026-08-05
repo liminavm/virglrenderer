@@ -34,6 +34,7 @@
 #include "vkr_host_copy.h"
 #include "vkr_image.h"
 #include "vkr_instance.h"
+#include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 #include "vkr_pipeline.h"
 #include "vkr_query_pool.h"
@@ -550,6 +551,25 @@ vkr_context_import_resource(struct vkr_context *ctx,
                             uint32_t iosurface_id,
                             uint64_t map_ptr)
 {
+#ifdef __APPLE__
+   /* gkvm: an IOSurface-backed classic pipe resource attaches with size 0 (a pipe
+    * resource has no map_size) — the surface knows its own allocation size, and the
+    * props path reports res->size as allocationSize, so resolve it here. */
+   if (!size && iosurface_id) {
+      void *base = NULL;
+      uint64_t span = 0;
+      void *io = vkr_mtl_iosurface_lookup(iosurface_id, &base, &span);
+      if (!io) {
+         vkr_log_error("import res %u: IOSurface id=%u not in the registry — attach "
+                       "dropped",
+                       res_id, iosurface_id);
+         return false;
+      }
+      vkr_mtl_iosurface_release_ref(io);
+      size = span;
+   }
+#endif
+
    bool ok;
    if (fd_type == VIRGL_RESOURCE_FD_SHM)
       ok = vkr_context_import_resource_from_shm(ctx, res_id, size, fd);

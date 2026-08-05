@@ -494,6 +494,32 @@ proxy_context_attach_resource(struct virgl_context *base, struct virgl_resource 
       return;
    }
 
+   /* gkvm: a CLASSIC vrend pipe resource whose texture is IOSurface-backed (a
+    * SCANOUT-bound gbm buffer since the EGLImage scanout work) also attaches fd-less,
+    * by surface id — venus memory imports then alias the same IOSurface bytes. This is
+    * a Vulkan compositor importing its own gbm/KMS buffers into venus (the synoik
+    * 2026-08-05 stall: without this the attach fell through to the dmabuf export below,
+    * which cannot succeed on macOS, and was silently dropped — every later import got
+    * "invalid res_id" / VK_ERROR_INVALID_EXTERNAL_HANDLE). Size is resolved
+    * server-side from the IOSurface (a pipe resource has no map_size). */
+   if (res->fd_type == VIRGL_RESOURCE_FD_INVALID && res->pipe_resource &&
+       res->iosurface_id) {
+      const struct render_context_op_import_resource_request req = {
+         .header.op = RENDER_CONTEXT_OP_IMPORT_RESOURCE,
+         .res_id = res_id,
+         .fd_type = VIRGL_RESOURCE_FD_INVALID,
+         .size = 0,
+         .iosurface_id = res->iosurface_id,
+         .map_ptr = 0,
+      };
+      if (!proxy_socket_send_request(&ctx->socket, &req, sizeof(req))) {
+         proxy_log("failed to attach IOSurface-backed pipe res %d", res_id);
+         return;
+      }
+      proxy_context_resource_add(ctx, res_id);
+      return;
+   }
+
    /* The current render protocol only supports importing dma-buf, shm or pipe resource
     * that can be exported to dma-buf. A protocol change is needed when there exists use
     * case for importing external Vulkan opaque resource.
