@@ -10508,6 +10508,17 @@ int vrend_renderer_export_ctx_contents(struct vrend_context *ctx,
 
    if (!content_append(&w, head, sizeof(head)))
       return -ENOMEM;
+   /* VREND_CONTENT=0: kill switch (and the pixel-gate RED lever) — export a
+    * valid empty blob so replay runs structure-only, reproducing the
+    * gray-blocks state. */
+   const char *env = getenv("VREND_CONTENT");
+   if (env && env[0] == '0') {
+      virgl_info("vrend content export ctx %d: disabled (VREND_CONTENT=0)\n",
+                 ctx->ctx_id);
+      *out_buf = w.buf;
+      *out_size = w.size;
+      return 0;
+   }
    if (util_hash_table_foreach(ctx->res_hash, content_export_res, &w) != PIPE_OK) {
       free(w.buf);
       return -ENOMEM;
