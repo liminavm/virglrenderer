@@ -18,6 +18,8 @@ struct vkr_mtl_shm {
    void *shm_ptr;
    size_t shm_size;
    void *mtl_buffer;
+   /* limina host-memory budget (vkr_budget.h): the context this allocation was charged to. */
+   uint32_t limina_budget_ctx;
 };
 
 /*
@@ -38,6 +40,8 @@ struct vkr_mtl_iosurface {
    uint32_t bytes_per_row;
    void *base_addr;     /* IOSurfaceGetBaseAddress — page-aligned host pointer */
    uint64_t alloc_size; /* IOSurfaceGetAllocSize */
+   /* limina host-memory budget (vkr_budget.h): the context alloc_size was charged to. */
+   uint32_t limina_budget_ctx;
 };
 
 #ifdef __APPLE__

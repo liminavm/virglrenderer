@@ -11,6 +11,7 @@
 #include "virtgpu_drm.h"
 #include "venus_hw.h"
 
+#include "vkr_budget.h"
 #include "vkr_context.h"
 #include "vkr_device.h"
 #include "vkr_device_memory.h"
@@ -78,6 +79,9 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
 
    if (cbs->debug_logger)
       virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
+
+   /* After the log handler is installed, so the cap announcement reaches the worker log. */
+   vkr_budget_init();
 
    vkr_state.cbs = cbs;
    list_inithead(&vkr_state.contexts);

@@ -21,6 +21,7 @@
 #include "util/anon_file.h"
 #include "vulkan/vulkan_metal.h"
 
+#include "vkr_budget.h"
 #include "vkr_metal_helpers.h"
 
 /*
@@ -244,6 +245,7 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
    shm->shm_ptr = shm_ptr;
    shm->shm_size = aligned_size;
    shm->mtl_buffer = (void *)buffer;
+   shm->limina_budget_ctx = vkr_budget_charge(aligned_size, "shm carrier");
    if (vkr_fd_trace())
       vkr_log_error("[FDTRACE] shm_alloc fd=%d size=%zu", shm_fd, aligned_size);
    return shm;
@@ -254,6 +256,7 @@ vkr_mtl_shm_free(struct vkr_mtl_shm *shm)
 {
    if (!shm)
       return;
+   vkr_budget_credit(shm->limina_budget_ctx, shm->shm_size);
    if (shm->mtl_buffer)
       CFRelease(shm->mtl_buffer);
    if (shm->shm_ptr)
@@ -346,6 +349,7 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
    surf->base_addr = IOSurfaceGetBaseAddress(io);
    surf->alloc_size = IOSurfaceGetAllocSize(io);
+   surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
 
    /* Scoped surfaces are non-global: register id->IOSurfaceRef so vkr_mtl_iosurface_lookup can
     * still resolve them, and hand the Mach port to the supervisor for present. */
@@ -395,6 +399,7 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
    surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
    surf->base_addr = IOSurfaceGetBaseAddress(io);
    surf->alloc_size = IOSurfaceGetAllocSize(io);
+   surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
 
    if (scope) {
       limina_registry_insert(surf->id, io);
@@ -433,6 +438,7 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
 {
    if (!surf)
       return;
+   vkr_budget_credit(surf->limina_budget_ctx, surf->alloc_size);
    /* Drop the registry's retain before ours (no-op if the surface was global). */
    limina_registry_remove(surf->id);
    if (surf->mtl_texture)

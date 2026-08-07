@@ -12,6 +12,7 @@
 
 #include "vn_protocol_renderer_dispatches.h"
 
+#include "vkr_budget.h"
 #include "vkr_context.h"
 
 static inline void *
@@ -527,6 +528,13 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
 
    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
 
+   /* The ring runs on its own thread, so bind it to this context for allocation
+    * attribution (see vkr_budget.h). */
+   {
+      const struct vkr_context *ctx = ring->dispatch.data;
+      vkr_budget_set_context(ctx->ctx_id, ctx->debug_name);
+   }
+
    vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(dec)) {
       vkr_journal_pre_dispatch(&ring->dispatch);
@@ -568,6 +576,10 @@ vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size)
       return false;
 
    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+   {
+      const struct vkr_context *ctx = ring->dispatch.data;
+      vkr_budget_set_context(ctx->ctx_id, ctx->debug_name);
+   }
    while (vkr_cs_decoder_has_command(dec)) {
       vkr_journal_pre_dispatch(&ring->dispatch);
       vn_dispatch_command(&ring->dispatch);

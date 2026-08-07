@@ -10,6 +10,7 @@
 #include "vn_protocol_renderer_transport.h"
 
 #include "vkr_device_memory_gen.h"
+#include "vkr_budget.h" /* limina: host-memory budget for guest GPU allocations */
 #include "vkr_buffer.h" /* limina: vkr_buffer_from_handle for the dedicated-alloc pin */
 #include "vkr_image.h" /* #30 Path A: vkr_image_from_handle for the dedicated scanout image */
 #include "vkr_metal_helpers.h"
@@ -268,6 +269,26 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    const uint32_t mem_type_index = alloc_info->memoryTypeIndex;
    if (unlikely(mem_type_index >= physical_dev->memory_properties.memoryTypeCount)) {
       args->ret = VK_ERROR_UNKNOWN;
+      return;
+   }
+
+   /* Host-memory budget (vkr_budget.h). Refuse BEFORE allocating anything, so a guest
+    * running away with host memory loses its own context here — with the culprit named in
+    * the log — rather than having the host OS kill the whole VM later. Imports are exempt:
+    * they alias bytes someone else already paid for.
+    *
+    * The FATAL is what makes the refusal stick. venus submits vkAllocateMemory
+    * asynchronously and never reads our VkResult (see vkr_budget.h), so returning an error
+    * alone would leave the guest holding a ghost VkDeviceMemory and poison the ring a few
+    * commands later anyway — same outcome, delayed and misattributed. `args->ret` is still
+    * set for the VN_PERF=no_async_mem_alloc path. */
+   if (!vkr_find_struct(alloc_info->pNext,
+                        VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA) &&
+       !vkr_budget_admit(alloc_info->allocationSize)) {
+      vkr_budget_refused(alloc_info->allocationSize, "device memory allocation");
+      args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      if (vkr_budget_kills_context())
+         vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -745,6 +766,25 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->mtl_shm = mtl_shm;
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
+
+   /* Charge the driver's own commitment to the budget ledger. Only a FRESH driver
+    * allocation counts: an import aliases bytes already charged to whoever allocated
+    * them (the exporting context's memory, or the IOSurface charged at its own
+    * allocator), and billing both sides would double-count the same 31.6 MiB. The
+    * mtl_shm carrier and the IOSurfaces charge themselves in vkr_metal_helpers.m, so
+    * every host allocator is counted exactly once, at the site that calls it. */
+   {
+      bool aliases_existing = res_info != NULL;
+#ifdef __APPLE__
+      if (limina_host_import.pHostPointer || limina_metal_import.handle)
+         aliases_existing = true;
+#endif
+      if (!aliases_existing) {
+         mem->limina_budget_size = alloc_info->allocationSize;
+         mem->limina_budget_ctx =
+            vkr_budget_charge(mem->limina_budget_size, "device memory");
+      }
+   }
 #ifdef __APPLE__
    /* limina #30: link the scanout image's IOSurface onto this dedicated memory now, so
     * vkr_device_memory_export_blob carries the id even before vkBindImageMemory2. */
@@ -934,6 +974,9 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
     * BEFORE this release (vkr_device.c) — an explicit unmap here would hit already-freed memory
     * (a MoltenVK use-after-free / SIGSEGV). The borrowed pointer in the resource layer is only
     * read while the guest holds the mapping; by free time the guest side is already gone. */
+   vkr_budget_credit(mem->limina_budget_ctx, mem->limina_budget_size);
+   mem->limina_budget_size = 0;
+
    vkr_mtl_shm_free(mem->mtl_shm);
    vkr_mtl_iosurface_release_ref(mem->imported_iosurface);
    if (mem->gbm_bo)
