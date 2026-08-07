@@ -85,6 +85,21 @@ vkr_budget_init(void);
 void
 vkr_budget_set_context(uint32_t ctx_id, const char *debug_name);
 
+/* Bind the calling thread to the shared "vrend" pseudo-context, for allocations made on
+ * behalf of a CLASSIC resource.
+ *
+ * vrend cannot use vkr_budget_set_context: a classic resource is created through the
+ * VMM's global resource-create path, which carries no context at all (the guest attaches
+ * it to one only afterwards), and that path runs on the same thread that dispatches venus
+ * commands. Without this, a vrend IOSurface is charged to whichever venus context that
+ * thread happened to serve last — silently blaming an innocent guest client, which matters
+ * now that per-context numbers are reported back to the guest.
+ *
+ * A shared bucket rather than real attribution is the honest answer, not a shortcut: at
+ * allocation time nobody owns the resource yet. */
+void
+vkr_budget_set_vrend(void);
+
 /* True if a `size`-byte allocation fits under the cap. Does not charge. Always true when
  * no cap is configured. On false the caller must log via vkr_budget_refused() AND kill the
  * context — see the header comment for why an error return alone does nothing. */
