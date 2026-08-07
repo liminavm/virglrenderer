@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -58,6 +59,21 @@ static bool vkr_budget_cap_read;
  * VN_PERF=no_async_mem_alloc — see vkr_budget_kills_context(). */
 static bool vkr_budget_soft;
 
+/* Periodic census interval in seconds; 0 = off. The host half of a guest-vs-host leak
+ * hunt: pair it with the guest's own per-allocation-site census and diff the two series.
+ * vmmap is NOT a substitute — it did not move measurably for a 2 GiB live set of venus
+ * images during the 2026-08-07 churn probes, which is precisely why this exists. */
+static unsigned vkr_budget_census_secs;
+static uint64_t vkr_budget_last_census_ns;
+
+static uint64_t
+vkr_budget_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 /* Watermark hysteresis: report once on the way up, re-arm on the way back down, so a
  * session hovering at the line does not spam the log. */
 static bool vkr_budget_warned;
@@ -74,6 +90,20 @@ vkr_budget_init_locked(void)
       return;
    vkr_budget_cap_read = true;
 
+   /* Read the two modifiers BEFORE the cap, so they stay independent of it: the census in
+    * particular is most useful with no cap set at all (measure first, bound later). */
+   const char *soft = getenv("LIMINA_GPU_MEM_BUDGET_SOFT");
+   vkr_budget_soft = soft && soft[0] == '1';
+
+   const char *census = getenv("LIMINA_GPU_MEM_BUDGET_CENSUS");
+   if (census && *census) {
+      vkr_budget_census_secs = (unsigned)strtoul(census, NULL, 10);
+      if (vkr_budget_census_secs) {
+         vkr_budget_last_census_ns = vkr_budget_now_ns();
+         vkr_log_error("limina GPU budget: census every %us", vkr_budget_census_secs);
+      }
+   }
+
    const char *env = getenv("LIMINA_GPU_MEM_BUDGET_MIB");
    if (!env || !*env)
       return;
@@ -89,9 +119,6 @@ vkr_budget_init_locked(void)
    /* ERROR level deliberately: one line, once, and it is the context for any refusal that
     * follows — a log showing a killed context without it leaves you guessing what the cap
     * was. It also makes the env plumbing verifiable without provoking a refusal. */
-   const char *soft = getenv("LIMINA_GPU_MEM_BUDGET_SOFT");
-   vkr_budget_soft = soft && soft[0] == '1';
-
    if (vkr_budget_cap)
       vkr_log_error("limina GPU budget: cap %llu MiB%s", mib,
                     vkr_budget_soft ? " (SOFT — refuse but do not kill the context; only"
@@ -334,6 +361,17 @@ vkr_budget_charge(uint64_t size, const char *what)
    }
    if (report)
       vkr_budget_report_locked("80% watermark crossed");
+
+   /* Census on the allocation path rather than from a timer thread: it needs no thread,
+    * and a workload that has stopped allocating has nothing new to report anyway. */
+   if (vkr_budget_census_secs) {
+      const uint64_t now = vkr_budget_now_ns();
+      if (now - vkr_budget_last_census_ns >=
+          (uint64_t)vkr_budget_census_secs * 1000000000ull) {
+         vkr_budget_last_census_ns = now;
+         vkr_budget_report_locked("census");
+      }
+   }
    pthread_mutex_unlock(&vkr_budget_lock);
 
    return ctx_id;
