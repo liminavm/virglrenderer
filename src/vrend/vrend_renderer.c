@@ -8741,6 +8741,9 @@ struct vkr_mtl_iosurface *
 vkr_mtl_iosurface_alloc_plain(uint32_t width, uint32_t height,
                               uint32_t iosurface_pixel_format, uint32_t bytes_per_element);
 void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
+/* From vkr_budget: charge what follows to the shared classic-resource bucket rather than
+ * to whichever venus context this thread served last. */
+void vkr_budget_set_vrend(void);
 /* field accessors would drag the struct in; it is already public in the helpers header,
  * but keep vrend decoupled with two tiny getters implemented in vkr_metal_helpers.m. */
 uint32_t vkr_mtl_iosurface_get_id(const struct vkr_mtl_iosurface *surf);
@@ -8809,6 +8812,11 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
    default:
       return;
    }
+
+   /* Classic resources are created on the VMM's global resource path, which carries no
+    * context — and on the same thread that dispatches venus. Without this the surface is
+    * billed to an unrelated guest client. */
+   vkr_budget_set_vrend();
 
    struct vkr_mtl_iosurface *surf =
       vkr_mtl_iosurface_alloc_plain(gr->base.width0, gr->base.height0, io_fourcc, 4);

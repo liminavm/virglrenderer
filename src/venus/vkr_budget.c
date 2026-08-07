@@ -149,6 +149,11 @@ vkr_budget_kills_context(void)
  * only the attribution is lost, never the arithmetic. */
 #define VKR_BUDGET_OVERFLOW_CTX UINT32_MAX
 
+/* The shared bucket for classic (vrend) resources — see vkr_budget_set_vrend(). Like the
+ * overflow slot it uses an id no venus context can have, so its credits find it and
+ * vkr_budget_forget_context() never sweeps it. */
+#define VKR_BUDGET_VREND_CTX (UINT32_MAX - 1)
+
 /* Find the slot for ctx_id, creating it if there is room. Never returns NULL. */
 static struct vkr_budget_slot *
 vkr_budget_slot_locked(uint32_t ctx_id, const char *name)
@@ -286,6 +291,15 @@ vkr_budget_set_context(uint32_t ctx_id, const char *debug_name)
 {
    vkr_budget_tls_ctx_id = ctx_id;
    vkr_budget_tls_name = debug_name;
+}
+
+void
+vkr_budget_set_vrend(void)
+{
+   /* Safe to leave set: every venus dispatch re-binds the thread at its own entry, so this
+    * can never bleed into a venus allocation. */
+   vkr_budget_tls_ctx_id = VKR_BUDGET_VREND_CTX;
+   vkr_budget_tls_name = "vrend";
 }
 
 bool
