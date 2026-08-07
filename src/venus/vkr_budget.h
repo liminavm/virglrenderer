@@ -100,6 +100,11 @@ vkr_budget_set_context(uint32_t ctx_id, const char *debug_name);
 void
 vkr_budget_set_vrend(void);
 
+/* The context the calling thread is currently billing to — for instrumentation that wants
+ * to say WHICH client a host allocation belongs to. */
+uint32_t
+vkr_budget_current_ctx(void);
+
 /* True if a `size`-byte allocation fits under the cap. Does not charge. Always true when
  * no cap is configured. On false the caller must log via vkr_budget_refused() AND kill the
  * context — see the header comment for why an error return alone does nothing. */

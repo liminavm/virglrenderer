@@ -5,6 +5,7 @@
 
 #include "vkr_image.h"
 
+#include "vkr_budget.h"
 #include "vkr_device_memory.h"
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
@@ -122,6 +123,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    /* Captured PRE-create: vkr_image_create_and_add replaces args->device with the raw
     * driver handle, so vkr_device_from_handle(args->device) is INVALID afterwards. */
    struct vkr_device *limina_dev = NULL;
+   bool limina_dbg_had_ext = false, limina_dbg_had_modlist = false,
+        limina_dbg_had_modexpl = false;
    VkImportMetalIOSurfaceInfoEXT limina_io_import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
    };
@@ -133,6 +136,18 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
             break;
          }
       }
+      /* Captured BEFORE the unlink loop below strips these structs — the end-of-function
+       * trace runs after, so it can only ever report zeroes for them. */
+      limina_dbg_had_ext = ext && ext->handleTypes;
+      limina_dbg_had_modlist =
+         vkr_find_struct(ci->pNext,
+                         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) !=
+         NULL;
+      limina_dbg_had_modexpl =
+         vkr_find_struct(
+            ci->pNext,
+            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) != NULL;
+
       if (ext && ext->handleTypes) {
          /* The external-memory struct never reaches the driver: the guest speaks
           * dma-buf/fd handle types no macOS driver honors — vkr implements the
@@ -340,6 +355,45 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
               ci->extent.width, ci->extent.height, (uint32_t)layout.rowPitch,
               limina_kk_surf ? limina_kk_surf->id : 0,
               limina_kk_surf ? limina_kk_surf->bytes_per_row : 0);
+   }
+
+   /* LIMINA_SCANOUT_TRACE=1: report what the guest actually asked for on the first few
+    * image creates, and whether it ended up IOSurface-backed. Three attempts at a minimal
+    * repro (2026-08-07) guessed this shape from the source and missed every time — the
+    * probes charged 1 and 0 IOSurfaces against a compositor's thousands. Reading the real
+    * parameters is cheaper than a fourth guess. Bounded, because the workload that needs
+    * observing allocates ~120/s. */
+   if (ci) {
+      static int limina_trace = -1;
+      static unsigned limina_traced;
+      if (limina_trace < 0) {
+         /* The value is the LINE BUDGET, not a boolean: "=1" would log a single line, and
+          * a fixed cap ran dry mid-investigation. Bare "=1" therefore means "the default
+          * budget", and a number above 1 sets it. */
+         const char *e = getenv("LIMINA_SCANOUT_TRACE");
+         long n = (e && *e) ? strtol(e, NULL, 10) : 0;
+         limina_trace = n > 1 ? (int)n : (n == 1 ? 40 : 0);
+      }
+      /* Only images that ASKED for external memory — everything else is noise, and the
+       * first run burned its whole budget on ordinary texture creates. */
+      if (limina_trace && limina_dbg_had_ext && limina_traced < (unsigned)limina_trace) {
+         limina_traced++;
+         /* The ctx id is the whole point of the line: log timestamps cluster at drain
+          * time, so they cannot tell you WHICH client allocated a surface. Without this,
+          * a trace burst and a census row can't be reconciled. */
+         vkr_log_error("[SCANOUT-TRACE %u] ctx %u: %ux%u fmt=%d tiling=%d usage=0x%x "
+                       "flags=0x%x mips=%u layers=%u samples=%d ext=%d modlist=%d "
+                       "modexpl=%d ret=%d -> IOSurface id=%u",
+                       limina_traced, vkr_budget_current_ctx(), ci->extent.width,
+                       ci->extent.height, (int)ci->format,
+                       (int)ci->tiling, ci->usage, ci->flags, ci->mipLevels,
+                       ci->arrayLayers, (int)ci->samples, limina_dbg_had_ext ? 1 : 0,
+                       limina_dbg_had_modlist ? 1 : 0, limina_dbg_had_modexpl ? 1 : 0,
+                       (int)args->ret,
+                       (limina_obj && limina_obj->mtl_iosurface)
+                          ? ((struct vkr_mtl_iosurface *)limina_obj->mtl_iosurface)->id
+                          : 0);
+      }
    }
 #else
    (void)limina_obj;
