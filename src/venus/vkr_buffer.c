@@ -37,6 +37,18 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
     * vkr_physical_device_init_memory_properties as well.
     */
 
+   /* The guest command stream is untrusted, and a zero size is invalid usage
+    * (VUID-VkBufferCreateInfo-size-00912). Passed through, it reaches mesa's common
+    * vk_buffer_init, whose `assert(pCreateInfo->size > 0)` aborts the render server —
+    * i.e. a guest app's own bug takes the whole VM down (seen live 2026-08-07 on the
+    * dogfood host: kk_CreateBuffer -> vk_buffer_init -> __assert_rtn). Reject it here
+    * instead; the guest gets an error from its own bad call, which is what the spec
+    * would have given it on a driver that validated rather than asserted. */
+   if (!args->pCreateInfo || args->pCreateInfo->size == 0) {
+      args->ret = VK_ERROR_INITIALIZATION_FAILED;
+      return;
+   }
+
    vkr_buffer_create_and_add(dispatch->data, args);
 }
 
