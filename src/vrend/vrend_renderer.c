@@ -8719,7 +8719,12 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
  *
  * PBO mode (plan A1, the fallback): a normal GL texture plus a
  * GL_AMD_pinned_memory PBO aliasing the surface bytes;
- * vrend_renderer_resource_sync_iosurface() readpixels-blits on flush.
+ * vrend_renderer_resource_sync_iosurface() readpixels-blits on flush. SCANOUT
+ * only — see the guard below.
+ *
+ * VIRGL_BIND_SHARED resources are backed too (since 2026-08-06), which is what
+ * lets a Vulkan compositor import its clients' window buffers into venus and not
+ * just its own framebuffer.
  *
  * Any ineligible resource (format, target, multisample, missing extension)
  * silently keeps the CPU readback path — the fallback is never removed
@@ -8746,10 +8751,39 @@ void vkr_mtl_iosurface_get_layout(const struct vkr_mtl_iosurface *surf, void **o
 void *vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size);
 void vkr_mtl_iosurface_release_ref(void *io_surface);
 
+/* LIMINA_VREND_SHARED_IOSURFACE=0 turns the VIRGL_BIND_SHARED half off, leaving only
+ * VIRGL_BIND_SCANOUT backed (the pre-2026-08-06 behavior) — the A/B lever for the cost
+ * of linear render targets, and the escape hatch if a workload regresses. Cached: this
+ * is on the resource-create path. */
+static bool vrend_shared_iosurface_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = getenv("LIMINA_VREND_SHARED_IOSURFACE");
+      cached = !(env && !strcmp(env, "0"));
+      if (!cached)
+         virgl_info("iosurface: SHARED-resource backing disabled "
+                    "(LIMINA_VREND_SHARED_IOSURFACE=0) — a Vulkan compositor's client "
+                    "buffers will not import into venus\n");
+   }
+   return cached != 0;
+}
+
 static void vrend_resource_iosurface_init(struct vrend_resource *gr,
                                           enum virgl_formats format)
 {
-   if (!(gr->base.bind & VIRGL_BIND_SCANOUT))
+   /* SCANOUT is the compositor's own KMS framebuffer. SHARED is every buffer gbm hands
+    * out — gbm_bo_create sets __DRI_IMAGE_USE_SHARE unconditionally ("Gallium drivers
+    * requires shared in order to get the handle/stride"), which becomes
+    * PIPE_BIND_SHARED -> VIRGL_BIND_SHARED. A Vulkan compositor imports BOTH into venus:
+    * its framebuffer and each client's window buffer. Backing only SCANOUT left every
+    * client buffer without an IOSurface, so proxy_context_attach_resource fell through
+    * to the dmabuf export that cannot succeed on macOS and dropped the attach —
+    * "invalid res_id" / VK_ERROR_INVALID_EXTERNAL_HANDLE per frame, which is what kept
+    * a Vulkan compositor off the virgl GL default. */
+   const bool scanout = gr->base.bind & VIRGL_BIND_SCANOUT;
+   const bool shared = gr->base.bind & VIRGL_BIND_SHARED;
+   if (!scanout && !(shared && vrend_shared_iosurface_enabled()))
       return;
    if (gr->base.target != PIPE_TEXTURE_2D || gr->base.last_level != 0 ||
        gr->base.nr_samples > 1 || gr->base.depth0 != 1)
@@ -8792,10 +8826,18 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
          gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
          gr->iosurface = surf;
          gr->iosurf_pbo = 0;
-         virgl_warn("iosurface scanout: %ux%u %s EGL-backed (IOSurface id %u), "
-                    "renders land in the surface directly\n",
-                    gr->base.width0, gr->base.height0, util_format_name(format),
-                    vkr_mtl_iosurface_get_id(surf));
+         /* One line per scanout is useful; one per client window buffer would drown
+          * the worker log, so the SHARED-only case reports at info. */
+         if (scanout)
+            virgl_warn("iosurface scanout: %ux%u %s EGL-backed (IOSurface id %u), "
+                       "renders land in the surface directly\n",
+                       gr->base.width0, gr->base.height0, util_format_name(format),
+                       vkr_mtl_iosurface_get_id(surf));
+         else
+            virgl_info("iosurface shared: %ux%u %s EGL-backed (IOSurface id %u), "
+                       "importable into venus\n",
+                       gr->base.width0, gr->base.height0, util_format_name(format),
+                       vkr_mtl_iosurface_get_id(surf));
          return;
       }
       virgl_warn("iosurface scanout: EGLImage refused (egl err 0x%x), trying "
@@ -8804,8 +8846,15 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
    }
 
    /* PBO mode (fallback): normal texture + pinned-memory PBO; sync readpixels
-    * into the surface bytes on flush. */
-   if (!has_feature(feat_amd_pinned_memory)) {
+    * into the surface bytes on flush.
+    *
+    * SCANOUT only. The blit runs from vrend_renderer_resource_sync_iosurface(), which
+    * the VMM calls on RESOURCE_FLUSH — and only scanouts are ever flushed. A SHARED
+    * client buffer in PBO mode would therefore publish an IOSurface whose bytes are
+    * never updated: the venus import would succeed and alias permanently stale
+    * content, compositing garbage. Failing the attach loudly (the pre-fix behavior)
+    * is the honest outcome, so drop the surface instead. */
+   if (!scanout || !has_feature(feat_amd_pinned_memory)) {
       vkr_mtl_iosurface_free(surf);
       return;
    }
