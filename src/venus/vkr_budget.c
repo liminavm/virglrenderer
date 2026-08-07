@@ -252,7 +252,7 @@ vkr_budget_report_locked(const char *reason)
     * of the 2026-08-07 storm (5912 charged, 3 live, 52 GiB held). Print the +1/-1 balance
     * of every retain site next to it, so the two can be read together. */
    {
-      char refs[320];
+      char refs[640];
       vkr_mtl_refcount_census(refs, sizeof(refs));
       if (refs[0])
          vkr_log_error("limina GPU budget:   refs — %s", refs);
