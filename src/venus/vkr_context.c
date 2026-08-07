@@ -23,6 +23,7 @@
 #include "util/xxhash.h"
 
 #include "vkr_acceleration_structure.h"
+#include "vkr_budget.h"
 #include "vkr_buffer.h"
 #include "vkr_command_buffer.h"
 #include "vkr_context.h"
@@ -248,6 +249,10 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
    }
 
    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
+
+   /* Attribute every host allocation made under this batch to the guest client that
+    * asked for it — the allocations happen several frames deep with no ctx argument. */
+   vkr_budget_set_context(ctx->ctx_id, ctx->debug_name);
 
    vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
@@ -1037,6 +1042,11 @@ vkr_context_destroy(struct vkr_context *ctx)
    vkr_cs_decoder_fini(&ctx->decoder);
 
    vkr_library_unload(&ctx->vulkan_library);
+
+   /* After every table has been swept, so a residual charge here means host GPU memory
+    * this context allocated was never released — the same leak class as the mtl_shm
+    * canary above, but for bytes rather than fds. */
+   vkr_budget_forget_context(ctx->ctx_id);
 
    free(ctx->debug_name);
    free(ctx);

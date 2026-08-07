@@ -52,6 +52,13 @@ struct vkr_device_memory {
    uint64_t allocation_size;
    uint32_t memory_type_index;
 
+   /* limina host-memory budget (vkr_budget.h): bytes charged for this memory and the
+    * context they were charged to. Zero when the allocation only aliased memory someone
+    * else had already paid for. Kept here because the credit happens at release, long
+    * after the allocating thread's context binding is gone. */
+   uint64_t limina_budget_size;
+   uint32_t limina_budget_ctx;
+
    bool exported;
 
    /* limina snapshot-replay P2: this memory was created by importing a virgl
