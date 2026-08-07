@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#import <objc/runtime.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -66,6 +67,88 @@ static _Atomic uint64_t g_limina_n_unref;       /* vkr_mtl_iosurface_release_ref
 static _Atomic uint64_t g_limina_n_publish_ok;  /* Mach send right handed to supervisor */
 static _Atomic uint64_t g_limina_n_publish_err; /* send failed, right dropped locally */
 
+/* limina: DEALLOC sentinels.
+ *
+ * The counters above answer "did our release calls balance", and the 2026-08-07 storm showed
+ * that is the wrong question: 613 surfaces created, 608 released by us, all 613 still resident.
+ * A balanced +1/-1 tally cannot see a ref taken by someone else, because only the object's own
+ * death proves the last ref went away. So attach an associated object to every surface and
+ * texture we create — the runtime releases associated objects when the host object is
+ * deallocated — and count the sentinel's -dealloc. created-vs-deallocated then reads directly as
+ * "did this object actually die", per class of object, with no guessing about who holds it.
+ */
+#define LIMINA_SENTINEL_BUILD_TAG "sentinel-1"
+
+enum {
+   LIMINA_SENTINEL_IOSURFACE,  /* IOSurfaceCreate in our helpers */
+   LIMINA_SENTINEL_VKR_TEX,    /* the MTLTexture vkr_mtl_iosurface_alloc builds internally */
+   LIMINA_SENTINEL_IMPORT_TEX, /* vkr_mtl_texture_from_iosurface (the vrend import) */
+   LIMINA_SENTINEL_SELFTEST,   /* proves the mechanism itself fires; never a production object */
+   LIMINA_SENTINEL_KINDS,
+};
+
+static _Atomic uint64_t g_limina_n_dealloc[LIMINA_SENTINEL_KINDS];
+
+@interface LiminaDeallocSentinel : NSObject
+@property(nonatomic) int kind;
+@end
+
+@implementation LiminaDeallocSentinel
+- (void)dealloc
+{
+   atomic_fetch_add(&g_limina_n_dealloc[_kind], 1);
+   [super dealloc];
+}
+@end
+
+static const char g_limina_sentinel_key; /* address only */
+
+static void
+limina_sentinel_attach(id obj, int kind)
+{
+   if (!obj)
+      return;
+   LiminaDeallocSentinel *s = [[LiminaDeallocSentinel alloc] init];
+   s.kind = kind;
+   objc_setAssociatedObject(obj, &g_limina_sentinel_key, s,
+                            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+   [s release]; /* the association holds the only ref; it dies with obj */
+}
+
+/* Run once, at the first surface we create. An instrument that silently never fires reads
+ * exactly like "nothing leaked", so prove the mechanism on a surface whose death we control
+ * before trusting a single production number — and print a build tag, so a stale dylib is
+ * visible in the log rather than inferred. */
+static void
+limina_sentinel_selftest(void)
+{
+   uint64_t before = atomic_load(&g_limina_n_dealloc[LIMINA_SENTINEL_SELFTEST]);
+   @autoreleasepool {
+      NSDictionary *props = @{
+         (id)kIOSurfaceWidth : @16,
+         (id)kIOSurfaceHeight : @16,
+         (id)kIOSurfaceBytesPerElement : @4,
+      };
+      IOSurfaceRef io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+      if (io) {
+         limina_sentinel_attach((id)io, LIMINA_SENTINEL_SELFTEST);
+         CFRelease(io);
+      }
+   }
+   uint64_t after = atomic_load(&g_limina_n_dealloc[LIMINA_SENTINEL_SELFTEST]);
+   fprintf(stderr,
+           "[LIMINA-SENTINEL] vkr " LIMINA_SENTINEL_BUILD_TAG
+           " armed; IOSurface dealloc sentinel self-test: %s\n",
+           after > before ? "OK" : "FAILED (dealloc counts below are meaningless)");
+}
+
+static void
+limina_sentinel_once(void)
+{
+   static pthread_once_t once = PTHREAD_ONCE_INIT;
+   pthread_once(&once, limina_sentinel_selftest);
+}
+
 void
 vkr_mtl_refcount_census(char *buf, unsigned long len)
 {
@@ -77,14 +160,20 @@ vkr_mtl_refcount_census(char *buf, unsigned long len)
    uint64_t lk = atomic_load(&g_limina_n_lookup), ur = atomic_load(&g_limina_n_unref);
    uint64_t po = atomic_load(&g_limina_n_publish_ok),
             pe = atomic_load(&g_limina_n_publish_err);
+   uint64_t dio = atomic_load(&g_limina_n_dealloc[LIMINA_SENTINEL_IOSURFACE]),
+            dvt = atomic_load(&g_limina_n_dealloc[LIMINA_SENTINEL_VKR_TEX]),
+            dit = atomic_load(&g_limina_n_dealloc[LIMINA_SENTINEL_IMPORT_TEX]);
    snprintf(buf, len,
             "iosurface %llu/%llu (+%lld) texture %llu/%llu (+%lld) registry %llu/%llu "
-            "(+%lld) lookup %llu/%llu (+%lld) publish %llu ok %llu err",
+            "(+%lld) lookup %llu/%llu (+%lld) publish %llu ok %llu err | DEALLOC "
+            "iosurface %llu (alive %lld) vkr-tex %llu (alive %lld) import-tex %llu",
             (unsigned long long)a, (unsigned long long)f, (long long)(a - f),
             (unsigned long long)tm, (unsigned long long)tr, (long long)(tm - tr),
             (unsigned long long)ri, (unsigned long long)rr, (long long)(ri - rr),
             (unsigned long long)lk, (unsigned long long)ur, (long long)(lk - ur),
-            (unsigned long long)po, (unsigned long long)pe);
+            (unsigned long long)po, (unsigned long long)pe, (unsigned long long)dio,
+            (long long)(a - dio), (unsigned long long)dvt, (long long)(a - dvt),
+            (unsigned long long)dit);
 }
 
 static pthread_mutex_t g_limina_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -394,6 +483,9 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    surf->alloc_size = IOSurfaceGetAllocSize(io);
    surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
    atomic_fetch_add(&g_limina_n_ios_alloc, 1);
+   limina_sentinel_once();
+   limina_sentinel_attach((id)io, LIMINA_SENTINEL_IOSURFACE);
+   limina_sentinel_attach(tex, LIMINA_SENTINEL_VKR_TEX);
 
    /* Scoped surfaces are non-global: register id->IOSurfaceRef so vkr_mtl_iosurface_lookup can
     * still resolve them, and hand the Mach port to the supervisor for present. */
@@ -445,6 +537,8 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
    surf->alloc_size = IOSurfaceGetAllocSize(io);
    surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
    atomic_fetch_add(&g_limina_n_ios_alloc, 1);
+   limina_sentinel_once();
+   limina_sentinel_attach((id)io, LIMINA_SENTINEL_IOSURFACE);
 
    if (scope) {
       limina_registry_insert(surf->id, io);
@@ -485,6 +579,27 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
       return;
    vkr_budget_credit(surf->limina_budget_ctx, surf->alloc_size);
    atomic_fetch_add(&g_limina_n_ios_free, 1);
+
+   /* LIMINA_SURF_REFTRACE=N: dump the CF retain count of the surface and its texture on the
+    * last line where we can still legally touch them. Our own refs are one each, so anything
+    * above that names a holder we did not put there. A count is a LEAD, not a verdict (the
+    * runtime takes transient refs); the dealloc sentinels above are the verdict. Budgeted,
+    * because 613 frees a run drowns the log. */
+   {
+      static _Atomic int traced;
+      static _Atomic int budget = -1;
+      int b = atomic_load(&budget);
+      if (b < 0) {
+         const char *e = getenv("LIMINA_SURF_REFTRACE");
+         b = (e && *e) ? (int)strtol(e, NULL, 10) : 0;
+         atomic_store(&budget, b);
+      }
+      if (b > 0 && atomic_fetch_add(&traced, 1) < b)
+         fprintf(stderr,
+                 "[SURF-REF] id=%u retain: surface=%ld texture=%ld (ours: 1 each)\n",
+                 surf->id, surf->io_surface ? CFGetRetainCount(surf->io_surface) : -1,
+                 surf->mtl_texture ? CFGetRetainCount(surf->mtl_texture) : -1);
+   }
    /* Drop the registry's retain before ours (no-op if the surface was global). */
    limina_registry_remove(surf->id);
    if (surf->mtl_texture)
@@ -540,8 +655,10 @@ vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_
       td.storageMode = MTLStorageModeShared;
       tex = [(id<MTLDevice>)mtl_device newTextureWithDescriptor:td iosurface:io plane:0];
    }
-   if (tex)
+   if (tex) {
       atomic_fetch_add(&g_limina_n_tex_make, 1);
+      limina_sentinel_attach(tex, LIMINA_SENTINEL_IMPORT_TEX);
+   }
    return (void *)tex; /* +1 from newTextureWithDescriptor (ARC-retained by the cast) */
 }
 
