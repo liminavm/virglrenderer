@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "vkr_common.h"
+#include "vkr_metal_helpers.h"
 
 /* Contexts tracked individually; the rest fold into a shared overflow slot. A desktop
  * session runs one venus context per GPU client, so 64 covers a real workload with room
@@ -244,6 +245,17 @@ vkr_budget_report_locked(const char *reason)
                     (unsigned)((vkr_budget_total_live * 100) / vkr_budget_cap));
    } else {
       vkr_log_error("limina GPU budget: %s — %s live (no cap)", reason, live);
+   }
+
+   /* The ledger says what we allocated and released. It cannot say whether some OTHER
+    * reference is keeping the storage alive past our release — which is exactly the shape
+    * of the 2026-08-07 storm (5912 charged, 3 live, 52 GiB held). Print the +1/-1 balance
+    * of every retain site next to it, so the two can be read together. */
+   {
+      char refs[320];
+      vkr_mtl_refcount_census(refs, sizeof(refs));
+      if (refs[0])
+         vkr_log_error("limina GPU budget:   refs — %s", refs);
    }
 
    for (unsigned i = 0; i < VKR_BUDGET_MAX_SLOTS; i++) {
