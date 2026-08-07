@@ -319,6 +319,12 @@ vkr_budget_set_context(uint32_t ctx_id, const char *debug_name)
    vkr_budget_tls_name = debug_name;
 }
 
+uint32_t
+vkr_budget_current_ctx(void)
+{
+   return vkr_budget_tls_ctx_id;
+}
+
 void
 vkr_budget_set_vrend(void)
 {
@@ -479,6 +485,21 @@ vkr_budget_forget_context(uint32_t ctx_id)
                        s->ctx_id, s->name, residual);
          vkr_budget_total_live =
             vkr_budget_total_live >= s->live ? vkr_budget_total_live - s->live : 0;
+      }
+
+      /* Log the lifetime totals for EVERY teardown, not just the ones with a residual.
+       * The census is a sampler: a context that is born and dies between two ticks is
+       * otherwise invisible, and short-lived clients are exactly what one reaches for
+       * when reproducing a churn bug. This line is also the leak signature worth having
+       * in production logs — "destroyed after N GiB of lifetime charges" says what a
+       * client cost us even when it gave every byte back. */
+      if (s->lifetime_charges) {
+         char lifetime[32], peak[32];
+         vkr_budget_fmt_size(s->lifetime_bytes, lifetime, sizeof(lifetime));
+         vkr_budget_fmt_size(s->peak, peak, sizeof(peak));
+         vkr_log_error("limina GPU budget: ctx %u [%s] destroyed — lifetime %" PRIu64
+                       " charges totalling %s, peak %s",
+                       s->ctx_id, s->name, s->lifetime_charges, lifetime, peak);
       }
       memset(s, 0, sizeof(*s));
       break;
