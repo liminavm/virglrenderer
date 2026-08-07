@@ -43,6 +43,14 @@ struct vkr_budget_slot {
    uint64_t live;
    uint64_t peak;
    uint64_t untracked_live; /* charges whose bucket was evicted */
+   /* Cumulative: every charge ever made by this context, never decremented. LIVE says what
+    * is held; these say what passed through. The difference is the whole diagnosis when the
+    * process footprint disagrees with the ledger — a context that charged a thousand
+    * surfaces and holds two has freed them, so anything still resident is retained
+    * downstream of our release; a context that never charged them at all means the
+    * allocator responsible is simply not instrumented. Those are different searches. */
+   uint64_t lifetime_charges;
+   uint64_t lifetime_bytes;
    struct vkr_budget_bucket buckets[VKR_BUDGET_MAX_BUCKETS];
 };
 
@@ -240,22 +248,35 @@ vkr_budget_report_locked(const char *reason)
 
    for (unsigned i = 0; i < VKR_BUDGET_MAX_SLOTS; i++) {
       struct vkr_budget_slot *s = &vkr_budget_slots[i];
-      if (!s->used || !s->live)
+      /* A context that churned hard and holds nothing is REPORTABLE, not boring: it is the
+       * signature of memory we charged, credited, and yet the process still has. Filtering
+       * on live alone would hide exactly that case. */
+      if (!s->used || (!s->live && !s->lifetime_charges))
          continue;
 
-      /* Selection sort of the top buckets by live footprint — the histogram is tiny and
-       * this only runs when reporting. */
-      char line[256];
+      /* Selection sort of the top buckets, ranked by live footprint but falling back to
+       * lifetime volume once the live ones run out — same reason as above. The histogram is
+       * tiny and this only runs when reporting. */
+      char line[320];
       size_t at = 0;
       bool taken[VKR_BUDGET_MAX_BUCKETS] = { false };
       for (unsigned n = 0; n < VKR_BUDGET_REPORT_BUCKETS; n++) {
          int best = -1;
          for (unsigned b = 0; b < VKR_BUDGET_MAX_BUCKETS; b++) {
-            if (taken[b] || !s->buckets[b].live)
+            const struct vkr_budget_bucket *cand = &s->buckets[b];
+            if (taken[b] || !cand->size || !cand->total)
                continue;
-            if (best < 0 || s->buckets[b].live * s->buckets[b].size >
-                               s->buckets[best].live * s->buckets[best].size)
+            if (best < 0)
                best = (int)b;
+            else {
+               const struct vkr_budget_bucket *cur = &s->buckets[best];
+               /* Any live bucket outranks any dead one; ties broken by footprint. */
+               if ((cand->live > 0) != (cur->live > 0))
+                  best = cand->live ? (int)b : best;
+               else if (cand->live ? (cand->live * cand->size > cur->live * cur->size)
+                                   : (cand->total * cand->size > cur->total * cur->size))
+                  best = (int)b;
+            }
          }
          if (best < 0)
             break;
@@ -263,18 +284,23 @@ vkr_budget_report_locked(const char *reason)
 
          char each[32];
          vkr_budget_fmt_size(s->buckets[best].size, each, sizeof(each));
-         int n_written = snprintf(line + at, sizeof(line) - at, "%s%" PRIu64 " x %s (%s)",
-                                  at ? ", " : "", s->buckets[best].live, each,
-                                  s->buckets[best].what ? s->buckets[best].what : "?");
+         int n_written =
+            snprintf(line + at, sizeof(line) - at, "%s%" PRIu64 " x %s (%s, %" PRIu64 " ever)",
+                     at ? ", " : "", s->buckets[best].live, each,
+                     s->buckets[best].what ? s->buckets[best].what : "?",
+                     s->buckets[best].total);
          if (n_written < 0 || (size_t)n_written >= sizeof(line) - at)
             break;
          at += (size_t)n_written;
       }
 
-      char slot_live[32];
+      char slot_live[32], slot_ever[32];
       vkr_budget_fmt_size(s->live, slot_live, sizeof(slot_live));
-      vkr_log_error("limina GPU budget:   ctx %u [%s]: %s live — %s", s->ctx_id, s->name,
-                    slot_live, at ? line : "(no per-size detail)");
+      vkr_budget_fmt_size(s->lifetime_bytes, slot_ever, sizeof(slot_ever));
+      vkr_log_error("limina GPU budget:   ctx %u [%s]: %s live, %s over %" PRIu64
+                    " charges — %s",
+                    s->ctx_id, s->name, slot_live, slot_ever, s->lifetime_charges,
+                    at ? line : "(no per-size detail)");
    }
 }
 
@@ -356,6 +382,8 @@ vkr_budget_charge(uint64_t size, const char *what)
    bucket->live++;
    bucket->total++;
    slot->live += size;
+   slot->lifetime_charges++;
+   slot->lifetime_bytes += size;
    if (slot->live > slot->peak)
       slot->peak = slot->live;
 
