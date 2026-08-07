@@ -49,6 +49,44 @@ typedef struct {
    mach_msg_port_descriptor_t port;
 } limina_surface_msg_t;
 
+/* +1/-1 balance for every host-side reference we take on an IOSurface. The budget ledger
+ * answers "did we allocate and release it"; these answer the question that outlived it —
+ * "is something ELSE still holding the storage after our release". The 2026-08-07 storm
+ * charged 5912 surfaces, credited all but 3, and still held 52 GiB, so a holder exists
+ * that the ledger cannot see. Each pair is a site that takes a retain; a difference that
+ * grows with frames names the holder without any guessing. */
+static _Atomic uint64_t g_limina_n_ios_alloc;   /* IOSurfaceCreate in our helpers */
+static _Atomic uint64_t g_limina_n_ios_free;    /* vkr_mtl_iosurface_free */
+static _Atomic uint64_t g_limina_n_tex_make;    /* newTextureWithDescriptor:iosurface: +1 */
+static _Atomic uint64_t g_limina_n_tex_release; /* vkr_mtl_texture_release */
+static _Atomic uint64_t g_limina_n_reg_insert;  /* registry retain */
+static _Atomic uint64_t g_limina_n_reg_remove;  /* registry release */
+static _Atomic uint64_t g_limina_n_lookup;      /* lookup +1 handed to a caller */
+static _Atomic uint64_t g_limina_n_unref;       /* vkr_mtl_iosurface_release_ref */
+static _Atomic uint64_t g_limina_n_publish_ok;  /* Mach send right handed to supervisor */
+static _Atomic uint64_t g_limina_n_publish_err; /* send failed, right dropped locally */
+
+void
+vkr_mtl_refcount_census(char *buf, unsigned long len)
+{
+   uint64_t a = atomic_load(&g_limina_n_ios_alloc), f = atomic_load(&g_limina_n_ios_free);
+   uint64_t tm = atomic_load(&g_limina_n_tex_make),
+            tr = atomic_load(&g_limina_n_tex_release);
+   uint64_t ri = atomic_load(&g_limina_n_reg_insert),
+            rr = atomic_load(&g_limina_n_reg_remove);
+   uint64_t lk = atomic_load(&g_limina_n_lookup), ur = atomic_load(&g_limina_n_unref);
+   uint64_t po = atomic_load(&g_limina_n_publish_ok),
+            pe = atomic_load(&g_limina_n_publish_err);
+   snprintf(buf, len,
+            "iosurface %llu/%llu (+%lld) texture %llu/%llu (+%lld) registry %llu/%llu "
+            "(+%lld) lookup %llu/%llu (+%lld) publish %llu ok %llu err",
+            (unsigned long long)a, (unsigned long long)f, (long long)(a - f),
+            (unsigned long long)tm, (unsigned long long)tr, (long long)(tm - tr),
+            (unsigned long long)ri, (unsigned long long)rr, (long long)(ri - rr),
+            (unsigned long long)lk, (unsigned long long)ur, (long long)(lk - ur),
+            (unsigned long long)po, (unsigned long long)pe);
+}
+
 static pthread_mutex_t g_limina_lock = PTHREAD_MUTEX_INITIALIZER;
 static CFMutableDictionaryRef g_limina_registry; /* id (CFNumber) -> IOSurfaceRef (retained) */
 static mach_port_t g_limina_supervisor = MACH_PORT_NULL;
@@ -111,6 +149,7 @@ limina_registry_insert(uint32_t id, IOSurfaceRef io)
    }
    CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &id);
    CFDictionarySetValue(g_limina_registry, key, io); /* retains io */
+   atomic_fetch_add(&g_limina_n_reg_insert, 1);
    CFRelease(key);
    pthread_mutex_unlock(&g_limina_lock);
 }
@@ -122,6 +161,7 @@ limina_registry_remove(uint32_t id)
    if (g_limina_registry) {
       CFNumberRef key = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &id);
       CFDictionaryRemoveValue(g_limina_registry, key); /* releases io */
+      atomic_fetch_add(&g_limina_n_reg_remove, 1);
       CFRelease(key);
    }
    pthread_mutex_unlock(&g_limina_lock);
@@ -169,6 +209,9 @@ limina_publish_surface(uint32_t id, IOSurfaceRef io)
    if (kr != KERN_SUCCESS) {
       /* MOVE_SEND only consumes the right on success; drop it otherwise. */
       mach_port_deallocate(mach_task_self(), port);
+      atomic_fetch_add(&g_limina_n_publish_err, 1);
+   } else {
+      atomic_fetch_add(&g_limina_n_publish_ok, 1);
    }
 }
 
@@ -350,6 +393,7 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    surf->base_addr = IOSurfaceGetBaseAddress(io);
    surf->alloc_size = IOSurfaceGetAllocSize(io);
    surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
+   atomic_fetch_add(&g_limina_n_ios_alloc, 1);
 
    /* Scoped surfaces are non-global: register id->IOSurfaceRef so vkr_mtl_iosurface_lookup can
     * still resolve them, and hand the Mach port to the supervisor for present. */
@@ -400,6 +444,7 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
    surf->base_addr = IOSurfaceGetBaseAddress(io);
    surf->alloc_size = IOSurfaceGetAllocSize(io);
    surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
+   atomic_fetch_add(&g_limina_n_ios_alloc, 1);
 
    if (scope) {
       limina_registry_insert(surf->id, io);
@@ -439,6 +484,7 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
    if (!surf)
       return;
    vkr_budget_credit(surf->limina_budget_ctx, surf->alloc_size);
+   atomic_fetch_add(&g_limina_n_ios_free, 1);
    /* Drop the registry's retain before ours (no-op if the surface was global). */
    limina_registry_remove(surf->id);
    if (surf->mtl_texture)
@@ -460,6 +506,7 @@ vkr_mtl_iosurface_lookup(uint32_t id, void **out_base, uint64_t *out_alloc_size)
       return NULL;
    *out_base = IOSurfaceGetBaseAddress(io);
    *out_alloc_size = IOSurfaceGetAllocSize(io);
+   atomic_fetch_add(&g_limina_n_lookup, 1);
    return (void *)io;
 }
 
@@ -493,21 +540,27 @@ vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_
       td.storageMode = MTLStorageModeShared;
       tex = [(id<MTLDevice>)mtl_device newTextureWithDescriptor:td iosurface:io plane:0];
    }
+   if (tex)
+      atomic_fetch_add(&g_limina_n_tex_make, 1);
    return (void *)tex; /* +1 from newTextureWithDescriptor (ARC-retained by the cast) */
 }
 
 void
 vkr_mtl_texture_release(void *mtl_texture)
 {
-   if (mtl_texture)
+   if (mtl_texture) {
       CFRelease(mtl_texture);
+      atomic_fetch_add(&g_limina_n_tex_release, 1);
+   }
 }
 
 void
 vkr_mtl_iosurface_release_ref(void *io_surface)
 {
-   if (io_surface)
+   if (io_surface) {
       CFRelease(io_surface);
+      atomic_fetch_add(&g_limina_n_unref, 1);
+   }
 }
 
 /* limina: copy a registered scanout IOSurface's pixels (top-down, the surface's native BGRA)

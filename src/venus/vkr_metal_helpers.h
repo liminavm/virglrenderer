@@ -134,6 +134,13 @@ vkr_mtl_iosurface_release_ref(void *io_surface);
 void *
 vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_pixel_format);
 
+/* Format the +1/-1 balance of every host-side reference we take on an IOSurface, into buf.
+ * The ledger says whether we allocated and released a surface; it cannot say whether some
+ * OTHER reference is keeping the storage alive after our release. Each pair below is a
+ * place that takes a retain, so a growing difference names the holder directly. */
+void
+vkr_mtl_refcount_census(char *buf, unsigned long len);
+
 void
 vkr_mtl_texture_release(void *mtl_texture);
 
@@ -212,6 +219,13 @@ static inline void
 vkr_mtl_iosurface_release_ref(void *io_surface)
 {
    (void)io_surface;
+}
+
+static inline void
+vkr_mtl_refcount_census(char *buf, unsigned long len)
+{
+   if (len)
+      buf[0] = '\0';
 }
 
 static inline int
