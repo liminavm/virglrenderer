@@ -408,6 +408,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
                     "bytes) -> VK_ERROR_INVALID_EXTERNAL_HANDLE",
                     res_info->resourceId,
                     limina_res ? (int)limina_res->fd_type : -999);
+            /* The lookup above RETAINED the surface, and only IOSurfaceGetBaseAddress sets
+             * `ptr` — so a lookup that succeeds with a NULL base reaches here holding a +1
+             * nobody will ever drop. Every later failure path releases it (see the error
+             * label below); this early one has to as well. */
+            vkr_mtl_iosurface_release_ref(limina_imported_iosurface);
             args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
          }

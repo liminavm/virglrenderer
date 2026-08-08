@@ -7,6 +7,7 @@
 
 #include "vn_protocol_renderer_device.h"
 
+#include "vkr_budget.h"
 #include "vkr_context.h"
 #include "vkr_device.h"
 #include "vkr_instance.h"
@@ -733,6 +734,63 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties2(
                                                args->pQueueFamilyProperties);
 }
 
+/* Overwrite VK_EXT_memory_budget's answer with OUR budget, when we have one.
+ *
+ * The driver's reply describes the host GPU's heap, which is not the limit the guest will
+ * actually hit: past LIMINA_GPU_MEM_BUDGET_MIB we kill the asking context (see
+ * vkr_budget.h). Left alone, that reply actively misleads — measured against a 2 GiB cap,
+ * KosmicKrisp told a guest client it had 13.8 GiB, and the number went UP after the client
+ * allocated a further 1 GiB, because it tracks Metal's global state rather than anything
+ * this client did. A well-behaved allocator sizing its caches against that will be killed
+ * for believing us.
+ *
+ * Semantics, chosen because the cap is global while the ledger is per-context:
+ *   heapUsage  = what this context holds
+ *   heapBudget = cap - what every OTHER context holds, i.e. "what is left for me"
+ * Both are then clamped against the driver's own reply and the heap size, so we never
+ * promise more than the hardware has, and floored at the caller's own usage so the
+ * spec-required non-zero budget survives an exhausted cap.
+ *
+ * Only heaps the driver marks DEVICE_LOCAL are rewritten — those are the ones our
+ * allocations land in. With no cap configured (a bare virglrenderer, or accounting-only
+ * mode) nothing is touched and the driver's answer stands. */
+static void
+vkr_budget_answer_memory_budget(const struct vkr_physical_device *physical_dev,
+                                VkPhysicalDeviceMemoryProperties2 *props)
+{
+   VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget = vkr_find_struct(
+      props->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT);
+   if (!budget)
+      return;
+
+   uint64_t own = 0, others = 0, cap = 0;
+   if (!vkr_budget_query(vkr_budget_current_ctx(), &own, &others, &cap))
+      return;
+
+   const VkPhysicalDeviceMemoryProperties *mem = &physical_dev->memory_properties;
+   const uint64_t avail = cap > others ? cap - others : 0;
+
+   for (uint32_t i = 0; i < mem->memoryHeapCount; i++) {
+      if (!(mem->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+         continue;
+
+      /* "budget >= usage" and "budget != 0 for a valid heap" are both spec requirements
+       * (VkPhysicalDeviceMemoryBudgetPropertiesEXT); an exhausted cap would violate the
+       * first naively. Reporting own usage as the floor is also the honest number: memory
+       * you already hold is inside your budget. */
+      uint64_t heap_budget = avail > own ? avail : own;
+      if (heap_budget > mem->memoryHeaps[i].size)
+         heap_budget = mem->memoryHeaps[i].size;
+      if (budget->heapBudget[i] && heap_budget > budget->heapBudget[i])
+         heap_budget = budget->heapBudget[i];
+      if (!heap_budget)
+         heap_budget = 1;
+
+      budget->heapBudget[i] = heap_budget;
+      budget->heapUsage[i] = own < heap_budget ? own : heap_budget;
+   }
+}
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -751,6 +809,7 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
       vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
       vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
                                              args->pMemoryProperties);
+      vkr_budget_answer_memory_budget(physical_dev, args->pMemoryProperties);
    }
 }
 

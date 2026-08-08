@@ -528,6 +528,33 @@ vkr_budget_live(void)
    return live;
 }
 
+bool
+vkr_budget_query(uint32_t ctx_id, uint64_t *out_own, uint64_t *out_others, uint64_t *out_cap)
+{
+   pthread_mutex_lock(&vkr_budget_lock);
+   vkr_budget_init_locked();
+
+   uint64_t own = 0;
+   for (unsigned i = 0; i < VKR_BUDGET_MAX_SLOTS; i++) {
+      if (vkr_budget_slots[i].used && vkr_budget_slots[i].ctx_id == ctx_id) {
+         own = vkr_budget_slots[i].live;
+         break;
+      }
+   }
+
+   /* An unattributed caller (ctx_id 0, or a context with no slot yet because it has not
+    * charged anything) finds no slot and reports own = 0. That degrades correctly: it sees
+    * everyone else's usage as taken and its own as nothing, which is exactly true. */
+   const uint64_t cap = vkr_budget_cap;
+   const uint64_t total = vkr_budget_total_live;
+   pthread_mutex_unlock(&vkr_budget_lock);
+
+   *out_own = own;
+   *out_others = total >= own ? total - own : 0;
+   *out_cap = cap;
+   return cap != 0;
+}
+
 void
 vkr_budget_report(const char *reason)
 {
