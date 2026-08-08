@@ -63,12 +63,13 @@
  * before the ring-FATAL line. Never diagnose a venus context death from the guest symptom
  * alone — read the worker log at that timestamp.
  *
- * KNOWN LIMIT — attribution on the vrend path. `vkr_budget_set_context` is called from the
- * venus dispatch entry points only. vrend has its own dispatch, so an IOSurface allocated
- * for a classic vrend resource is charged to whatever context that thread last dispatched
- * for (or to 0). Totals stay exact — charge and credit hit the same ledger — but per-context
- * blame is unreliable for vrend-allocated surfaces. Bind the TLS at the vrend entry too if
- * that ever matters.
+ * ATTRIBUTION ON THE VREND PATH. `vkr_budget_set_context` is called from the venus dispatch
+ * entry points only, so an IOSurface allocated for a classic vrend resource used to be
+ * charged to whatever context that thread last dispatched for. vrend now binds a shared
+ * pseudo-context of its own at its entry (`vkr_budget_set_vrend`), which is the honest
+ * answer rather than a fix: at classic-resource creation time nobody owns the resource yet,
+ * so those bytes are billed to one "vrend" bucket instead of to an innocent guest client.
+ * Totals are exact either way — charge and credit hit the same ledger.
  */
 
 /* Read the configuration and announce it. Called from vkr_renderer_init — which the render
@@ -93,7 +94,7 @@ vkr_budget_set_context(uint32_t ctx_id, const char *debug_name);
  * it to one only afterwards), and that path runs on the same thread that dispatches venus
  * commands. Without this, a vrend IOSurface is charged to whichever venus context that
  * thread happened to serve last — silently blaming an innocent guest client, which matters
- * now that per-context numbers are reported back to the guest.
+ * because `vkr_budget_query` reports per-context numbers back to the guest.
  *
  * A shared bucket rather than real attribution is the honest answer, not a shortcut: at
  * allocation time nobody owns the resource yet. */
@@ -148,6 +149,23 @@ vkr_budget_forget_context(uint32_t ctx_id);
 /* Total live bytes charged across all contexts. */
 uint64_t
 vkr_budget_live(void);
+
+/* Snapshot for reporting the budget BACK to the guest through VK_EXT_memory_budget.
+ *
+ * This is the one piece of backpressure the venus transport does not discard. The header
+ * comment above explains why a refused ALLOCATION cannot be delivered as an error — the
+ * guest never reads our VkResult. A budget QUERY is not an allocation: the guest's
+ * `vn_GetPhysicalDeviceMemoryProperties2` issues a real synchronous `vn_call_` round-trip
+ * whenever the budget struct is chained, so what we answer here actually reaches the
+ * client, in time for it to drop caches instead of being killed.
+ *
+ * Splits the ledger the way the extension is defined: `own` is what the asking context
+ * holds (its heapUsage), `others` is what every other context holds — so the caller can
+ * report "cap minus what everyone else took" as the budget still available to this client.
+ * Returns false when no cap is configured, in which case there is nothing of ours to say
+ * and the caller must leave the driver's own answer alone. */
+bool
+vkr_budget_query(uint32_t ctx_id, uint64_t *out_own, uint64_t *out_others, uint64_t *out_cap);
 
 /* Log the per-context breakdown (live total + top exact-size buckets). `reason` is
  * prefixed to the line. */
