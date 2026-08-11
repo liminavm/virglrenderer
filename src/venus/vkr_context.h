@@ -119,6 +119,15 @@ struct vkr_context {
     * replay_end so ring-scoped stream state can replay on their decoders). */
    bool replaying;
 
+   /* limina: cmd_bufs whose recording replay failed (stale reference). Their
+    * remaining RECORDING entries are skipped until the next Begin/Reset — a
+    * state-dependent command replayed out of its recording context crashes in
+    * the driver (vkCmdEndRenderPass after a failed CmdBeginRenderPass derefs
+    * NULL render-pass state). Live only between replay_begin/replay_end. */
+   uint64_t *replay_poisoned;
+   uint32_t replay_poisoned_count;
+   uint32_t replay_poisoned_cap;
+
    mtx_t resource_mutex;
    struct hash_table *resource_table;
 

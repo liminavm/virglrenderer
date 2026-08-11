@@ -1048,6 +1048,7 @@ vkr_context_destroy(struct vkr_context *ctx)
     * canary above, but for bytes rather than fds. */
    vkr_budget_forget_context(ctx->ctx_id);
 
+   free(ctx->replay_poisoned);
    free(ctx->debug_name);
    free(ctx);
 }

@@ -990,6 +990,27 @@ vkr_journal_peek_u64(const uint8_t *start, size_t size, size_t offset, uint64_t 
    return true;
 }
 
+bool
+vkr_journal_cmd_recording_key(const void *cmd,
+                              uint32_t size,
+                              uint64_t *key,
+                              bool *resets_prior)
+{
+   uint32_t cmd_type;
+   if (size < sizeof(cmd_type))
+      return false;
+   memcpy(&cmd_type, cmd, sizeof(cmd_type));
+
+   const uint8_t klass_flags = vkr_journal_classify((VkCommandTypeEXT)cmd_type);
+   if ((klass_flags & VKR_JOURNAL_CLASS_MASK) != VKR_JOURNAL_RECORDING)
+      return false;
+
+   if (!vkr_journal_peek_u64(cmd, size, 8, key))
+      return false;
+   *resets_prior = (klass_flags & VKR_JOURNAL_F_RESETS_PRIOR) != 0;
+   return true;
+}
+
 /* which ring's decoder is dispatching, 0 = the context decoder */
 static uint64_t
 vkr_journal_ring_id(struct vkr_context *ctx, struct vn_dispatch_context *dctx)
