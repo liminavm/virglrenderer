@@ -144,6 +144,19 @@ vkr_journal_note_free(struct vkr_context *ctx,
 void
 vkr_journal_get_stats(struct vkr_journal *j, struct vkr_journal_stats *out);
 
+/* limina snapshot-replay poison filter: classify a raw wire command. Returns
+ * true when it is RECORDING-class (vkCmd* / Begin/End/Reset targeting a
+ * command buffer); *key = the cmd_buf id (wire offset 8), *resets_prior =
+ * Begin/ResetCommandBuffer. Used by the replayer to skip the remainder of a
+ * recording whose replay already failed — a state-dependent command dispatched
+ * out of its recording context crashes in the driver (vkCmdEndRenderPass with
+ * no active render pass derefs a NULL render-pass state). */
+bool
+vkr_journal_cmd_recording_key(const void *cmd,
+                              uint32_t size,
+                              uint64_t *key,
+                              bool *resets_prior);
+
 /* Serialized journal format (P1 snapshot section):
  *   u32 magic 'VKJR', u32 version=1, u32 entry_count, u32 reserved
  *   per entry: u64 seq, u32 cmd_type, u8 klass, u8 pad[3],

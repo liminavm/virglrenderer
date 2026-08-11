@@ -13,6 +13,7 @@
 
 #include "vkr_budget.h"
 #include "vkr_context.h"
+#include "vkr_journal.h"
 #include "vkr_device.h"
 #include "vkr_device_memory.h"
 #include "vkr_queue.h"
@@ -389,15 +390,92 @@ vkr_replay_recover_fatal(struct vkr_context *ctx)
    return true;
 }
 
+static bool
+vkr_replay_cmd_buf_poisoned(struct vkr_context *ctx, uint64_t cmd_buf)
+{
+   for (uint32_t i = 0; i < ctx->replay_poisoned_count; i++) {
+      if (ctx->replay_poisoned[i] == cmd_buf)
+         return true;
+   }
+   return false;
+}
+
+static void
+vkr_replay_poison_cmd_buf(struct vkr_context *ctx, uint64_t cmd_buf)
+{
+   if (vkr_replay_cmd_buf_poisoned(ctx, cmd_buf))
+      return;
+   if (ctx->replay_poisoned_count == ctx->replay_poisoned_cap) {
+      const uint32_t cap = ctx->replay_poisoned_cap ? ctx->replay_poisoned_cap * 2 : 8;
+      uint64_t *grown = realloc(ctx->replay_poisoned, cap * sizeof(*grown));
+      if (!grown)
+         return; /* worst case we dispatch and the entry fails again cleanly */
+      ctx->replay_poisoned = grown;
+      ctx->replay_poisoned_cap = cap;
+   }
+   ctx->replay_poisoned[ctx->replay_poisoned_count++] = cmd_buf;
+   vkr_log("replay: poisoning cmd_buf %" PRIu64
+           " — skipping the rest of its recording until the next Begin/Reset",
+           cmd_buf);
+}
+
+static void
+vkr_replay_unpoison_cmd_buf(struct vkr_context *ctx, uint64_t cmd_buf)
+{
+   for (uint32_t i = 0; i < ctx->replay_poisoned_count; i++) {
+      if (ctx->replay_poisoned[i] == cmd_buf) {
+         ctx->replay_poisoned[i] =
+            ctx->replay_poisoned[--ctx->replay_poisoned_count];
+         return;
+      }
+   }
+}
+
+/* The poison filter, run before dispatching a replayed entry. A recording is a
+ * stateful sequence: once one of its entries fails (a stale object reference —
+ * RECORDING entries do not pin what they reference, unlike CREATEs), the later
+ * entries run against state the earlier ones never established, and the mesa
+ * runtime dereferences that missing state (a vkCmdEndRenderPass whose
+ * CmdBeginRenderPass was skipped crashes in end_subpass on the NULL render
+ * pass). Skip the remainder of the poisoned cmd_buf's recording; the next
+ * Begin/Reset re-enters a defined state and lifts the poison (if the Begin
+ * itself fails, the post-dispatch hook re-poisons). */
+static bool
+vkr_replay_should_skip(struct vkr_context *ctx, const void *cmd, uint32_t size)
+{
+   uint64_t cmd_buf;
+   bool resets_prior;
+   if (!vkr_journal_cmd_recording_key(cmd, size, &cmd_buf, &resets_prior))
+      return false;
+   if (resets_prior) {
+      vkr_replay_unpoison_cmd_buf(ctx, cmd_buf);
+      return false;
+   }
+   return vkr_replay_cmd_buf_poisoned(ctx, cmd_buf);
+}
+
+static void
+vkr_replay_note_failure(struct vkr_context *ctx, const void *cmd, uint32_t size)
+{
+   uint64_t cmd_buf;
+   bool resets_prior;
+   if (vkr_journal_cmd_recording_key(cmd, size, &cmd_buf, &resets_prior))
+      vkr_replay_poison_cmd_buf(ctx, cmd_buf);
+}
+
 bool
 vkr_renderer_replay_submit(uint32_t ctx_id, void *cmd, uint32_t size)
 {
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
    if (!ctx || !vkr_replay_strip_reply(cmd, size))
       return false;
+   if (ctx->replaying && vkr_replay_should_skip(ctx, cmd, size))
+      return true;
    bool ok = vkr_context_submit_cmd(ctx, cmd, size);
-   if (!ok && ctx->replaying)
+   if (!ok && ctx->replaying) {
       vkr_replay_recover_fatal(ctx);
+      vkr_replay_note_failure(ctx, cmd, size);
+   }
    return ok;
 }
 
@@ -421,9 +499,13 @@ vkr_renderer_replay_ring_cmd(uint32_t ctx_id, uint64_t ring_id, void *cmd, uint3
       vkr_log("replay_ring_cmd: no ring %" PRIu64 " in ctx %u", ring_id, ctx_id);
       return false;
    }
+   if (ctx->replaying && vkr_replay_should_skip(ctx, cmd, size))
+      return true;
    bool ok = vkr_ring_replay_cmd(target, cmd, size);
-   if (!ok && ctx->replaying)
+   if (!ok && ctx->replaying) {
       vkr_replay_recover_fatal(ctx);
+      vkr_replay_note_failure(ctx, cmd, size);
+   }
    return ok;
 }
 
@@ -756,6 +838,15 @@ vkr_renderer_replay_end(uint32_t ctx_id)
          vkr_ring_start(ring);
    }
    mtx_unlock(&ctx->ring_mutex);
+
+   if (ctx->replay_poisoned_count) {
+      vkr_log("replay: %u cmd_buf(s) finished poisoned (their recordings were "
+              "cut at a stale reference)",
+              ctx->replay_poisoned_count);
+   }
+   free(ctx->replay_poisoned);
+   ctx->replay_poisoned = NULL;
+   ctx->replay_poisoned_count = ctx->replay_poisoned_cap = 0;
 
    ctx->replaying = false;
    return true;
