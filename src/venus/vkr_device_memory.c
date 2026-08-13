@@ -257,8 +257,8 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys
 #endif /* ENABLE_GBM_ALLOCATION */
 
 static void
-vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
-                              struct vn_command_vkAllocateMemory *args)
+vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkAllocateMemory *args)
 {
    TRACE_FUNC();
    struct vkr_context *ctx = dispatch->data;
@@ -802,6 +802,32 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
     * reference above is what keeps the underlying storage alive either way. */
    vkr_mtl_texture_release(limina_imported_texture);
 #endif
+}
+
+/* limina ghost containment (vkr_context.h tombstones). This dispatch has many
+ * error exits — a bad memory type, a refused budget, and above all an import the
+ * host cannot back (an unattachable resource: the 2026-08-13 dogfood totem
+ * crash, where GStreamer's udmabuf frames are not importable on a macOS host).
+ * An async guest was already told VK_SUCCESS by its own driver, so every one of
+ * those exits hands it a ghost VkDeviceMemory. Tombstone the id in ONE place
+ * here, rather than at each exit, so a new error path cannot silently forget to.
+ *
+ * The id is read BEFORE the work: a successful create replaces the handle in
+ * args with the driver's, and the guest id would no longer be there to read. */
+static void
+vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                              struct vn_command_vkAllocateMemory *args)
+{
+   struct vkr_context *ctx = dispatch->data;
+   const vkr_object_id mem_id =
+      args->pMemory ? vkr_cs_handle_load_id((const void **)args->pMemory,
+                                            VK_OBJECT_TYPE_DEVICE_MEMORY)
+                    : 0;
+
+   vkr_dispatch_vkAllocateMemory_impl(dispatch, args);
+
+   if (args->ret != VK_SUCCESS)
+      vkr_context_tombstone_object(ctx, mem_id);
 }
 
 static void

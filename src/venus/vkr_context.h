@@ -103,6 +103,25 @@ struct vkr_context {
 
    mtx_t object_mutex;
    struct hash_table *object_table;
+   /* limina: ids whose host-side create/import FAILED — "tombstones". Most venus
+    * commands are submitted ASYNC (upstream's design, not ours: see
+    * vn_device_memory_alloc_simple and vn_async_vkCreate*), so the guest was
+    * already told VK_SUCCESS and holds a handle the host never backed. Naming
+    * that handle used to miss the object table and poison the ring, turning one
+    * expected runtime failure (a dma-buf that cannot be imported, an image the
+    * driver rejects) into the death of every later command in the context — and
+    * mesa aborts the guest process on the FATAL bit. Recorded here, such a
+    * command is SKIPPED instead (vkr_cs_decoder_lookup_object) and the guest
+    * keeps running degraded.
+    *
+    * A ring buffer, not a table: bounded by construction, and consulted ONLY
+    * after the object table missed, so a wrapped-away entry just restores the
+    * old FATAL behavior — it can never produce a wrong lookup. An id reused by
+    * a later SUCCESSFUL create is found in the table first, so a stale entry
+    * cannot shadow a live object either. Guarded by object_mutex. */
+   vkr_object_id tombstones[VKR_CONTEXT_TOMBSTONE_MAX];
+   uint32_t tombstone_next;
+   uint64_t tombstone_total;
    /* limina: table generation for the decoders' lock-free repeat-lookup cache
     * (vkr_cs_decoder_lookup_object). Bumped under object_mutex on every
     * insert/remove; read without the mutex on the lookup fast path, so the
@@ -233,6 +252,23 @@ static inline bool
 vkr_context_get_fatal(struct vkr_context *ctx)
 {
    return ctx->cs_fatal_error;
+}
+
+/* limina: record an id whose host-side create/import failed. See the tombstones
+ * field. Safe to call with id 0 (no-op) and from any create/import failure path;
+ * the ONLY effect is that a later command naming this id is skipped rather than
+ * poisoning the ring. */
+static inline void
+vkr_context_tombstone_object(struct vkr_context *ctx, vkr_object_id id)
+{
+   if (!id)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   ctx->tombstones[ctx->tombstone_next % VKR_CONTEXT_TOMBSTONE_MAX] = id;
+   ctx->tombstone_next++;
+   ctx->tombstone_total++;
+   mtx_unlock(&ctx->object_mutex);
 }
 
 static inline bool
