@@ -256,6 +256,7 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
 
    vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
+      vkr_cs_decoder_clear_soft_error(&ctx->decoder);
       vkr_journal_pre_dispatch(&ctx->dispatch);
       vn_dispatch_command(&ctx->dispatch);
       vkr_journal_post_dispatch(&ctx->dispatch);

@@ -80,6 +80,7 @@ vkr_dispatch_vkExecuteCommandStreamsMESA(
       }
 
       while (vkr_cs_decoder_has_command(dec)) {
+         vkr_cs_decoder_clear_soft_error(dec);
          vkr_journal_pre_dispatch(dispatch);
          vn_dispatch_command(dispatch);
          vkr_journal_post_dispatch(dispatch);

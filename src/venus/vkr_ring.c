@@ -521,7 +521,7 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
                     uint32_t ring_head)
 {
    struct vkr_cs_decoder *dec = &ring->decoder;
-   if (vkr_cs_decoder_get_fatal(dec)) {
+   if (vkr_cs_decoder_get_hard_fatal(dec)) {
       vkr_log("ring_submit_cmd: early bail due to fatal decoder state");
       return false;
    }
@@ -537,10 +537,11 @@ vkr_ring_submit_cmd(struct vkr_ring *ring,
 
    vkr_journal_batch_begin();
    while (vkr_cs_decoder_has_command(dec)) {
+      vkr_cs_decoder_clear_soft_error(dec);
       vkr_journal_pre_dispatch(&ring->dispatch);
       vn_dispatch_command(&ring->dispatch);
       vkr_journal_post_dispatch(&ring->dispatch);
-      if (vkr_cs_decoder_get_fatal(dec)) {
+      if (vkr_cs_decoder_get_hard_fatal(dec)) {
          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
 
          vkr_journal_batch_flush();
@@ -572,7 +573,7 @@ vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size)
    assert(!ring->started);
 
    struct vkr_cs_decoder *dec = &ring->decoder;
-   if (vkr_cs_decoder_get_fatal(dec))
+   if (vkr_cs_decoder_get_hard_fatal(dec))
       return false;
 
    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
@@ -581,10 +582,11 @@ vkr_ring_replay_cmd(struct vkr_ring *ring, const void *buffer, size_t size)
       vkr_budget_set_context(ctx->ctx_id, ctx->debug_name);
    }
    while (vkr_cs_decoder_has_command(dec)) {
+      vkr_cs_decoder_clear_soft_error(dec);
       vkr_journal_pre_dispatch(&ring->dispatch);
       vn_dispatch_command(&ring->dispatch);
       vkr_journal_post_dispatch(&ring->dispatch);
-      if (vkr_cs_decoder_get_fatal(dec)) {
+      if (vkr_cs_decoder_get_hard_fatal(dec)) {
          vkr_log("ring_replay_cmd: vn_dispatch_command failed");
          vkr_cs_decoder_reset(dec);
          return false;

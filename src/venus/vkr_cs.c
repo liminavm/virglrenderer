@@ -7,6 +7,51 @@
 
 #include "vkr_context.h"
 
+/* limina ghost containment — see the tombstones field in vkr_context.h. Out of
+ * line because the inline lookup in vkr_cs.h cannot see struct vkr_context, and
+ * because this is a cold path: it runs only after the object table missed, which
+ * used to be the last thing a context ever did. */
+bool
+vkr_cs_decoder_is_tombstoned(const struct vkr_cs_decoder *dec, vkr_object_id id)
+{
+   struct vkr_context *ctx = dec->ctx;
+   if (!ctx)
+      return false;
+
+   bool found = false;
+   mtx_lock(&ctx->object_mutex);
+   for (uint32_t i = 0; i < VKR_CONTEXT_TOMBSTONE_MAX; i++) {
+      if (ctx->tombstones[i] == id) {
+         found = true;
+         break;
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   return found;
+}
+
+/* The dropped command's epilogue: everything else it named becomes a tombstone
+ * too, because the bind/write/recording it was going to perform did not happen.
+ * Loud at ERROR — the guest is now running degraded, and this is the only record
+ * of where its objects started diverging from what the host holds. */
+void
+vkr_cs_decoder_finish_soft_error(struct vkr_cs_decoder *dec)
+{
+   struct vkr_context *ctx = dec->ctx;
+   if (!ctx)
+      return;
+
+   for (uint32_t i = 0; i < dec->touched_count; i++)
+      vkr_context_tombstone_object(ctx, dec->touched[i]);
+
+   vkr_log_error("context %u [%s]: command naming a failed (tombstoned) object "
+                 "SKIPPED; %u co-named object(s) tombstoned with it — the guest "
+                 "runs degraded, the ring stays alive (%" PRIu64 " total)",
+                 dec->ctx_id, dec->ctx_name ? dec->ctx_name : "?", dec->touched_count,
+                 ctx->tombstone_total);
+}
+
 void
 vkr_cs_encoder_set_stream_locked(struct vkr_cs_encoder *enc,
                                  const struct vkr_resource *res,
@@ -53,6 +98,7 @@ int
 vkr_cs_decoder_init(struct vkr_cs_decoder *dec, struct vkr_context *ctx)
 {
    memset(dec, 0, sizeof(*dec));
+   dec->ctx = ctx;
    dec->ctx_id = ctx->ctx_id;
    dec->ctx_name = ctx->debug_name;
    dec->fatal_error = &ctx->cs_fatal_error;

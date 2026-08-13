@@ -173,12 +173,14 @@ vkr_{create_func_name}_create(
    if (vkr_{create_func_name}_create_driver_handle(ctx, args, obj) != VK_SUCCESS) {{
       /* Loud on purpose: venus guests submit most creations ASYNC and never
        * read this reply. A host-side failure therefore leaves the guest with
-       * a ghost object id whose next use is a ring FATAL (a guest-process
-       * abort). This line is the only record of the actual cause. */
+       * a ghost object id — tombstoned here so its next use is SKIPPED rather
+       * than poisoning the ring (which aborts the guest process). This line is
+       * the only record of the actual cause. */
       vkr_log_error("context %u: {create_cmd} failed host-side: %d "
                     "(an async guest won't see this; the object id is now a "
-                    "ghost and its next use will ring-FATAL)",
+                    "tombstoned ghost and commands naming it will be skipped)",
                     ctx->ctx_id, args->ret);
+      vkr_context_tombstone_object(ctx, obj->base.id);
       free(obj);
       return NULL;
    }}
@@ -287,8 +289,10 @@ vkr_{create_func_name}_add_array(
       /* Individual pipelines may fail creation. */
       if (obj->base.handle.{vkr_type} == VK_NULL_HANDLE) {{
          vkr_log_error("context %u: {create_cmd} element %u failed host-side "
-                       "(async guests hold a ghost pipeline id after this)",
+                       "(async guests hold a ghost pipeline id after this; "
+                       "tombstoned so its use is skipped, not fatal)",
                        ctx->ctx_id, i);
+         vkr_context_tombstone_object(ctx, obj->base.id);
          free(obj);
          arr->objects[i] = NULL;
          args_{create_objs}[i] = VK_NULL_HANDLE;

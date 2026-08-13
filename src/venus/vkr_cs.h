@@ -20,6 +20,23 @@
 void
 vkr_journal_note_lookup(uint64_t id);
 
+/* limina ghost containment (see vkr_context.h tombstones): the decoder consults
+ * and extends the context's tombstone set on its cold paths. Declared here —
+ * with vkr_context opaque — because vkr_context.h includes THIS header. */
+struct vkr_context;
+struct vkr_cs_decoder;
+
+/* Cap on the per-context tombstone ring. Sized for the realistic burst (a
+ * compositor failing a few imports per frame) with room to spare; overflow only
+ * costs the oldest entry its grace. */
+#define VKR_CONTEXT_TOMBSTONE_MAX 256
+
+bool
+vkr_cs_decoder_is_tombstoned(const struct vkr_cs_decoder *dec, vkr_object_id id);
+
+void
+vkr_cs_decoder_finish_soft_error(struct vkr_cs_decoder *dec);
+
 struct vkr_cs_encoder {
    bool *fatal_error;
 
@@ -93,6 +110,27 @@ struct vkr_cs_decoder {
    const char *ctx_name;
 
    bool *fatal_error;
+
+   /* limina ghost containment. ctx backs the tombstone set (vkr_context.h);
+    * soft_error marks the CURRENT command as "skip me" — a command that named a
+    * tombstoned id, i.e. an object the host never created. It reads as fatal to
+    * the generated dispatch wrappers (they consult vkr_cs_decoder_get_fatal to
+    * decide whether to call the handler and encode a reply), so the command is
+    * dropped without ever reaching the driver, while the ring loops use
+    * vkr_cs_decoder_get_hard_fatal and keep going.
+    *
+    * touched[] holds the other object ids this command looked up. When the
+    * command is dropped, they are tombstoned too: an object whose bind, write or
+    * recording never happened is not safe to hand the driver later (KK asserts
+    * on, say, an image with no memory bound, and an abort in the worker takes
+    * the whole VM — strictly worse than one guest losing a context). The poison
+    * therefore spreads only along real usage chains, and stops as soon as the
+    * guest's own error handling tears the objects down. */
+   struct vkr_context *ctx;
+   bool soft_error;
+   vkr_object_id touched[8];
+   uint32_t touched_count;
+
    struct vkr_cs_decoder_temp_pool temp_pool;
 
    /* Support vkExecuteCommandStreamsMESA for command buffer recording and indirect
@@ -250,8 +288,20 @@ vkr_cs_decoder_set_fatal_at(const struct vkr_cs_decoder *dec, const char *func, 
 
 #define vkr_cs_decoder_set_fatal(dec) vkr_cs_decoder_set_fatal_at((dec), __func__, __LINE__)
 
+/* What the GENERATED dispatch wrappers see: a soft error must make them skip
+ * the handler (and the reply) exactly as a fatal one does — that skip is the
+ * whole containment mechanism, and routing it through this one accessor keeps
+ * the generated code untouched. */
 static inline bool
 vkr_cs_decoder_get_fatal(const struct vkr_cs_decoder *dec)
+{
+   return *dec->fatal_error || dec->soft_error;
+}
+
+/* What the RING/TRANSPORT loops must see: only a real fatal stops the ring. A
+ * soft error is per-command and cleared when the command ends. */
+static inline bool
+vkr_cs_decoder_get_hard_fatal(const struct vkr_cs_decoder *dec)
 {
    return *dec->fatal_error;
 }
@@ -388,6 +438,20 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
    }
 
    if (unlikely(!obj || obj->type != type)) {
+      /* limina ghost containment: a miss on an id we KNOW failed host-side is
+       * an expected runtime state, not protocol corruption — the guest was told
+       * VK_SUCCESS by an async submission the host later refused. Drop just this
+       * command (see soft_error) instead of poisoning the ring. Tombstones are
+       * consulted only here, after the table missed, so they never shadow a live
+       * object and never enter the lookup cache (only found objects are cached).
+       *
+       * A miss on an id we have NO record of stays FATAL: that IS a protocol
+       * violation, and the detector has to keep working. */
+      if (!obj && vkr_cs_decoder_is_tombstoned(dec, id)) {
+         ((struct vkr_cs_decoder *)dec)->soft_error = true;
+         return NULL;
+      }
+
       /* ERROR, not INFO: this accompanies a ring FATAL, and the id + type are
        * the attribution a production log needs. A miss here usually means a
        * host-side create failed earlier on an async command, so the guest
@@ -399,6 +463,18 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
          vkr_log_error("failed to look up object %" PRIu64 " of type %d", id, type);
       vkr_cs_decoder_set_fatal(dec);
    } else {
+      /* limina ghost containment: remember what else this command names, so a
+       * drop can tombstone the objects it would have modified (see touched[]).
+       * Device/queue/instance/physical-device are the command's *subject*, never
+       * a casualty of it — tombstoning a VkDevice would skip every subsequent
+       * command in the context, i.e. reinvent the ring death this exists to
+       * prevent. */
+      struct vkr_cs_decoder *mut = (struct vkr_cs_decoder *)dec;
+      if (type != VK_OBJECT_TYPE_DEVICE && type != VK_OBJECT_TYPE_QUEUE &&
+          type != VK_OBJECT_TYPE_INSTANCE && type != VK_OBJECT_TYPE_PHYSICAL_DEVICE &&
+          mut->touched_count < ARRAY_SIZE(mut->touched))
+         mut->touched[mut->touched_count++] = id;
+
       /* limina snapshot-replay: feed the journal's create-arg closure — see
        * vkr_journal_note_lookup (no-op outside a journal dispatch frame) */
       vkr_journal_note_lookup(id);
@@ -407,11 +483,28 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
    return obj;
 }
 
+/* Every generated dispatch wrapper ends with this call, which makes it the one
+ * per-command epilogue vkr owns — so the dropped command's co-named objects are
+ * tombstoned here. soft_error itself is NOT cleared: the journal inspects it
+ * after the wrapper returns (a command that did not run must not be recorded for
+ * replay), so the dispatch loops clear it just before the next command. */
 static inline void
 vkr_cs_decoder_reset_temp_pool(struct vkr_cs_decoder *dec)
 {
+   if (unlikely(dec->soft_error))
+      vkr_cs_decoder_finish_soft_error(dec);
+   dec->touched_count = 0;
+
    struct vkr_cs_decoder_temp_pool *pool = &dec->temp_pool;
    pool->cur = pool->reset_to;
+}
+
+/* Called by each dispatch loop before handing the decoder the next command. */
+static inline void
+vkr_cs_decoder_clear_soft_error(struct vkr_cs_decoder *dec)
+{
+   dec->soft_error = false;
+   dec->touched_count = 0;
 }
 
 bool
