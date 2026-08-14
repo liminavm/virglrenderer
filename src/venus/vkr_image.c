@@ -208,12 +208,7 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                    * sheared every GTK4 window on 2026-08-04: the exporter wrote in the
                    * texture's layout while this side declared a linear rowPitch. Stay
                    * OPTIMAL so KK's bind can adopt the texture (it refuses LINEAR). */
-                  static int limina_mtltex_imp = -1;
-                  if (limina_mtltex_imp < 0) {
-                     const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
-                     limina_mtltex_imp = (e && *e == '1') ? 1 : 0;
-                  }
-                  if (limina_mtltex_imp)
+                  if (vkr_limina_mtltex_scanout())
                      mci->tiling = VK_IMAGE_TILING_OPTIMAL;
                   else
                      mci->tiling = VK_IMAGE_TILING_LINEAR;
@@ -248,20 +243,31 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                 * — render lands in the surface, presented zero-copy. The
                 * IOSurface is allocated AFTER create, with the driver's linear
                 * rowPitch (vkGetImageSubresourceLayout). */
-               /* LIMINA_KK_MTLTEXTURE_SCANOUT=1: the replacement for the forced LINEAR.
-                * KosmicKrisp now implements VK_EXT_external_memory_metal's MTLTEXTURE
+               /* The MTLTEXTURE path (on by default, LIMINA_KK_MTLTEXTURE_SCANOUT=0 opts
+                * out): KosmicKrisp implements VK_EXT_external_memory_metal's MTLTEXTURE
                 * handle type, so instead of contorting the image into a linear layout
                 * whose rowPitch an IOSurface can be made to match, we allocate the
                 * IOSurface up front and hand KK its texture as the image's memory
-                * (vkr_device_memory.c does the import). No pitch to match, so the
-                * "IOSurface pitch != image rowPitch -> no zero-copy" failure mode goes
-                * away, and the guest's own tiling survives. Kept behind a gate until it
-                * is measured against the forced-LINEAR path. */
-               static int limina_mtltex = -1;
-               if (limina_mtltex < 0) {
-                  const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
-                  limina_mtltex = (e && *e == '1') ? 1 : 0;
-               }
+                * (vkr_device_memory.c does the import). No pitch to match.
+                *
+                * This comment used to add "and the guest's own tiling survives". It does
+                * not, and cannot: the texture is built with
+                * -newTextureWithDescriptor:iosurface:plane:, so its storage IS the
+                * IOSurface's, which is linear with a bytesPerRow. Declaring OPTIMAL here
+                * buys KK's plain-2D layout bookkeeping, not a tiled surface. Nothing that
+                * has to cross to the compositor as an IOSurface can be truly tiled.
+                *
+                * NOTE (2026-08-14): on KosmicKrisp this branch is UNREACHABLE — the
+                * `else if (limina_native_mod)` arm above claims every modifier-tiled
+                * create, which is every scanout image a GBM/venus client allocates.
+                * What is left for this arm is an external-memory create carrying NO
+                * modifier struct, which no client we have measured emits. So treat it as
+                * an unexercised path, not a covered one: the 2026-08-04 A/B that this
+                * gate's default rests on actually measured the hybrid (native-mod create
+                * + MTLTEXTURE memory), never this branch. The alloc-failure fallback to
+                * forced LINEAR below bounds the risk, and KK's bind-time validation makes
+                * any mismatch loud rather than silent. */
+               bool limina_mtltex = vkr_limina_mtltex_scanout();
                if (limina_mtltex) {
                   /* OPTIMAL keeps kk_image_layout on the plain-2D, non-linear path that
                    * matches an IOSurface-backed MTLTexture; INPUT_ATTACHMENT would push

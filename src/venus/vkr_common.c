@@ -272,6 +272,18 @@ vkr_log_error(const char *fmt, ...)
    va_end(va);
 }
 
+bool
+vkr_limina_mtltex_scanout(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
+      /* Default ON; only an explicit "0" opts out. */
+      cached = (e && e[0] == '0') ? 0 : 1;
+   }
+   return cached != 0;
+}
+
 void
 vkr_extension_table_init(struct vn_info_extension_table *table,
                          const char *const *exts,

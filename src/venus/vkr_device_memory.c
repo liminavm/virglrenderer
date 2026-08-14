@@ -338,17 +338,12 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
             ptr = limina_res->u.data;
             span = limina_res->size;
          }
-         /* LIMINA_KK_MTLTEXTURE_SCANOUT=1, import half. The exporter's image adopted this
+         /* The MTLTEXTURE import half (on by default). The exporter's image adopted this
           * IOSurface's MTLTexture verbatim, so its contents are in the texture's layout,
           * not a linear rowPitch — the importer has to adopt the same object or it reads
           * sheared rows. Requires a DEDICATED import (KK advertises the MTLTEXTURE handle
           * type as DEDICATED_ONLY), whose image also tells us the exact pixel format. */
-         static int limina_mtltex_imp = -1;
-         if (limina_mtltex_imp < 0) {
-            const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
-            limina_mtltex_imp = (e && *e == '1') ? 1 : 0;
-         }
-         if (limina_mtltex_imp && limina_imported_iosurface && dev->mtl_device) {
+         if (vkr_limina_mtltex_scanout() && limina_imported_iosurface && dev->mtl_device) {
             const VkMemoryDedicatedAllocateInfo *ded = vkr_find_struct(
                alloc_info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
             const struct vkr_image *dimg =
@@ -650,20 +645,21 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
          struct vkr_mtl_iosurface *limina_io =
             (struct vkr_mtl_iosurface *)limina_scanout_surf;
 
-         /* LIMINA_KK_MTLTEXTURE_SCANOUT=1 (paired with the same gate in vkr_image.c):
-          * hand KK the IOSurface's MTLTexture as the memory itself, via
+         /* The MTLTEXTURE path, ON by default since 2026-08-14 (paired with the same gate
+          * in vkr_image.c): hand KK the IOSurface's MTLTexture as the memory itself, via
           * VK_EXT_external_memory_metal. The image bound to this memory adopts that
           * texture verbatim, so the render lands in the IOSurface with no host-pointer
           * aliasing and no rowPitch to match. KK validates the texture against the image
           * at bind and FAILS LOUDLY on a mismatch — deliberately, because the failure
           * mode this replaces is Metal silently no-op'ing the render (see the MoltenVK
-          * note in vkr_image.c). */
-         static int limina_mtltex = -1;
-         if (limina_mtltex < 0) {
-            const char *e = getenv("LIMINA_KK_MTLTEXTURE_SCANOUT");
-            limina_mtltex = (e && *e == '1') ? 1 : 0;
-         }
-         if (limina_mtltex && limina_io->mtl_texture) {
+          * note in vkr_image.c).
+          *
+          * THIS is the site that actually fires on KosmicKrisp: the image itself was
+          * created by the native-modifier path (its create-side twin is shadowed dead),
+          * so what the default decides is purely how scanout memory binds — adopt the
+          * texture, or alias the bytes. Measured neutral either way for pitch and for
+          * frame rate; the reason to prefer adoption is loud-vs-silent failure. */
+         if (vkr_limina_mtltex_scanout() && limina_io->mtl_texture) {
             limina_metal_import.sType =
                VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
             limina_metal_import.handleType =
