@@ -496,6 +496,53 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
    return surf;
 }
 
+/* Row pitch a Metal LINEAR texture over these bytes will use — i.e. exactly what
+ * KosmicKrisp computes in kk_image_layout.c (align(width * bpe, minimumLinearTexture-
+ * AlignmentForPixelFormat)). Returns 0 for formats we can't map, meaning "let IOSurface
+ * pick".
+ *
+ * Why this exists (spikes/vrend-stride-2026-08-14): left to itself IOSurface aligns rows
+ * to 256 B, while KK computes 16 B for BGRA8. A GL client's buffer is allocated here, but
+ * the compositor imports it through venus as a LINEAR VkImage, and KK then addresses it at
+ * ITS pitch — so every row of every GL window slipped (256-16)/4 px sideways. Measured
+ * 16.000 px/row at width 1968, 8.000 at 1976, matching (align256 - align16)/4 exactly.
+ *
+ * Deliberately querying Metal rather than hardcoding 16: the 256-vs-16 gap is settled at
+ * the source, so the number can never drift out of step with KK's own computation. */
+static uint32_t
+limina_metal_linear_pitch(uint32_t iosurface_pixel_format,
+                          uint32_t width,
+                          uint32_t bytes_per_element)
+{
+   MTLPixelFormat mtl_format;
+   switch (iosurface_pixel_format) {
+   case 'BGRA':
+      mtl_format = MTLPixelFormatBGRA8Unorm;
+      break;
+   case 'RGBA':
+      mtl_format = MTLPixelFormatRGBA8Unorm;
+      break;
+   default:
+      return 0;
+   }
+
+   /* Cached: this is on the resource-create path. */
+   static id<MTLDevice> device;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{
+      device = MTLCreateSystemDefaultDevice();
+   });
+   if (!device)
+      return 0;
+
+   NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:mtl_format];
+   if (!align)
+      return 0;
+
+   uint64_t row = (uint64_t)width * bytes_per_element;
+   return (uint32_t)(((row + align - 1) / align) * align);
+}
+
 struct vkr_mtl_iosurface *
 vkr_mtl_iosurface_alloc_plain(uint32_t width,
                               uint32_t height,
@@ -508,19 +555,37 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
    bool scope = limina_scope_surfaces();
    bool mark_global = limina_mark_global();
 
+   /* Force the pitch a Metal linear texture over these bytes will use, so an importer
+    * that lays the surface out as a LINEAR image addresses the same rows we allocated. */
+   uint32_t want_row = limina_metal_linear_pitch(iosurface_pixel_format, width,
+                                                 bytes_per_element);
+
    IOSurfaceRef io = NULL;
    @autoreleasepool {
-      NSDictionary *props = @{
+      NSMutableDictionary *props = [@{
          (id)kIOSurfaceWidth : @(width),
          (id)kIOSurfaceHeight : @(height),
          (id)kIOSurfaceBytesPerElement : @(bytes_per_element),
          (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
          (id)kIOSurfaceIsGlobal : @(mark_global),
-      };
+      } mutableCopy];
+      if (want_row)
+         props[(id)kIOSurfaceBytesPerRow] = @(want_row);
       io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
    }
    if (!io)
       return NULL;
+
+   /* Unlike the venus scanout path, which drops zero-copy when IOSurface overrides the
+    * pitch, there is no fallback here: refusing the surface would take VIRGL_BIND_SHARED
+    * down with it and re-break Vulkan-compositor imports outright. Keep it and be loud —
+    * an override means importers shear again, and this line is the only warning. */
+   if (want_row && (uint32_t)IOSurfaceGetBytesPerRow(io) != want_row) {
+      fprintf(stderr,
+              "[KK-STRIDE] IOSurface overrode the row pitch (asked %u, got %zu) for %ux%u "
+              "— linear importers will shear\n",
+              want_row, IOSurfaceGetBytesPerRow(io), width, height);
+   }
 
    struct vkr_mtl_iosurface *surf = calloc(1, sizeof(*surf));
    if (!surf) {
