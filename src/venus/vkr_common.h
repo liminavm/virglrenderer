@@ -193,6 +193,25 @@ vkr_log(const char *fmt, ...);
 void
 vkr_log_error(const char *fmt, ...);
 
+/* limina: the KK MTLTEXTURE scanout path — ON by default since 2026-08-14,
+ * LIMINA_KK_MTLTEXTURE_SCANOUT=0 falls back to the host-pointer import.
+ *
+ * ONE parse for every site (two in vkr_image.c, two in vkr_device_memory.c): the halves
+ * must agree, because an image whose create took the MTLTEXTURE branch bound to memory
+ * that took the host-pointer branch is not a fallback, it is corruption. A single
+ * cached answer makes disagreement unrepresentable.
+ *
+ * Why on: on KK the create-side half is shadowed dead by the native-modifier branch, so
+ * this governs only how scanout MEMORY binds — adopting the IOSurface's MTLTexture
+ * (VK_EXT_external_memory_metal) instead of aliasing its bytes (VK_EXT_external_memory_host).
+ * Measured neutral for coverage and perf (spikes/modifier-necessity/RESULTS.md, 2026-08-14:
+ * identical pitches and zero no-zero-copy drops in both arms, at aligned and unaligned
+ * widths alike). The surviving reason to prefer it is FAILURE MODE: KK validates the
+ * texture against the image at bind and fails loudly, where a host-pointer mismatch is
+ * the class Metal silently no-ops, leaving the surface untouched and the screen stale. */
+bool
+vkr_limina_mtltex_scanout(void);
+
 /* limina: VKR_FD_TRACE=1 turns on per-event fd tracing (mtl_shm carrier
  * alloc/free/dup sites log at ERROR so they reach the shipped log). Field
  * attribution for fd ratchets: the 2026-07-11 dogfood worker sat at 14k+
