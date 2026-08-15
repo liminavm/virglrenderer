@@ -8772,6 +8772,24 @@ static bool vrend_shared_iosurface_enabled(void)
    return cached != 0;
 }
 
+/* LIMINA_VREND_SHARED_TRANSFER_SYNC=0 drops the completion barrier a guest CPU write
+ * into a venus-shared IOSurface owes its consumer (see the end of
+ * vrend_renderer_transfer_write_iov) -- the A/B lever, and the escape hatch if a
+ * workload regresses. */
+static bool vrend_shared_transfer_sync_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = getenv("LIMINA_VREND_SHARED_TRANSFER_SYNC");
+      cached = !(env && !strcmp(env, "0"));
+      if (!cached)
+         virgl_info("iosurface: shared-transfer completion barrier disabled "
+                    "(LIMINA_VREND_SHARED_TRANSFER_SYNC=0) -- a CPU-written client "
+                    "buffer can be sampled before the upload lands\n");
+   }
+   return cached != 0;
+}
+
 static void vrend_resource_iosurface_init(struct vrend_resource *gr,
                                           enum virgl_formats format)
 {
@@ -9913,6 +9931,29 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
 
       if (need_temp)
          free(data);
+
+      /* LIMINA: make this transfer's completion mean what the guest's fence claims.
+       *
+       * An iosurface-backed resource has no host-side copy -- the texture's storage IS
+       * the IOSurface a venus context imports -- so the glTexSubImage2D above is a Metal
+       * upload queued on the vrend context's queue, and the consumer submits on venus's.
+       * Metal does not order work across queues. The guest cannot cover this either: it
+       * waits on the virtio-gpu fence for this command, but that fence signals when we
+       * RETURN, not when the upload executes, so the wait can be satisfied while the
+       * bytes are still in flight.
+       *
+       * Ordering alone is not enough and neither is this alone. Guest mesa's matching
+       * half (virgl: settle a CPU write into a shared resource before unmap returns)
+       * puts the transfer ahead of the consumer's read; this makes it complete before
+       * the guest is told it did. With ordering broken, this barrier changed nothing
+       * (measured: still 10/10 stale); with ordering fixed, its absence left the first
+       * write after a guest boot reading pre-write contents, roughly 2 boots in 5.
+       * See spikes/dmabuf-cpu-coherency/RESULTS.md.
+       *
+       * Scoped to the shared case, and the guest is already blocked here, so this adds
+       * little to a wait it is doing anyway; ordinary transfers keep their async upload. */
+      if (res->iosurface && !res->iosurf_pbo && vrend_shared_transfer_sync_enabled())
+         glFinish();
    }
    return 0;
 }
