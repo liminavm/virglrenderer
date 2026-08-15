@@ -7,6 +7,8 @@
 
 #include "vn_protocol_renderer_device.h"
 
+#include <inttypes.h>
+
 #include "vkr_budget.h"
 #include "vkr_context.h"
 #include "vkr_device.h"
@@ -754,6 +756,61 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties2(
  * Only heaps the driver marks DEVICE_LOCAL are rewritten — those are the ones our
  * allocations land in. With no cap configured (a bare virglrenderer, or accounting-only
  * mode) nothing is touched and the driver's answer stands. */
+/* Explain one heap's reported budget, because the number the guest finally sees is
+ * min(our answer, the driver's own answer) and only the host can tell those apart.
+ *
+ * That distinction is not academic. Our pre-clamp answer is cap - others, which does NOT
+ * move as the asking client allocates (its own usage is excluded from `others`), so a
+ * guest-visible budget that GROWS across a client's own allocations can only come from the
+ * driver's number rising — KosmicKrisp's tracks real host GPU pressure and has been
+ * observed at 5 MB, 93 MB and 300 MB across three runs of the same test on the same
+ * binary. Without this line that is indistinguishable from our ledger being wrong, and it
+ * cost an L2 flake diagnosis (task #38).
+ *
+ * Emission is deliberately asymmetric. A client may query the budget every frame, so the
+ * full line is gated on LIMINA_GPU_MEM_BUDGET_TRACE; the clamp event itself is logged
+ * untraced but only when the driver's number CHANGES, so a steady state stays silent while
+ * the transition that moves the guest's budget is always on the record. The static
+ * last-seen state is racy under concurrent queries and that is fine: the worst outcome is
+ * a duplicate log line. */
+static void
+vkr_budget_trace_heap(uint32_t ctx_id,
+                      uint32_t heap,
+                      uint64_t own,
+                      uint64_t others,
+                      uint64_t cap,
+                      uint64_t ours,
+                      uint64_t driver,
+                      uint64_t final)
+{
+   static bool trace_read = false;
+   static bool trace = false;
+   if (!trace_read) {
+      const char *env = getenv("LIMINA_GPU_MEM_BUDGET_TRACE");
+      trace = env && env[0] && env[0] != '0';
+      trace_read = true;
+   }
+
+   const bool clamped = driver && ours > driver;
+   static uint64_t last_driver[VK_MAX_MEMORY_HEAPS];
+   static bool last_clamped[VK_MAX_MEMORY_HEAPS];
+   bool transition = false;
+   if (heap < VK_MAX_MEMORY_HEAPS) {
+      transition = clamped != last_clamped[heap] ||
+                   (clamped && driver != last_driver[heap]);
+      last_clamped[heap] = clamped;
+      last_driver[heap] = driver;
+   }
+
+   if (!trace && !(clamped && transition))
+      return;
+
+   vkr_log_error("limina GPU budget: memory_budget ctx %u heap %u own=%" PRIu64
+                 " others=%" PRIu64 " cap=%" PRIu64 " ours=%" PRIu64 " driver=%" PRIu64
+                 " final=%" PRIu64 " clamped=%d",
+                 ctx_id, heap, own, others, cap, ours, driver, final, clamped ? 1 : 0);
+}
+
 static void
 vkr_budget_answer_memory_budget(const struct vkr_physical_device *physical_dev,
                                 VkPhysicalDeviceMemoryProperties2 *props)
@@ -763,8 +820,9 @@ vkr_budget_answer_memory_budget(const struct vkr_physical_device *physical_dev,
    if (!budget)
       return;
 
+   const uint32_t ctx_id = vkr_budget_current_ctx();
    uint64_t own = 0, others = 0, cap = 0;
-   if (!vkr_budget_query(vkr_budget_current_ctx(), &own, &others, &cap))
+   if (!vkr_budget_query(ctx_id, &own, &others, &cap))
       return;
 
    const VkPhysicalDeviceMemoryProperties *mem = &physical_dev->memory_properties;
@@ -781,10 +839,16 @@ vkr_budget_answer_memory_budget(const struct vkr_physical_device *physical_dev,
       uint64_t heap_budget = avail > own ? avail : own;
       if (heap_budget > mem->memoryHeaps[i].size)
          heap_budget = mem->memoryHeaps[i].size;
-      if (budget->heapBudget[i] && heap_budget > budget->heapBudget[i])
-         heap_budget = budget->heapBudget[i];
+      /* Our answer, before the driver gets a vote — the only part of this number limina
+       * owns, and so the only part a test may assert monotonicity on. */
+      const uint64_t ours = heap_budget;
+      const uint64_t driver = budget->heapBudget[i];
+      if (driver && heap_budget > driver)
+         heap_budget = driver;
       if (!heap_budget)
          heap_budget = 1;
+
+      vkr_budget_trace_heap(ctx_id, i, own, others, cap, ours, driver, heap_budget);
 
       budget->heapBudget[i] = heap_budget;
       budget->heapUsage[i] = own < heap_budget ? own : heap_budget;
