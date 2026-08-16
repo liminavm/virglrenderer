@@ -459,6 +459,15 @@ VIRGL_EXPORT int virgl_renderer_resource_read_iosurface(uint32_t res_handle, voi
  * no IOSurface (fall back to transfer_read). */
 VIRGL_EXPORT int virgl_renderer_resource_sync_iosurface(uint32_t res_handle);
 
+/* limina: re-hand an already-published scanout IOSurface to the supervisor, keyed by IOSURFACE id
+ * (not resource handle — the supervisor only knows the former, and the resource may be gone while
+ * the surface lives). The supervisor's surface store is bounded and evicts; a non-global surface it
+ * dropped cannot be recovered from its side, so a guest presenting an evicted id froze the display
+ * permanently for that id. Answers on the same Mach port as every other publish, preserving the
+ * ordering that makes id recycling safe. Returns 0 on success, -EINVAL if the id is not
+ * registered. See spikes/scanout-blob-freeze/RESULTS.md. */
+VIRGL_EXPORT int virgl_renderer_republish_iosurface(uint32_t iosurface_id);
+
 /* limina M9.3 diagnostics: log the live venus (vkr) context table — per context: rings,
  * object counts by VkObjectType, resources, sync queues. Thread-safe; a no-op log line
  * when venus/the renderer isn't initialized. */
