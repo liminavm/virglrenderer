@@ -151,6 +151,13 @@ vkr_mtl_texture_release(void *mtl_texture);
 int
 vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height);
 
+/* limina: re-hand an already-registered scanout surface to the supervisor over the surface port.
+ * The supervisor's store is bounded and evicts; a non-global surface it dropped is unrecoverable
+ * from its side, so a guest presenting an evicted id froze the display permanently for that id
+ * (spikes/scanout-blob-freeze/RESULTS.md). Returns 1 if the id was registered, 0 otherwise. */
+int
+limina_republish_surface(uint32_t id);
+
 #else /* !__APPLE__ */
 
 static inline void *
@@ -235,6 +242,13 @@ vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t hei
    (void)dst;
    (void)dst_stride;
    (void)height;
+   return 0;
+}
+
+static inline int
+limina_republish_surface(uint32_t id)
+{
+   (void)id;
    return 0;
 }
 

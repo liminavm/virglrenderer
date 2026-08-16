@@ -1311,7 +1311,36 @@ int virgl_renderer_resource_sync_iosurface(uint32_t res_handle)
 /* Defined in venus/vkr_metal_helpers.m (forward-declared to avoid pulling the Vulkan-typed
  * vkr_metal_helpers.h into this TU). */
 int vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height);
+int limina_republish_surface(uint32_t id);
 #endif
+
+/* limina: re-hand an already-published scanout IOSurface to the supervisor.
+ *
+ * The supervisor keeps our published surfaces in a bounded store and evicts at its cap. These
+ * surfaces are deliberately non-global, so an evicted one is unrecoverable from its side —
+ * IOSurfaceLookup fails by design and only the creator can mint a Mach port. A guest that kept
+ * presenting an evicted id therefore had every later frame silently skipped, freezing the display
+ * permanently for that id (spikes/scanout-blob-freeze/RESULTS.md).
+ *
+ * This lets the supervisor ask for a dropped surface back, which turns its cap from a correctness
+ * parameter into a memory one. Keyed by IOSURFACE id, not resource handle: the supervisor only
+ * ever knows the former, and the resource may be long gone while the surface lives.
+ *
+ * The reply is an ordinary publish on the same Mach port as every publish and release, so it
+ * inherits that queue's ordering guarantee — answering over another channel would reintroduce the
+ * two-queue id-recycling hazard that ordering closed.
+ *
+ * Returns 0 if the surface was registered and re-published, -EINVAL if we do not have it. */
+int virgl_renderer_republish_iosurface(uint32_t iosurface_id)
+{
+   TRACE_FUNC();
+#ifdef __APPLE__
+   return limina_republish_surface(iosurface_id) ? 0 : -EINVAL;
+#else
+   (void)iosurface_id;
+   return -EINVAL;
+#endif
+}
 
 /* limina: copy a scanout resource's presented IOSurface into a CPU buffer (top-down BGRA,
  * dst_stride bytes/row, height rows). The headless capture display sink uses this because venus

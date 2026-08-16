@@ -745,6 +745,33 @@ vkr_mtl_iosurface_release_ref(void *io_surface)
    }
 }
 
+/* limina: re-hand an already-registered scanout surface to the supervisor.
+ *
+ * The supervisor holds our published surfaces in a bounded store and evicts at its cap. A
+ * non-global surface it has dropped is unrecoverable from its side — IOSurfaceLookup fails by
+ * design and only the creator can mint a Mach port — so a guest that presents an evicted id had
+ * every later frame silently skipped, freezing the display permanently for that id
+ * (spikes/scanout-blob-freeze/RESULTS.md). This lets the supervisor ask for it back, which makes
+ * its cap a memory parameter rather than a correctness one.
+ *
+ * The reply is an ordinary publish on the SAME Mach port as every other publish and release, so
+ * it inherits that queue's ordering: an id cannot recycle until its surface dies, a release is
+ * enqueued before the unref that kills it, and one port is one FIFO. Answering over any other
+ * channel would reintroduce the two-queue hazard that ordering closed.
+ *
+ * Returns 1 if the id was registered and a publish was attempted, 0 if we do not have it.
+ * Thread-safe: the registry is mutex-guarded and mach_msg is not thread-affine. */
+int
+limina_republish_surface(uint32_t id)
+{
+   IOSurfaceRef io = limina_registry_lookup(id); /* +1 */
+   if (!io)
+      return 0;
+   limina_publish_surface(id, io);
+   vkr_mtl_iosurface_release_ref((void *)io); /* -1 */
+   return 1;
+}
+
 /* limina: copy a registered scanout IOSurface's pixels (top-down, the surface's native BGRA)
  * into dst — `height` rows of min(dst_stride, surface bytesPerRow). The scanout textures are
  * MTLStorageModeShared (CPU-visible), so the headless capture display sink — which has no
