@@ -530,8 +530,41 @@ static void vrend_add_compressed_formats(struct vrend_format_table *table, int n
 }
 
 
+/* limina: planar YUV, sampled as RGBA.
+ *
+ * We have no dmabuf to alias and no EGL external image, so a planar frame
+ * cannot become a real multi-planar GL texture here. What we do have is the
+ * frame's bytes -- a guest-memory blob arrives with every plane's stride and
+ * offset (see vrend_resource::guest_pixels) -- so the planes are converted to
+ * RGBA on upload and the guest samples one ordinary RGBA8 texture.
+ *
+ * That is exactly the contract gallium expects from a driver that advertises
+ * native YUV sampling: one sampler view in the composite format, returning
+ * RGB. Advertising these is what keeps the guest OFF the "lowered" path, where
+ * it would import each plane as its own R8/RG8 pipe_resource -- all sharing one
+ * virtio resource handle, which the protocol cannot tell apart (I420's two
+ * chroma planes are identical in format AND size).
+ *
+ * SAMPLER_VIEW only, never a render target: nothing renders into a YUV
+ * surface, and the storage is a lie we only maintain in one direction.
+ */
+static struct vrend_format_table yuv_planar_formats[] =
+  {
+    { VIRGL_FORMAT_NV12, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, NO_SWIZZLE, view_class_unsupported },
+    { VIRGL_FORMAT_NV21, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, NO_SWIZZLE, view_class_unsupported },
+    { VIRGL_FORMAT_IYUV, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, NO_SWIZZLE, view_class_unsupported },
+    { VIRGL_FORMAT_YV12, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, NO_SWIZZLE, view_class_unsupported },
+  };
+
+static void vrend_add_sampler_only_formats(struct vrend_format_table *table, int num_entries)
+{
+   for (int i = 0; i < num_entries; i++)
+      vrend_insert_format(&table[i], VIRGL_BIND_SAMPLER_VIEW, 0);
+}
+
 #define add_formats(x) vrend_add_formats((x), ARRAY_SIZE((x)))
 #define add_compressed_formats(x) vrend_add_compressed_formats((x), ARRAY_SIZE((x)))
+#define add_sampler_only_formats(x) vrend_add_sampler_only_formats((x), ARRAY_SIZE((x)))
 
 void vrend_build_format_list_common(void)
 {
@@ -583,6 +616,8 @@ void vrend_build_format_list_common(void)
 
   add_formats(packed_float_formats);
   add_formats(exponent_float_formats);
+
+  add_sampler_only_formats(yuv_planar_formats);
 }
 
 
