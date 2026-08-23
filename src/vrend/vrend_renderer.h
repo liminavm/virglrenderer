@@ -123,6 +123,18 @@ struct vrend_resource {
    uint32_t blob_id;
    struct list_head head;
    bool is_imported;
+
+   /* limina: a guest-memory blob (blob_mem=GUEST) that SET_TYPE turned into a
+    * plain GL texture. Its pixels live in the guest pages behind ->iov, and on
+    * a host with no dmabuf we cannot alias them — we copy. The guest rewrites
+    * those pages in place (a video pool cycling its frames) and sends nothing
+    * to say so, so the copy is refreshed before every command batch that
+    * samples the texture. ->guest_pixels_serial records the batch the current
+    * contents came from. */
+   bool guest_pixels;
+   uint32_t guest_pixels_stride;
+   uint32_t guest_pixels_offset;
+   uint64_t guest_pixels_serial;
 };
 
 #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)
@@ -554,6 +566,10 @@ void vrend_renderer_get_rect(struct pipe_resource *pres,
                              const struct iovec *iov, unsigned int num_iovs,
                              uint32_t offset,
                              int x, int y, int width, int height);
+
+/* limina: starts a new command batch, invalidating the cached copies of
+ * guest-memory-backed textures (see vrend_resource::guest_pixels). */
+void vrend_renderer_begin_cmd_batch(void);
 
 void vrend_renderer_attach_res_ctx(struct vrend_context *ctx,
                                    struct virgl_resource *res);

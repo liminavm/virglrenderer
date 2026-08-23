@@ -2122,6 +2122,8 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
    if (bret == false)
       return EINVAL;
 
+   vrend_renderer_begin_cmd_batch();
+
    if (VREND_DEBUG_ENABLED &&
        vrend_debug(gdctx->grctx, dbg_dump_cmd_streams) &&
        size > TRANSFER_HEADER_SIZE) {

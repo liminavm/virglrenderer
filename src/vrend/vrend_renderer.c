@@ -56,6 +56,7 @@
 #include "vrend_blitter.h"
 
 #include "virgl_util.h"
+#include "vrend_iov.h"
 
 #include "virgl_hw.h"
 #include "virgl_resource.h"
@@ -406,6 +407,10 @@ struct global_renderer_state {
 #endif
    bool d3d_share_texture : 1;
    bool gbm_layout_feat : 1;
+
+   /* limina: bumped once per command batch; textures copied out of guest
+    * memory compare against it to refresh at most once per batch. */
+   uint64_t cmd_batch_serial;
 };
 
 struct sysval_uniform_block {
@@ -5266,6 +5271,8 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
    }
 }
 
+static void vrend_resource_refresh_guest_pixels(struct vrend_resource *gr);
+
 static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
                                               int shader_type,
                                               GLuint next_sampler_id)
@@ -5280,6 +5287,11 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
    while (mask) {
       int i = u_bit_scan(&mask);
       struct vrend_sampler_view *tview = shader_view->views[i];
+
+      /* Nothing dirties a texture whose guest pages were rewritten behind our
+       * back, so this runs outside the dirty check. */
+      if (tview)
+         vrend_resource_refresh_guest_pixels(tview->texture);
 
       if ((dirty & (1 << i)) && tview) {
          glActiveTexture(GL_TEXTURE0 + next_sampler_id);
@@ -13983,6 +13995,122 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
    return NULL;
 }
 
+/* limina: copy a guest-memory blob's pixels into its GL texture.
+ *
+ * The blob's pages arrive as host-VA iovecs. Read them row by row: the guest's
+ * stride commonly exceeds width * bpp, and the image starts at
+ * ->guest_pixels_offset inside the blob. Returns false if the layout does not
+ * fit the blob, in which case the texture is left untouched — uploading half a
+ * frame is worse than not uploading one.
+ */
+static bool
+vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
+{
+   const uint32_t width = gr->base.width0;
+   const uint32_t height = gr->base.height0;
+   const uint32_t bpp = util_format_get_blocksize(gr->base.format);
+   const size_t row = (size_t)width * bpp;
+   const size_t need = row * height;
+
+   if (!gr->iov || !gr->num_iovs || !need)
+      return false;
+   /* SET_TYPE builds these as PIPE_TEXTURE_2D; the 2D paths below assume it. */
+   if (gr->target != GL_TEXTURE_2D)
+      return false;
+
+   const size_t stride = gr->guest_pixels_stride ? gr->guest_pixels_stride : row;
+   char *staging = malloc(need);
+   if (!staging)
+      return false;
+
+   for (uint32_t y = 0; y < height; y++) {
+      if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
+                                gr->guest_pixels_offset + (size_t)y * stride,
+                                staging + (size_t)y * row, row) != row) {
+         virgl_warn("%s: res %ux%u %s: guest blob is short of its claimed "
+                    "layout (stride %zu, offset %u) at row %u — not uploading\n",
+                    why, width, height, util_format_name(gr->base.format),
+                    stride, gr->guest_pixels_offset, y);
+         free(staging);
+         return false;
+      }
+   }
+
+   /* This can run in the middle of binding a draw's samplers, so leave the
+    * texture unit exactly as it was — unbinding to 0 would silently drop a
+    * binding the draw still needs. Rows are tightly packed in the staging
+    * buffer; vrend's resting pixel-store state is ROW_LENGTH 0 / ALIGNMENT 4. */
+   GLint prev_tex = 0;
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+   glBindTexture(GL_TEXTURE_2D, gr->gl_id);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                   tex_conv_table[gr->base.format].glformat,
+                   tex_conv_table[gr->base.format].gltype,
+                   staging);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+   free(staging);
+
+   gr->guest_pixels_serial = vrend_state.cmd_batch_serial;
+   return true;
+}
+
+/* glTexStorage leaves contents undefined; make that explicit rather than
+ * sampling whatever the GPU last held there. */
+static void
+vrend_resource_zero_texture(struct vrend_resource *gr)
+{
+   const uint32_t width = gr->base.width0;
+   const uint32_t height = gr->base.height0;
+   const size_t need = (size_t)width * height *
+                       util_format_get_blocksize(gr->base.format);
+   void *zeros = need ? calloc(1, need) : NULL;
+
+   if (!zeros)
+      return;
+
+   GLint prev_tex = 0;
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+   glBindTexture(GL_TEXTURE_2D, gr->gl_id);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                   tex_conv_table[gr->base.format].glformat,
+                   tex_conv_table[gr->base.format].gltype,
+                   zeros);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+   free(zeros);
+}
+
+/* limina: re-read a guest-memory-backed texture before it is sampled.
+ *
+ * Nothing on the wire announces that the guest rewrote the pages — a real
+ * dmabuf import would alias them, so the protocol has no refresh command to
+ * send. Assume they changed, but do it at most once per command batch so a
+ * frame drawing the same texture many times pays for one upload.
+ */
+static void
+vrend_resource_refresh_guest_pixels(struct vrend_resource *gr)
+{
+   if (!gr || !gr->guest_pixels)
+      return;
+   if (gr->guest_pixels_serial == vrend_state.cmd_batch_serial)
+      return;
+
+   /* Keep the previous contents on failure; the layout was already validated
+    * once at set_type, so a failure here means the backing went away. */
+   if (!vrend_resource_upload_guest_pixels(gr, "refresh"))
+      gr->guest_pixels_serial = vrend_state.cmd_batch_serial;
+}
+
+void vrend_renderer_begin_cmd_batch(void)
+{
+   vrend_state.cmd_batch_serial++;
+}
+
 int
 vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                       uint32_t res_id,
@@ -14114,20 +14242,32 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                FREE(gr);
                return aret;
             }
-            /* glTexStorage contents are UNDEFINED — without this the
-             * placeholder shows stale GPU memory (garbage, and a cross-context
-             * info leak), not black. Zero it explicitly. */
-            const uint32_t limina_bpp = util_format_get_blocksize(gr->base.format);
-            void *limina_zeros =
-               calloc(1, (size_t)args->width * args->height * limina_bpp);
-            if (limina_zeros) {
-               glBindTexture(gr->target, gr->gl_id);
-               glTexSubImage2D(gr->target, 0, 0, 0, args->width, args->height,
-                               tex_conv_table[gr->base.format].glformat,
-                               tex_conv_table[gr->base.format].gltype,
-                               limina_zeros);
-               glBindTexture(gr->target, 0);
-               free(limina_zeros);
+            /* A guest-memory blob (blob_mem=GUEST) carries its pages as
+             * host-VA iovecs: /dev/udmabuf wraps a guest memfd, the guest
+             * kernel PRIME-imports it and registers the sg_table as a
+             * virtio-gpu resource, and the VMM translates the backing into
+             * iovecs. Those are the frame's real bytes, so fill the texture
+             * from them rather than from zeros — this is how a software-decoded
+             * video frame (every GStreamer glupload whose buffers qualify)
+             * reaches the GPU at all. Without it the texture keeps whatever
+             * glTexStorage left behind and the player draws garbage, silently.
+             *
+             * A real dmabuf import would alias the guest pages and need no
+             * refresh; we copy, so remember the layout and re-read before every
+             * batch that samples this texture (vrend_resource::guest_pixels). */
+            gr->iov = res->iov;
+            gr->num_iovs = res->iov_count;
+            gr->guest_pixels_stride = args->plane_strides[0];
+            gr->guest_pixels_offset = args->plane_offsets[0];
+            gr->guest_pixels =
+               vrend_resource_upload_guest_pixels(gr, "set_type");
+            if (!gr->guest_pixels) {
+               /* glTexStorage contents are UNDEFINED — leaving them shows stale
+                * GPU memory (garbage, and a cross-context info leak) rather
+                * than black. Zero it explicitly. */
+               vrend_resource_zero_texture(gr);
+               gr->iov = NULL;
+               gr->num_iovs = 0;
             }
          }
       } else
