@@ -132,8 +132,9 @@ struct vrend_resource {
     * samples the texture. ->guest_pixels_serial records the batch the current
     * contents came from. */
    bool guest_pixels;
-   uint32_t guest_pixels_stride;
-   uint32_t guest_pixels_offset;
+   uint32_t guest_pixels_planes;
+   uint32_t guest_pixels_stride[VIRGL_GBM_MAX_PLANES];
+   uint32_t guest_pixels_offset[VIRGL_GBM_MAX_PLANES];
    uint64_t guest_pixels_serial;
 };
 

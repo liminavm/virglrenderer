@@ -14003,12 +14003,137 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
  * fit the blob, in which case the texture is left untouched — uploading half a
  * frame is worse than not uploading one.
  */
+/* limina: how the guest laid out one plane inside the blob. Chroma planes are
+ * subsampled, so a plane's own width/height are not the resource's. */
+struct guest_plane {
+   uint32_t width, height, bpp;
+};
+
+static void
+guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
+                   struct guest_plane planes[VIRGL_GBM_MAX_PLANES],
+                   uint32_t *plane_count)
+{
+   switch (format) {
+   case VIRGL_FORMAT_NV12:
+   case VIRGL_FORMAT_NV21:
+      planes[0] = (struct guest_plane){ width, height, 1 };
+      planes[1] = (struct guest_plane){ (width + 1) / 2, (height + 1) / 2, 2 };
+      *plane_count = 2;
+      return;
+   case VIRGL_FORMAT_IYUV: /* I420 */
+   case VIRGL_FORMAT_YV12:
+      planes[0] = (struct guest_plane){ width, height, 1 };
+      planes[1] = (struct guest_plane){ (width + 1) / 2, (height + 1) / 2, 1 };
+      planes[2] = (struct guest_plane){ (width + 1) / 2, (height + 1) / 2, 1 };
+      *plane_count = 3;
+      return;
+   default:
+      planes[0] = (struct guest_plane){
+         width, height, util_format_get_blocksize(format)
+      };
+      *plane_count = 1;
+      return;
+   }
+}
+
+/* BT.601 limited range, the EGL default. The guest's colour-space hint is
+ * consumed by its own EGL and never reaches us, so HD content encoded BT.709
+ * comes out slightly off rather than wrong. */
+static void
+yuv_to_rgba(uint8_t y, uint8_t u, uint8_t v, uint8_t *out)
+{
+   const int c = (int)y - 16;
+   const int d = (int)u - 128;
+   const int e = (int)v - 128;
+
+   out[0] = CLAMP((298 * c + 409 * e + 128) >> 8, 0, 255);
+   out[1] = CLAMP((298 * c - 100 * d - 208 * e + 128) >> 8, 0, 255);
+   out[2] = CLAMP((298 * c + 516 * d + 128) >> 8, 0, 255);
+   out[3] = 255;
+}
+
+/* Read every plane of a planar-YUV blob and convert it to RGBA at luma
+ * resolution -- the texture the guest samples is an ordinary RGBA8 one (see
+ * yuv_planar_formats in vrend_formats.c for why). */
+static bool
+guest_pixels_convert_yuv(struct vrend_resource *gr,
+                         const struct guest_plane *planes,
+                         uint32_t plane_count, uint8_t *rgba)
+{
+   const uint32_t width = gr->base.width0;
+   const uint32_t height = gr->base.height0;
+   const bool semiplanar = plane_count == 2;
+   /* NV21 and YV12 are the same layouts with the two chroma samples swapped. */
+   const bool swapped = gr->base.format == VIRGL_FORMAT_NV21 ||
+                        gr->base.format == VIRGL_FORMAT_YV12;
+   uint8_t *plane_data[VIRGL_GBM_MAX_PLANES] = { NULL };
+   uint32_t plane_pitch[VIRGL_GBM_MAX_PLANES] = { 0 };
+   bool ok = true;
+
+   for (uint32_t p = 0; p < plane_count && ok; p++) {
+      const uint32_t pitch = planes[p].width * planes[p].bpp;
+      const uint32_t stride = gr->guest_pixels_stride[p] ?
+                              gr->guest_pixels_stride[p] : pitch;
+
+      plane_pitch[p] = pitch;
+      plane_data[p] = malloc((size_t)pitch * planes[p].height);
+      if (!plane_data[p]) {
+         ok = false;
+         break;
+      }
+      for (uint32_t y = 0; y < planes[p].height; y++) {
+         if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
+                                   gr->guest_pixels_offset[p] + (size_t)y * stride,
+                                   (char *)plane_data[p] + (size_t)y * pitch,
+                                   pitch) != pitch) {
+            ok = false;
+            break;
+         }
+      }
+   }
+
+   for (uint32_t y = 0; ok && y < height; y++) {
+      const uint32_t cy = MIN2(y / 2, planes[1].height - 1);
+      for (uint32_t x = 0; x < width; x++) {
+         const uint32_t cx = MIN2(x / 2, planes[1].width - 1);
+         const uint8_t luma = plane_data[0][(size_t)y * plane_pitch[0] + x];
+         uint8_t u, v;
+
+         if (semiplanar) {
+            const uint8_t *pair =
+               &plane_data[1][(size_t)cy * plane_pitch[1] + cx * 2];
+            u = pair[swapped ? 1 : 0];
+            v = pair[swapped ? 0 : 1];
+         } else {
+            const uint32_t ui = swapped ? 2 : 1;
+            const uint32_t vi = swapped ? 1 : 2;
+            u = plane_data[ui][(size_t)cy * plane_pitch[ui] + cx];
+            v = plane_data[vi][(size_t)cy * plane_pitch[vi] + cx];
+         }
+         yuv_to_rgba(luma, u, v, rgba + ((size_t)y * width + x) * 4);
+      }
+   }
+
+   for (uint32_t p = 0; p < plane_count; p++)
+      free(plane_data[p]);
+   return ok;
+}
+
 static bool
 vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
 {
    const uint32_t width = gr->base.width0;
    const uint32_t height = gr->base.height0;
-   const uint32_t bpp = util_format_get_blocksize(gr->base.format);
+   struct guest_plane planes[VIRGL_GBM_MAX_PLANES];
+   uint32_t plane_count = 0;
+
+   guest_plane_layout(gr->base.format, width, height, planes, &plane_count);
+
+   /* Planar frames are converted, so the staging buffer -- and what GL is
+    * handed -- is always RGBA at luma resolution. */
+   const bool yuv = plane_count > 1;
+   const uint32_t bpp = yuv ? 4 : planes[0].bpp;
    const size_t row = (size_t)width * bpp;
    const size_t need = row * height;
 
@@ -14018,22 +14143,34 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
    if (gr->target != GL_TEXTURE_2D)
       return false;
 
-   const size_t stride = gr->guest_pixels_stride ? gr->guest_pixels_stride : row;
    char *staging = malloc(need);
    if (!staging)
       return false;
 
-   for (uint32_t y = 0; y < height; y++) {
-      if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
-                                gr->guest_pixels_offset + (size_t)y * stride,
-                                staging + (size_t)y * row, row) != row) {
-         virgl_warn("%s: res %ux%u %s: guest blob is short of its claimed "
-                    "layout (stride %zu, offset %u) at row %u — not uploading\n",
-                    why, width, height, util_format_name(gr->base.format),
-                    stride, gr->guest_pixels_offset, y);
-         free(staging);
-         return false;
+   bool ok;
+   if (yuv) {
+      ok = guest_pixels_convert_yuv(gr, planes, plane_count, (uint8_t *)staging);
+   } else {
+      const size_t stride = gr->guest_pixels_stride[0] ?
+                            gr->guest_pixels_stride[0] : row;
+      ok = true;
+      for (uint32_t y = 0; y < height; y++) {
+         if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
+                                   gr->guest_pixels_offset[0] + (size_t)y * stride,
+                                   staging + (size_t)y * row, row) != row) {
+            ok = false;
+            break;
+         }
       }
+   }
+   if (!ok) {
+      virgl_warn("%s: res %ux%u %s: guest blob is short of its claimed layout "
+                 "(%u plane(s), stride %u, offset %u) — not uploading\n",
+                 why, width, height, util_format_name(gr->base.format),
+                 plane_count, gr->guest_pixels_stride[0],
+                 gr->guest_pixels_offset[0]);
+      free(staging);
+      return false;
    }
 
    /* This can run in the middle of binding a draw's samplers, so leave the
@@ -14046,8 +14183,8 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-                   tex_conv_table[gr->base.format].glformat,
-                   tex_conv_table[gr->base.format].gltype,
+                   yuv ? GL_RGBA : tex_conv_table[gr->base.format].glformat,
+                   yuv ? GL_UNSIGNED_BYTE : tex_conv_table[gr->base.format].gltype,
                    staging);
    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
@@ -14117,6 +14254,11 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                       const struct vrend_renderer_resource_set_type_args *args)
 {
    struct virgl_resource *res = NULL;
+
+   VREND_DEBUG(dbg_tex, ctx, "SET_TYPE res %u %s %ux%u bind 0x%x, %u plane(s), "
+               "stride/offset 0: %u/%u\n", res_id, util_format_name(args->format),
+               args->width, args->height, args->bind, args->plane_count,
+               args->plane_strides[0], args->plane_offsets[0]);
 
    /* look up the untyped resource */
    if (ctx->untyped_resource_cache &&
@@ -14257,8 +14399,12 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
              * batch that samples this texture (vrend_resource::guest_pixels). */
             gr->iov = res->iov;
             gr->num_iovs = res->iov_count;
-            gr->guest_pixels_stride = args->plane_strides[0];
-            gr->guest_pixels_offset = args->plane_offsets[0];
+            gr->guest_pixels_planes = MIN2(args->plane_count,
+                                           VIRGL_GBM_MAX_PLANES);
+            for (uint32_t i = 0; i < gr->guest_pixels_planes; i++) {
+               gr->guest_pixels_stride[i] = args->plane_strides[i];
+               gr->guest_pixels_offset[i] = args->plane_offsets[i];
+            }
             gr->guest_pixels =
                vrend_resource_upload_guest_pixels(gr, "set_type");
             if (!gr->guest_pixels) {
