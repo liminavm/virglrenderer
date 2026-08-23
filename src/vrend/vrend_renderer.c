@@ -7509,6 +7509,16 @@ static void vrend_pipe_resource_unref(struct pipe_resource *pres,
 {
    struct vrend_resource *res = (struct vrend_resource *)pres;
 
+   /* The iovecs describe the VMM's backing for the resource being destroyed, and
+    * they die with it. A vrend_resource can outlive that -- a sampler view still
+    * holding a reference keeps it alive past the guest's RESOURCE_UNREF -- and the
+    * guest_pixels refresh would then re-read freed memory before the next batch.
+    * Only detach_iov clears these on the classic (DETACH_BACKING) path, which a
+    * guest-memory blob never takes. */
+   res->iov = NULL;
+   res->num_iovs = 0;
+   res->guest_pixels = false;
+
    if (vrend_state.finishing || pipe_reference(&res->base.reference, NULL))
       vrend_renderer_resource_destroy(res);
 }
