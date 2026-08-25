@@ -8247,11 +8247,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    }
 
    vrend_state.eventfd = -1;
-   if (flags & VREND_USE_THREAD_SYNC) {
-      if (flags & VREND_USE_ASYNC_FENCE_CB)
-         vrend_state.use_async_fence_cb = true;
-      vrend_renderer_use_threaded_sync();
-   }
+   if (flags & VREND_USE_THREAD_SYNC && flags & VREND_USE_ASYNC_FENCE_CB)
+      vrend_state.use_async_fence_cb = true;
    if (flags & VREND_USE_EXTERNAL_BLOB)
       vrend_state.use_external_blob = true;
 
@@ -8299,6 +8296,15 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    if (gbm && gbm->device && vrend_state.gbm_layout_feat)
       vrend_init_venus_interop(gbm->device);
 #endif
+
+   /* Start the sync thread LAST. It runs against the global vrend_state, so anything
+    * still being written into that struct is written while the thread is already
+    * reading it -- an unsynchronised handoff ThreadSanitizer flags on every boot
+    * (thread_sync's read vs the use_external_blob / use_egl_fence stores below where
+    * this call used to sit). Every failure path above reaches cleanup_and_fail, and
+    * vrend_free_sync_thread() returns early when no thread was created. */
+   if (flags & VREND_USE_THREAD_SYNC)
+      vrend_renderer_use_threaded_sync();
 
    return 0;
 cleanup_and_fail:
