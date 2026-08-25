@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_atomic.h"
+
 #include "proxy_context.h"
 
 #include <fcntl.h>
@@ -178,7 +180,7 @@ proxy_context_sync_thread(void *arg)
 
    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
 
-   while (!ctx->sync_thread.stop) {
+   while (!p_atomic_read(&ctx->sync_thread.stop)) {
       const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
       if (ret <= 0) {
          if (ret < 0 && (errno == EINTR || errno == EAGAIN))
@@ -586,7 +588,7 @@ proxy_context_destroy(struct virgl_context *base)
 
    if (ctx->sync_thread.fence_eventfd >= 0) {
       if (ctx->sync_thread.created) {
-         ctx->sync_thread.stop = true;
+         p_atomic_set(&ctx->sync_thread.stop, true);
          write_eventfd(ctx->sync_thread.fence_eventfd, 1);
          thrd_join(ctx->sync_thread.thread, NULL);
       }
