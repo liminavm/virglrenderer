@@ -5273,6 +5273,327 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
 
 static void vrend_resource_refresh_guest_pixels(struct vrend_resource *gr);
 
+/* LIMINA_VREND_INK=WxH: read back a host texture of that size at the moment a draw is about to
+ * SAMPLE it, and report how much ink it holds.
+ *
+ * This is the measurement that splits the notification-card fault in two, and nothing above it can.
+ * The guest has been proven to submit the label's draws, in the correct order, before the composite
+ * that samples them (cogl journal issue-order probe), and both ends of the host render pass are
+ * exonerated (KK_LIMINA_FORCE_LOAD, KK_LIMINA_FORCE_STORE). So either the content is on the host
+ * and the sample does not see it, or it never arrived. Those have different fixes.
+ *
+ * Rate-limited by wall clock rather than by texture id. Deduplicating on the id looked right --
+ * every card gets a fresh offscreen -- but the guest recycles GL texture ids aggressively, so an
+ * id-keyed probe fires for the first few cards and goes silent for the rest, which is exactly how
+ * a thin sample gets mistaken for a general result.
+ *
+ * It also reports a checksum, not just a count. Ink alone cannot tell fresh content from a previous
+ * card's text left in a recycled texture, and those mean opposite things.
+ *
+ * It IS a perturbation -- a readback is a sync, and forcing one in the guest cured the damage. So
+ * the arm is only readable together with the damage rate from the same run: ink present WHILE cards
+ * still come out damaged is decisive; cards coming out clean means the probe cured it and the
+ * reading is void. */
+static int limina_probe_w = -1, limina_probe_h = 0;
+static GLuint limina_last_src = 0;
+/* An occlusion query around the label draw. Everything observable about the two passes is now
+ * identical -- same target, same draw count, same program and state, same source texture with the
+ * same contents -- so the question is whether the failing draw rasterises anything at all.
+ * Samples of zero means the geometry never covered a pixel, which is a data or transform problem;
+ * samples above zero means fragments were produced and did not reach the texture, which is a
+ * blend, mask or store problem. The result is read at episode end, where a readback is already
+ * known not to cure, so the draw itself is not synchronised. */
+static GLuint limina_query = 0;
+static int limina_query_active = 0;
+static int limina_query_pending = 0;
+static int limina_query_ok = 1;
+static GLuint limina_last_vbo = 0, limina_last_ibo = 0;
+
+/* Reading the geometry from the host is CLOSED as an avenue. glGetBufferSubData on the bound
+ * attribute buffer aborted the worker with SIGABRT, and so did copying into a scratch buffer we
+ * own with glCopyBufferSubData first -- two different methods, same signal 6. Whatever the failing
+ * draw fetches has to be established some other way; the buffer ids are still logged so the two
+ * passes can at least be compared by identity. */
+
+/* Count non-empty texels of an arbitrary texture (the glyph atlas is single-channel, so red
+ * counts as well as alpha). */
+static unsigned limina_tex_ink(GLuint gl_id, int *out_w, int *out_h)
+{
+   static GLuint fbo = 0;
+   GLint prev_read = 0, prev_tex = 0, w = 0, h = 0;
+   unsigned char *px;
+   unsigned ink = 0;
+
+   *out_w = *out_h = 0;
+   if (!gl_id)
+      return 0;
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+   glBindTexture(GL_TEXTURE_2D, gl_id);
+   glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+   glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+   glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+   *out_w = w;
+   *out_h = h;
+   if (w <= 0 || h <= 0 || (long)w * h > 4L * 1024 * 1024)
+      return 0;
+   px = malloc((size_t)w * h * 4);
+   if (!px)
+      return 0;
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+   if (!fbo)
+      glGenFramebuffers(1, &fbo);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl_id, 0);
+   if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+      glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      for (long i = 0; i < (long)w * h; i++)
+         if (px[i * 4] > 32 || px[i * 4 + 3] > 32)
+            ink++;
+   }
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+   free(px);
+   return ink;
+}
+
+static void limina_read_ink(GLuint gl_id, unsigned *out_ink, unsigned *out_after, uint32_t *out_sum)
+{
+   static GLuint probe_fbo = 0;
+   GLint prev_read = 0, prev_pack = 0;
+   unsigned char *px;
+   unsigned ink = 0, ink_after = 0;
+   uint32_t sum = 2166136261u;
+
+   *out_ink = *out_after = 0;
+   *out_sum = 0;
+   if (limina_probe_w <= 0)
+      return;
+   px = malloc((size_t)limina_probe_w * limina_probe_h * 4);
+   if (!px)
+      return;
+
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+   glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
+   if (prev_pack)
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   if (!probe_fbo)
+      glGenFramebuffers(1, &probe_fbo);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, probe_fbo);
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl_id, 0);
+   if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+      glReadPixels(0, 0, limina_probe_w, limina_probe_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      for (int i = 0; i < limina_probe_w * limina_probe_h; i++) {
+         if (px[i * 4 + 3] > 32) {
+            ink++;
+            sum = (sum ^ (uint32_t)i) * 16777619u;
+         }
+      }
+      glFinish();
+      glReadPixels(0, 0, limina_probe_w, limina_probe_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      for (int i = 0; i < limina_probe_w * limina_probe_h; i++)
+         if (px[i * 4 + 3] > 32)
+            ink_after++;
+   }
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+   if (prev_pack)
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack);
+   free(px);
+
+   *out_ink = ink;
+   *out_after = ink_after;
+   *out_sum = sum;
+}
+
+/* The other half of the identity question, and it has to live at the DRAW entry point rather than
+ * in the sampler probe: the sampler path only runs for views that are dirty, so a draw that rebinds
+ * nothing is invisible to it. Placed there first, it never fired once, which reads exactly like
+ * "the title is never rendered into a 968x44 target" and is instead a dead probe. */
+static void limina_rt_probe(struct vrend_sub_context *sub_ctx)
+{
+   /* Track the target of EVERY draw, not just matching ones, and report each time rendering
+    * SWITCHES to the size under study. Deduplicating on "the id changed" hid the case that
+    * matters: the guest returns to the same offscreen to redraw it, and a repaint of the same
+    * target prints nothing, so a clear-then-redraw between two composites is invisible. */
+   static GLuint last_any = 0xffffffffu;
+   static GLuint episode_tex = 0;
+   static unsigned episode_draws = 0;
+   static int in_episode = 0;
+   GLuint cur = 0;
+   int match = 0;
+
+   if (limina_probe_w <= 0)
+      return;
+
+   /* Our episodes carry exactly one draw, so ending the query at the next draw entry brackets
+    * precisely that draw. */
+   if (limina_query_active) {
+      glEndQuery(GL_ANY_SAMPLES_PASSED);
+      limina_query_active = 0;
+      limina_query_pending = 1;
+   }
+
+   if (sub_ctx && sub_ctx->nr_cbufs > 0 && sub_ctx->surf[0] && sub_ctx->surf[0]->texture) {
+      cur = sub_ctx->surf[0]->texture->gl_id;
+      match = sub_ctx->surf[0]->texture->base.width0 == (uint32_t)limina_probe_w &&
+              sub_ctx->surf[0]->texture->base.height0 == (uint32_t)limina_probe_h;
+   } else {
+      cur = 0xffffffffu;
+   }
+
+   /* Close the previous episode and report how many draws vrend actually processed into that
+    * target. This is the split that matters: the first render into a label offscreen lands and the
+    * second leaves it empty, so either the second episode carries no draws (the work never reached
+    * the host, and the fault is above vrend) or it carries the same draws and writes nothing (the
+    * fault is below). */
+   if (in_episode && cur != last_any) {
+      /* Read the target the instant its render episode ends. This is the question the
+       * sample-time probe cannot answer: if the texture is already empty here, the pass itself
+       * produced nothing; if it holds the text here and is empty by the time the stage samples
+       * it, something between the two wipes it, which is a different fault entirely. */
+      unsigned ink = 0, after = 0;
+      uint32_t sum = 0;
+
+      int aw = 0, ah = 0;
+      unsigned aink;
+
+      limina_read_ink(episode_tex, &ink, &after, &sum);
+      aink = limina_tex_ink(limina_last_src, &aw, &ah);
+      {
+         GLuint samples = 0xffffffffu;
+
+         if (limina_query_pending) {
+            glGetQueryObjectuiv(limina_query, GL_QUERY_RESULT, &samples);
+            limina_query_pending = 0;
+         }
+         {
+            fprintf(stderr,
+                    "[LIMINA-INK] RENDER episode END tex=%u draws=%u ink=%u after_finish=%u"
+                    " sum=%08x | source tex=%u %dx%d ink=%u | samples=%u | vbo=%u ibo=%u\n",
+                    episode_tex, episode_draws, ink, after, sum, limina_last_src, aw, ah, aink,
+                    samples, limina_last_vbo, limina_last_ibo);
+         }
+      }
+      fflush(stderr);
+      in_episode = 0;
+   }
+
+   if (match) {
+      if (!in_episode || cur != last_any) {
+         in_episode = 1;
+         episode_tex = cur;
+         episode_draws = 0;
+         fprintf(stderr, "[LIMINA-INK] RENDER episode START tex=%u %dx%d\n", cur,
+                 limina_probe_w, limina_probe_h);
+         fflush(stderr);
+      }
+      episode_draws++;
+   }
+
+   last_any = cur;
+}
+
+static void limina_ink_probe(struct vrend_sub_context *sub_ctx,
+                             struct vrend_resource *res, GLuint gl_id, GLenum target)
+{
+   static int probe_w = -1, probe_h = 0;
+   static GLuint probe_fbo = 0;
+   static int64_t last_us = 0;
+
+   if (unlikely(probe_w < 0)) {
+      const char *env = getenv("LIMINA_VREND_INK");
+      probe_w = 0;
+      if (env && sscanf(env, "%dx%d", &probe_w, &probe_h) != 2)
+         probe_w = 0;
+      limina_probe_w = probe_w;
+      limina_probe_h = probe_h;
+      fprintf(stderr, "[LIMINA-INK] host texture ink probe %s\n",
+              probe_w ? env : "off (LIMINA_VREND_INK=WxH)");
+      fflush(stderr);
+   }
+
+   if (!probe_w)
+      return;
+
+   if (!res || target != GL_TEXTURE_2D)
+      return;
+   if (res->base.width0 != (uint32_t)probe_w || res->base.height0 != (uint32_t)probe_h)
+      return;
+
+   {
+      struct timespec ts;
+      int64_t now_us;
+
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      now_us = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+      if (now_us - last_us < 400000)
+         return;
+      last_us = now_us;
+   }
+
+   {
+      GLint prev_read = 0, prev_pack = 0;
+      unsigned char *px = malloc((size_t)probe_w * probe_h * 4);
+      unsigned ink = 0, ink_after = 0;
+      uint32_t sum = 2166136261u;
+
+      if (!px)
+         return;
+
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+      glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pack);
+      if (prev_pack)
+         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      if (!probe_fbo)
+         glGenFramebuffers(1, &probe_fbo);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, probe_fbo);
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gl_id, 0);
+      if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+         /* Read twice, with a glFinish between, because an empty first read has two very
+          * different meanings and they are the whole question. If the second read finds the text
+          * the first one missed, the draws were merely not EXECUTED yet when the composite came
+          * to sample -- the sample runs ahead of the render, which is the hazard a guest-side
+          * flush would paper over. If both reads are empty, the content genuinely is not there
+          * and the fault is upstream of the sample. */
+         glReadPixels(0, 0, probe_w, probe_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+         for (int i = 0; i < probe_w * probe_h; i++) {
+            if (px[i * 4 + 3] > 32) {
+               ink++;
+               sum = (sum ^ (uint32_t)i) * 16777619u;
+            }
+         }
+         glFinish();
+         glReadPixels(0, 0, probe_w, probe_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+         for (int i = 0; i < probe_w * probe_h; i++)
+            if (px[i * 4 + 3] > 32)
+               ink_after++;
+      } else {
+         ink = (unsigned)-1;
+      }
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read);
+      if (prev_pack)
+         glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pack);
+      free(px);
+
+      /* WHICH draw is sampling it decides between the two remaining stories. If the empty reads
+       * belong to draws targeting the stage, the visible composite is reading a texture that has
+       * nothing in it. If they belong to some other target, the stage is fine and the empty
+       * texture is a different consumer's business. */
+      {
+         int tw = 0, th = 0;
+
+         if (sub_ctx && sub_ctx->nr_cbufs > 0 && sub_ctx->surf[0] &&
+             sub_ctx->surf[0]->texture) {
+            tw = (int)sub_ctx->surf[0]->texture->base.width0;
+            th = (int)sub_ctx->surf[0]->texture->base.height0;
+         }
+         fprintf(stderr,
+                 "[LIMINA-INK] sample tex=%u %dx%d ink=%u after_finish=%u sum=%08x "
+                 "-> drawing into %dx%d\n",
+                 gl_id, probe_w, probe_h, ink, ink_after, sum, tw, th);
+      }
+      fflush(stderr);
+   }
+}
+
 static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
                                               int shader_type,
                                               GLuint next_sampler_id)
@@ -5331,6 +5652,8 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
          if (tview->texture) {
             GLuint id = tview->gl_id;
             GLenum target = tview->target;
+
+            limina_ink_probe(sub_ctx, tview->texture, id, target);
 
             debug_texture(__func__, tview->texture);
 
@@ -5943,6 +6266,8 @@ int vrend_draw_vbo(struct vrend_context *ctx,
    struct vrend_resource *indirect_params_res = NULL;
    struct vrend_sub_context *sub_ctx = ctx->sub;
 
+   limina_rt_probe(sub_ctx);
+
    if (ctx->in_error)
       return ENOTRECOVERABLE;
 
@@ -6133,6 +6458,136 @@ int vrend_draw_vbo(struct vrend_context *ctx,
       GLenum blend = translate_blend_func_advanced(blend_mode);
       glBlendEquation(blend);
       glEnable(GL_BLEND);
+   }
+
+   /* [LIMINA] Both render episodes into the label offscreen carry exactly one draw, and one fills
+    * the texture while the other leaves it empty. The work arrives either way, so whatever differs
+    * is state -- dumped here, after vrend has finished setting it and immediately before the draw
+    * is emitted, so the two passes can simply be diffed. */
+   if (limina_probe_w > 0 && sub_ctx && sub_ctx->nr_cbufs > 0 && sub_ctx->surf[0] &&
+       sub_ctx->surf[0]->texture &&
+       sub_ctx->surf[0]->texture->base.width0 == (uint32_t)limina_probe_w &&
+       sub_ctx->surf[0]->texture->base.height0 == (uint32_t)limina_probe_h) {
+      GLint vp[4] = {0}, sc[4] = {0}, prog = 0, tex0 = 0, act = 0, fbo = 0;
+      GLboolean cmask[4] = {0};
+      GLint sfac = 0, dfac = 0;
+
+      glGetIntegerv(GL_VIEWPORT, vp);
+      glGetIntegerv(GL_SCISSOR_BOX, sc);
+      glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+      glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+      glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+      glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+      glGetIntegerv(GL_BLEND_SRC_RGB, &sfac);
+      glGetIntegerv(GL_BLEND_DST_RGB, &dfac);
+      /* Only RECORD which texture the draw samples; do not read it here.
+       *
+       * Reading the atlas at the draw site cured the bug outright -- 4 of 4 cards came out clean
+       * and every render episode ended with ink -- because a 512x512 glReadPixels before the draw
+       * is a synchronisation, and every synchronisation tried so far cures this. The read has to
+       * happen where a readback is already known NOT to cure: at the end of the episode, after the
+       * draw has run. */
+      {
+         GLint src = 0, cur_q = 0;
+
+         GLint vb = 0, ib = 0;
+
+         glGetIntegerv(GL_TEXTURE_BINDING_2D, &src);
+         limina_last_src = (GLuint)src;
+         glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &vb);
+         glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ib);
+         limina_last_vbo = (GLuint)vb;
+         limina_last_ibo = (GLuint)ib;
+
+         /* GL_SAMPLES_PASSED is not available in this context -- glBeginQuery rejects it with
+          * GL_INVALID_ENUM -- so use the GLES3 boolean form, which still answers the only
+          * question being asked: did this draw rasterise anything at all. Disabled on the first
+          * error so a probe cannot keep spraying into the log. */
+         if (limina_query_ok) {
+            glGetQueryiv(GL_ANY_SAMPLES_PASSED, GL_CURRENT_QUERY, &cur_q);
+            if (!cur_q && !limina_query_active) {
+               if (!limina_query)
+                  glGenQueries(1, &limina_query);
+               while (glGetError() != GL_NO_ERROR)
+                  ;
+               glBeginQuery(GL_ANY_SAMPLES_PASSED, limina_query);
+               if (glGetError() != GL_NO_ERROR) {
+                  limina_query_ok = 0;
+                  fprintf(stderr, "[LIMINA-INK] occlusion query unavailable, disabled\n");
+                  fflush(stderr);
+               } else {
+                  limina_query_active = 1;
+               }
+            }
+         }
+      }
+
+      /* The transform is the last difference that could put 18 quads outside a 968x44 viewport
+       * while every other piece of state matches. Reading uniforms does not synchronise, so
+       * unlike the texture read this can safely happen at the draw itself. */
+      {
+         GLint nu = 0;
+
+         glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nu);
+         for (GLint u = 0; u < nu && u < 16; u++) {
+            char nm[80];
+            GLint usz = 0;
+            GLenum uty = 0;
+            GLsizei ulen = 0;
+
+            glGetActiveUniform((GLuint)prog, (GLuint)u, sizeof nm, &ulen, &usz, &uty, nm);
+            if (uty == GL_FLOAT_MAT4) {
+               GLint loc = glGetUniformLocation((GLuint)prog, nm);
+               float m[16] = {0};
+
+               if (loc >= 0) {
+                  glGetUniformfv((GLuint)prog, loc, m);
+                  fprintf(stderr,
+                          "[LIMINA-INK] DRAW uniform %s diag=%.4f,%.4f,%.4f,%.4f "
+                          "trans=%.3f,%.3f,%.3f\n",
+                          nm, m[0], m[5], m[10], m[15], m[12], m[13], m[14]);
+               }
+            }
+         }
+      }
+
+      fprintf(stderr,
+              "[LIMINA-INK] DRAW mode=%u count=%d idx=%d inst=%d prog=%d fbo=%d "
+              "vp=%d,%d,%dx%d scissor=%d[%d,%d,%dx%d] blend=%d[%x,%x] "
+              "cmask=%d%d%d%d depth=%d stencil=%d cull=%d act=%x tex0=%d\n",
+              info->mode, info->count, info->indexed ? 1 : 0, info->instance_count, prog, fbo,
+              vp[0], vp[1], vp[2], vp[3], glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0,
+              sc[0], sc[1], sc[2], sc[3], glIsEnabled(GL_BLEND) ? 1 : 0, sfac, dfac,
+              cmask[0], cmask[1], cmask[2], cmask[3],
+              glIsEnabled(GL_DEPTH_TEST) ? 1 : 0, glIsEnabled(GL_STENCIL_TEST) ? 1 : 0,
+              glIsEnabled(GL_CULL_FACE) ? 1 : 0, act, tex0);
+      fflush(stderr);
+   }
+
+   /* LIMINA_VREND_SCISSOR_FIX=1: when the GL scissor test is DISABLED, restate the box as the
+    * current framebuffer's bounds before drawing.
+    *
+    * In GL a disabled scissor test means the box is irrelevant. Vulkan and Metal have no such
+    * thing -- a scissor is always applied -- so the layers below have to synthesise "no scissor"
+    * as a full-attachment rect, and if a stale rect from a previous, much larger target survives
+    * into a small one, the draw is clipped away while every other piece of state looks right.
+    * That is exactly the difference between the label pass that lands and the one that does not:
+    * both have the test disabled, and only the box differs. */
+   {
+      static int scissor_fix = -1;
+
+      if (unlikely(scissor_fix < 0)) {
+         scissor_fix = getenv("LIMINA_VREND_SCISSOR_FIX") ? 1 : 0;
+         fprintf(stderr, "[LIMINA] vrend scissor restate on disabled test: %s\n",
+                 scissor_fix ? "ON (LIMINA_VREND_SCISSOR_FIX)" : "off");
+         fflush(stderr);
+      }
+      if (scissor_fix && sub_ctx && sub_ctx->nr_cbufs > 0 && sub_ctx->surf[0] &&
+          sub_ctx->surf[0]->texture && !glIsEnabled(GL_SCISSOR_TEST)) {
+         glScissor(0, 0, (GLsizei)sub_ctx->surf[0]->texture->base.width0,
+                   (GLsizei)sub_ctx->surf[0]->texture->base.height0);
+      }
    }
 
    /* set the vertex state up now on a delay */
@@ -8812,9 +9267,32 @@ static bool vrend_shared_transfer_sync_enabled(void)
    return cached != 0;
 }
 
+/* LIMINA_VREND_IOSURFACE=0 disables IOSurface backing outright, scanout included. The zero-copy
+ * scanout is a KosmicKrisp/Metal path: a host GL driver that cannot import an IOSurface-backed
+ * texture (llvmpipe asserts in init_scene_texture when the map fails) cannot run at all while it
+ * is on. Turning it off costs the host window its image, so this is only for arms whose oracle is
+ * the guest's own screenshot -- notably the host-implementation locus split, LIMINA_HOST_GALLIUM. */
+static bool vrend_iosurface_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = getenv("LIMINA_VREND_IOSURFACE");
+      cached = !(env && env[0] == '0');
+      if (!cached) {
+         fprintf(stderr, "[LIMINA] IOSurface backing DISABLED (LIMINA_VREND_IOSURFACE=0) -- "
+                         "the host window will have no image\n");
+         fflush(stderr);
+      }
+   }
+   return cached != 0;
+}
+
 static void vrend_resource_iosurface_init(struct vrend_resource *gr,
                                           enum virgl_formats format)
 {
+   if (!vrend_iosurface_enabled())
+      return;
+
    /* SCANOUT is the compositor's own KMS framebuffer. SHARED is every buffer gbm hands
     * out — gbm_bo_create sets __DRI_IMAGE_USE_SHARE unconditionally ("Gallium drivers
     * requires shared in order to get the handle/stride"), which becomes
@@ -9633,12 +10111,38 @@ static void vrend_collapse_data_r16g16b16x16(uint64_t size, void *data) {
    }
 }
 
-static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
-                                             struct vrend_resource *res,
-                                             const struct iovec *iov, int num_iovs,
-                                             const struct vrend_transfer_info *info)
+/* LIMINA_VREND_TRANSFER_FORCE_SYNC=1 turns every guest->host transfer into a fully ordered
+ * one: the unsynchronized/orphan map heuristic below is ignored (the map is a plain
+ * INVALIDATE_RANGE write) and a glFinish() drains all in-flight host GL work before the
+ * upload lands. Off by default -- it costs a full pipeline stall per transfer. This is the
+ * A/B lever for "is a host-side upload/draw ordering race behind this corruption?": if a
+ * symptom survives FORCE_SYNC, host transfer ordering is not what produces it. */
+static bool vrend_transfer_force_sync(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = getenv("LIMINA_VREND_TRANSFER_FORCE_SYNC");
+      cached = env && env[0] == '1';
+      if (cached) {
+         /* stderr, not virgl_info: virglrenderer's own log never reaches the worker log,
+          * and a lever whose engagement cannot be verified is worse than no lever. */
+         fprintf(stderr, "[LIMINA] transfer FORCE_SYNC ON\n");
+         fflush(stderr);
+      }
+   }
+   return cached != 0;
+}
+
+static int vrend_renderer_transfer_write_iov_inner(struct vrend_context *ctx,
+                                                   struct vrend_resource *res,
+                                                   const struct iovec *iov, int num_iovs,
+                                                   const struct vrend_transfer_info *info)
 {
    void *data;
+   const bool force_sync = vrend_transfer_force_sync();
+
+   if (force_sync)
+      glFinish();
 
    if ((is_only_bit(res->storage_bits, VREND_STORAGE_GUEST_MEMORY) ||
        has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) && res->iov) {
@@ -9677,7 +10181,7 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
        * guest's discarded, don't-care tail). A mid-buffer unsynchronized write (box.x!=0, e.g. a
        * streamed index ring) targets a live buffer we cannot orphan; the guest guarantees that
        * sub-range is idle, so leave it as an in-place unsynchronized write. */
-      if (!info->synchronized) {
+      if (!info->synchronized && !force_sync) {
          if (info->box->x == 0)
             map_flags = GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_WRITE_BIT;
          else
@@ -9979,6 +10483,37 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
    }
    return 0;
 }
+
+/* LIMINA_VREND_TRANSFER_SYNC_AFTER=1 drains the host GL pipeline AFTER the upload rather than
+ * before it. FORCE_SYNC orders a transfer against PRIOR work; this orders it against the
+ * SUBSEQUENT consuming draw. GL guarantees that ordering within the API, but here the guarantee
+ * is implemented by zink's barrier tracking and KosmicKrisp's Metal encoding, so it is a real
+ * suspect and not covered by any pre-transfer sync. Off by default -- it stalls per transfer. */
+static bool vrend_transfer_sync_after(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = getenv("LIMINA_VREND_TRANSFER_SYNC_AFTER");
+      cached = env && env[0] == '1';
+      if (cached) {
+         fprintf(stderr, "[LIMINA] transfer SYNC_AFTER ON\n");
+         fflush(stderr);
+      }
+   }
+   return cached != 0;
+}
+
+static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+                                             struct vrend_resource *res,
+                                             const struct iovec *iov, int num_iovs,
+                                             const struct vrend_transfer_info *info)
+{
+   int ret = vrend_renderer_transfer_write_iov_inner(ctx, res, iov, num_iovs, info);
+   if (vrend_transfer_sync_after())
+      glFinish();
+   return ret;
+}
+
 
 static uint32_t vrend_get_texture_depth(struct vrend_resource *res, uint32_t level)
 {
