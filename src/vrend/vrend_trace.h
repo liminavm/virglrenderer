@@ -37,6 +37,32 @@ enum vrend_trace_type {
    VREND_TRACE_FENCE    = 5,
    VREND_TRACE_RETIRE   = 6,
    VREND_TRACE_PAD      = 7,  /* filler to the end of the ring; carries no meaning */
+   VREND_TRACE_XFERDATA = 9,  /* the BYTES a guest->host transfer carried; aux0 = res handle */
+};
+
+/* Resource creation does NOT pass through the command stream -- it arrives on the control path
+ * (virgl_renderer_resource_create / _create_blob), so a trace of decoded commands contains zero
+ * PIPE_RESOURCE_CREATE and a replay built from it cannot construct a single resource.
+ *
+ * These records live in a SIDE STORE that is never evicted, not in the ring. The resources a
+ * replay most needs -- the cached index buffer, the rolling constant-attribute buffer, the glyph
+ * atlas -- are created once at client startup, so they are the OLDEST records in the stream and
+ * would be the first thing FIFO eviction eats once transfer payloads inflate the ring. */
+/* An ORDERED log of create/destroy events, not a table keyed by handle: resource handles are
+ * reused, so a keyed table would silently merge two different resources that happened to share
+ * an id. `seq` interleaves these against the ring's records. */
+enum vrend_trace_res_kind {
+   VREND_TRACE_RES_CREATE = 0,
+   VREND_TRACE_RES_BLOB   = 1,
+   VREND_TRACE_RES_UNREF  = 2,
+};
+
+struct vrend_trace_res {
+   uint64_t seq;
+   uint32_t kind;
+   uint32_t handle, target, format, bind;
+   uint32_t width, height, depth, array_size;
+   uint32_t last_level, nr_samples, flags;
 };
 
 /* 32-byte header, 8-aligned, followed by payload_len bytes of payload. */
@@ -64,6 +90,12 @@ void vrend_trace_transfer(uint32_t ctx_id, uint32_t res_handle, int mode, uint32
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                           uint32_t stride, uint64_t offset);
 void vrend_trace_fence(uint32_t ctx_id, uint32_t flags, uint64_t fence_id);
+void vrend_trace_res_event(struct vrend_trace_res *res);
+/* The bytes a guest->host transfer carried, captured where vrend consumes them -- one site
+ * covering TRANSFER3D and COPY_TRANSFER3D alike, so a replayer never has to reconstruct the
+ * blob/iov machinery: it synthesizes one backing iov per resource and memcpys these in. */
+void vrend_trace_transfer_data(uint32_t ctx_id, uint32_t res_handle, uint64_t offset,
+                               const void *data, uint32_t len);
 void vrend_trace_retire_fence(uint32_t ctx_id, uint64_t fence_id);
 
 /* Called at a safe point (the top of a submit) -- a relaxed atomic load when idle. The dump runs
