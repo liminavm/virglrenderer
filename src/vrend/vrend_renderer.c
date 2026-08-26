@@ -11055,11 +11055,20 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
 
    res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
    if (!res) {
+      /* limina: the two rejections below both report ILLEGAL_RESOURCE, and they mean opposite
+       * things -- "the context does not know this handle" versus "it does, but the resource has
+       * no backing iov". Reading one for the other sends you chasing attachment for a sizing
+       * bug. LIMINA_ATTACH_TRACE separates them. */
+      if (getenv("LIMINA_ATTACH_TRACE"))
+         virgl_warn("[xfer-fail] res=%d NOT IN ctx=%d res_hash\n", dst_handle, ctx->ctx_id);
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
       return EINVAL;
    }
 
    if (!check_transfer_iovec(res, info)) {
+      if (getenv("LIMINA_ATTACH_TRACE"))
+         virgl_warn("[xfer-fail] res=%d found in ctx=%d but NO IOV (res->iov=%p info->iovec=%p cnt=%d)\n",
+                    dst_handle, ctx->ctx_id, (void *)res->iov, (void *)info->iovec, info->iovec_cnt);
       if (has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE))
          return 0;
       else {
@@ -14312,6 +14321,14 @@ vrend_renderer_find_untyped_resource(struct vrend_context *ctx, uint32_t res_id)
 void vrend_renderer_attach_res_ctx(struct vrend_context *ctx,
                                    struct virgl_resource *res)
 {
+   /* limina: LIMINA_ATTACH_TRACE reports which branch every attach takes. The two are not
+    * equivalent: an untyped resource is only STASHED here and does not enter ctx->res_hash
+    * until vrend_renderer_pipe_resource_set_type runs, so a command touching it in between
+    * fails the res_hash lookup and aborts the batch with "Illegal resource". That is
+    * indistinguishable from an attach that never happened unless the branch is printed. */
+   if (getenv("LIMINA_ATTACH_TRACE"))
+      virgl_warn("[attach] ctx=%d res=%d pipe_resource=%s\n",
+                 ctx->ctx_id, res->res_id, res->pipe_resource ? "yes -> res_hash" : "NO -> deferred");
    if (!res->pipe_resource) {
       struct virgl_resource *last = ctx->untyped_resource_cache;
 
@@ -14342,6 +14359,8 @@ void vrend_renderer_attach_res_ctx(struct vrend_context *ctx,
 void vrend_renderer_detach_res_ctx(struct vrend_context *ctx,
                                    struct virgl_resource *res)
 {
+   if (getenv("LIMINA_ATTACH_TRACE"))
+      virgl_warn("[detach] ctx=%d res=%d\n", ctx->ctx_id, res->res_id);
    if (!res->pipe_resource) {
       if (ctx->untyped_resource_cache == res) {
          ctx->untyped_resource_cache = NULL;
