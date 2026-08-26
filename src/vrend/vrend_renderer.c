@@ -10524,12 +10524,48 @@ static bool vrend_transfer_sync_after(void)
    return cached != 0;
 }
 
+/* limina: the resource handle for the transfer currently being serviced. The unified write path
+ * below receives only a `struct vrend_resource *`, which carries no handle, and both public entry
+ * points that DO know the handle sit two frames up through helpers with four other callers each.
+ * A thread-local set at those two entry points is the contained way to get it down there; vrend
+ * services a transfer to completion on the calling thread, so there is no interleaving to lose. */
+static __thread uint32_t limina_trace_xfer_handle;
+
 static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                                              struct vrend_resource *res,
                                              const struct iovec *iov, int num_iovs,
                                              const struct vrend_transfer_info *info)
 {
-   int ret = vrend_renderer_transfer_write_iov_inner(ctx, res, iov, num_iovs, info);
+   int ret;
+
+   /* limina: capture the BYTES, not just the fact of the transfer. Both guest->host paths
+    * converge here -- TRANSFER3D through vrend_renderer_transfer_iov and COPY_TRANSFER3D
+    * through vrend_renderer_copy_transfer3d -- so one site covers them uniformly and a replayer
+    * never has to reconstruct blob or iov machinery: it synthesizes a backing iov per resource
+    * and memcpys these in before submitting the batch that reads them. */
+   if (vrend_trace_enabled() && iov && num_iovs > 0 && info->box) {
+      uint32_t stride = info->stride ? info->stride
+                        : util_format_get_stride(res->base.format,
+                                                 u_minify(res->base.width0, info->level));
+      uint32_t layer_stride = info->layer_stride ? info->layer_stride
+                              : util_format_get_2d_size(res->base.format, stride,
+                                                        u_minify(res->base.height0, info->level));
+      uint64_t size = vrend_transfer_size(res, info, stride, layer_stride);
+      /* Bounded: a stray huge transfer must not evict the whole ring. The buffers this spike
+       * needs are kilobytes; anything past the cap is recorded truncated and says so via its
+       * payload length being short of the transfer's own extent. */
+      if (size > 0 && size <= (1u << 20)) {
+         void *tmp = malloc((size_t)size);
+         if (tmp) {
+            vrend_read_from_iovec(iov, num_iovs, info->offset, tmp, (size_t)size);
+            vrend_trace_transfer_data(ctx->ctx_id, limina_trace_xfer_handle,
+                                      info->offset, tmp, (uint32_t)size);
+            free(tmp);
+         }
+      }
+   }
+
+   ret = vrend_renderer_transfer_write_iov_inner(ctx, res, iov, num_iovs, info);
    if (vrend_transfer_sync_after())
       glFinish();
    return ret;
@@ -11036,6 +11072,7 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
     * decode-loop hook is blind to them. They are also the glyph-atlas upload path -- exactly
     * the write-then-sample shape under suspicion -- so a trace without them would be missing
     * the work most likely to matter. */
+   limina_trace_xfer_handle = dst_handle;
    if (vrend_trace_enabled() && info->box)
       vrend_trace_transfer(ctx->ctx_id, dst_handle, transfer_mode, info->level,
                            (uint32_t)info->box->x, (uint32_t)info->box->y,
@@ -11327,6 +11364,16 @@ int vrend_renderer_copy_transfer3d(struct vrend_context *ctx,
                                    struct vrend_resource *src_res,
                                    const struct vrend_transfer_info *info)
 {
+   /* limina: this path had no trace record at all -- the metadata hook lives in
+    * vrend_renderer_transfer_iov, which COPY_TRANSFER3D does not go through. That left 699 copy
+    * transfers per damaged session invisible to the trace. */
+   limina_trace_xfer_handle = dst_handle;
+   if (vrend_trace_enabled() && info->box)
+      vrend_trace_transfer(ctx->ctx_id, dst_handle, VIRGL_TRANSFER_TO_HOST, info->level,
+                           (uint32_t)info->box->x, (uint32_t)info->box->y,
+                           (uint32_t)info->box->width, (uint32_t)info->box->height,
+                           info->stride, info->offset);
+
    if (!resource_contains_box(dst_res, info->box, info->level)) {
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, dst_handle);
       return EINVAL;

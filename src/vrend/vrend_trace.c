@@ -19,7 +19,9 @@
 #include <unistd.h>
 
 #define TRACE_MAGIC   0x4c4d5654u   /* "LMVT" */
-#define TRACE_VERSION 1
+#define TRACE_VERSION 2
+/* Creates are never evicted, so this is a hard cap rather than a window. Overflow is loud. */
+#define TRACE_MAX_RES 32768u
 #define MAX_AUX       8
 
 struct trace_state {
@@ -40,6 +42,12 @@ struct trace_state {
 };
 
 static struct trace_state tr;
+/* The resource create/destroy log. Deliberately NOT in the ring: the resources a replay most
+ * needs are created once at client startup, so in a FIFO they are the first thing evicted once
+ * transfer payloads inflate the stream. */
+static struct vrend_trace_res *tr_res;
+static uint32_t tr_res_n;
+static bool tr_res_full;
 static bool tr_on;
 static bool tr_inited;
 static atomic_int tr_dump_req;
@@ -125,6 +133,12 @@ void vrend_trace_init(void)
    /* Touch it now: a first-touch page fault inside the hot path would be a timing
     * perturbation of exactly the kind this design exists to avoid. */
    memset(tr.buf, 0, tr.cap);
+   tr_res = calloc(TRACE_MAX_RES, sizeof *tr_res);
+   if (!tr_res) {
+      free(tr.buf);
+      tr.buf = NULL;
+      return;
+   }
 
    p = getenv("LIMINA_VREND_TRACE_OUT");
    snprintf(tr.out_path, sizeof tr.out_path, "%s",
@@ -274,6 +288,40 @@ void vrend_trace_transfer(uint32_t ctx_id, uint32_t res_handle, int mode, uint32
    trace_put(VREND_TRACE_TRANSFER, 0, ctx_id, aux, 8, &offset, sizeof offset);
 }
 
+void vrend_trace_res_event(struct vrend_trace_res *res)
+{
+   if (!tr_on)
+      return;
+   pthread_mutex_lock(&tr_lock);
+   if (tr_res_n >= TRACE_MAX_RES) {
+      /* Loud once. Silently dropping creates would produce a trace that looks complete and
+       * replays into a context missing resources -- a failure that reads as a renderer bug. */
+      if (!tr_res_full) {
+         tr_res_full = true;
+         fprintf(stderr, "[LIMINA-TRACE] resource log full at %u entries; trace is NOT replayable\n",
+                 TRACE_MAX_RES);
+         fflush(stderr);
+      }
+      pthread_mutex_unlock(&tr_lock);
+      return;
+   }
+   res->seq = tr.seq;
+   tr_res[tr_res_n++] = *res;
+   pthread_mutex_unlock(&tr_lock);
+}
+
+void vrend_trace_transfer_data(uint32_t ctx_id, uint32_t res_handle, uint64_t offset,
+                               const void *data, uint32_t len)
+{
+   uint32_t aux[3];
+   if (!tr_on || !data || !len)
+      return;
+   aux[0] = res_handle;
+   aux[1] = (uint32_t)(offset & 0xffffffffu);
+   aux[2] = (uint32_t)(offset >> 32);
+   trace_put(VREND_TRACE_XFERDATA, 0, ctx_id, aux, 3, data, len);
+}
+
 void vrend_trace_fence(uint32_t ctx_id, uint32_t flags, uint64_t fence_id)
 {
    uint32_t aux[1];
@@ -321,7 +369,13 @@ static void trace_dump_locked(void)
    hdr[9]  = (uint32_t)(tr.base_mono_ns >> 32);
    hdr[10] = (uint32_t)(tr.base_realtime_ns & 0xffffffffu);
    hdr[11] = (uint32_t)(tr.base_realtime_ns >> 32);
+   hdr[12] = tr_res_n;
+   hdr[13] = tr_res_full ? 1u : 0u;
    fwrite(hdr, sizeof hdr, 1, f);
+   /* The resource log sits between the header and the ring, so a reader can build every
+    * resource before it walks a single command. */
+   if (tr_res_n)
+      fwrite(tr_res, sizeof *tr_res, tr_res_n, f);
 
    /* Walk from the oldest live record forward, wrapping once. */
    pos = tr.tail;

@@ -52,6 +52,7 @@
 #endif
 
 #include "virglrenderer.h"
+#include "vrend/vrend_trace.h"
 #include "virtgpu_drm.h"
 
 #include "virgl_context.h"
@@ -131,6 +132,20 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
       return -ENOMEM;
 
    res->map_info = map_info;
+
+   /* limina: resource creation never enters the command stream, so a trace of decoded commands
+    * has zero PIPE_RESOURCE_CREATE and cannot be replayed. Record it here, on the control path
+    * where it actually happens. */
+   if (vrend_trace_enabled()) {
+      struct vrend_trace_res tres = {
+         .kind = VREND_TRACE_RES_CREATE, .handle = args->handle,
+         .target = args->target, .format = args->format, .bind = args->bind,
+         .width = args->width, .height = args->height, .depth = args->depth,
+         .array_size = args->array_size, .last_level = args->last_level,
+         .nr_samples = args->nr_samples, .flags = args->flags,
+      };
+      vrend_trace_res_event(&tres);
+   }
 #ifdef __APPLE__
    /* limina vrend zero-copy scanout: publish the display IOSurface id (0 when the
     * resource is not IOSurface-backed) so virgl_renderer_resource_get_iosurface_id and
@@ -190,6 +205,13 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
                   res ? "found" : "MISSING");
    if (!res)
       return;
+
+   /* Recorded so a replay can free the handle before it is reused. Handles ARE reused, and a
+    * replay that keeps the first resource alive would bind the wrong one. */
+   if (vrend_trace_enabled()) {
+      struct vrend_trace_res tres = { .kind = VREND_TRACE_RES_UNREF, .handle = res_handle };
+      vrend_trace_res_event(&tres);
+   }
 
    /* A resource destroyed while its VMM mapping is live leaked the mapping:
     * virgl_resource_destroy_func() closes the fd and frees the struct but never
@@ -1217,6 +1239,21 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    } else {
       if (args->num_iovs)
          return -EINVAL;
+   }
+
+   /* limina: recorded before the branches rather than at each success return -- the blob path
+    * has half a dozen exits and a record for a create that then failed is harmless (the replayer
+    * skips a resource nothing ever references), while a missed create is not. */
+   if (vrend_trace_enabled()) {
+      struct vrend_trace_res tres = {
+         .kind = VREND_TRACE_RES_BLOB, .handle = args->res_handle,
+         .width = (uint32_t)(args->size & 0xffffffffu),
+         .height = (uint32_t)(args->size >> 32),
+         .format = args->blob_mem, .bind = args->blob_flags,
+         .depth = (uint32_t)args->blob_id, .array_size = (uint32_t)(args->blob_id >> 32),
+         .flags = args->ctx_id,
+      };
+      vrend_trace_res_event(&tres);
    }
 
    if (!has_host_storage) {
