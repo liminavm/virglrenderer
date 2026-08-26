@@ -166,7 +166,17 @@ void vrend_trace_init(void)
    fflush(stderr);
 }
 
-bool vrend_trace_enabled(void) { return tr_on; }
+/* Arms on first ask, not on first submit. Resources are created on the CONTROL path, and the
+ * guest KMS driver makes its scanout and cursor resources at boot -- before any 3D client
+ * submits a command. Arming only from the decode path left those creates unlogged while the
+ * stream referenced them forever, which makes a trace look complete and replay as if the
+ * resources had never existed. */
+bool vrend_trace_enabled(void)
+{
+   if (!tr_inited)
+      vrend_trace_init();
+   return tr_on;
+}
 
 static void evict_one(void)
 {
