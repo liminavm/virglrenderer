@@ -50,6 +50,7 @@
 #include "vrend_shader.h"
 
 #include "vrend_renderer.h"
+#include "vrend_trace.h"
 #include "vrend_blitter.h"
 #include "vrend_debug.h"
 #include "vrend_winsys.h"
@@ -6268,6 +6269,19 @@ int vrend_draw_vbo(struct vrend_context *ctx,
 
    limina_rt_probe(sub_ctx);
 
+   /* limina: emit the bound target's dimensions with every draw. The trace ring holds a window,
+    * not the whole session, so a draw identified only by a resource handle would become
+    * anonymous the moment its create aged out -- and the one thing we always need to find is
+    * the 968x44 label. Read from vrend's own state, never a GL query, which would sync. */
+   if (vrend_trace_enabled()) {
+      struct vrend_surface *cs = sub_ctx->nr_cbufs ? sub_ctx->surf[0] : NULL;
+      vrend_trace_draw_fb(ctx->ctx_id,
+                          cs && cs->texture ? cs->texture->base.width0 : 0,
+                          cs && cs->texture ? cs->texture->base.height0 : 0,
+                          sub_ctx->nr_cbufs,
+                          cs ? cs->gl_id : 0);
+   }
+
    if (ctx->in_error)
       return ENOTRECOVERABLE;
 
@@ -7861,6 +7875,7 @@ static void wait_sync(struct vrend_fence *fence)
     * by setting fence->ctx to NULL
     */
    if (ctx) {
+      vrend_trace_retire_fence(ctx->ctx_id, fence->fence_id);
       ctx->fence_retire(fence->fence_id, ctx->fence_retire_data);
    }
 
@@ -11017,6 +11032,16 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
       }
    }
 
+   /* limina: transfers arrive through this entry point, NOT through the command stream, so the
+    * decode-loop hook is blind to them. They are also the glyph-atlas upload path -- exactly
+    * the write-then-sample shape under suspicion -- so a trace without them would be missing
+    * the work most likely to matter. */
+   if (vrend_trace_enabled() && info->box)
+      vrend_trace_transfer(ctx->ctx_id, dst_handle, transfer_mode, info->level,
+                           (uint32_t)info->box->x, (uint32_t)info->box->y,
+                           (uint32_t)info->box->width, (uint32_t)info->box->height,
+                           info->stride, info->offset);
+
    return vrend_renderer_transfer_internal(ctx, res, info,
                                            transfer_mode);
 }
@@ -12526,6 +12551,11 @@ int vrend_renderer_create_fence(struct vrend_context *ctx,
                                 uint64_t fence_id)
 {
    struct vrend_fence *fence;
+
+   /* limina: hooked HERE rather than at the decode layer, because libkrun fences through the
+    * ctx0 entry point, which never reaches vrend_decode_ctx_submit_fence. Hooking the decode
+    * path recorded zero fences and looked like "this session takes no fences". */
+   vrend_trace_fence(ctx ? ctx->ctx_id : 0, flags, fence_id);
 
    fence = malloc(sizeof(struct vrend_fence));
    if (!fence)

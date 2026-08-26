@@ -35,6 +35,7 @@
 #include "virgl_context.h"
 #include "virgl_resource.h"
 #include "vrend_renderer.h"
+#include "vrend_trace.h"
 #include "vrend_journal.h"
 #include "vrend_object.h"
 #include "tgsi/tgsi_text.h"
@@ -2124,6 +2125,12 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
 
    vrend_renderer_begin_cmd_batch();
 
+   /* limina: the tracer arms itself on first submit and services a pending dump request here,
+    * which is the coarsest safe point in the path -- between batches, never mid-command. */
+   vrend_trace_init();
+   vrend_trace_maybe_dump();
+   vrend_trace_submit(gdctx->base.ctx_id, size);
+
    if (VREND_DEBUG_ENABLED &&
        vrend_debug(gdctx->grctx, dbg_dump_cmd_streams) &&
        size > TRANSFER_HEADER_SIZE) {
@@ -2173,6 +2180,11 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
        * that dispatched successfully (mirrors the venus journal's on-success
        * recording; a rejected command re-created no state worth replaying). */
       vrend_journal_record(gdctx->journal, buf, len + 1);
+
+      /* limina: the trace records EVERY command, unlike the journal's durable subset -- the
+       * question it answers is what ran alongside the failing draw, and transient commands
+       * are most of that. */
+      vrend_trace_cmd(gdctx->base.ctx_id, cmd, buf, len + 1);
    }
    return 0;
 }
