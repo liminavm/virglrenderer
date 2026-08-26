@@ -11383,12 +11383,27 @@ int vrend_renderer_copy_transfer3d(struct vrend_context *ctx,
                            (uint32_t)info->box->width, (uint32_t)info->box->height,
                            info->stride, info->offset);
 
+   /* limina: these two rejections share one error code and one message, and they say different
+    * things -- the box does not fit the DESTINATION, versus the SOURCE iov is too small for it.
+    * Either poisons the context (in_error is sticky), after which every later submit fails
+    * silently through vrend_hw_switch_context, so knowing which one fired is worth a line. */
    if (!resource_contains_box(dst_res, info->box, info->level)) {
+      if (getenv("LIMINA_ATTACH_TRACE"))
+         virgl_warn("[copy-fail] dst res=%d box does not fit: box %d,%d %dx%dx%d level %d vs "
+                    "%dx%dx%d\n", dst_handle, info->box->x, info->box->y, info->box->width,
+                    info->box->height, info->box->depth, info->level,
+                    dst_res->base.width0, dst_res->base.height0, dst_res->base.depth0);
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, dst_handle);
       return EINVAL;
    }
 
    if (!check_iov_bounds(dst_res, info, src_res->iov, src_res->num_iovs)) {
+      if (getenv("LIMINA_ATTACH_TRACE"))
+         virgl_warn("[copy-fail] src iov too small: dst res=%d src iov_len=%zu num_iovs=%d "
+                    "offset=%" PRIu64 " stride=%u layer_stride=%u box %dx%dx%d\n",
+                    dst_handle, src_res->iov ? src_res->iov[0].iov_len : 0, src_res->num_iovs,
+                    info->offset, info->stride, info->layer_stride,
+                    info->box->width, info->box->height, info->box->depth);
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, dst_handle);
       return EINVAL;
    }
