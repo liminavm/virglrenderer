@@ -25,6 +25,10 @@
 #include "vkr_budget.h"
 #include "vkr_metal_helpers.h"
 
+/* Defined in virgl_resource.c; forward-declared to keep the resource layer's headers out of
+ * this Objective-C TU. */
+void virgl_resource_forget_iosurface(uint32_t iosurface_id);
+
 /*
  * limina: capability-scope the zero-copy scanout IOSurfaces.
  *
@@ -667,6 +671,11 @@ vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf)
    }
    /* Drop the registry's retain before ours (no-op if the surface was global). */
    limina_registry_remove(surf->id);
+   /* An IOSurface id is reusable the moment its surface dies, so every cached copy of this id
+    * must die with it -- a resource still naming it would hand the VMM a stranger's surface to
+    * present or, worse, to release. (Declared in virgl_resource.h; forward-declared here so this
+    * TU does not pull the resource layer's headers in.) */
+   virgl_resource_forget_iosurface(surf->id);
    if (surf->mtl_texture)
       CFRelease(surf->mtl_texture);
    if (surf->io_surface)

@@ -218,6 +218,43 @@ struct virgl_resource *virgl_resource_lookup(uint32_t res_id)
                               uintptr_to_pointer(res_id));
 }
 
+#ifdef __APPLE__
+static enum pipe_error
+virgl_resource_forget_iosurface_cb(UNUSED void *key, void *val, void *data)
+{
+   struct virgl_resource *res = (struct virgl_resource *)val;
+   const uint32_t id = *(const uint32_t *)data;
+
+   if (res->iosurface_id == id)
+      res->iosurface_id = 0;
+
+   return PIPE_OK;
+}
+
+/* limina tier-2 (macOS): forget a cached IOSurface id wherever a resource still holds it.
+ *
+ * A resource's iosurface_id is stamped once, at create, from the surface backing it. The
+ * surface's owner -- a venus VkImage, a vrend resource -- can free that surface while the
+ * virtio resource lives on (vkDestroyImage on a bound scanout image is the common case), and
+ * an IOSurface id is reusable the moment its surface dies. A cache kept past the free therefore
+ * names whatever surface took the id next, so the VMM's RESOURCE_UNREF sends a release for a
+ * stranger's surface. That is how a live cursor image was dropped from the supervisor's store,
+ * unrecoverably: these surfaces are non-global, so only their creator can hand one over again.
+ *
+ * Called from the single free choke point (vkr_mtl_iosurface_free), so no cached id ever
+ * outlives the surface it names. Zero is the "not IOSurface-backed" value every reader already
+ * handles, so a poisoned resource degrades to the non-zero-copy path instead of aliasing. */
+void
+virgl_resource_forget_iosurface(uint32_t iosurface_id)
+{
+   if (!virgl_resource_table || !iosurface_id)
+      return;
+
+   util_hash_table_foreach(virgl_resource_table, virgl_resource_forget_iosurface_cb,
+                           &iosurface_id);
+}
+#endif
+
 int
 virgl_resource_attach_iov(struct virgl_resource *res,
                           const struct iovec *iov,

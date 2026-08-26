@@ -174,6 +174,13 @@ virgl_resource_remove(uint32_t res_id);
 struct virgl_resource *
 virgl_resource_lookup(uint32_t res_id);
 
+#ifdef __APPLE__
+/* limina tier-2 (macOS): zero the cached IOSurface id on every resource naming it, because the
+ * surface it named has just been freed and the id is now reusable by anyone. */
+void
+virgl_resource_forget_iosurface(uint32_t iosurface_id);
+#endif
+
 int
 virgl_resource_attach_iov(struct virgl_resource *res,
                           const struct iovec *iov,
