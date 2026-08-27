@@ -16,6 +16,22 @@
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 
+/* limina: pad every host-visible allocation up to this.
+ *
+ * A guest turns host-visible memory into a virtio-gpu blob, and the guest kernel PAGE_ALIGNs
+ * the blob to ITS page size (drm/virtio virtgpu_vram.c) -- so a 1280-byte VkDeviceMemory
+ * arrives here as a 4096-byte blob on a 4 KiB guest, and a 16384-byte one on a 16 KiB guest.
+ * The VMM maps the BLOB's size from the pointer we publish, so an allocation smaller than the
+ * blob has to be refused (below), and a refused export costs the guest the resource: venus
+ * loses the buffer and the client dies. Measured on stock Fedora 44 with vkcube.
+ *
+ * 64 KiB because we do not know the guest's page size and cannot ask -- the allocation happens
+ * before any blob exists. It is the largest page size any guest uses, so padding to it makes
+ * the host independent of who is running. Do NOT lower it to the host page size: that would
+ * work for 4 KiB and 16 KiB guests and silently cost a 64 KiB-page guest its host-visible
+ * memory. */
+#define LIMINA_BLOB_SIZE_ALIGN (64 * 1024)
+
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
                                    const VkImportMemoryResourceInfoMESA *res_info,
@@ -457,6 +473,17 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+
+#ifdef __APPLE__
+   /* limina: pad host-visible memory so the allocation always covers the blob the guest will
+    * create from it (see LIMINA_BLOB_SIZE_ALIGN). An import aliases bytes that already exist,
+    * so it is left alone. */
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+      alloc_info->allocationSize =
+         align64(alloc_info->allocationSize, LIMINA_BLOB_SIZE_ALIGN);
+   }
+#endif
+
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
@@ -1113,6 +1140,17 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       if (mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
          struct vn_device_proc_table *vk = &mem->device->proc_table;
          void *ptr = NULL;
+
+         /* limina: the VMM maps the BLOB's size from this pointer, not ours, so a blob
+          * larger than the allocation would publish host memory past the end of it into
+          * the guest. LIMINA_BLOB_SIZE_ALIGN keeps the allocation large enough for any
+          * guest's page-aligned blob; refuse rather than over-map if one ever isn't. */
+         if (blob_size > mem->allocation_size) {
+            vkr_log_error("limina: blob %" PRIu64 " exceeds its %" PRIu64
+                          " allocation — refusing to map past the end of it",
+                          blob_size, (uint64_t)mem->allocation_size);
+            return false;
+         }
          VkResult ret = vk->MapMemory(mem->device->base.handle.device,
                                       mem->base.handle.device_memory, 0, mem->allocation_size, 0,
                                       &ptr);
