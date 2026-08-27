@@ -16,6 +16,23 @@
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 
+/* limina: host-visible blob sizes are rounded up to this on BOTH sides of the seam --
+ * here, and in the guest's `align64(blob_size, ...)` (mesa vn_renderer_virtgpu.c).
+ *
+ * The guest kernel packs host-visible blobs back to back in one arena with no alignment
+ * (drm/virtio virtgpu_vram.c, `drm_mm_insert_node` = alignment 0), so a blob's offset is
+ * the running sum of the sizes before it. hv_vm_map can only translate at host-page
+ * granularity, and a guest page is smaller than a host page on Apple silicon (4 KiB guest
+ * / 16 KiB host), so one ragged size skews every offset after it and those maps are then
+ * refused outright -- the guest loses host-visible memory with no way to ask differently.
+ * Rounding the size makes every offset aligned by induction.
+ *
+ * 64 KiB, not the host page size: it is the largest page size any host uses, so a guest
+ * built against it needs no knowledge of who is running it. The two sides MUST use the
+ * same value -- a guest rounding UP past what we allocate here would have us map host
+ * memory past the end of the allocation into the guest. */
+#define LIMINA_BLOB_SIZE_ALIGN (64 * 1024)
+
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
                                    const VkImportMemoryResourceInfoMESA *res_info,
@@ -457,6 +474,19 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
     */
    const uint32_t property_flags =
       physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags;
+
+#ifdef __APPLE__
+   /* limina: pad host-visible memory to the blob granularity the guest rounds to, so the
+    * allocation always covers the blob the guest will create from it. Without this the
+    * map in vkr_device_memory_export_blob runs off the end of the allocation and hands
+    * the guest whatever host memory follows. An import aliases bytes that already exist,
+    * so it is left alone. */
+   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+      alloc_info->allocationSize =
+         align64(alloc_info->allocationSize, LIMINA_BLOB_SIZE_ALIGN);
+   }
+#endif
+
    uint32_t valid_fd_types = 0;
    int udmabuf_fd = -1;
    void *gbm_bo = NULL;
@@ -1113,6 +1143,19 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       if (mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
          struct vn_device_proc_table *vk = &mem->device->proc_table;
          void *ptr = NULL;
+
+         /* limina: the VMM maps the BLOB's size from this pointer, not ours, so a blob
+          * larger than the allocation would publish host memory past the end of it into
+          * the guest. LIMINA_BLOB_SIZE_ALIGN keeps the two in step; refuse rather than
+          * over-map if they ever drift (a guest rounding to a larger granularity than we
+          * pad to, most likely). */
+         if (blob_size > mem->allocation_size) {
+            vkr_log_error("limina: blob %" PRIu64 " exceeds its %" PRIu64
+                          " allocation — refusing to map past the end of it (guest and "
+                          "host blob-size granularity disagree)",
+                          blob_size, (uint64_t)mem->allocation_size);
+            return false;
+         }
          VkResult ret = vk->MapMemory(mem->device->base.handle.device,
                                       mem->base.handle.device_memory, 0, mem->allocation_size, 0,
                                       &ptr);
