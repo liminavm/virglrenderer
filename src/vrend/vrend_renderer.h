@@ -132,6 +132,12 @@ struct vrend_resource {
     * samples the texture. ->guest_pixels_serial records the batch the current
     * contents came from. */
    bool guest_pixels;
+   /* limina: some guest-memory blobs arrive as an mmap()-able SHM fd rather than as
+    * iovecs — a stock guest's WSI prime-blit staging buffer, whose venus memory is
+    * backed by its own exported carrier (vkr_device_memory.c). Then the pixels come
+    * from this mapping instead of ->iov. Owned; munmap'd at resource destroy. */
+   void *guest_pixels_map;
+   size_t guest_pixels_map_size;
    uint32_t guest_pixels_planes;
    uint32_t guest_pixels_stride[VIRGL_GBM_MAX_PLANES];
    uint32_t guest_pixels_offset[VIRGL_GBM_MAX_PLANES];

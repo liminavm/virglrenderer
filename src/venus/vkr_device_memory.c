@@ -743,9 +743,52 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
             args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
             return;
          }
+
+         /* limina (stock guest): back the memory WITH the carrier, so the carrier's
+          * bytes really are the guest's pixels.
+          *
+          * Stripping the export and handing the guest a side carrier whose bytes go
+          * unused is the ENHANCED-tier shape: there this memory is only a bind target for
+          * an IOSurface-backed image, and present resolves through that image. A STOCK
+          * guest never gets there: its virgl driver enumerates no DRM
+          * modifiers, so its compositor advertises only DRM_FORMAT_MOD_INVALID and mesa's
+          * WSI takes the prime-blit path — the client blits each frame into a linear
+          * staging VkBuffer, and it is THAT buffer's memory the compositor imports. A
+          * buffer has no image and no IOSurface, so present has nothing to resolve and
+          * vrend hands the compositor a zeroed placeholder: every Vulkan window black
+          * (spikes/stock-venus-black-windows/).
+          *
+          * Import the carrier's own mapping as the memory (VK_EXT_external_memory_host,
+          * the same mechanism the KK scanout path above uses for IOSurface bytes), and
+          * the guest's blit lands in the bytes the exported fd carries — which vrend then
+          * uploads into the compositor's texture. A CPU copy per frame, not the enhanced
+          * tier's zero-copy scanout: the stock tier is meant to be slower, not blank.
+          *
+          * Only for HOST_VISIBLE memory types. There is no preflight to run — KK does not
+          * expose vkGetMemoryHostPointerPropertiesEXT (see the note at
+          * vkGetMemoryResourcePropertiesMESA) — so the host-visible bit IS the gate, the
+          * same one that path already relies on. A non-host-visible type keeps the old
+          * side carrier and stays black rather than failing the allocation. */
+         if (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            limina_host_import.sType =
+               VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+            limina_host_import.handleType =
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            limina_host_import.pHostPointer = mtl_shm->shm_ptr;
+            limina_host_import.pNext = alloc_info->pNext;
+            alloc_info->pNext = &limina_host_import;
+            /* The pointer backs exactly shm_size bytes (page-rounded up from the
+             * guest's request), and the import length must match the backing or KK's
+             * newBufferWithBytesNoCopy runs past it. */
+            alloc_info->allocationSize = mtl_shm->shm_size;
+         }
+
          vkr_log("limina: scanout memory -> stripped OPAQUE/DMA_BUF export, attached mtl_shm "
-                 "carrier (size=%llu); present uses the bound image's IOSurface",
-                 (unsigned long long)alloc_info->allocationSize);
+                 "carrier (size=%llu, bytes %s)",
+                 (unsigned long long)alloc_info->allocationSize,
+                 (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                    ? "ARE the memory (host-pointer import)"
+                    : "unused; present needs the bound image's IOSurface");
          /* limina probe (2026-08-04): WHICH handle type the guest asked to export tells
           * us which venus branch chose renderer_handle_type. DMA_BUF => upstream's own
           * branch fired (vkr now advertises the extension) and mesa 0010(a) is dead

@@ -25,6 +25,8 @@
 #include "config.h"
 #endif
 
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -9758,6 +9760,12 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       free(res->ptr);
    }
 
+   if (res->guest_pixels_map) {
+      munmap(res->guest_pixels_map, res->guest_pixels_map_size);
+      res->guest_pixels_map = NULL;
+      res->guest_pixels_map_size = 0;
+   }
+
    if (res->rbo_id) {
       glDeleteRenderbuffers(1, &res->rbo_id);
    }
@@ -14799,7 +14807,12 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
    const size_t row = (size_t)width * bpp;
    const size_t need = row * height;
 
-   if (!gr->iov || !gr->num_iovs || !need)
+   if (!need)
+      return false;
+   /* The bytes come either from the guest's iovecs or, for an SHM-backed blob, from
+    * our own mapping of it. The YUV converter reads iovecs only; an SHM blob here is
+    * a WSI blit buffer, never a planar video frame. */
+   if (gr->guest_pixels_map ? yuv : (!gr->iov || !gr->num_iovs))
       return false;
    /* SET_TYPE builds these as PIPE_TEXTURE_2D; the 2D paths below assume it. */
    if (gr->target != GL_TEXTURE_2D)
@@ -14817,9 +14830,19 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
                             gr->guest_pixels_stride[0] : row;
       ok = true;
       for (uint32_t y = 0; y < height; y++) {
-         if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
-                                   gr->guest_pixels_offset[0] + (size_t)y * stride,
-                                   staging + (size_t)y * row, row) != row) {
+         const size_t off = gr->guest_pixels_offset[0] + (size_t)y * stride;
+         if (gr->guest_pixels_map) {
+            /* The iovec reader bounds-checks for us; a flat memcpy does not, and
+             * the layout is guest-declared. */
+            if (off > gr->guest_pixels_map_size ||
+                row > gr->guest_pixels_map_size - off) {
+               ok = false;
+               break;
+            }
+            memcpy(staging + (size_t)y * row, (const char *)gr->guest_pixels_map + off,
+                   row);
+         } else if (vrend_read_from_iovec(gr->iov, gr->num_iovs, off,
+                                          staging + (size_t)y * row, row) != row) {
             ok = false;
             break;
          }
@@ -15061,6 +15084,23 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
              * batch that samples this texture (vrend_resource::guest_pixels). */
             gr->iov = res->iov;
             gr->num_iovs = res->iov_count;
+#ifdef __APPLE__
+            /* limina: a venus blob has no iovecs — its bytes live in the exported
+             * SHM carrier that backs the VkDeviceMemory (vkr_device_memory.c). Map
+             * it and read the frame from there, which is what makes a stock guest's
+             * Vulkan window show its own pixels instead of the placeholder. */
+            if (!gr->iov && res->fd_type == VIRGL_RESOURCE_FD_SHM && res->fd >= 0) {
+               struct stat st;
+               if (!fstat(res->fd, &st) && st.st_size > 0) {
+                  const size_t len = (size_t)st.st_size;
+                  void *map = mmap(NULL, len, PROT_READ, MAP_SHARED, res->fd, 0);
+                  if (map != MAP_FAILED) {
+                     gr->guest_pixels_map = map;
+                     gr->guest_pixels_map_size = len;
+                  }
+               }
+            }
+#endif
             gr->guest_pixels_planes = MIN2(args->plane_count,
                                            VIRGL_GBM_MAX_PLANES);
             for (uint32_t i = 0; i < gr->guest_pixels_planes; i++) {
@@ -15076,6 +15116,11 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                vrend_resource_zero_texture(gr);
                gr->iov = NULL;
                gr->num_iovs = 0;
+               if (gr->guest_pixels_map) {
+                  munmap(gr->guest_pixels_map, gr->guest_pixels_map_size);
+                  gr->guest_pixels_map = NULL;
+                  gr->guest_pixels_map_size = 0;
+               }
             }
          }
       } else
