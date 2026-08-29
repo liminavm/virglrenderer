@@ -459,6 +459,7 @@ vkr_replay_note_failure(struct vkr_context *ctx, const void *cmd, uint32_t size)
 {
    uint64_t cmd_buf;
    bool resets_prior;
+   ctx->replay_dropped++;
    if (vkr_journal_cmd_recording_key(cmd, size, &cmd_buf, &resets_prior))
       vkr_replay_poison_cmd_buf(ctx, cmd_buf);
 }
@@ -847,6 +848,16 @@ vkr_renderer_replay_end(uint32_t ctx_id)
    free(ctx->replay_poisoned);
    ctx->replay_poisoned = NULL;
    ctx->replay_poisoned_count = ctx->replay_poisoned_cap = 0;
+
+   /* Anything the replay could not re-create is a hole the guest does not know
+    * about. Arm the containment BEFORE the guest resumes, or its first reference
+    * to one of those objects kills the ring. */
+   if (ctx->replay_dropped) {
+      ctx->restored_lossy = true;
+      vkr_log("replay: %u entry(ies) dropped — later misses in this context will "
+              "be SKIPPED rather than fatal, so the ring survives the holes",
+              ctx->replay_dropped);
+   }
 
    ctx->replaying = false;
    return true;
