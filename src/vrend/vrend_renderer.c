@@ -1175,6 +1175,11 @@ void vrend_context_clear_error(struct vrend_context *ctx)
    ctx->in_error = false;
 }
 
+bool vrend_context_has_error(const struct vrend_context *ctx)
+{
+   return ctx->in_error;
+}
+
 #define CORE_PROFILE_WARN_NONE 0
 #define CORE_PROFILE_WARN_STIPPLE 1
 #define CORE_PROFILE_WARN_POLYGON_MODE 2

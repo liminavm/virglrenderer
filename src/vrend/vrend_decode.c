@@ -22,6 +22,7 @@
  *
  **************************************************************************/
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -59,6 +60,8 @@ struct vrend_decode_ctx {
    /* limina: classic snapshot-replay re-creation journal (vrend_journal.h);
     * NULL when disabled via VREND_JOURNAL=0 */
    struct vrend_journal *journal;
+   /* limina: LIMINA_REPLAY_POISON fired for this context already */
+   bool poisoned;
 };
 
 static inline uint32_t get_buf_entry(const uint32_t *buf, uint32_t offset)
@@ -1707,14 +1710,38 @@ struct vrend_journal *vrend_decode_ctx_journal(struct virgl_context *ctx)
  * submit path. A failed entry (a retained command referencing an object that
  * died around the snapshot) must NOT poison the fresh context — in_error is
  * sticky and gates every later draw, so clear it and let the replayer drop the
- * entry and continue (the venus sticky-FATAL lesson, classic edition). */
+ * entry and continue (the venus sticky-FATAL lesson, classic edition).
+ *
+ * The return code alone does not detect that entry. A reported context error
+ * (vrend_report_context_error, e.g. "Illegal handle" from a retained
+ * SET_SAMPLER_VIEWS whose view was destroyed pre-snapshot) sets in_error and
+ * returns success: vrend_decode_ctx_submit_cmd only upgrades ret to EINVAL when
+ * vrend_check_no_error() fails, and that inspects glGetError(), never in_error.
+ * The flag then survives the rest of the replay unseen, because
+ * vrend_hw_switch_context_with_sub short-circuits to true while the context is
+ * still current — and brands every post-restore guest submit EINVAL, forever.
+ * So test the flag itself after every entry. */
 bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32_t size)
 {
    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
    int ret = ctx->submit_cmd(ctx, cmd, size);
-   if (ret)
+
+   /* RED lever (LIMINA_REPLAY_POISON=1): raise a context error on the first
+    * replayed entry of each context, the way a stale retained reference does, so a
+    * test reproduces the poisoning deterministically instead of waiting for a
+    * journal to grow one by chance. The entry itself still counts as applied — what
+    * this gates is that the flag gets CLEARED, and dropping a live entry's state
+    * would only add content-loss noise to the oracles downstream. */
+   bool poisoned_here = false;
+   if (!dctx->poisoned && getenv("LIMINA_REPLAY_POISON")) {
+      dctx->poisoned = poisoned_here = true;
+      vrend_report_context_error(dctx->grctx, VIRGL_ERROR_CTX_ILLEGAL_HANDLE, 0);
+   }
+
+   bool errored = vrend_context_has_error(dctx->grctx);
+   if (ret || errored)
       vrend_context_clear_error(dctx->grctx);
-   return ret == 0;
+   return ret == 0 && (!errored || poisoned_here);
 }
 
 /* limina P2: classic content capture/restore, routed from the FFI. */

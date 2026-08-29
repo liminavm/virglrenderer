@@ -290,6 +290,10 @@ struct vrend_journal *vrend_decode_ctx_journal(struct virgl_context *ctx);
 bool vrend_decode_ctx_replay_submit(struct virgl_context *ctx, void *cmd, uint32_t size);
 /* limina P1: clear the sticky protocol-error flag after a dropped replay entry */
 void vrend_context_clear_error(struct vrend_context *ctx);
+/* limina P1: has the context raised a protocol error? The replayer needs this to
+ * notice a poisoned entry — a reported context error does not fail the submit,
+ * because vrend_check_no_error() only inspects glGetError(). */
+bool vrend_context_has_error(const struct vrend_context *ctx);
 /* limina P2: classic host-side content capture — read every GL-storage resource
  * back into an opaque blob at snapshot / upload it back after the creates
  * replay (vrend_renderer.c; virgl_context wrappers in vrend_decode.c). */
