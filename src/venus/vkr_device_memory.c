@@ -1312,6 +1312,17 @@ vkr_device_memory_content_copy(struct vkr_device_memory *mem,
                                 mem->base.handle.device_memory, 0, VK_WHOLE_SIZE,
                                 0, &ptr);
    if (ret != VK_SUCCESS || !ptr) {
+      /* A KK scanout memory is an MTLTEXTURE (or host-pointer) import of an IOSurface: its
+       * bytes ARE that surface's, and vkMapMemory refuses it (VK_ERROR_MEMORY_MAP_FAILED)
+       * precisely because the storage is not the driver's to map. Those are the client
+       * window buffers the compositor samples — reachable, and lost from the snapshot only
+       * for want of asking the surface instead. Not the mtl_shm carrier: the alloc path is
+       * explicit that its bytes are never the pixels. */
+      if (mem->mtl_iosurface &&
+          vkr_mtl_iosurface_bytes_copy((struct vkr_mtl_iosurface *)mem->mtl_iosurface, buf,
+                                       n, to_mem))
+         return true;
+
       /* WARN, and say WHAT this allocation is. "content read failed" alone cannot
        * tell a client's private render target (lost, and only its own repaint
        * brings it back) from a buffer the compositor samples (whose absence is a
