@@ -137,6 +137,21 @@ struct vkr_context {
     * words hold restored snapshot values, not zeros; ring threads start at
     * replay_end so ring-scoped stream state can replay on their decoders). */
    bool replaying;
+   /* limina snapshot-restore: this context was rebuilt by a replay that could NOT
+    * re-create everything the guest still holds handles for — the replay dropped
+    * entries whose own references were already stale. The guest was never told;
+    * it resumes naming those objects, and a miss on them is an EXPECTED
+    * consequence of the restore, not the protocol violation the FATAL detector
+    * exists to catch. Treated like a tombstone (vkr_cs_decoder_lookup_object):
+    * skip the command, keep the ring alive, let the guest run degraded.
+    *
+    * Getting this wrong is not a subtle degradation. A FATAL ring stops
+    * consuming, so vn_ring_wait_seqno in the guest never advances, and a
+    * compositor that hits it while allocating a buffer hangs there forever:
+    * a frozen desktop with every process alive and nothing to show for it. */
+   bool restored_lossy;
+   /* Replay entries that failed, i.e. how much of the object world is missing. */
+   uint32_t replay_dropped;
 
    /* limina: cmd_bufs whose recording replay failed (stale reference). Their
     * remaining RECORDING entries are skipped until the next Begin/Reset — a
