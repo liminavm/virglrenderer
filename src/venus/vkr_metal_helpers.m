@@ -807,4 +807,34 @@ vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t hei
    return 1;
 }
 
+/* limina snapshot-replay P2: raw byte copy in/out of a scanout IOSurface — see the header. The
+ * copy is flat, not row-by-row: capture and restore see the same geometry, so the surface's own
+ * bytesPerRow is on both sides and translating strides would only invent a way to get it wrong.
+ * Clamped to the surface's alloc size because a guest's allocationSize can exceed it (the
+ * MTLTEXTURE import path does not clamp the way the host-pointer one does). */
+int
+vkr_mtl_iosurface_bytes_copy(struct vkr_mtl_iosurface *surf,
+                             void *buf,
+                             unsigned long long size,
+                             int to_surface)
+{
+   if (!surf || !surf->io_surface || !buf || !size)
+      return 0;
+   IOSurfaceRef io = (IOSurfaceRef)surf->io_surface;
+   const uint32_t lock_flags = to_surface ? 0 : kIOSurfaceLockReadOnly;
+   IOSurfaceLock(io, lock_flags, NULL);
+   uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(io);
+   size_t n = (size_t)IOSurfaceGetAllocSize(io);
+   if (size < n)
+      n = (size_t)size;
+   if (base) {
+      if (to_surface)
+         memcpy(base, buf, n);
+      else
+         memcpy(buf, base, n);
+   }
+   IOSurfaceUnlock(io, lock_flags, NULL);
+   return base ? 1 : 0;
+}
+
 #endif /* __APPLE__ */

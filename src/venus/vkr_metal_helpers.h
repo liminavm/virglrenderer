@@ -151,6 +151,18 @@ vkr_mtl_texture_release(void *mtl_texture);
 int
 vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t height);
 
+/* limina snapshot-replay P2: copy the raw bytes of a scanout IOSurface between `buf` and the
+ * surface, min(size, the surface's alloc size) — the capture path for memory vkMapMemory
+ * refuses. A KK scanout VkDeviceMemory IS the IOSurface (an MTLTEXTURE / host-pointer import
+ * of it), so these bytes are the client's rendered pixels; the memory's own mtl_shm carrier is
+ * NOT (see the alloc path in vkr_device_memory.c). to_surface=false reads, true writes.
+ * Returns 1 on success. */
+int
+vkr_mtl_iosurface_bytes_copy(struct vkr_mtl_iosurface *surf,
+                             void *buf,
+                             unsigned long long size,
+                             int to_surface);
+
 /* limina: re-hand an already-registered scanout surface to the supervisor over the surface port.
  * The supervisor's store is bounded and evicts; a non-global surface it dropped is unrecoverable
  * from its side, so a guest presenting an evicted id froze the display permanently for that id
@@ -242,6 +254,19 @@ vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t hei
    (void)dst;
    (void)dst_stride;
    (void)height;
+   return 0;
+}
+
+static inline int
+vkr_mtl_iosurface_bytes_copy(struct vkr_mtl_iosurface *surf,
+                             void *buf,
+                             unsigned long long size,
+                             int to_surface)
+{
+   (void)surf;
+   (void)buf;
+   (void)size;
+   (void)to_surface;
    return 0;
 }
 
