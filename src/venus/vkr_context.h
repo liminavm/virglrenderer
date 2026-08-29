@@ -137,20 +137,36 @@ struct vkr_context {
     * words hold restored snapshot values, not zeros; ring threads start at
     * replay_end so ring-scoped stream state can replay on their decoders). */
    bool replaying;
-   /* limina snapshot-restore: this context was rebuilt by a replay that could NOT
-    * re-create everything the guest still holds handles for — the replay dropped
-    * entries whose own references were already stale. The guest was never told;
-    * it resumes naming those objects, and a miss on them is an EXPECTED
-    * consequence of the restore, not the protocol violation the FATAL detector
-    * exists to catch. Treated like a tombstone (vkr_cs_decoder_lookup_object):
-    * skip the command, keep the ring alive, let the guest run degraded.
+   /* limina snapshot-restore: this context was rebuilt from a snapshot, and from
+    * here on a lookup miss is SKIPPED rather than fatal — for the life of the
+    * context. Say it plainly, because it is broader than it first looks: a
+    * restored context trades the FATAL protocol detector for liveness.
     *
-    * Getting this wrong is not a subtle degradation. A FATAL ring stops
-    * consuming, so vn_ring_wait_seqno in the guest never advances, and a
-    * compositor that hits it while allocating a buffer hangs there forever:
-    * a frozen desktop with every process alive and nothing to show for it. */
-   bool restored_lossy;
-   /* Replay entries that failed, i.e. how much of the object world is missing. */
+    * The trade is not a preference, it is what we can actually implement. We
+    * cannot enumerate what a restore left behind. The dropped entries are not the
+    * holes — every drop measured has been FREE-class, a partial free keyed to its
+    * (still live) pool whose targets were deliberately not re-created, and
+    * dropping it loses nothing. The holes come from re-creations that RAN and
+    * FAILED: an import that returns VK_ERROR_INVALID_EXTERNAL_HANDLE tombstones
+    * its own memory, but nothing tombstones the images bound to that memory or
+    * the views of those images, and the guest still holds handles for all of
+    * them. Until vkr can walk that dependency closure, "which ids are missing" is
+    * not a question this code can answer — only "this context came back from a
+    * snapshot", which it can.
+    *
+    * What the trade buys: a FATAL ring stops consuming, so the guest's
+    * vn_ring_wait_seqno never advances, and a compositor that hits it while
+    * allocating a buffer parks there forever — a frozen desktop, every process
+    * alive, nothing drawing, no error anywhere in the guest. One stale reference
+    * did that to an entire session. What it costs: a genuine protocol violation
+    * in a restored context is now skipped silently instead of caught. Every skip
+    * is logged with a running total, so it stays attributable.
+    *
+    * Narrowing this to the objects actually missing is the real fix, and it wants
+    * its own RED test. */
+   bool fatal_contained;
+   /* Entries the replay could not apply. Reported, not used as the arming
+    * condition — see above: these are overwhelmingly benign. */
    uint32_t replay_dropped;
 
    /* limina: cmd_bufs whose recording replay failed (stale reference). Their

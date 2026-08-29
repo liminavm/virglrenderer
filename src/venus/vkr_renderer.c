@@ -849,15 +849,13 @@ vkr_renderer_replay_end(uint32_t ctx_id)
    ctx->replay_poisoned = NULL;
    ctx->replay_poisoned_count = ctx->replay_poisoned_cap = 0;
 
-   /* Anything the replay could not re-create is a hole the guest does not know
-    * about. Arm the containment BEFORE the guest resumes, or its first reference
-    * to one of those objects kills the ring. */
-   if (ctx->replay_dropped) {
-      ctx->restored_lossy = true;
-      vkr_log("replay: %u entry(ies) dropped — later misses in this context will "
-              "be SKIPPED rather than fatal, so the ring survives the holes",
-              ctx->replay_dropped);
-   }
+   /* Arm the containment BEFORE the guest resumes: its very first reference to
+    * something the restore failed to bring back would otherwise kill the ring,
+    * and a dead ring hangs the guest rather than degrading it. */
+   ctx->fatal_contained = true;
+   vkr_log("replay: context restored (%u entry(ies) dropped); lookup misses here are "
+           "SKIPPED rather than fatal from now on — see fatal_contained",
+           ctx->replay_dropped);
 
    ctx->replaying = false;
    return true;

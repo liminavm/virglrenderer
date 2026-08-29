@@ -34,12 +34,11 @@ struct vkr_cs_decoder;
 bool
 vkr_cs_decoder_is_tombstoned(const struct vkr_cs_decoder *dec, vkr_object_id id);
 
-/* limina snapshot-restore: was this context rebuilt by a replay that left holes?
- * Every id the replay failed to re-create is one the guest still holds and will
- * name, so a miss here is expected rather than protocol corruption — see
- * restored_lossy in vkr_context.h. */
+/* limina snapshot-restore: is this context one whose lookup misses are skipped
+ * rather than fatal? True for the life of any restored context — see
+ * fatal_contained in vkr_context.h for why it cannot be narrower yet. */
 bool
-vkr_cs_decoder_restored_lossy(const struct vkr_cs_decoder *dec);
+vkr_cs_decoder_fatal_contained(const struct vkr_cs_decoder *dec);
 
 void
 vkr_cs_decoder_finish_soft_error(struct vkr_cs_decoder *dec);
@@ -455,7 +454,7 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
        * A miss on an id we have NO record of stays FATAL: that IS a protocol
        * violation, and the detector has to keep working. */
       if (!obj && (vkr_cs_decoder_is_tombstoned(dec, id) ||
-                   vkr_cs_decoder_restored_lossy(dec))) {
+                   vkr_cs_decoder_fatal_contained(dec))) {
          ((struct vkr_cs_decoder *)dec)->soft_error = true;
          return NULL;
       }
