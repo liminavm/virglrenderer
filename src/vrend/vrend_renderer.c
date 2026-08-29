@@ -11273,7 +11273,11 @@ int vrend_renderer_export_ctx_contents(struct vrend_context *ctx,
     * back empty — and reporting that at a level nobody runs made a lossy capture
     * indistinguishable from a complete one in every log we have. The all-clear
     * stays at INFO so a healthy restore is quiet. */
-   if (w.skipped || w.excluded)
+   /* Only `skipped` is a loss. `excluded` is a deliberate exclusion — a
+    * multisample render target the compositor regenerates, a resource whose only
+    * storage is guest memory and is already in the RAM dump — and every context
+    * has a few, so warning on it would cry wolf on every healthy snapshot. */
+   if (w.skipped)
       virgl_warn("vrend content export ctx %d: %u entries (%zu bytes), "
                  "%u SKIPPED, %u excluded — the skipped resources have no "
                  "content in this snapshot\n",
