@@ -1312,8 +1312,24 @@ vkr_device_memory_content_copy(struct vkr_device_memory *mem,
                                 mem->base.handle.device_memory, 0, VK_WHOLE_SIZE,
                                 0, &ptr);
    if (ret != VK_SUCCESS || !ptr) {
-      vkr_log("content: vkMapMemory failed for mem id %" PRIu64 " (vk ret %d)",
-              (uint64_t)mem->base.id, ret);
+      /* WARN, and say WHAT this allocation is. "content read failed" alone cannot
+       * tell a client's private render target (lost, and only its own repaint
+       * brings it back) from a buffer the compositor samples (whose absence is a
+       * blank window nothing repaints). The flags separate them: HOST_VISIBLE is
+       * the property the map needs, `exported`/`iosurface` say whether the pixels
+       * are reachable by some other host-side path, and `dedicated` names the
+       * image or buffer bound to it — which is what a staging readback would have
+       * to copy from. */
+      vkr_log_error(
+         "content: vkMapMemory REFUSED mem id %" PRIu64 " (vk ret %d) size %" PRIu64
+         " type %u flags 0x%x%s%s%s%s%s dedicated_id %" PRIu64
+         " — these pixels are in NO snapshot",
+         (uint64_t)mem->base.id, ret, mem->allocation_size, mem->memory_type_index,
+         mem->property_flags,
+         (mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " HOST_VISIBLE" : "",
+         (mem->property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " DEVICE_LOCAL" : "",
+         mem->exported ? " exported" : "", mem->mtl_iosurface ? " has-iosurface" : "",
+         mem->imported_iosurface ? " imported-iosurface" : "", mem->limina_dedicated_id);
       return false;
    }
    if (to_mem)
