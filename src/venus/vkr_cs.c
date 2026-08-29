@@ -32,11 +32,11 @@ vkr_cs_decoder_is_tombstoned(const struct vkr_cs_decoder *dec, vkr_object_id id)
 }
 
 /* limina snapshot-restore containment — same cold path, same reason it lives out
- * of line. See restored_lossy in vkr_context.h. */
+ * of line. See fatal_contained in vkr_context.h. */
 bool
-vkr_cs_decoder_restored_lossy(const struct vkr_cs_decoder *dec)
+vkr_cs_decoder_fatal_contained(const struct vkr_cs_decoder *dec)
 {
-   return dec->ctx && dec->ctx->restored_lossy;
+   return dec->ctx && dec->ctx->fatal_contained;
 }
 
 /* The dropped command's epilogue: everything else it named becomes a tombstone
