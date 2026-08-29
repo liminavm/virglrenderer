@@ -11268,9 +11268,20 @@ int vrend_renderer_export_ctx_contents(struct vrend_context *ctx,
       free(w.buf);
       return -ENOMEM;
    }
-   virgl_info("vrend content export ctx %d: %u entries (%zu bytes), "
-              "%u skipped, %u excluded\n",
-              ctx->ctx_id, w.entries, w.size, w.skipped, w.excluded);
+   /* WARN when anything was left out, INFO otherwise. A skipped or excluded
+    * resource is content this snapshot does NOT carry — a texture that will come
+    * back empty — and reporting that at a level nobody runs made a lossy capture
+    * indistinguishable from a complete one in every log we have. The all-clear
+    * stays at INFO so a healthy restore is quiet. */
+   if (w.skipped || w.excluded)
+      virgl_warn("vrend content export ctx %d: %u entries (%zu bytes), "
+                 "%u SKIPPED, %u excluded — the skipped resources have no "
+                 "content in this snapshot\n",
+                 ctx->ctx_id, w.entries, w.size, w.skipped, w.excluded);
+   else
+      virgl_info("vrend content export ctx %d: %u entries (%zu bytes), "
+                 "%u skipped, %u excluded\n",
+                 ctx->ctx_id, w.entries, w.size, w.skipped, w.excluded);
    *out_buf = w.buf;
    *out_size = w.size;
    return 0;
@@ -11325,8 +11336,17 @@ int vrend_renderer_restore_ctx_contents(struct vrend_context *ctx,
          restored++;
       p += sz;
    }
-   virgl_info("vrend content restore ctx %d: %u restored, %u dropped\n",
-              ctx->ctx_id, restored, dropped);
+   /* Same reasoning as the export side, and one degree worse: this function
+    * returns 0 whatever happens, so a caller counting return codes sees every
+    * dropped resource as a success. Until that changes, the log line is the only
+    * account of content that did not come back. */
+   if (dropped)
+      virgl_warn("vrend content restore ctx %d: %u restored, %u DROPPED — the "
+                 "dropped resources came back with no content\n",
+                 ctx->ctx_id, restored, dropped);
+   else
+      virgl_info("vrend content restore ctx %d: %u restored, %u dropped\n",
+                 ctx->ctx_id, restored, dropped);
    return 0;
 }
 
