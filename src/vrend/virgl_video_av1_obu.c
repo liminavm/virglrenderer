@@ -39,6 +39,8 @@
  * is repeated in every temporal unit rather than tracked.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "virgl_video_av1_obu.h"
@@ -48,6 +50,7 @@
 #define AV1_OBU_TEMPORAL_DELIMITER 2
 #define AV1_OBU_FRAME_HEADER      3
 #define AV1_OBU_TILE_GROUP        4
+#define AV1_OBU_FRAME             6
 
 #define AV1_FRAME_KEY        0
 #define AV1_FRAME_INTER      1
@@ -278,6 +281,16 @@ struct seq_params {
    bool enable_order_hint;
    bool enable_ref_frame_mvs;
    bool film_grain_params_present;
+   /* These gate symbol decoding inside the tiles, not just the header, so they have to be
+    * what the encoder used -- a permissive 1 here silently corrupts every tile. The
+    * descriptor carries all of them. */
+   bool enable_filter_intra;
+   bool enable_intra_edge_filter;
+   bool enable_interintra_compound;
+   bool enable_masked_compound;
+   bool enable_dual_filter;
+   bool enable_jnt_comp;
+   bool enable_cdef;
    uint16_t max_width, max_height;
    uint8_t width_bits, height_bits;   /* minus 1, as coded */
 };
@@ -321,6 +334,15 @@ static void derive_seq(const struct virgl_av1_picture_desc *d, struct seq_params
       d->picture_parameter.seq_info_fields.film_grain_params_present;
    s->order_hint_bits = s->enable_order_hint
                       ? d->picture_parameter.order_hint_bits_minus_1 + 1 : 0;
+   s->enable_filter_intra = d->picture_parameter.seq_info_fields.enable_filter_intra;
+   s->enable_intra_edge_filter =
+      d->picture_parameter.seq_info_fields.enable_intra_edge_filter;
+   s->enable_interintra_compound =
+      d->picture_parameter.seq_info_fields.enable_interintra_compound;
+   s->enable_masked_compound = d->picture_parameter.seq_info_fields.enable_masked_compound;
+   s->enable_dual_filter = d->picture_parameter.seq_info_fields.enable_dual_filter;
+   s->enable_jnt_comp = d->picture_parameter.seq_info_fields.enable_jnt_comp;
+   s->enable_cdef = d->picture_parameter.seq_info_fields.enable_cdef;
 
    switch (d->picture_parameter.bit_depth_idx) {
    case 1:  s->bit_depth = 10; break;
@@ -389,16 +411,19 @@ static void write_sequence_header(struct bw *w, const struct seq_params *s)
 
    flag(w, false);                 /* frame_id_numbers_present_flag */
    flag(w, s->use_128x128_superblock);
-   flag(w, true);                  /* enable_filter_intra */
-   flag(w, true);                  /* enable_intra_edge_filter */
+   flag(w, s->enable_filter_intra);
+   flag(w, s->enable_intra_edge_filter);
 
-   flag(w, true);                  /* enable_interintra_compound */
-   flag(w, true);                  /* enable_masked_compound */
+   flag(w, s->enable_interintra_compound);
+   flag(w, s->enable_masked_compound);
+   /* Not in the descriptor, and safe to enable: it only decides whether the frame header
+    * carries allow_warped_motion, which we then write from the descriptor. Reader and
+    * writer stay in step either way. */
    flag(w, true);                  /* enable_warped_motion */
-   flag(w, true);                  /* enable_dual_filter */
+   flag(w, s->enable_dual_filter);
    flag(w, s->enable_order_hint);
    if (s->enable_order_hint) {
-      flag(w, true);               /* enable_jnt_comp */
+      flag(w, s->enable_jnt_comp);
       flag(w, s->enable_ref_frame_mvs);
    }
    /* SELECT for both, so each frame states its own choice and nothing is inherited from
@@ -408,8 +433,10 @@ static void write_sequence_header(struct bw *w, const struct seq_params *s)
    if (s->enable_order_hint)
       f(w, 3, s->order_hint_bits - 1);
 
+   /* enable_superres and enable_restoration are likewise absent from the descriptor and
+    * only gate header fields we then write from it. enable_cdef is carried, and matters. */
    flag(w, true);                  /* enable_superres */
-   flag(w, true);                  /* enable_cdef */
+   flag(w, s->enable_cdef);
    flag(w, true);                  /* enable_restoration */
 
    write_color_config(w, s);
@@ -435,6 +462,8 @@ struct frame_ctx {
    uint8_t primary_ref_frame;
    uint32_t tile_cols, tile_rows;
    uint32_t tile_cols_log2, tile_rows_log2;
+   uint8_t refresh;                                   /* ours, not the guest's */
+   uint8_t our_ref_idx[VIRGL_AV1_REFS_PER_FRAME];     /* refs in our slot numbering */
 };
 
 /* 7.12.2. Lossless has to be derived because it gates whether the loop filter, CDEF and
@@ -709,8 +738,8 @@ static void write_cdef_params(struct bw *w, struct frame_ctx *c)
 {
    const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
-   if (c->coded_lossless || p->pic_info_fields.allow_intrabc)
-      return;   /* enable_cdef is always signalled on in our sequence header */
+   if (c->coded_lossless || p->pic_info_fields.allow_intrabc || !c->s->enable_cdef)
+      return;
 
    f(w, 2, p->cdef_damping_minus_3);
    f(w, 2, p->cdef_bits);
@@ -832,7 +861,7 @@ static void write_global_motion_params(struct bw *w, struct frame_ctx *c,
       if (c->primary_ref_frame == AV1_PRIMARY_REF_NONE)
          prev = default_warp;
       else
-         prev = state->saved_gm[p->ref_frame_idx[c->primary_ref_frame] & 7][ref];
+         prev = state->saved_gm[c->our_ref_idx[c->primary_ref_frame] & 7][ref];
 
       flag(w, type != 0);                 /* is_global */
       if (type != 0) {
@@ -958,7 +987,7 @@ static bool skip_mode_allowed(struct frame_ctx *c, struct virgl_av1_obu_state *s
       return false;
 
    for (int i = 0; i < VIRGL_AV1_REFS_PER_FRAME; i++) {
-      const int hint = state->saved_order_hint[p->ref_frame_idx[i] & 7];
+      const int hint = state->saved_order_hint[c->our_ref_idx[i] & 7];
       const int dist = get_relative_dist(bits, hint, p->order_hint);
 
       if (dist < 0) {
@@ -980,7 +1009,7 @@ static bool skip_mode_allowed(struct frame_ctx *c, struct virgl_av1_obu_state *s
       return true;
 
    for (int i = 0; i < VIRGL_AV1_REFS_PER_FRAME; i++) {
-      const int hint = state->saved_order_hint[p->ref_frame_idx[i] & 7];
+      const int hint = state->saved_order_hint[c->our_ref_idx[i] & 7];
 
       if (get_relative_dist(bits, hint, forward_hint) < 0)
          return true;
@@ -995,7 +1024,12 @@ static void write_uncompressed_header(struct bw *w, struct frame_ctx *c,
    const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
    const bool size_override = c->upscaled_width != c->s->max_width ||
                               c->frame_height != c->s->max_height;
-   const bool all_frames_refreshed = p->refresh_frame_flags == 0xff;
+   /* Inferred, not what the descriptor holds: a switch frame and a shown key frame refresh
+    * every slot by definition, and the *inferred* value is what the reader tests. Using the
+    * descriptor's raw field here made the ref_order_hint loop below fire on a key frame and
+    * emit 56 bits nobody reads, which desynchronised the whole rest of the header. */
+   const uint8_t refresh = c->refresh;
+   const bool all_frames_refreshed = refresh == 0xff;
 
    flag(w, false);                       /* show_existing_frame */
    f(w, 2, c->frame_type);
@@ -1027,7 +1061,7 @@ static void write_uncompressed_header(struct bw *w, struct frame_ctx *c,
 
    if (!(c->frame_type == AV1_FRAME_SWITCH ||
          (c->frame_type == AV1_FRAME_KEY && c->show_frame)))
-      f(w, 8, p->refresh_frame_flags);
+      f(w, 8, refresh);
 
    if ((!c->frame_is_intra || !all_frames_refreshed) && c->s->enable_order_hint &&
        c->error_resilient)
@@ -1045,7 +1079,7 @@ static void write_uncompressed_header(struct bw *w, struct frame_ctx *c,
          flag(w, false);                 /* frame_refs_short_signaling */
 
       for (int i = 0; i < VIRGL_AV1_REFS_PER_FRAME; i++)
-         f(w, 3, p->ref_frame_idx[i]);
+         f(w, 3, c->our_ref_idx[i]);
 
       if (size_override && !c->error_resilient) {
          /* frame_size_with_refs: decline every reference-derived size and state it. */
@@ -1165,6 +1199,93 @@ static void write_tile_group(struct bw *w, const struct virgl_av1_picture_desc *
    }
 }
 
+/* Learn, from this frame's ref[], where the *previous* frame's picture landed, and pick a
+ * slot for this one. See the comment on virgl_av1_obu_state for why this is needed at all:
+ * the guest never tells us refresh_frame_flags, so we assign our own slots and remap.
+ *
+ * Returns the mask to emit. Also fills our_ref_idx[] with this frame's references expressed
+ * in our slot numbering. */
+static uint8_t assign_slots(struct virgl_av1_obu_state *state,
+                            const struct virgl_av1_picture_desc *d,
+                            const struct frame_ctx *c,
+                            uint8_t our_ref_idx[VIRGL_AV1_REFS_PER_FRAME])
+{
+   const typeof(d->picture_parameter) *p = &d->picture_parameter;
+   uint8_t slot;
+
+   /* A surface that has appeared in ref[] since last time is the previous frame's output,
+    * and it sits in the slot we handed that frame. */
+   if (state->have_prev) {
+      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
+         if (d->ref[i] && d->ref[i] != state->prev_ref[i]) {
+            state->slot_surface[state->pending_slot] = d->ref[i];
+            state->slot_valid |= (uint8_t)(1 << state->pending_slot);
+            break;
+         }
+      }
+   }
+
+   for (int j = 0; j < VIRGL_AV1_REFS_PER_FRAME; j++) {
+      const uint32_t want = d->ref[p->ref_frame_idx[j] & 7];
+
+      bool found = false;
+
+      our_ref_idx[j] = 0;
+      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
+         if (want && state->slot_surface[i] == want) {
+            our_ref_idx[j] = (uint8_t)i;
+            found = true;
+            break;
+         }
+      if (!found && getenv("LIMINA_AV1_SLOT_TRACE"))
+         fprintf(stderr, "[AV1SLOT] ref %d wants surface %u (guest slot %u): not in our DPB\n",
+                 j, want, p->ref_frame_idx[j] & 7);
+   }
+
+   /* A key frame refreshes everything, by inference rather than by choice. */
+   if (c->frame_type == AV1_FRAME_SWITCH ||
+       (c->frame_type == AV1_FRAME_KEY && c->show_frame)) {
+      state->pending_slot = 0;
+      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
+         state->slot_surface[i] = 0;
+      state->have_prev = true;
+      memcpy(state->prev_ref, d->ref, sizeof(state->prev_ref));
+      return 0xff;
+   }
+
+   /* Prefer a slot holding nothing, or something the guest no longer keeps live -- ref[] is
+    * exactly the set it still has. Only when every slot is live does the cursor decide. */
+   slot = 0xff;
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES && slot == 0xff; i++) {
+      bool live = false;
+
+      if (!state->slot_surface[i])
+         slot = (uint8_t)i;
+      else {
+         for (int k = 0; k < VIRGL_AV1_NUM_REF_FRAMES; k++)
+            if (d->ref[k] == state->slot_surface[i])
+               live = true;
+         if (!live)
+            slot = (uint8_t)i;
+      }
+   }
+   if (slot == 0xff) {
+      slot = state->next_slot;
+      state->next_slot = (uint8_t)((state->next_slot + 1) % VIRGL_AV1_NUM_REF_FRAMES);
+      if (getenv("LIMINA_AV1_SLOT_TRACE"))
+         fprintf(stderr, "[AV1SLOT] every slot live; evicting %u by cursor\n", slot);
+   }
+   if (getenv("LIMINA_AV1_SLOT_TRACE"))
+      fprintf(stderr, "[AV1SLOT] frame order_hint=%u -> our slot %u\n", p->order_hint, slot);
+
+   state->pending_slot = slot;
+   state->slot_surface[slot] = 0;   /* filled in next frame, once we see the surface */
+   state->have_prev = true;
+   memcpy(state->prev_ref, d->ref, sizeof(state->prev_ref));
+
+   return (uint8_t)(1u << slot);
+}
+
 static void init_frame_ctx(struct frame_ctx *c, const struct virgl_av1_picture_desc *d,
                            const struct seq_params *s)
 {
@@ -1203,11 +1324,7 @@ static void update_state(struct virgl_av1_obu_state *state,
                          const struct frame_ctx *c)
 {
    const typeof(d->picture_parameter) *p = &d->picture_parameter;
-   uint8_t refresh = p->refresh_frame_flags;
-
-   if (c->frame_type == AV1_FRAME_SWITCH ||
-       (c->frame_type == AV1_FRAME_KEY && c->show_frame))
-      refresh = 0xff;
+   const uint8_t refresh = c->refresh;
 
    for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
       if (!(refresh & (1 << i)))
@@ -1250,6 +1367,7 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
 
    derive_seq(desc, &seq);
    init_frame_ctx(&ctx, desc, &seq);
+   ctx.refresh = assign_slots(state, desc, &ctx, ctx.our_ref_idx);
 
    bw_init(&w, out, out ? out_size : 0);
 
@@ -1267,28 +1385,33 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
    emit_obu(&w, AV1_OBU_SEQUENCE_HEADER, scratch, payload.pos);
    state->seq_valid = true;
 
+   /* One OBU_FRAME rather than a separate header and tile group. Both are legal, but this
+    * is the form every real stream uses, so it is the path decoders actually exercise --
+    * and inside it the frame header is byte-aligned rather than terminated with trailing
+    * bits, which is the one syntactic difference. */
    bw_init(&payload, scratch, sizeof(scratch));
    write_uncompressed_header(&payload, &ctx, state);
-   trailing_bits(&payload);
+   byte_alignment(&payload);
    if (payload.overflow)
       return -1;
-   emit_obu(&w, AV1_OBU_FRAME_HEADER, scratch, payload.pos);
 
-   /* Size the tile group first, then emit it: its length has to precede it. */
+   /* Size the whole payload before emitting: the OBU length precedes it. */
    {
       struct bw sizer;
 
       bw_init(&sizer, NULL, 0);
       write_tile_group(&sizer, desc, &ctx, tiles, tiles_size);
-      tile_payload_len = sizer.pos;
+      tile_payload_len = payload.pos + sizer.pos;
    }
 
    f(&w, 1, 0);
-   f(&w, 4, AV1_OBU_TILE_GROUP);
+   f(&w, 4, AV1_OBU_FRAME);
    f(&w, 1, 0);
    f(&w, 1, 1);
    f(&w, 1, 0);
    leb128(&w, tile_payload_len);
+   for (size_t i = 0; i < payload.pos; i++)
+      f(&w, 8, scratch[i]);
    write_tile_group(&w, desc, &ctx, tiles, tiles_size);
 
    if (w.overflow)
