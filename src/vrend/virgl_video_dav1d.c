@@ -35,6 +35,7 @@ void virgl_error(const char *fmt, ...);
 #endif
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #ifdef HAVE_DAV1D
 
@@ -67,7 +68,23 @@ struct virgl_video_dav1d *virgl_dav1d_open(void)
      * is not, and it is driven one unit at a time from the vrend thread; frame threading
      * would buy throughput at the cost of a picture arriving after the frame that asked
      * for it has already been answered. */
-    s.n_threads = 1;
+    /* max_frame_delay = 1 is what keeps output in coding order, one picture per unit --
+     * the contract the caller's one-unit-one-target model rests on. n_threads is a
+     * separate knob: it buys tile and row parallelism *within* a frame and does not
+     * reorder anything, so it can be raised freely.
+     *
+     * It is deliberately not dav1d's default (every logical core). This decoder runs
+     * inside a VMM whose vCPU threads are also competing for the same cores, and taking
+     * all of them to decode would stall the guest it is decoding for. Half the cores,
+     * bounded, leaves the vCPUs room while being far more than enough for the resolutions
+     * a desktop guest plays. */
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+
+    s.n_threads = (int)(cores > 0 ? cores / 2 : 2);
+    if (s.n_threads < 2)
+        s.n_threads = 2;
+    if (s.n_threads > 8)
+        s.n_threads = 8;
     s.max_frame_delay = 1;
     /* The guest allocates a surface for EVERY decoded frame, hidden ones included -- a
      * later show_existing_frame displays one without any of it reaching us. dav1d emits
