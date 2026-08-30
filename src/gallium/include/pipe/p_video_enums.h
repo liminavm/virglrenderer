@@ -36,8 +36,7 @@ enum pipe_video_format
 {
    PIPE_VIDEO_FORMAT_UNKNOWN = 0,
    PIPE_VIDEO_FORMAT_MPEG12,   /**< MPEG1, MPEG2 */
-   PIPE_VIDEO_FORMAT_MPEG4,    /**< DIVX, XVID */
-   PIPE_VIDEO_FORMAT_VC1,      /**< WMV */
+   PIPE_VIDEO_FORMAT_VC1 = 3,  /**< WMV */
    PIPE_VIDEO_FORMAT_MPEG4_AVC,/**< H.264 */
    PIPE_VIDEO_FORMAT_HEVC,     /**< H.265 */
    PIPE_VIDEO_FORMAT_JPEG,     /**< JPEG */
@@ -45,14 +44,20 @@ enum pipe_video_format
    PIPE_VIDEO_FORMAT_AV1       /**< AV1 */
 };
 
+/* WARNING: the virgl video protocol puts `pipe_video_profile` on the wire raw —
+ * virgl_video_caps.profile and every picture descriptor carry the enumerator's
+ * NUMERIC value, and the guest compares it against its own mesa's copy of this
+ * header. So this enum must track mesa's exactly; a stale copy here does not fail
+ * to build, it silently renames codecs across the boundary. It had drifted: mesa
+ * dropped the two MPEG-4 part 2 profiles and added three HEVC ones, which left
+ * this file's VP9_PROFILE0 sitting on mesa's JPEG_BASELINE. A host advertising VP9
+ * decode made the guest publish a JPEG decoder. */
 enum pipe_video_profile
 {
    PIPE_VIDEO_PROFILE_UNKNOWN,
    PIPE_VIDEO_PROFILE_MPEG1,
    PIPE_VIDEO_PROFILE_MPEG2_SIMPLE,
    PIPE_VIDEO_PROFILE_MPEG2_MAIN,
-   PIPE_VIDEO_PROFILE_MPEG4_SIMPLE,
-   PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE,
    PIPE_VIDEO_PROFILE_VC1_SIMPLE,
    PIPE_VIDEO_PROFILE_VC1_MAIN,
    PIPE_VIDEO_PROFILE_VC1_ADVANCED,
@@ -68,11 +73,15 @@ enum pipe_video_profile
    PIPE_VIDEO_PROFILE_HEVC_MAIN_10,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_STILL,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_12,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN10_444,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN_422,
+   PIPE_VIDEO_PROFILE_HEVC_MAIN10_422,
    PIPE_VIDEO_PROFILE_HEVC_MAIN_444,
    PIPE_VIDEO_PROFILE_JPEG_BASELINE,
    PIPE_VIDEO_PROFILE_VP9_PROFILE0,
    PIPE_VIDEO_PROFILE_VP9_PROFILE2,
    PIPE_VIDEO_PROFILE_AV1_MAIN,
+   PIPE_VIDEO_PROFILE_AV1_PROFILE2,
    PIPE_VIDEO_PROFILE_MAX
 };
 
