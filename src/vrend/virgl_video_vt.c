@@ -71,6 +71,7 @@
 #include "virgl_util.h"
 #include "virgl_video.h"
 #include "virgl_video_av1_obu.h"
+#include "virgl_video_dav1d.h"
 
 /* Advertised ceiling. VideoToolbox's VP9 decoder goes higher on current silicon,
  * but nothing we can query says by how much, and the guest only uses this to size
@@ -81,6 +82,13 @@
 /* Declared in the vpcC box. Levels constrain the *stream*, so declaring the highest
  * one avoids a needless rejection; VideoToolbox parses the real bitstream anyway. */
 #define VP9_LEVEL_MAX 61
+
+/* One temporal unit as it was submitted, kept so the software decoder can be brought up
+ * to the same reference state the hardware decoder reached. */
+struct unit_log {
+    uint8_t *data;
+    size_t len;
+};
 
 struct virgl_video_codec {
     enum pipe_video_profile profile;
@@ -146,6 +154,21 @@ struct virgl_video_codec {
     uint8_t frame_bit_depth;
     uint8_t frame_subsampling;
     uint32_t frame_width;
+    /* Software fallback. Once the stream shows a frame the hardware decoder cannot be
+     * trusted with, everything from the last full refresh onward is re-decoded here and
+     * the codec stays on this path for the rest of its life. */
+    struct virgl_video_dav1d *sw;
+    struct unit_log *replay;       /* units since the last shown key frame */
+    unsigned replay_n, replay_cap;
+    size_t replay_bytes;
+    bool replay_lost;              /* the cap was hit: a replay from here would be wrong */
+    uint8_t *interleave;           /* scratch for NV12 targets, which dav1d cannot fill directly */
+    size_t interleave_cap;
+
+    /* The frame declares AV1 super-resolution. Read from the stream, not inferred from what
+     * the host hands back, so the refusal below does not depend on the host's bug staying
+     * the shape we measured it in. */
+    bool frame_superres;
     uint32_t frame_height;
 };
 
@@ -356,6 +379,8 @@ static void destroy_session(struct virgl_video_codec *codec)
     }
 }
 
+static void replay_reset(struct virgl_video_codec *codec);
+
 void virgl_video_destroy_codec(struct virgl_video_codec *codec)
 {
     if (!codec)
@@ -372,6 +397,10 @@ void virgl_video_destroy_codec(struct virgl_video_codec *codec)
     destroy_session(codec);
     if (codec->pending)
         CFRelease(codec->pending);
+    virgl_dav1d_close(codec->sw);
+    replay_reset(codec);
+    free(codec->replay);
+    free(codec->interleave);
     free(codec->unit);
     free(codec->bitstream);
     free(codec);
@@ -774,6 +803,7 @@ static int av1_decode_bitstream(struct virgl_video_codec *codec,
 
     codec->frame_width = p->frame_width ? p->frame_width : codec->width;
     codec->frame_height = p->frame_height ? p->frame_height : codec->height;
+    codec->frame_superres = p->pic_info_fields.use_superres;
     codec->frame_bit_depth = p->bit_depth_idx ? 10 : 8;
     codec->frame_profile = p->profile;
     codec->frame_subsampling = 1;
@@ -839,6 +869,7 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
                        ? vp9->picture_parameter.frame_width : codec->width;
     codec->frame_height = vp9->picture_parameter.frame_height
                         ? vp9->picture_parameter.frame_height : codec->height;
+    codec->frame_superres = false;   /* VP9's scaling is per-reference, not a frame upscale */
 
     for (unsigned i = 0; i < num_buffers; i++)
         needed += sizes[i];
@@ -937,6 +968,42 @@ static int submit_unit(struct virgl_video_codec *codec, const uint8_t *data, siz
     /* Back on the vrend thread, with the GL context current: now the picture can be
      * copied into the guest's resources. */
     if (codec->pending) {
+        /* What this host returns for an AV1 super-resolution frame is not that frame. It
+         * comes back at the CODED width holding, near enough, the rightmost coded_width
+         * columns of the correctly upscaled picture -- not the pre-upscale picture, which
+         * could have been upscaled here (measured: 6.9% of pixels match the pre-upscale
+         * reading, 76% match the right-hand crop). Asking for output buffers at the
+         * sequence's own size only stretches the same wrong pixels. Half the picture is
+         * simply absent from the buffer, so there is nothing to reconstruct it from, and
+         * delivering it would put visibly wrong content on screen with nothing anywhere
+         * reporting a problem. Refuse, and let the guest fall back to a software decoder.
+         * See docs/hardening-backlog.md.
+         *
+         * Keyed on the stream's own `use_superres`, not on the width that came back: a host
+         * that returns a full-width buffer holding the same wrong pixels must still be
+         * refused, and the width is checked separately below as its own sanity error.
+         *
+         * Note what this does NOT do: the frame is still submitted and decoded. Only its
+         * DELIVERY is refused. This host's reconstruction is internally correct -- the
+         * frames that predict from super-resolution references come back bit-exact -- so
+         * skipping the submission would silently corrupt every later frame. */
+        size_t got = CVPixelBufferGetWidth(codec->pending);
+
+        /* Only a delivered frame can put wrong pixels on screen; a held frame is decoded
+         * purely to keep the reference state right and is never copied out. */
+        if (target && codec->frame_superres) {
+            virgl_error("video: this host does not return AV1 super-resolution frames "
+                        "correctly (frame declares %u wide, got %zu); refusing the frame "
+                        "rather than delivering wrong pixels\n",
+                        codec->frame_width, got);
+            err = -1;
+            target = NULL;
+        } else if (target && got != codec->frame_width) {
+            virgl_error("video: the host returned a %zu-wide picture for a frame that "
+                        "declares %u; refusing it\n", got, codec->frame_width);
+            err = -1;
+            target = NULL;
+        }
         if (target)
             deliver_picture(codec, codec->pending, target);
         CFRelease(codec->pending);
@@ -947,6 +1014,231 @@ static int submit_unit(struct virgl_video_codec *codec, const uint8_t *data, siz
     }
 
     return err;
+}
+
+/* --- software fallback ------------------------------------------------------------ */
+
+#define REPLAY_MAX_BYTES (64u << 20)
+
+static void replay_reset(struct virgl_video_codec *codec)
+{
+    for (unsigned i = 0; i < codec->replay_n; i++)
+        free(codec->replay[i].data);
+    codec->replay_n = 0;
+    codec->replay_bytes = 0;
+    codec->replay_lost = false;
+}
+
+/* Keep a copy of a unit so a later switch can rebuild the reference state. Dropping one
+ * is not fatal on its own, but it makes any replay from here wrong, so it is recorded:
+ * a decoder brought up on a gapped history produces headers that parse and pictures that
+ * are subtly wrong, which is the failure mode this whole path exists to avoid. */
+static void replay_append(struct virgl_video_codec *codec, const uint8_t *data, size_t len)
+{
+    struct unit_log *grown;
+    uint8_t *copy;
+
+    if (codec->replay_lost)
+        return;
+
+    if (codec->replay_bytes + len > REPLAY_MAX_BYTES) {
+        VT_TRACE("replay: over %u bytes, dropping the history\n", REPLAY_MAX_BYTES);
+        replay_reset(codec);
+        codec->replay_lost = true;
+        return;
+    }
+
+    if (codec->replay_n == codec->replay_cap) {
+        unsigned want = codec->replay_cap ? codec->replay_cap * 2 : 64;
+
+        grown = realloc(codec->replay, want * sizeof(*grown));
+        if (!grown) {
+            replay_reset(codec);
+            codec->replay_lost = true;
+            return;
+        }
+        codec->replay = grown;
+        codec->replay_cap = want;
+    }
+
+    copy = malloc(len);
+    if (!copy) {
+        replay_reset(codec);
+        codec->replay_lost = true;
+        return;
+    }
+    memcpy(copy, data, len);
+    codec->replay[codec->replay_n].data = copy;
+    codec->replay[codec->replay_n].len = len;
+    codec->replay_n++;
+    codec->replay_bytes += len;
+}
+
+/* Hand a dav1d picture to the guest. The hardware path's delivery is reused wholesale
+ * where the target is planar -- which is what mesa asks for on decode targets -- and the
+ * planes are interleaved into scratch first for a biplanar (NV12) target, which dav1d
+ * cannot produce. */
+static void deliver_dav1d_picture(struct virgl_video_codec *codec,
+                                  const struct virgl_dav1d_picture *pic,
+                                  struct virgl_video_buffer *target)
+{
+    struct virgl_video_dma_buf dmabuf;
+    const bool nv12 = target && target->format == PIPE_FORMAT_NV12;
+    const bool swap_chroma = target && target->format == PIPE_FORMAT_YV12;
+
+    if (!video_cbs || !video_cbs->decode_completed)
+        return;
+
+    if (pic->bpc != 8) {
+        virgl_error("video: the software decoder only delivers 8-bit pictures (got %u)\n",
+                    pic->bpc);
+        return;
+    }
+
+    memset(&dmabuf, 0, sizeof(dmabuf));
+    dmabuf.buf = target;
+    dmabuf.width = pic->width;
+    dmabuf.height = pic->height;
+    dmabuf.flags = VIRGL_VIDEO_DMABUF_READ_ONLY;
+
+    if (nv12) {
+        const uint32_t cw = (pic->width + 1) / 2, ch = (pic->height + 1) / 2;
+        const size_t need = (size_t)cw * 2 * ch;
+
+        if (need > codec->interleave_cap) {
+            uint8_t *grown = realloc(codec->interleave, need);
+
+            if (!grown) {
+                virgl_error("video: out of memory interleaving chroma\n");
+                return;
+            }
+            codec->interleave = grown;
+            codec->interleave_cap = need;
+        }
+        for (uint32_t y = 0; y < ch; y++) {
+            const uint8_t *u = pic->plane[1] + (size_t)y * pic->pitch[1];
+            const uint8_t *v = pic->plane[2] + (size_t)y * pic->pitch[2];
+            uint8_t *dst = codec->interleave + (size_t)y * cw * 2;
+
+            for (uint32_t x = 0; x < cw; x++) {
+                dst[2 * x] = u[x];
+                dst[2 * x + 1] = v[x];
+            }
+        }
+
+        dmabuf.num_planes = 2;
+        dmabuf.planes[0].fd = -1;
+        dmabuf.planes[0].map = (void *)(uintptr_t)pic->plane[0];
+        dmabuf.planes[0].pitch = pic->pitch[0];
+        dmabuf.planes[0].size = (size_t)pic->pitch[0] * pic->height;
+        dmabuf.planes[1].fd = -1;
+        dmabuf.planes[1].map = codec->interleave;
+        dmabuf.planes[1].pitch = cw * 2;
+        dmabuf.planes[1].size = need;
+    } else {
+        dmabuf.num_planes = 3;
+        for (unsigned i = 0; i < 3; i++) {
+            unsigned src = i;
+
+            /* YV12 is I420 with the chroma planes the other way round. */
+            if (swap_chroma && i > 0)
+                src = 3 - i;
+
+            dmabuf.planes[i].fd = -1;
+            dmabuf.planes[i].map = (void *)(uintptr_t)pic->plane[src];
+            dmabuf.planes[i].pitch = pic->pitch[src];
+            dmabuf.planes[i].size = (size_t)pic->pitch[src] *
+                                    (src ? (pic->height + 1) / 2 : pic->height);
+        }
+    }
+
+    VT_TRACE("deliver (sw): %u planes, %ux%u, pitch0 %u\n", dmabuf.num_planes,
+             dmabuf.width, dmabuf.height, dmabuf.planes[0].pitch);
+    video_cbs->decode_completed(codec, &dmabuf);
+}
+
+static int sw_submit_unit(struct virgl_video_codec *codec, const uint8_t *data, size_t len,
+                          struct virgl_video_buffer *target)
+{
+    struct virgl_dav1d_picture pic;
+    int r = virgl_dav1d_decode(codec->sw, data, len, &pic);
+
+    if (r < 0)
+        return -1;
+    if (r == 0)
+        return 0;               /* decoded, nothing to show for it */
+    if (target)
+        deliver_dav1d_picture(codec, &pic, target);
+    virgl_dav1d_release(codec->sw);
+    return 0;
+}
+
+/* Bring the software decoder up to the reference state the hardware one already reached,
+ * by re-decoding every unit since the last full refresh. The unit that triggered the
+ * switch has already been logged and is decoded by the caller, so it is left out here.
+ *
+ * Failure is not fatal: the codec simply stays on the hardware path, where the frame it
+ * cannot deliver correctly is refused rather than shown wrong. */
+static bool sw_begin(struct virgl_video_codec *codec)
+{
+    if (!virgl_dav1d_available()) {
+        virgl_error("video: no software AV1 decoder in this build; the frames this host "
+                    "returns incorrectly will be refused instead\n");
+        return false;
+    }
+    if (codec->frame_bit_depth != 8) {
+        virgl_error("video: the software AV1 fallback is 8-bit only (stream is %u-bit); "
+                    "refusing the affected frames instead\n", codec->frame_bit_depth);
+        return false;
+    }
+    if (codec->replay_lost || !codec->replay_n) {
+        virgl_error("video: no usable frame history to start the software AV1 decoder "
+                    "from; refusing the affected frames instead\n");
+        return false;
+    }
+
+    codec->sw = virgl_dav1d_open();
+    if (!codec->sw)
+        return false;
+
+    for (unsigned i = 0; i + 1 < codec->replay_n; i++) {
+        struct virgl_dav1d_picture pic;
+
+        if (virgl_dav1d_decode(codec->sw, codec->replay[i].data, codec->replay[i].len,
+                               &pic) < 0) {
+            virgl_error("video: could not replay unit %u of %u into the software decoder; "
+                        "staying on the hardware path\n", i, codec->replay_n);
+            virgl_dav1d_close(codec->sw);
+            codec->sw = NULL;
+            return false;
+        }
+        /* These frames were already delivered by the hardware path; they are re-decoded
+         * only so the references they leave behind are right. */
+        virgl_dav1d_release(codec->sw);
+    }
+
+    virgl_error("video: switching to the software AV1 decoder for the rest of this stream "
+                "(this host does not return super-resolution frames correctly); replayed "
+                "%u unit(s)\n", codec->replay_n - 1);
+    return true;
+}
+
+/* Every AV1 unit goes through here, so the replay history and the hardware/software
+ * choice are decided in exactly one place. */
+static int av1_route_unit(struct virgl_video_codec *codec, const uint8_t *data, size_t len,
+                          struct virgl_video_buffer *target, bool starts_dpb)
+{
+    if (starts_dpb)
+        replay_reset(codec);
+    replay_append(codec, data, len);
+
+    if (!codec->sw && codec->frame_superres)
+        sw_begin(codec);
+
+    if (codec->sw)
+        return sw_submit_unit(codec, data, len, target);
+
+    return submit_unit(codec, data, len, target);
 }
 
 /* Grow the temporal-unit buffer to at least `want` bytes. */
@@ -992,7 +1284,8 @@ static int av1_flush_held(struct virgl_video_codec *codec,
 
     codec->held_target = NULL;
     VT_TRACE("av1: flushing the held frame, %zd bytes\n", n);
-    return submit_unit(codec, codec->unit, (size_t)n, target);
+    /* Never a full refresh: only a hidden frame is ever held. */
+    return av1_route_unit(codec, codec->unit, (size_t)n, target, false);
 }
 
 int virgl_video_end_frame(struct virgl_video_codec *codec,
@@ -1008,6 +1301,13 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
             codec->bitstream_len = 0;
             return 0;   /* capture-only: nothing was accumulated to decode */
         }
+
+        /* A shown key frame refreshes every reference slot, so the replay history can
+         * start again here -- and must, or it grows for the life of the stream. Read
+         * before the build, which clears the descriptor. */
+        const bool starts_dpb =
+            codec->av1_desc.picture_parameter.pic_info_fields.frame_type == 0 &&
+            codec->av1_desc.picture_parameter.pic_info_fields.show_frame;
 
         if (!ensure_unit(codec, codec->bitstream_len + VIRGL_AV1_UNIT_OVERHEAD))
             return -1;
@@ -1032,7 +1332,7 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
         }
 
         VT_TRACE("av1: %zd bytes\n", n);
-        return submit_unit(codec, codec->unit, (size_t)n, target);
+        return av1_route_unit(codec, codec->unit, (size_t)n, target, starts_dpb);
     }
 
     VT_TRACE("end_frame: %zu bytes\n", codec->bitstream_len);
