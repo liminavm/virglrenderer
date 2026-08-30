@@ -1569,7 +1569,6 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
          return r;
       state->pending_slot = 0;
       state->pending_unlearned = true;
-      state->have_prev = true;
       return n + r;
    }
 
@@ -1594,7 +1593,6 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
       state->pending_slot = (uint8_t)slot;
       state->pending_unlearned = true;
    }
-   state->have_prev = true;
    return n + r;
 }
 

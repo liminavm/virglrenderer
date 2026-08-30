@@ -95,9 +95,7 @@ struct virgl_av1_obu_state {
     * difference between that map and the next one. */
    uint32_t prev_ref[VIRGL_AV1_NUM_REF_FRAMES];
    uint8_t pending_slot;      /* the slot the previous frame was given */
-   uint8_t next_slot;         /* round-robin cursor for eviction */
    bool pending_unlearned;    /* the previous frame's surface is not yet identified */
-   bool have_prev;
 
    /* Set once the first sequence header has been derived, so callers can build an av1C
     * record before the first frame is submitted. */
