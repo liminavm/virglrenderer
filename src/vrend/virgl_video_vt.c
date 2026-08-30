@@ -154,6 +154,8 @@ struct virgl_video_codec {
     uint8_t frame_bit_depth;
     uint8_t frame_subsampling;
     uint32_t frame_width;
+    bool hw_av1;                   /* this host has AV1 silicon */
+
     /* Software fallback. Once the stream shows a frame the hardware decoder cannot be
      * trusted with, everything from the last full refresh onward is re-decoded here and
      * the codec stays on this path for the rest of its life. */
@@ -299,9 +301,12 @@ int virgl_video_fill_caps(union virgl_caps *caps)
      * that cannot decode it, because capture never decodes: the picture descriptors are a
      * pure function of the *guest's* own bitstream parse, so a machine with no AV1 silicon
      * produces exactly the fixtures an M3 would. */
-    if (vt_can_decode(kCMVideoCodecType_AV1) || av1_capture_dir()) {
+    if (vt_can_decode(kCMVideoCodecType_AV1) || virgl_dav1d_available() ||
+        av1_capture_dir()) {
         VT_TRACE("fill_caps: advertising AV1 main decode%s\n",
-                 vt_can_decode(kCMVideoCodecType_AV1) ? "" : " (capture build, no silicon)");
+                 vt_can_decode(kCMVideoCodecType_AV1) ? ""
+                     : virgl_dav1d_available() ? " (no silicon; software)"
+                                               : " (capture build, no silicon)");
         vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
         memset(vcaps, 0, sizeof(*vcaps));
         vcaps->profile = PIPE_VIDEO_PROFILE_AV1_MAIN;
@@ -354,14 +359,16 @@ struct virgl_video_codec *virgl_video_create_codec(
     codec->opaque = args->opaque;
 
     if (args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
-        codec->av1_decode = vt_can_decode(kCMVideoCodecType_AV1);
+        codec->hw_av1 = vt_can_decode(kCMVideoCodecType_AV1);
+        codec->av1_decode = codec->hw_av1 || virgl_dav1d_available();
         virgl_av1_obu_state_init(&codec->av1);
         codec_register(codec);
     }
 
     VT_TRACE("create_codec: profile %d %ux%u%s\n", args->profile, args->width, args->height,
-             args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN && !codec->av1_decode
-                 ? " (no AV1 silicon; capture only)" : "");
+             args->profile != PIPE_VIDEO_PROFILE_AV1_MAIN ? ""
+                 : !codec->av1_decode ? " (no AV1 silicon; capture only)"
+                 : !codec->hw_av1     ? " (no AV1 silicon; decoding in software)" : "");
 
     return codec;
 }
@@ -1179,21 +1186,20 @@ static int sw_submit_unit(struct virgl_video_codec *codec, const uint8_t *data, 
  *
  * Failure is not fatal: the codec simply stays on the hardware path, where the frame it
  * cannot deliver correctly is refused rather than shown wrong. */
-static bool sw_begin(struct virgl_video_codec *codec)
+static bool sw_begin(struct virgl_video_codec *codec, const char *why)
 {
     if (!virgl_dav1d_available()) {
-        virgl_error("video: no software AV1 decoder in this build; the frames this host "
-                    "returns incorrectly will be refused instead\n");
+        virgl_error("video: no software AV1 decoder in this build (%s)\n", why);
         return false;
     }
     if (codec->frame_bit_depth != 8) {
-        virgl_error("video: the software AV1 fallback is 8-bit only (stream is %u-bit); "
-                    "refusing the affected frames instead\n", codec->frame_bit_depth);
+        virgl_error("video: the software AV1 fallback is 8-bit only (stream is %u-bit, "
+                    "%s)\n", codec->frame_bit_depth, why);
         return false;
     }
     if (codec->replay_lost || !codec->replay_n) {
         virgl_error("video: no usable frame history to start the software AV1 decoder "
-                    "from; refusing the affected frames instead\n");
+                    "from (%s)\n", why);
         return false;
     }
 
@@ -1217,9 +1223,8 @@ static bool sw_begin(struct virgl_video_codec *codec)
         virgl_dav1d_release(codec->sw);
     }
 
-    virgl_error("video: switching to the software AV1 decoder for the rest of this stream "
-                "(this host does not return super-resolution frames correctly); replayed "
-                "%u unit(s)\n", codec->replay_n - 1);
+    virgl_error("video: decoding this AV1 stream in software (%s); replayed %u unit(s)\n",
+                why, codec->replay_n - 1);
     return true;
 }
 
@@ -1232,8 +1237,15 @@ static int av1_route_unit(struct virgl_video_codec *codec, const uint8_t *data, 
         replay_reset(codec);
     replay_append(codec, data, len);
 
-    if (!codec->sw && codec->frame_superres)
-        sw_begin(codec);
+    /* Two reasons to leave the hardware decoder. Neither is recoverable, so the codec
+     * stays in software once it switches: a host with no AV1 silicon never gains any, and
+     * a stream that used super-resolution once will use it again. */
+    if (!codec->sw) {
+        if (!codec->hw_av1)
+            sw_begin(codec, "this host has no AV1 silicon");
+        else if (codec->frame_superres)
+            sw_begin(codec, "this host does not return super-resolution frames correctly");
+    }
 
     if (codec->sw)
         return sw_submit_unit(codec, data, len, target);
