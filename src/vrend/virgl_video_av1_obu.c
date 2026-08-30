@@ -1465,8 +1465,8 @@ static ssize_t emit_frame(struct virgl_av1_obu_state *state,
  * which is exactly where the guest's own choice of slot becomes visible: if the held picture
  * is in it, the guest stored it and so must we; if it is absent, the guest kept nothing and a
  * frame it never stored can never be referenced. */
-static ssize_t flush_held(struct virgl_av1_obu_state *state,
-                          const uint32_t *before, const uint32_t *live,
+static ssize_t emit_held(struct virgl_av1_obu_state *state,
+                         const uint32_t *before, const uint32_t *live,
                           uint8_t *out, size_t out_size)
 {
    uint32_t surface;
@@ -1519,29 +1519,36 @@ static bool hold_frame(struct virgl_av1_obu_state *state,
    return true;
 }
 
-ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
-                                      const struct virgl_av1_picture_desc *desc,
-                                      const void *tiles, size_t tiles_size,
-                                      uint8_t *out, size_t out_size)
+/*
+ * Advance the model onto this descriptor: emit the held frame, learn where the previous
+ * frame's picture landed, and forget pictures the guest has dropped.
+ *
+ * Split out from building the frame's own unit because the two must not share a buffer. A
+ * decoder is handed one sample per temporal unit; two units in one sample loses a picture,
+ * which is the very failure the hold exists to prevent. It is also called at a different
+ * time: the descriptor is known at the guest's first decode_bitstream, while the frame's
+ * own unit cannot be built until end_frame, since a frame's tile data may arrive over
+ * several decode_bitstream calls.
+ */
+static ssize_t advance(struct virgl_av1_obu_state *state,
+                       const struct virgl_av1_picture_desc *desc,
+                       uint8_t *out, size_t out_size)
 {
-   const typeof(desc->picture_parameter) *p;
-   uint8_t refresh;
-   ssize_t n = 0, r;
-   int slot;
+   ssize_t n;
 
-   if (!state || !desc)
-      return -1;
-   p = &desc->picture_parameter;
+   if (state->advanced)
+      return 0;
 
-   /* A frame held from the previous submission goes first: decode order is preserved, and
-    * this descriptor's ref[] is what makes its refresh exact. */
-   r = flush_held(state, state->prev_ref, desc->ref, out, out_size);
-   if (r < 0)
-      return r;
-   n = r;
+   /* The held frame goes first: decode order is preserved, and this descriptor's ref[] is
+    * what makes its refresh exact. */
+   n = emit_held(state, state->prev_ref, desc->ref, out, out_size);
+   if (n < 0)
+      return n;
 
    /* Learn where a frame we emitted immediately ended up. Its slot was chosen when it was
-    * written; only the surface that landed there was still unknown. */
+    * written; only the surface that landed there was still unknown. This must happen before
+    * anything asks for a free slot, or a just-stored slot still reading as empty is handed
+    * out again and the picture in it is lost. */
    if (state->pending_unlearned) {
       const uint32_t surface = new_surface(state->prev_ref, desc->ref);
 
@@ -1554,6 +1561,49 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
 
    prune_slots(state, desc->ref);
    memcpy(state->prev_ref, desc->ref, sizeof(state->prev_ref));
+   state->advanced = true;
+   return n;
+}
+
+ssize_t virgl_av1_flush_held(struct virgl_av1_obu_state *state,
+                             const struct virgl_av1_picture_desc *desc,
+                             uint8_t *out, size_t out_size)
+{
+   if (!state || !desc)
+      return -1;
+   return advance(state, desc, out, out_size);
+}
+
+void virgl_av1_drop_held(struct virgl_av1_obu_state *state)
+{
+   if (state)
+      state->held = false;
+}
+
+ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
+                                      const struct virgl_av1_picture_desc *desc,
+                                      const void *tiles, size_t tiles_size,
+                                      uint8_t *out, size_t out_size)
+{
+   const typeof(desc->picture_parameter) *p;
+   uint8_t refresh;
+   ssize_t r;
+   int slot;
+
+   if (!state || !desc)
+      return -1;
+   p = &desc->picture_parameter;
+
+   /* A caller that never flushed still needs the model advanced, but it must not be left
+    * holding a frame -- this unit would then be the second in one buffer. Refuse instead of
+    * concatenating. */
+   if (!state->advanced) {
+      r = advance(state, desc, NULL, 0);
+      if (r < 0)
+         return r;
+   }
+   if (state->held)
+      return -1;
 
    /* A key frame refreshes everything, by inference rather than by choice, and resets our
     * model with it. Its own surface is learned on the next submission, like any frame we
@@ -1563,13 +1613,13 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
         p->pic_info_fields.show_frame)) {
       for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
          state->slot_surface[i] = 0;
-      r = emit_frame(state, desc, tiles, tiles_size, 0xff, out ? out + n : NULL,
-                     out ? out_size - n : 0);
+      r = emit_frame(state, desc, tiles, tiles_size, 0xff, out, out_size);
       if (r < 0)
          return r;
       state->pending_slot = 0;
       state->pending_unlearned = true;
-      return n + r;
+      state->advanced = false;
+      return r;
    }
 
    /* A hidden frame waits one submission so its refresh can be exact -- but only when it
@@ -1583,15 +1633,15 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
          fprintf(stderr, "[AV1SLOT] oh=%3u held: every slot live\n", p->order_hint);
       if (!hold_frame(state, desc, tiles, tiles_size))
          return -1;
-      return n;
+      state->advanced = false;
+      return 0;
    }
 
    /* A shown frame is emitted now, into a slot nothing live occupies. When there is none,
     * store nothing rather than evict a picture a later frame may still want. */
    slot = dead_slot(state, desc->ref);
    refresh = slot >= 0 ? (uint8_t)(1u << slot) : 0;
-   r = emit_frame(state, desc, tiles, tiles_size, refresh, out ? out + n : NULL,
-                  out ? out_size - n : 0);
+   r = emit_frame(state, desc, tiles, tiles_size, refresh, out, out_size);
    if (r < 0)
       return r;
    if (slot >= 0) {
@@ -1600,7 +1650,8 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
       state->pending_slot = (uint8_t)slot;
       state->pending_unlearned = true;
    }
-   return n + r;
+   state->advanced = false;
+   return r;
 }
 
 /*
@@ -1612,7 +1663,7 @@ ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
 {
    if (!state)
       return -1;
-   return flush_held(state, state->prev_ref, NULL, out, out_size);
+   return emit_held(state, state->prev_ref, NULL, out, out_size);
 }
 
 void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state)

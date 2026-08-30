@@ -91,6 +91,11 @@ struct virgl_av1_obu_state {
    size_t held_tiles_size;
    size_t held_tiles_cap;
    bool held;
+
+   /* The model has been advanced onto the current descriptor. A frame's tile data may
+    * arrive over several decode_bitstream calls, each carrying the same descriptor, so the
+    * advance has to be idempotent within a frame. */
+   bool advanced;
    /* The guest's reference map as of the previous submission. What a frame stored is the
     * difference between that map and the next one. */
    uint32_t prev_ref[VIRGL_AV1_NUM_REF_FRAMES];
@@ -106,9 +111,29 @@ struct virgl_av1_obu_state {
 void virgl_av1_obu_state_init(struct virgl_av1_obu_state *state);
 void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state);
 
+/*
+ * Emit the frame held from the previous submission, if any, and advance the model onto
+ * this descriptor. Call as soon as the descriptor is known -- the guest's first
+ * decode_bitstream -- so the held picture reaches its target as early as possible: a
+ * stream may display a hidden frame just one decode later, leaving no margin.
+ *
+ * Writes at most one temporal unit, which MUST be submitted to the decoder as its own
+ * sample and delivered into the *held* frame's target, not this frame's. Idempotent
+ * within a frame, so it is safe to call on every decode_bitstream.
+ */
+ssize_t virgl_av1_flush_held(struct virgl_av1_obu_state *state,
+                             const struct virgl_av1_picture_desc *desc,
+                             uint8_t *out, size_t out_size);
+
 /* Emit any frame still held. Call once the last frame has been submitted. */
 ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
                                       uint8_t *out, size_t out_size);
+
+/*
+ * Discard a held frame without emitting it. For codec teardown: a frame the decoder never
+ * output cannot be read afterwards, so decoding it there would be work nobody collects.
+ */
+void virgl_av1_drop_held(struct virgl_av1_obu_state *state);
 
 /*
  * Build one temporal unit -- temporal delimiter, sequence header, frame header and tile
@@ -120,8 +145,11 @@ ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
  * *frame* at a time and expects one picture back. Repeating the sequence header in every
  * unit is legal and avoids tracking when a new one is owed.
  *
- * `tiles`/`tiles_size` is the tile payload exactly as the guest sent it. Returns the number
- * of bytes written to `out`, or a negative value on error. Call with out == NULL to size.
+ * `tiles`/`tiles_size` is the tile payload exactly as the guest sent it. Writes at most one
+ * temporal unit -- nothing when the frame is held -- and returns the number of bytes
+ * written, or a negative value on error. Fails rather than emitting a second unit if a held
+ * frame has not been flushed first: two units in one buffer reach the decoder as one sample
+ * and lose a picture.
  */
 ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
                                       const struct virgl_av1_picture_desc *desc,
