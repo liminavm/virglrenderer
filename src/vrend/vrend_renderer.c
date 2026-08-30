@@ -4372,6 +4372,15 @@ static inline void vrend_fill_shader_key(struct vrend_sub_context *sub_ctx,
          vrend_shader_sampler_views_mask_set(key->sampler_views_emulated_rect_mask, i);
       }
 
+      /* Gallium lets a shader declare a sampler as 2D_ARRAY while a plain 2D view is bound:
+       * native drivers build the descriptor from the view and take only the coordinate count
+       * from the shader, so the mismatch is harmless there. GLSL has no such latitude. Record
+       * the view's real target so the shader can be compiled to match it. mesa's vl_compositor
+       * is the case that matters -- it samples 2D_ARRAY unconditionally while vl_video_buffer
+       * allocates plain 2D planes for any progressive video buffer. */
+      if (view->target == GL_TEXTURE_2D)
+         vrend_shader_sampler_views_mask_set(key->sampler_views_lower_array_mask, i);
+
       if (view->texture->target == GL_TEXTURE_BUFFER) {
          enum pipe_swizzle swizzle[4];
          if (vrend_get_swizzle(view, swizzle)) {
@@ -5741,6 +5750,54 @@ static void vrend_draw_bind_const_shader(struct vrend_sub_context *sub_ctx,
             sub_ctx->shaders[shader_type]->sinfo.num_consts,
             sub_ctx->consts[shader_type].consts);
       sub_ctx->const_dirty[shader_type] = false;
+      return;
+   }
+
+   /* Constant buffer 0 supplied as a RESOURCE, feeding a shader that declared plain uniforms.
+    *
+    * A guest delivers constants in one of two unrelated ways, and they land in different
+    * places: SET_CONSTANT_BUFFER carries the data inline into sub_ctx->consts[], uploaded
+    * above with glUniform4uiv, while SET_UNIFORM_BUFFER references a buffer resource and is
+    * only ever bound as a GL uniform block. Which of the two a shader can read is decided far
+    * away, by its TGSI: a one-dimensional `DCL CONST[0..n]` is translated into a plain
+    * `uniform uvec4 fsconst0[]` array rather than a block. A guest that declares its constants
+    * that way and then binds buffer 0 as a resource gets a shader whose constants are never
+    * written at all.
+    *
+    * Nothing rejects the combination, so it fails silently and simply reads as zeroes. mesa's
+    * vl_compositor is exactly that shape -- one-dimensional CONST, colour-space matrix held in
+    * a pipe_resource -- so every VA post-processing draw multiplied its texels by an all-zero
+    * matrix and produced pure black.
+    *
+    * Bridge it: read the data out of the bound resource and upload it as the uniforms the
+    * shader actually reads.
+    */
+   if (!sub_ctx->consts[shader_type].consts && sub_ctx->shaders[shader_type] &&
+       sub_ctx->prog->const_location[shader_type] != -1) {
+      struct pipe_constant_buffer *cb = &sub_ctx->cbs[shader_type][0];
+      struct vrend_resource *res = (struct vrend_resource *)cb->buffer;
+      unsigned num_consts = sub_ctx->shaders[shader_type]->sinfo.num_consts;
+
+      if (res && res->gl_id && num_consts) {
+         unsigned want = num_consts * 4 * sizeof(uint32_t);
+         unsigned avail = cb->buffer_size ? cb->buffer_size : want;
+         unsigned len = MIN2(want, avail);
+         uint32_t *tmp = calloc(1, want);
+
+         if (tmp) {
+            void *ptr;
+
+            glBindBuffer(GL_UNIFORM_BUFFER, res->gl_id);
+            ptr = glMapBufferRange(GL_UNIFORM_BUFFER, cb->buffer_offset, len, GL_MAP_READ_BIT);
+            if (ptr) {
+               memcpy(tmp, ptr, len);
+               glUnmapBuffer(GL_UNIFORM_BUFFER);
+            }
+            glBindBuffer(GL_UNIFORM_BUFFER, 0);
+            glUniform4uiv(sub_ctx->prog->const_location[shader_type], num_consts, tmp);
+            free(tmp);
+         }
+      }
    }
 }
 
