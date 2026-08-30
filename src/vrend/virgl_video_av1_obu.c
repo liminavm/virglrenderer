@@ -1143,8 +1143,20 @@ static void write_uncompressed_header(struct bw *w, struct frame_ctx *c,
    if (!c->frame_is_intra)
       flag(w, p->mode_control_fields.reference_select);
 
-   if (skip_mode_allowed(c, state))
-      flag(w, p->mode_control_fields.skip_mode_present);
+   {
+      const bool allowed = skip_mode_allowed(c, state);
+
+      /* The guest can only have resolved skip_mode_present = 1 if its decoder judged the
+       * mode allowed, so a disagreement here is ours and is fatal: the bit is either
+       * written or not, and getting that wrong shifts everything after it. */
+      if (getenv("LIMINA_AV1_SLOT_TRACE") && !allowed &&
+          p->mode_control_fields.skip_mode_present)
+         fprintf(stderr, "[AV1SKIP] order_hint=%u: we say skip mode is not allowed but the "
+                 "guest resolved skip_mode_present=1\n", p->order_hint);
+
+      if (allowed)
+         flag(w, p->mode_control_fields.skip_mode_present);
+   }
 
    if (!(c->frame_is_intra || c->error_resilient))
       flag(w, p->pic_info_fields.allow_warped_motion);
@@ -1205,29 +1217,101 @@ static void write_tile_group(struct bw *w, const struct virgl_av1_picture_desc *
  *
  * Returns the mask to emit. Also fills our_ref_idx[] with this frame's references expressed
  * in our slot numbering. */
-static uint8_t assign_slots(struct virgl_av1_obu_state *state,
-                            const struct virgl_av1_picture_desc *d,
-                            const struct frame_ctx *c,
-                            uint8_t our_ref_idx[VIRGL_AV1_REFS_PER_FRAME])
+/*
+ * refresh_frame_flags is not in the descriptor. VA-API does not carry it -- mesa writes a
+ * constant 1 (src/gallium/frontends/va/picture_av1.c) -- because a VA driver never needs it:
+ * the application hands it the whole reference map every  frame and manages the DPB itself. A
+ * bitstream writer does need it, so slots are assigned here and ref_frame_idx remapped onto
+ * them.
+ *
+ * The assignment must not merely be self-consistent, it must not evict a picture a later
+ * frame still references. Once eight distinct pictures are live -- which happens in any
+ * pyramid GOP -- storing a ninth means evicting one, and which one the guest chose is
+ * information that exists only in the *next* frame's ref[]. Guessing costs a reference the
+ * decoder needs; the frame header still parses field-for-field correctly and the loss
+ * surfaces much later as an entropy-decode desync.
+ *
+ * So a hidden frame is held for one submission and emitted once the next descriptor reveals
+ * the guest's choice exactly. Only hidden frames are held: nothing waits on their pixels
+ * until a later show_existing, whereas holding a shown frame would stall a caller that reads
+ * its surface back before submitting the next one. A shown frame is emitted at once into a
+ * slot nothing live occupies, which is free of that risk -- in a pyramid GOP shown frames are
+ * never stored at all, and a low-delay stream, where they are, never fills eight slots.
+ */
+
+/* The picture the frame between two reference maps produced: the surface `now` lists that
+ * `before` did not. Exactly one decode separates them, so a surface that has appeared can
+ * only be its output, and a guest that stored nothing leaves the map unchanged.
+ *
+ * Compared as a set difference against the previous map, not against our own slots and not
+ * per-slot. Surface ids are recycled -- a capture cycles through a handful of them -- so a
+ * freshly reused id reads as one we already hold and teaches us nothing, while a per-slot
+ * diff misses a frame that lands in a slot whose contents we had seen elsewhere. The guest
+ * never reuses an id still in its own live map, which is what makes the set difference
+ * exact. */
+static uint32_t new_surface(const uint32_t *before, const uint32_t *now)
+{
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
+      const uint32_t h = now[i];
+      bool seen = (h == 0);
+
+      for (int k = 0; k < VIRGL_AV1_NUM_REF_FRAMES && !seen; k++)
+         seen = before[k] == h;
+      if (!seen)
+         return h;
+   }
+   return 0;
+}
+
+/* Drop pictures the guest no longer lists. Nothing can reference them again, and leaving
+ * them behind lets a recycled id match a slot holding a picture that is long gone. */
+static void prune_slots(struct virgl_av1_obu_state *state, const uint32_t *live)
+{
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
+      bool alive = false;
+
+      if (!state->slot_surface[i])
+         continue;
+      for (int k = 0; k < VIRGL_AV1_NUM_REF_FRAMES; k++)
+         if (live[k] == state->slot_surface[i])
+            alive = true;
+      if (!alive)
+         state->slot_surface[i] = 0;
+   }
+}
+
+/* A slot we may overwrite: one holding nothing, a second copy of a picture we keep elsewhere,
+ * or one holding a picture the guest no longer lists. -1 when all eight are needed. */
+static int dead_slot(const struct virgl_av1_obu_state *state, const uint32_t *live)
+{
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
+      if (!state->slot_surface[i])
+         return i;
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
+      for (int k = 0; k < i; k++)
+         if (state->slot_surface[k] == state->slot_surface[i])
+            return i;
+   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
+      bool alive = false;
+
+      for (int k = 0; k < VIRGL_AV1_NUM_REF_FRAMES; k++)
+         if (live[k] == state->slot_surface[i])
+            alive = true;
+      if (!alive)
+         return i;
+   }
+   return -1;
+}
+
+/* Map the guest's ref_frame_idx, which indexes its reference map, onto our own slots. */
+static void resolve_refs(const struct virgl_av1_obu_state *state,
+                         const struct virgl_av1_picture_desc *d,
+                         uint8_t our_ref_idx[VIRGL_AV1_REFS_PER_FRAME])
 {
    const typeof(d->picture_parameter) *p = &d->picture_parameter;
-   uint8_t slot;
-
-   /* A surface that has appeared in ref[] since last time is the previous frame's output,
-    * and it sits in the slot we handed that frame. */
-   if (state->have_prev) {
-      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
-         if (d->ref[i] && d->ref[i] != state->prev_ref[i]) {
-            state->slot_surface[state->pending_slot] = d->ref[i];
-            state->slot_valid |= (uint8_t)(1 << state->pending_slot);
-            break;
-         }
-      }
-   }
 
    for (int j = 0; j < VIRGL_AV1_REFS_PER_FRAME; j++) {
       const uint32_t want = d->ref[p->ref_frame_idx[j] & 7];
-
       bool found = false;
 
       our_ref_idx[j] = 0;
@@ -1237,53 +1321,10 @@ static uint8_t assign_slots(struct virgl_av1_obu_state *state,
             found = true;
             break;
          }
-      if (!found && getenv("LIMINA_AV1_SLOT_TRACE"))
+      if (!found && want && getenv("LIMINA_AV1_SLOT_TRACE"))
          fprintf(stderr, "[AV1SLOT] ref %d wants surface %u (guest slot %u): not in our DPB\n",
                  j, want, p->ref_frame_idx[j] & 7);
    }
-
-   /* A key frame refreshes everything, by inference rather than by choice. */
-   if (c->frame_type == AV1_FRAME_SWITCH ||
-       (c->frame_type == AV1_FRAME_KEY && c->show_frame)) {
-      state->pending_slot = 0;
-      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
-         state->slot_surface[i] = 0;
-      state->have_prev = true;
-      memcpy(state->prev_ref, d->ref, sizeof(state->prev_ref));
-      return 0xff;
-   }
-
-   /* Prefer a slot holding nothing, or something the guest no longer keeps live -- ref[] is
-    * exactly the set it still has. Only when every slot is live does the cursor decide. */
-   slot = 0xff;
-   for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES && slot == 0xff; i++) {
-      bool live = false;
-
-      if (!state->slot_surface[i])
-         slot = (uint8_t)i;
-      else {
-         for (int k = 0; k < VIRGL_AV1_NUM_REF_FRAMES; k++)
-            if (d->ref[k] == state->slot_surface[i])
-               live = true;
-         if (!live)
-            slot = (uint8_t)i;
-      }
-   }
-   if (slot == 0xff) {
-      slot = state->next_slot;
-      state->next_slot = (uint8_t)((state->next_slot + 1) % VIRGL_AV1_NUM_REF_FRAMES);
-      if (getenv("LIMINA_AV1_SLOT_TRACE"))
-         fprintf(stderr, "[AV1SLOT] every slot live; evicting %u by cursor\n", slot);
-   }
-   if (getenv("LIMINA_AV1_SLOT_TRACE"))
-      fprintf(stderr, "[AV1SLOT] frame order_hint=%u -> our slot %u\n", p->order_hint, slot);
-
-   state->pending_slot = slot;
-   state->slot_surface[slot] = 0;   /* filled in next frame, once we see the surface */
-   state->have_prev = true;
-   memcpy(state->prev_ref, d->ref, sizeof(state->prev_ref));
-
-   return (uint8_t)(1u << slot);
 }
 
 static void init_frame_ctx(struct frame_ctx *c, const struct virgl_av1_picture_desc *d,
@@ -1351,10 +1392,10 @@ void virgl_av1_obu_state_init(struct virgl_av1_obu_state *state)
  * the tile group is written straight into the caller's buffer instead. */
 #define OBU_SCRATCH 4096
 
-ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
-                                      const struct virgl_av1_picture_desc *desc,
-                                      const void *tiles, size_t tiles_size,
-                                      uint8_t *out, size_t out_size)
+static ssize_t emit_frame(struct virgl_av1_obu_state *state,
+                          const struct virgl_av1_picture_desc *desc,
+                          const void *tiles, size_t tiles_size,
+                          uint8_t refresh, uint8_t *out, size_t out_size)
 {
    uint8_t scratch[OBU_SCRATCH];
    struct seq_params seq;
@@ -1362,12 +1403,10 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
    struct bw w, payload;
    size_t tile_payload_len;
 
-   if (!state || !desc)
-      return -1;
-
    derive_seq(desc, &seq);
    init_frame_ctx(&ctx, desc, &seq);
-   ctx.refresh = assign_slots(state, desc, &ctx, ctx.our_ref_idx);
+   ctx.refresh = refresh;
+   resolve_refs(state, desc, ctx.our_ref_idx);
 
    bw_init(&w, out, out ? out_size : 0);
 
@@ -1420,6 +1459,165 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
    update_state(state, desc, &ctx);
 
    return (ssize_t)w.pos;
+}
+
+/* Emit the held frame. `live` is the guest reference map from the descriptor that follows it,
+ * which is exactly where the guest's own choice of slot becomes visible: if the held picture
+ * is in it, the guest stored it and so must we; if it is absent, the guest kept nothing and a
+ * frame it never stored can never be referenced. */
+static ssize_t flush_held(struct virgl_av1_obu_state *state,
+                          const uint32_t *before, const uint32_t *live,
+                          uint8_t *out, size_t out_size)
+{
+   uint32_t surface;
+   uint8_t refresh = 0;
+   int slot = -1;
+   ssize_t n;
+
+   if (!state->held)
+      return 0;
+
+   surface = live ? new_surface(before, live) : 0;
+   if (surface) {
+      slot = dead_slot(state, live);
+      if (slot >= 0)
+         refresh = (uint8_t)(1u << slot);
+      else if (getenv("LIMINA_AV1_SLOT_TRACE"))
+         fprintf(stderr, "[AV1SLOT] held frame stored by the guest but our slots are all live\n");
+   }
+
+   n = emit_frame(state, &state->held_desc, state->held_tiles, state->held_tiles_size,
+                  refresh, out, out_size);
+   state->held = false;
+   if (n < 0)
+      return n;
+
+   if (slot >= 0) {
+      state->slot_surface[slot] = surface;
+      state->slot_valid |= (uint8_t)(1u << slot);
+   }
+   return n;
+}
+
+static bool hold_frame(struct virgl_av1_obu_state *state,
+                       const struct virgl_av1_picture_desc *desc,
+                       const void *tiles, size_t tiles_size)
+{
+   if (tiles_size > state->held_tiles_cap) {
+      uint8_t *p = realloc(state->held_tiles, tiles_size);
+
+      if (!p)
+         return false;
+      state->held_tiles = p;
+      state->held_tiles_cap = tiles_size;
+   }
+   if (tiles_size)
+      memcpy(state->held_tiles, tiles, tiles_size);
+   state->held_desc = *desc;
+   state->held_tiles_size = tiles_size;
+   state->held = true;
+   return true;
+}
+
+ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
+                                      const struct virgl_av1_picture_desc *desc,
+                                      const void *tiles, size_t tiles_size,
+                                      uint8_t *out, size_t out_size)
+{
+   const typeof(desc->picture_parameter) *p;
+   uint8_t refresh;
+   ssize_t n = 0, r;
+   int slot;
+
+   if (!state || !desc)
+      return -1;
+   p = &desc->picture_parameter;
+
+   /* A frame held from the previous submission goes first: decode order is preserved, and
+    * this descriptor's ref[] is what makes its refresh exact. */
+   r = flush_held(state, state->prev_ref, desc->ref, out, out_size);
+   if (r < 0)
+      return r;
+   n = r;
+
+   /* Learn where a frame we emitted immediately ended up. Its slot was chosen when it was
+    * written; only the surface that landed there was still unknown. */
+   if (state->pending_unlearned) {
+      const uint32_t surface = new_surface(state->prev_ref, desc->ref);
+
+      if (surface) {
+         state->slot_surface[state->pending_slot] = surface;
+         state->slot_valid |= (uint8_t)(1u << state->pending_slot);
+      }
+      state->pending_unlearned = false;
+   }
+
+   prune_slots(state, desc->ref);
+   memcpy(state->prev_ref, desc->ref, sizeof(state->prev_ref));
+
+   /* A key frame refreshes everything, by inference rather than by choice, and resets our
+    * model with it. Its own surface is learned on the next submission, like any frame we
+    * emit immediately. */
+   if (p->pic_info_fields.frame_type == AV1_FRAME_SWITCH ||
+       (p->pic_info_fields.frame_type == AV1_FRAME_KEY &&
+        p->pic_info_fields.show_frame)) {
+      for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++)
+         state->slot_surface[i] = 0;
+      r = emit_frame(state, desc, tiles, tiles_size, 0xff, out ? out + n : NULL,
+                     out ? out_size - n : 0);
+      if (r < 0)
+         return r;
+      state->pending_slot = 0;
+      state->pending_unlearned = true;
+      state->have_prev = true;
+      return n + r;
+   }
+
+   /* A hidden frame waits one submission so its refresh can be exact. */
+   if (!p->pic_info_fields.show_frame) {
+      if (!hold_frame(state, desc, tiles, tiles_size))
+         return -1;
+      return n;
+   }
+
+   /* A shown frame is emitted now, into a slot nothing live occupies. When there is none,
+    * store nothing rather than evict a picture a later frame may still want. */
+   slot = dead_slot(state, desc->ref);
+   refresh = slot >= 0 ? (uint8_t)(1u << slot) : 0;
+   r = emit_frame(state, desc, tiles, tiles_size, refresh, out ? out + n : NULL,
+                  out ? out_size - n : 0);
+   if (r < 0)
+      return r;
+   if (slot >= 0) {
+      state->slot_surface[slot] = 0;   /* the surface is learned on the next submission */
+      state->slot_valid |= (uint8_t)(1u << slot);
+      state->pending_slot = (uint8_t)slot;
+      state->pending_unlearned = true;
+   }
+   state->have_prev = true;
+   return n + r;
+}
+
+/*
+ * Emit whatever is still held. Nothing follows to reveal where the guest stored it, and
+ * nothing that follows can reference it either, so it is written storing nothing.
+ */
+ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
+                                      uint8_t *out, size_t out_size)
+{
+   if (!state)
+      return -1;
+   return flush_held(state, state->prev_ref, NULL, out, out_size);
+}
+
+void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state)
+{
+   if (!state)
+      return;
+   free(state->held_tiles);
+   state->held_tiles = NULL;
+   state->held_tiles_cap = state->held_tiles_size = 0;
+   state->held = false;
 }
 
 ssize_t virgl_av1_build_av1c(struct virgl_av1_obu_state *state,

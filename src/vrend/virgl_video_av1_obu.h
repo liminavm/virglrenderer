@@ -45,7 +45,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct virgl_av1_picture_desc;
+#include "virgl_video_hw.h"
 
 #define VIRGL_AV1_NUM_REF_FRAMES     8
 #define VIRGL_AV1_REFS_PER_FRAME     7
@@ -80,10 +80,23 @@ struct virgl_av1_obu_state {
     * ref[], where its surface has appeared. So a slot is chosen for each frame immediately
     * (emission cannot wait), and which surface ended up there is learned one frame later.
     * That is never too late: a frame cannot reference itself. */
-   uint32_t prev_ref[VIRGL_AV1_NUM_REF_FRAMES];  /* the previous frame's ref[] */
    uint32_t slot_surface[VIRGL_AV1_NUM_REF_FRAMES]; /* surface we placed in each of our slots */
+
+   /* A hidden frame held for one submission. Which slot the guest stored a frame in is only
+    * visible in the *next* frame's ref[], and guessing it evicts pictures later frames still
+    * reference. Hidden frames can wait -- nothing needs their pixels until a later
+    * show_existing -- so they are emitted once the answer is in. */
+   struct virgl_av1_picture_desc held_desc;
+   uint8_t *held_tiles;
+   size_t held_tiles_size;
+   size_t held_tiles_cap;
+   bool held;
+   /* The guest's reference map as of the previous submission. What a frame stored is the
+    * difference between that map and the next one. */
+   uint32_t prev_ref[VIRGL_AV1_NUM_REF_FRAMES];
    uint8_t pending_slot;      /* the slot the previous frame was given */
    uint8_t next_slot;         /* round-robin cursor for eviction */
+   bool pending_unlearned;    /* the previous frame's surface is not yet identified */
    bool have_prev;
 
    /* Set once the first sequence header has been derived, so callers can build an av1C
@@ -93,6 +106,11 @@ struct virgl_av1_obu_state {
 
 /* Reset to the state implied by "no frames decoded yet". */
 void virgl_av1_obu_state_init(struct virgl_av1_obu_state *state);
+void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state);
+
+/* Emit any frame still held. Call once the last frame has been submitted. */
+ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
+                                      uint8_t *out, size_t out_size);
 
 /*
  * Build one temporal unit -- temporal delimiter, sequence header, frame header and tile
