@@ -176,7 +176,8 @@ endif
 # host codec backend, of which exactly one is built.
 video_sources = ['vrend/vrend_video.c']
 if host_machine.system() == 'darwin'
-   video_sources += ['vrend/virgl_video_vt.c', 'vrend/virgl_video_av1_obu.c']
+   video_sources += ['vrend/virgl_video_vt.c', 'vrend/virgl_video_av1_obu.c',
+                     'vrend/virgl_video_dav1d.c']
 else
    video_sources += ['vrend/virgl_video.c']
 endif

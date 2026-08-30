@@ -451,6 +451,18 @@ if with_video
      video_deps = [dependency('appleframeworks',
                               modules : ['VideoToolbox', 'CoreMedia',
                                          'CoreVideo', 'CoreFoundation'])]
+     # A software AV1 decoder for the streams VideoToolbox will not hand back correctly
+     # (super-resolution -- see src/vrend/virgl_video_dav1d.c). Optional: without it those
+     # frames are refused rather than shown wrong, which is a worse experience but not an
+     # incorrect one, so a build without dav1d stays valid.
+     dav1d_dep = dependency('dav1d', required: false)
+     if dav1d_dep.found()
+        conf_data.set('HAVE_DAV1D', 1)
+        video_deps += dav1d_dep
+     else
+        warning('dav1d not found: AV1 super-resolution streams will be refused rather ' +
+                'than decoded in software')
+     endif
   else
      video_deps = [dependency('libva'), dependency('libva-drm')]
   endif

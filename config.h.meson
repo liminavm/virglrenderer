@@ -56,6 +56,7 @@
 #mesondefine HAVE_LINUX_UDMABUF_H
 #mesondefine HAVE_DLFCN_H
 #mesondefine ENABLE_VIDEO
+#mesondefine HAVE_DAV1D
 #mesondefine ENABLE_TRACING
 #mesondefine ENABLE_TESTS
 #mesondefine UTIL_ARCH_LITTLE_ENDIAN
