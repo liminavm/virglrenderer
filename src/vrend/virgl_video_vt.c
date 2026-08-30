@@ -70,6 +70,7 @@
 #include "virgl_video_hw.h"
 #include "virgl_util.h"
 #include "virgl_video.h"
+#include "virgl_video_av1_obu.h"
 
 /* Advertised ceiling. VideoToolbox's VP9 decoder goes higher on current silicon,
  * but nothing we can query says by how much, and the guest only uses this to size
@@ -101,12 +102,40 @@ struct virgl_video_codec {
     /* AV1 fixture capture only: how many frames have been recorded. */
     unsigned av1_capture_seq;
 
-    /* The picture in flight: bitstream accumulated across decode_bitstream calls,
-     * and the target the completed picture belongs to. */
+    /* Whether this host's VideoToolbox can decode AV1 at all. When it cannot, the codec is
+     * still created so fixtures can be recorded, but nothing is submitted. */
+    bool av1_decode;
+
+    /* AV1 only. The guest's descriptor carries no bitstream, so one is synthesized: the
+     * serializer holds the reference-slot model, and one hidden frame when the guest's DPB
+     * is full, because which picture it evicted is only visible in the next descriptor. */
+    struct virgl_av1_obu_state av1;
+    struct virgl_av1_picture_desc av1_desc;
+    bool av1_desc_valid;
+
+    /* The target of a frame the serializer is holding. The guest has moved on to later
+     * frames by the time that unit is emitted, so its destination has to be kept here.
+     * NULL means the buffer was destroyed underneath us: the frame still has to be
+     * decoded, or the decoder's reference list loses it, but its picture goes nowhere. */
+    struct virgl_video_buffer *held_target;
+
+    /* One temporal unit, built here and submitted as its own sample. */
+    uint8_t *unit;
+    size_t unit_cap;
+
+    /* Codec configuration record (vpcC or av1C), and the one the live session was built
+     * from -- an AV1 sequence header can change mid-stream. */
+    uint8_t frame_config[256];
+    size_t frame_config_len;
+    uint8_t session_config[256];
+    size_t session_config_len;
+
+    /* The picture in flight: the bitstream accumulated across decode_bitstream calls. The
+     * target is not kept here -- every path that needs one is handed it explicitly, because
+     * a held frame's target is not the current frame's. */
     uint8_t *bitstream;
     size_t bitstream_len;
     size_t bitstream_cap;
-    struct virgl_video_buffer *target;
 
     /* The decoded picture, parked by the output callback for end_frame to deliver.
      * See decode_output() for why it cannot be delivered where it arrives. */
@@ -130,6 +159,30 @@ struct virgl_video_buffer {
 
 static struct virgl_video_callbacks *video_cbs;
 static uint32_t next_buffer_id = 1;
+
+/* AV1 codecs currently alive. destroy_buffer is handed a buffer and nothing else, so
+ * finding the codec that is holding a frame for it needs a way back. Only AV1 codecs are
+ * registered, since only they hold frames. */
+#define MAX_LIVE_CODECS 16
+static struct virgl_video_codec *live_codecs[MAX_LIVE_CODECS];
+static unsigned num_live_codecs;
+
+static void codec_register(struct virgl_video_codec *codec)
+{
+    if (num_live_codecs < MAX_LIVE_CODECS)
+        live_codecs[num_live_codecs++] = codec;
+    else
+        virgl_error("video: too many live codecs to track held frames\n");
+}
+
+static void codec_unregister(struct virgl_video_codec *codec)
+{
+    for (unsigned i = 0; i < num_live_codecs; i++)
+        if (live_codecs[i] == codec) {
+            live_codecs[i] = live_codecs[--num_live_codecs];
+            return;
+        }
+}
 
 /* LIMINA_VIDEO_TRACE=1 narrates the decode path to the worker log. virgl_error()
  * goes to a logger the embedder may not have installed, and the failure modes here
@@ -277,7 +330,15 @@ struct virgl_video_codec *virgl_video_create_codec(
     codec->height = args->height;
     codec->opaque = args->opaque;
 
-    VT_TRACE("create_codec: profile %d %ux%u\n", args->profile, args->width, args->height);
+    if (args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
+        codec->av1_decode = vt_can_decode(kCMVideoCodecType_AV1);
+        virgl_av1_obu_state_init(&codec->av1);
+        codec_register(codec);
+    }
+
+    VT_TRACE("create_codec: profile %d %ux%u%s\n", args->profile, args->width, args->height,
+             args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN && !codec->av1_decode
+                 ? " (no AV1 silicon; capture only)" : "");
 
     return codec;
 }
@@ -300,9 +361,18 @@ void virgl_video_destroy_codec(struct virgl_video_codec *codec)
     if (!codec)
         return;
 
+    codec_unregister(codec);
+
+    /* Drop a held frame rather than decoding it. Its picture could only be collected by a
+     * guest that is tearing the codec down, and decoding here would do GL work on a
+     * teardown path for a result nobody reads. */
+    virgl_av1_drop_held(&codec->av1);
+    virgl_av1_obu_state_fini(&codec->av1);
+
     destroy_session(codec);
     if (codec->pending)
         CFRelease(codec->pending);
+    free(codec->unit);
     free(codec->bitstream);
     free(codec);
 }
@@ -340,6 +410,17 @@ struct virgl_video_buffer *virgl_video_create_buffer(
 
 void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
 {
+    /* A held frame's target can be destroyed before the frame is emitted, which would
+     * leave a dangling pointer to write a picture into. The frame itself still has to be
+     * decoded when its turn comes -- the decoder's reference list needs it -- so only the
+     * destination is dropped. */
+    for (unsigned i = 0; i < num_live_codecs; i++)
+        if (live_codecs[i]->held_target == buffer) {
+            VT_TRACE("av1: the held frame's target was destroyed; it will decode "
+                     "without being delivered\n");
+            live_codecs[i]->held_target = NULL;
+        }
+
     free(buffer);
 }
 
@@ -398,7 +479,8 @@ static CFDataRef build_vpcc(uint8_t profile, uint8_t bit_depth, uint8_t subsampl
  * than exported — see the `map` member of struct virgl_video_dma_buf_plane. The
  * mapping lives only for the duration of the callback, which is all vrend needs:
  * it copies each plane into the guest-visible resource and returns. */
-static void deliver_picture(struct virgl_video_codec *codec, CVPixelBufferRef pixbuf)
+static void deliver_picture(struct virgl_video_codec *codec, CVPixelBufferRef pixbuf,
+                            struct virgl_video_buffer *target)
 {
     struct virgl_video_dma_buf dmabuf;
     size_t num_planes;
@@ -416,14 +498,14 @@ static void deliver_picture(struct virgl_video_codec *codec, CVPixelBufferRef pi
         num_planes = ARRAY_SIZE(dmabuf.planes);
 
     memset(&dmabuf, 0, sizeof(dmabuf));
-    dmabuf.buf = codec->target;
+    dmabuf.buf = target;
     dmabuf.width = (uint32_t)CVPixelBufferGetWidth(pixbuf);
     dmabuf.height = (uint32_t)CVPixelBufferGetHeight(pixbuf);
     dmabuf.flags = VIRGL_VIDEO_DMABUF_READ_ONLY;
     dmabuf.num_planes = (uint32_t)num_planes;
 
     /* CoreVideo's planar output is Y,Cb,Cr; YV12 wants Y,Cr,Cb. */
-    const bool swap_chroma = codec->target && codec->target->format == PIPE_FORMAT_YV12;
+    const bool swap_chroma = target && target->format == PIPE_FORMAT_YV12;
 
     for (size_t i = 0; i < num_planes; i++) {
         size_t src = i;
@@ -486,13 +568,15 @@ static void decode_output(void *codec_ref, void *frame_ref, OSStatus status,
 /* Create (or recreate) the decompression session. VP9 streams can change resolution
  * or bit depth at a keyframe, so the session is keyed on the shape of the frame we
  * are about to decode rather than built once from the codec's creation arguments. */
-static int ensure_session(struct virgl_video_codec *codec)
+static int ensure_session(struct virgl_video_codec *codec,
+                          struct virgl_video_buffer *target)
 {
-    CFDataRef vpcc;
+    CFDataRef config;
     CFMutableDictionaryRef atoms, extensions, pixel_attrs, empty;
     CFNumberRef pixel_format_num;
     VTDecompressionOutputCallbackRecord callback;
-    enum pipe_format target_format = codec->target ? codec->target->format : PIPE_FORMAT_NV12;
+    const bool av1 = codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN;
+    enum pipe_format target_format = target ? target->format : PIPE_FORMAT_NV12;
     int32_t pixel_format = cv_format_for(target_format);
     OSStatus status;
 
@@ -507,21 +591,29 @@ static int ensure_session(struct virgl_video_codec *codec)
         codec->session_profile == codec->frame_profile &&
         codec->session_bit_depth == codec->frame_bit_depth &&
         codec->session_subsampling == codec->frame_subsampling &&
-        codec->session_target_format == target_format)
+        codec->session_target_format == target_format &&
+        codec->session_config_len == codec->frame_config_len &&
+        !memcmp(codec->session_config, codec->frame_config, codec->frame_config_len))
         return 0;
 
     destroy_session(codec);
 
-    vpcc = build_vpcc(codec->frame_profile, codec->frame_bit_depth,
-                      codec->frame_subsampling);
-    if (!vpcc)
+    /* AV1 carries a whole sequence header OBU in its av1C, so unlike VP9's six scalars it
+     * is built by the serializer and simply handed over here. */
+    if (av1)
+        config = CFDataCreate(kCFAllocatorDefault, codec->frame_config,
+                              (CFIndex)codec->frame_config_len);
+    else
+        config = build_vpcc(codec->frame_profile, codec->frame_bit_depth,
+                            codec->frame_subsampling);
+    if (!config)
         return -1;
 
     atoms = CFDictionaryCreateMutable(kCFAllocatorDefault, 1,
                                       &kCFTypeDictionaryKeyCallBacks,
                                       &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(atoms, CFSTR("vpcC"), vpcc);
-    CFRelease(vpcc);
+    CFDictionarySetValue(atoms, av1 ? CFSTR("av1C") : CFSTR("vpcC"), config);
+    CFRelease(config);
 
     extensions = CFDictionaryCreateMutable(kCFAllocatorDefault, 1,
                                            &kCFTypeDictionaryKeyCallBacks,
@@ -531,7 +623,9 @@ static int ensure_session(struct virgl_video_codec *codec)
                          atoms);
     CFRelease(atoms);
 
-    status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_VP9,
+    status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
+                                            av1 ? kCMVideoCodecType_AV1
+                                                : kCMVideoCodecType_VP9,
                                             codec->frame_width, codec->frame_height,
                                             extensions, &codec->format);
     CFRelease(extensions);
@@ -578,6 +672,8 @@ static int ensure_session(struct virgl_video_codec *codec)
     codec->session_bit_depth = codec->frame_bit_depth;
     codec->session_subsampling = codec->frame_subsampling;
     codec->session_target_format = target_format;
+    memcpy(codec->session_config, codec->frame_config, codec->frame_config_len);
+    codec->session_config_len = codec->frame_config_len;
 
     return 0;
 }
@@ -589,7 +685,6 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
         return -1;
 
     codec->bitstream_len = 0;
-    codec->target = target;
     VT_TRACE("begin_frame: target %u\n", target->id);
 
     return 0;
@@ -608,6 +703,9 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
  *
  * The descriptor is written raw. It is an ABI-shaped dump consumed only by a spike built from
  * this same tree on the same machine, never a persisted format. */
+static int av1_flush_held(struct virgl_video_codec *codec,
+                          const struct virgl_av1_picture_desc *desc);
+
 static int av1_decode_bitstream(struct virgl_video_codec *codec,
                                 const union virgl_picture_desc *desc,
                                 unsigned num_buffers,
@@ -616,46 +714,98 @@ static int av1_decode_bitstream(struct virgl_video_codec *codec,
 {
     const char *dir = av1_capture_dir();
     const struct virgl_av1_picture_desc *av1 = &desc->av1;
-    char path[1024];
-    FILE *f;
+    const __typeof__(av1->picture_parameter) *p = &av1->picture_parameter;
+    size_t needed = codec->bitstream_len;
+    ssize_t av1c;
 
-    if (!dir) {
-        virgl_error("video: AV1 decode is not implemented yet "
-                    "(set LIMINA_AV1_CAPTURE to record fixtures)\n");
+    if (!codec->av1_decode && !dir) {
+        virgl_error("video: this host cannot decode AV1 "
+                    "(set LIMINA_AV1_CAPTURE to record fixtures instead)\n");
         return -1;
     }
 
-    snprintf(path, sizeof(path), "%s/frame%05u.desc", dir, codec->av1_capture_seq);
-    if ((f = fopen(path, "wb"))) {
-        fwrite(av1, sizeof(*av1), 1, f);
-        fclose(f);
-    } else {
-        virgl_error("video: cannot write AV1 fixture %s\n", path);
+    if (dir) {
+        char path[1024];
+        FILE *f;
+
+        snprintf(path, sizeof(path), "%s/frame%05u.desc", dir, codec->av1_capture_seq);
+        if ((f = fopen(path, "wb"))) {
+            fwrite(av1, sizeof(*av1), 1, f);
+            fclose(f);
+        } else {
+            virgl_error("video: cannot write AV1 fixture %s\n", path);
+            return -1;
+        }
+
+        snprintf(path, sizeof(path), "%s/frame%05u.tile", dir, codec->av1_capture_seq);
+        if ((f = fopen(path, "wb"))) {
+            for (unsigned i = 0; i < num_buffers; i++)
+                if (buffers[i] && sizes[i])
+                    fwrite(buffers[i], sizes[i], 1, f);
+            fclose(f);
+        }
+
+        VT_TRACE("av1 capture %u: %ux%u frame_type %u show %u primary_ref %u tiles %ux%u "
+                 "slices %u, %u buffers\n",
+                 codec->av1_capture_seq,
+                 av1->picture_parameter.frame_width, av1->picture_parameter.frame_height,
+                 av1->picture_parameter.pic_info_fields.frame_type,
+                 av1->picture_parameter.pic_info_fields.show_frame,
+                 av1->picture_parameter.primary_ref_frame,
+                 av1->picture_parameter.tile_cols, av1->picture_parameter.tile_rows,
+                 av1->slice_parameter.slice_count, num_buffers);
+
+        codec->av1_capture_seq++;
+    }
+
+    if (!codec->av1_decode)
+        return 0;
+
+    /* First: emit whatever frame is being held. This descriptor is what makes its
+     * reference slot exact, and the serializer ignores the repeat calls a frame whose tile
+     * data arrives in several buffers produces. */
+    if (av1_flush_held(codec, av1) < 0)
+        return -1;
+
+    /* The frame's own unit cannot be built yet -- more tile data may still arrive -- so
+     * keep the descriptor for end_frame. Every call in a frame carries the same one. */
+    codec->av1_desc = *av1;
+    codec->av1_desc_valid = true;
+
+    codec->frame_width = p->frame_width ? p->frame_width : codec->width;
+    codec->frame_height = p->frame_height ? p->frame_height : codec->height;
+    codec->frame_bit_depth = p->bit_depth_idx ? 10 : 8;
+    codec->frame_profile = p->profile;
+    codec->frame_subsampling = 1;
+
+    av1c = virgl_av1_build_av1c(&codec->av1, av1, codec->frame_config,
+                                sizeof(codec->frame_config));
+    if (av1c < 0) {
+        virgl_error("video: could not build the AV1 configuration record\n");
         return -1;
     }
+    codec->frame_config_len = (size_t)av1c;
 
-    snprintf(path, sizeof(path), "%s/frame%05u.tile", dir, codec->av1_capture_seq);
-    if ((f = fopen(path, "wb"))) {
-        for (unsigned i = 0; i < num_buffers; i++)
-            if (buffers[i] && sizes[i])
-                fwrite(buffers[i], sizes[i], 1, f);
-        fclose(f);
+    for (unsigned i = 0; i < num_buffers; i++)
+        needed += sizes[i];
+
+    if (needed > codec->bitstream_cap) {
+        uint8_t *grown = realloc(codec->bitstream, needed);
+        if (!grown) {
+            virgl_error("video: out of memory growing the tile buffer\n");
+            return -1;
+        }
+        codec->bitstream = grown;
+        codec->bitstream_cap = needed;
     }
 
-    VT_TRACE("av1 capture %u: %ux%u frame_type %u show %u primary_ref %u tiles %ux%u "
-             "slices %u, %u buffers\n",
-             codec->av1_capture_seq,
-             av1->picture_parameter.frame_width, av1->picture_parameter.frame_height,
-             av1->picture_parameter.pic_info_fields.frame_type,
-             av1->picture_parameter.pic_info_fields.show_frame,
-             av1->picture_parameter.primary_ref_frame,
-             av1->picture_parameter.tile_cols, av1->picture_parameter.tile_rows,
-             av1->slice_parameter.slice_count, num_buffers);
+    for (unsigned i = 0; i < num_buffers; i++) {
+        if (!buffers[i] || !sizes[i])
+            continue;
+        memcpy(codec->bitstream + codec->bitstream_len, buffers[i], sizes[i]);
+        codec->bitstream_len += sizes[i];
+    }
 
-    codec->av1_capture_seq++;
-
-    /* Report success with no picture. ffmpeg keeps submitting frames because every
-     * descriptor comes from its own parse, not from anything we return. */
     return 0;
 }
 
@@ -730,8 +880,18 @@ int virgl_video_encode_bitstream(struct virgl_video_codec *codec,
     return -1;
 }
 
-int virgl_video_end_frame(struct virgl_video_codec *codec,
-                          struct virgl_video_buffer *target)
+/*
+ * Decode one temporal unit and put its picture in `target`.
+ *
+ * One unit per sample, always. A sample carrying two would come back as one picture (or
+ * two callbacks, the second releasing the first), and the frame that lost its picture is
+ * silently never delivered -- the guest reads whatever its surface held before.
+ *
+ * `target` may be NULL: the unit is still decoded, because the decoder's own reference
+ * list needs it, but nothing collects the picture.
+ */
+static int submit_unit(struct virgl_video_codec *codec, const uint8_t *data, size_t len,
+                       struct virgl_video_buffer *target)
 {
     CMBlockBufferRef block = NULL;
     CMSampleBufferRef sample = NULL;
@@ -739,37 +899,25 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
     OSStatus status;
     int err = 0;
 
-    if (!codec || !target)
-        return -1;
-
-    if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN)
-        return 0; /* phase 0 capture: nothing was accumulated and nothing decodes */
-
-    VT_TRACE("end_frame: %zu bytes\n", codec->bitstream_len);
-
-    if (!codec->bitstream_len)
+    if (!len)
         return 0;
 
-    codec->target = target;
-
-    if (ensure_session(codec) < 0)
+    if (ensure_session(codec, target) < 0)
         return -1;
 
-    /* kCFAllocatorNull: the sample borrows our accumulation buffer rather than
-     * copying it. Safe because the decode is synchronous and the buffer outlives
-     * the call. */
-    status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, codec->bitstream,
-                                                codec->bitstream_len, kCFAllocatorNull,
-                                                NULL, 0, codec->bitstream_len, 0, &block);
+    /* kCFAllocatorNull: the sample borrows our buffer rather than copying it. Safe because
+     * the decode is synchronous and the buffer outlives the call. */
+    status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, (void *)(uintptr_t)data,
+                                                len, kCFAllocatorNull,
+                                                NULL, 0, len, 0, &block);
     if (status != noErr) {
         virgl_error("video: CMBlockBufferCreateWithMemoryBlock failed, status %d\n",
                     (int)status);
         return -1;
     }
 
-    const size_t sample_size = codec->bitstream_len;
     status = CMSampleBufferCreate(kCFAllocatorDefault, block, TRUE, NULL, NULL,
-                                  codec->format, 1, 0, NULL, 1, &sample_size, &sample);
+                                  codec->format, 1, 0, NULL, 1, &len, &sample);
     if (status != noErr) {
         virgl_error("video: CMSampleBufferCreate failed, status %d\n", (int)status);
         CFRelease(block);
@@ -786,12 +934,11 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
     CFRelease(sample);
     CFRelease(block);
 
-    codec->bitstream_len = 0;
-
     /* Back on the vrend thread, with the GL context current: now the picture can be
      * copied into the guest's resources. */
     if (codec->pending) {
-        deliver_picture(codec, codec->pending);
+        if (target)
+            deliver_picture(codec, codec->pending, target);
         CFRelease(codec->pending);
         codec->pending = NULL;
     } else if (!err) {
@@ -800,4 +947,103 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
     }
 
     return err;
+}
+
+/* Grow the temporal-unit buffer to at least `want` bytes. */
+static bool ensure_unit(struct virgl_video_codec *codec, size_t want)
+{
+    uint8_t *grown;
+
+    if (want <= codec->unit_cap)
+        return true;
+    grown = realloc(codec->unit, want);
+    if (!grown) {
+        virgl_error("video: out of memory growing the temporal unit buffer\n");
+        return false;
+    }
+    codec->unit = grown;
+    codec->unit_cap = want;
+    return true;
+}
+
+/*
+ * Emit the frame the serializer is holding, if any. Called as soon as a descriptor is in
+ * hand, because that descriptor is what settles the held frame's reference slot -- and
+ * because a stream may display a hidden frame just one decode later, which leaves no
+ * margin: nothing waits on delivery, so a picture that arrives late is read as a stale
+ * surface rather than waited for.
+ */
+static int av1_flush_held(struct virgl_video_codec *codec,
+                          const struct virgl_av1_picture_desc *desc)
+{
+    struct virgl_video_buffer *target = codec->held_target;
+    ssize_t n;
+
+    if (!ensure_unit(codec, virgl_av1_held_bound(&codec->av1) + VIRGL_AV1_UNIT_OVERHEAD))
+        return -1;
+
+    n = virgl_av1_flush_held(&codec->av1, desc, codec->unit, codec->unit_cap);
+    if (n < 0) {
+        virgl_error("video: could not serialize the held AV1 frame\n");
+        return -1;
+    }
+    if (!n)
+        return 0;
+
+    codec->held_target = NULL;
+    VT_TRACE("av1: flushing the held frame, %zd bytes\n", n);
+    return submit_unit(codec, codec->unit, (size_t)n, target);
+}
+
+int virgl_video_end_frame(struct virgl_video_codec *codec,
+                          struct virgl_video_buffer *target)
+{
+    if (!codec || !target)
+        return -1;
+
+    if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
+        ssize_t n;
+
+        if (!codec->av1_decode || !codec->av1_desc_valid) {
+            codec->bitstream_len = 0;
+            return 0;   /* capture-only: nothing was accumulated to decode */
+        }
+
+        if (!ensure_unit(codec, codec->bitstream_len + VIRGL_AV1_UNIT_OVERHEAD))
+            return -1;
+
+        n = virgl_av1_build_temporal_unit(&codec->av1, &codec->av1_desc,
+                                          codec->bitstream, codec->bitstream_len,
+                                          codec->unit, codec->unit_cap);
+        codec->bitstream_len = 0;
+        codec->av1_desc_valid = false;
+        if (n < 0) {
+            virgl_error("video: could not serialize the AV1 frame\n");
+            return -1;
+        }
+
+        /* Nothing emitted means the serializer is holding this frame until the next
+         * descriptor says which slot the guest stored it in. Its target has to be kept:
+         * by the time it is emitted, the guest is several frames further on. */
+        if (!n) {
+            codec->held_target = target;
+            VT_TRACE("av1: holding this frame\n");
+            return 0;
+        }
+
+        VT_TRACE("av1: %zd bytes\n", n);
+        return submit_unit(codec, codec->unit, (size_t)n, target);
+    }
+
+    VT_TRACE("end_frame: %zu bytes\n", codec->bitstream_len);
+
+    if (!codec->bitstream_len)
+        return 0;
+
+    {
+        const size_t len = codec->bitstream_len;
+
+        codec->bitstream_len = 0;
+        return submit_unit(codec, codec->bitstream, len, target);
+    }
 }

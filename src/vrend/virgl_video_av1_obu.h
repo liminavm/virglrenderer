@@ -51,6 +51,12 @@
 #define VIRGL_AV1_REFS_PER_FRAME     7
 #define VIRGL_AV1_WARP_PARAMS        6
 
+/* Room a temporal unit needs beyond its tile payload: temporal delimiter, sequence header,
+ * frame header and the OBU framing around them. The real total is well under a hundred
+ * bytes; this is deliberately loose so a caller can size a buffer without a trial run,
+ * which the serializer cannot offer because building advances its state. */
+#define VIRGL_AV1_UNIT_OVERHEAD   4096
+
 struct virgl_av1_obu_state {
    /* Saved warp parameters per reference slot. global_motion_param() codes each value as a
     * subexp delta against the primary reference's saved params, so a writer holding only
@@ -110,6 +116,9 @@ struct virgl_av1_obu_state {
 /* Reset to the state implied by "no frames decoded yet". */
 void virgl_av1_obu_state_init(struct virgl_av1_obu_state *state);
 void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state);
+
+/* Bytes a held frame's temporal unit can need, or 0 when none is held. */
+size_t virgl_av1_held_bound(const struct virgl_av1_obu_state *state);
 
 /*
  * Emit the frame held from the previous submission, if any, and advance the model onto

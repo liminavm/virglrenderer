@@ -470,7 +470,7 @@ struct frame_ctx {
  * loop restoration sections appear in the bitstream at all -- not merely what they say. */
 static void derive_lossless(struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
    c->coded_lossless = true;
    for (int i = 0; i < 8; i++) {
@@ -495,7 +495,7 @@ static void derive_lossless(struct frame_ctx *c)
 
 static void write_superres_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    uint32_t denom = 8; /* SUPERRES_NUM */
 
    flag(w, p->pic_info_fields.use_superres);
@@ -527,7 +527,7 @@ static void write_render_size(struct bw *w)
  * because it is both shorter and what the original stream said. */
 static void write_tile_info(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    const int mi_cols = 2 * ((c->frame_width + 7) >> 3);
    const int mi_rows = 2 * ((c->frame_height + 7) >> 3);
    const int sb_shift = c->s->use_128x128_superblock ? 5 : 4;
@@ -639,7 +639,7 @@ static void write_delta_q(struct bw *w, int8_t v)
 
 static void write_quantization_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
    f(w, 8, p->base_qindex);
    write_delta_q(w, p->y_dc_delta_q);
@@ -672,7 +672,7 @@ static void write_segmentation_params(struct bw *w, struct frame_ctx *c)
 {
    static const uint8_t bits[8] = { 8, 6, 6, 6, 6, 3, 0, 0 };
    static const uint8_t is_signed[8] = { 1, 1, 1, 1, 1, 0, 0, 0 };
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    const bool enabled = p->seg_info.segment_info_fields.enabled;
 
    flag(w, enabled);
@@ -703,7 +703,7 @@ static void write_segmentation_params(struct bw *w, struct frame_ctx *c)
 
 static void write_loop_filter_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
    if (c->coded_lossless || p->pic_info_fields.allow_intrabc)
       return;
@@ -736,7 +736,7 @@ static void write_loop_filter_params(struct bw *w, struct frame_ctx *c)
 
 static void write_cdef_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
    if (c->coded_lossless || p->pic_info_fields.allow_intrabc || !c->s->enable_cdef)
       return;
@@ -770,7 +770,7 @@ static uint32_t lr_type_to_coded(uint32_t type)
 
 static void write_lr_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    uint32_t types[3];
    bool uses_lr = false, uses_chroma_lr = false;
 
@@ -805,7 +805,7 @@ static void write_lr_params(struct bw *w, struct frame_ctx *c)
 static void write_gm_param(struct bw *w, struct frame_ctx *c, const int32_t *prev,
                            const int32_t *wmmat, uint32_t type, int idx)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    unsigned abs_bits, prec_bits, prec_diff;
    int32_t round, sub, mx, r, v;
 
@@ -849,7 +849,7 @@ static void write_global_motion_params(struct bw *w, struct frame_ctx *c,
    static const int32_t default_warp[VIRGL_AV1_WARP_PARAMS] = {
       0, 0, 1 << WARPEDMODEL_PREC_BITS, 0, 0, 1 << WARPEDMODEL_PREC_BITS
    };
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
 
    if (c->frame_is_intra)
       return;
@@ -890,7 +890,7 @@ static void write_global_motion_params(struct bw *w, struct frame_ctx *c,
  * would otherwise point at, so inheriting is not expressible while writing always is. */
 static void write_film_grain_params(struct bw *w, struct frame_ctx *c)
 {
-   const typeof(c->d->picture_parameter.film_grain_info) *g =
+   const __typeof__(c->d->picture_parameter.film_grain_info) *g =
       &c->d->picture_parameter.film_grain_info;
    const bool showable = c->d->picture_parameter.pic_info_fields.showable_frame;
    unsigned num_pos_luma, num_pos_chroma;
@@ -977,7 +977,7 @@ static void write_film_grain_params(struct bw *w, struct frame_ctx *c)
  * wrong shifts every bit after it, so the reference search is reproduced exactly. */
 static bool skip_mode_allowed(struct frame_ctx *c, struct virgl_av1_obu_state *state)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    const int bits = c->s->order_hint_bits;
    int forward_idx = -1, backward_idx = -1;
    int forward_hint = 0, backward_hint = 0;
@@ -1021,7 +1021,7 @@ static bool skip_mode_allowed(struct frame_ctx *c, struct virgl_av1_obu_state *s
 static void write_uncompressed_header(struct bw *w, struct frame_ctx *c,
                                       struct virgl_av1_obu_state *state)
 {
-   const typeof(c->d->picture_parameter) *p = &c->d->picture_parameter;
+   const __typeof__(c->d->picture_parameter) *p = &c->d->picture_parameter;
    const bool size_override = c->upscaled_width != c->s->max_width ||
                               c->frame_height != c->s->max_height;
    /* Inferred, not what the descriptor holds: a switch frame and a shown key frame refresh
@@ -1308,7 +1308,7 @@ static void resolve_refs(const struct virgl_av1_obu_state *state,
                          const struct virgl_av1_picture_desc *d,
                          uint8_t our_ref_idx[VIRGL_AV1_REFS_PER_FRAME])
 {
-   const typeof(d->picture_parameter) *p = &d->picture_parameter;
+   const __typeof__(d->picture_parameter) *p = &d->picture_parameter;
 
    for (int j = 0; j < VIRGL_AV1_REFS_PER_FRAME; j++) {
       const uint32_t want = d->ref[p->ref_frame_idx[j] & 7];
@@ -1330,7 +1330,7 @@ static void resolve_refs(const struct virgl_av1_obu_state *state,
 static void init_frame_ctx(struct frame_ctx *c, const struct virgl_av1_picture_desc *d,
                            const struct seq_params *s)
 {
-   const typeof(d->picture_parameter) *p = &d->picture_parameter;
+   const __typeof__(d->picture_parameter) *p = &d->picture_parameter;
 
    memset(c, 0, sizeof(*c));
    c->d = d;
@@ -1364,7 +1364,7 @@ static void update_state(struct virgl_av1_obu_state *state,
                          const struct virgl_av1_picture_desc *d,
                          const struct frame_ctx *c)
 {
-   const typeof(d->picture_parameter) *p = &d->picture_parameter;
+   const __typeof__(d->picture_parameter) *p = &d->picture_parameter;
    const uint8_t refresh = c->refresh;
 
    for (int i = 0; i < VIRGL_AV1_NUM_REF_FRAMES; i++) {
@@ -1488,9 +1488,9 @@ static ssize_t emit_held(struct virgl_av1_obu_state *state,
 
    n = emit_frame(state, &state->held_desc, state->held_tiles, state->held_tiles_size,
                   refresh, out, out_size);
-   state->held = false;
    if (n < 0)
-      return n;
+      return n;   /* keep holding it: a frame dropped here is one no later frame can find */
+   state->held = false;
 
    if (slot >= 0) {
       state->slot_surface[slot] = surface;
@@ -1574,6 +1574,13 @@ ssize_t virgl_av1_flush_held(struct virgl_av1_obu_state *state,
    return advance(state, desc, out, out_size);
 }
 
+size_t virgl_av1_held_bound(const struct virgl_av1_obu_state *state)
+{
+   if (!state || !state->held)
+      return 0;
+   return state->held_tiles_size + VIRGL_AV1_UNIT_OVERHEAD;
+}
+
 void virgl_av1_drop_held(struct virgl_av1_obu_state *state)
 {
    if (state)
@@ -1585,7 +1592,7 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
                                       const void *tiles, size_t tiles_size,
                                       uint8_t *out, size_t out_size)
 {
-   const typeof(desc->picture_parameter) *p;
+   const __typeof__(desc->picture_parameter) *p;
    uint8_t refresh;
    ssize_t r;
    int slot;
@@ -1594,16 +1601,17 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
       return -1;
    p = &desc->picture_parameter;
 
-   /* A caller that never flushed still needs the model advanced, but it must not be left
-    * holding a frame -- this unit would then be the second in one buffer. Refuse instead of
-    * concatenating. */
+   /* A caller that never flushed still needs the model advanced. Refuse first if a frame is
+    * being held: this unit would be the second in one buffer, and advancing here would emit
+    * the held one into no buffer at all -- out == NULL is how a unit is *sized*, so it would
+    * report a length, be recorded as emitted, and never be written anywhere. */
+   if (state->held)
+      return -1;
    if (!state->advanced) {
       r = advance(state, desc, NULL, 0);
       if (r < 0)
          return r;
    }
-   if (state->held)
-      return -1;
 
    /* A key frame refreshes everything, by inference rather than by choice, and resets our
     * model with it. Its own surface is learned on the next submission, like any frame we
