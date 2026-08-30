@@ -98,6 +98,9 @@ struct virgl_video_codec {
     uint8_t session_subsampling;
     enum pipe_format session_target_format;
 
+    /* AV1 fixture capture only: how many frames have been recorded. */
+    unsigned av1_capture_seq;
+
     /* The picture in flight: bitstream accumulated across decode_bitstream calls,
      * and the target the completed picture belongs to. */
     uint8_t *bitstream;
@@ -140,6 +143,22 @@ static int vt_trace = -1;
         fprintf(stderr, "[VIDEO] " __VA_ARGS__);                        \
 } while (0)
 
+/* Where to record AV1 fixtures, or NULL when not capturing. Set LIMINA_AV1_CAPTURE to a
+ * directory; see docs/design/av1-decode.md, phase 0. */
+static const char *av1_capture_dir(void)
+{
+    static const char *dir;
+    static bool looked;
+
+    if (!looked) {
+        dir = getenv("LIMINA_AV1_CAPTURE");
+        if (dir && !*dir)
+            dir = NULL;
+        looked = true;
+    }
+    return dir;
+}
+
 /* Whether the running Mac has silicon for a codec. Must be asked after the
  * supplemental registration below: without it VP9 reads as unsupported on hardware
  * that has it. */
@@ -156,6 +175,7 @@ int virgl_video_init(int drm_fd, struct virgl_video_callbacks *cbs, unsigned int
     /* VP9 and AV1 arrive as supplemental decoders; VTIsHardwareDecodeSupported
      * answers "no" for them until this call has been made. */
     VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+    VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_AV1);
 
     video_cbs = cbs;
 
@@ -180,25 +200,48 @@ int virgl_video_fill_caps(union virgl_caps *caps)
      * virgl_get_video_param() then reports no profiles — the driver still loads and
      * initializes, it just offers no hardware decode. That is the whole of the
      * stock-tier fallback: there is nothing to gate. */
-    if (!vt_can_decode(kCMVideoCodecType_VP9))
-        return 0;
+    if (vt_can_decode(kCMVideoCodecType_VP9)) {
+        VT_TRACE("fill_caps: advertising VP9 profile0 decode\n");
+        vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
+        memset(vcaps, 0, sizeof(*vcaps));
+        vcaps->profile = PIPE_VIDEO_PROFILE_VP9_PROFILE0;
+        vcaps->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+        vcaps->max_level = 0;
+        vcaps->stacked_frames = 0;
+        vcaps->max_width = VT_MAX_WIDTH;
+        vcaps->max_height = VT_MAX_HEIGHT;
+        vcaps->prefered_format = PIPE_FORMAT_NV12;
+        vcaps->max_macroblocks = 1;
+        vcaps->npot_texture = 1;
+        vcaps->supports_progressive = 1;
+        vcaps->supports_interlaced = 0;
+        vcaps->prefers_interlaced = 0;
+        vcaps->max_temporal_layers = 0;
+    }
 
-    VT_TRACE("fill_caps: advertising VP9 profile0 decode\n");
-    vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
-    memset(vcaps, 0, sizeof(*vcaps));
-    vcaps->profile = PIPE_VIDEO_PROFILE_VP9_PROFILE0;
-    vcaps->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
-    vcaps->max_level = 0;
-    vcaps->stacked_frames = 0;
-    vcaps->max_width = VT_MAX_WIDTH;
-    vcaps->max_height = VT_MAX_HEIGHT;
-    vcaps->prefered_format = PIPE_FORMAT_NV12;
-    vcaps->max_macroblocks = 1;
-    vcaps->npot_texture = 1;
-    vcaps->supports_progressive = 1;
-    vcaps->supports_interlaced = 0;
-    vcaps->prefers_interlaced = 0;
-    vcaps->max_temporal_layers = 0;
+    /* AV1 needs M3-or-later silicon. A capture build forces the advertisement on hardware
+     * that cannot decode it, because capture never decodes: the picture descriptors are a
+     * pure function of the *guest's* own bitstream parse, so a machine with no AV1 silicon
+     * produces exactly the fixtures an M3 would. */
+    if (vt_can_decode(kCMVideoCodecType_AV1) || av1_capture_dir()) {
+        VT_TRACE("fill_caps: advertising AV1 main decode%s\n",
+                 vt_can_decode(kCMVideoCodecType_AV1) ? "" : " (capture build, no silicon)");
+        vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
+        memset(vcaps, 0, sizeof(*vcaps));
+        vcaps->profile = PIPE_VIDEO_PROFILE_AV1_MAIN;
+        vcaps->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+        vcaps->max_level = 0;
+        vcaps->stacked_frames = 0;
+        vcaps->max_width = VT_MAX_WIDTH;
+        vcaps->max_height = VT_MAX_HEIGHT;
+        vcaps->prefered_format = PIPE_FORMAT_NV12;
+        vcaps->max_macroblocks = 1;
+        vcaps->npot_texture = 1;
+        vcaps->supports_progressive = 1;
+        vcaps->supports_interlaced = 0;
+        vcaps->prefers_interlaced = 0;
+        vcaps->max_temporal_layers = 0;
+    }
 
     return 0;
 }
@@ -217,7 +260,8 @@ struct virgl_video_codec *virgl_video_create_codec(
                     args->entrypoint);
         return NULL;
     }
-    if (args->profile != PIPE_VIDEO_PROFILE_VP9_PROFILE0) {
+    if (args->profile != PIPE_VIDEO_PROFILE_VP9_PROFILE0 &&
+        args->profile != PIPE_VIDEO_PROFILE_AV1_MAIN) {
         virgl_error("video: profile %d not supported by the VideoToolbox backend\n",
                     args->profile);
         return NULL;
@@ -553,6 +597,68 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
 
 /* The guest may split one picture across several calls, so this only accumulates;
  * the decode itself happens in end_frame, mirroring vaEndPicture. */
+/* AV1, phase 0: record the descriptor and the tile bytes, decode nothing.
+ *
+ * The guest hands us a fully parsed picture descriptor plus tile payload only -- the frame
+ * header was consumed by ffmpeg's own parse and destroyed at the ffmpeg -> VA-API boundary
+ * (libavcodec/av1dec.c passes `raw_tile_group->tile_data.data` to its hwaccel). Synthesizing
+ * a conformant OBU_FRAME_HEADER from this descriptor is the whole of the AV1 work, and these
+ * fixtures are what let that be developed and tested offline, against dav1d, on a machine
+ * with no AV1 silicon.
+ *
+ * The descriptor is written raw. It is an ABI-shaped dump consumed only by a spike built from
+ * this same tree on the same machine, never a persisted format. */
+static int av1_decode_bitstream(struct virgl_video_codec *codec,
+                                const union virgl_picture_desc *desc,
+                                unsigned num_buffers,
+                                const void * const *buffers,
+                                const unsigned *sizes)
+{
+    const char *dir = av1_capture_dir();
+    const struct virgl_av1_picture_desc *av1 = &desc->av1;
+    char path[1024];
+    FILE *f;
+
+    if (!dir) {
+        virgl_error("video: AV1 decode is not implemented yet "
+                    "(set LIMINA_AV1_CAPTURE to record fixtures)\n");
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/frame%05u.desc", dir, codec->av1_capture_seq);
+    if ((f = fopen(path, "wb"))) {
+        fwrite(av1, sizeof(*av1), 1, f);
+        fclose(f);
+    } else {
+        virgl_error("video: cannot write AV1 fixture %s\n", path);
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/frame%05u.tile", dir, codec->av1_capture_seq);
+    if ((f = fopen(path, "wb"))) {
+        for (unsigned i = 0; i < num_buffers; i++)
+            if (buffers[i] && sizes[i])
+                fwrite(buffers[i], sizes[i], 1, f);
+        fclose(f);
+    }
+
+    VT_TRACE("av1 capture %u: %ux%u frame_type %u show %u primary_ref %u tiles %ux%u "
+             "slices %u, %u buffers\n",
+             codec->av1_capture_seq,
+             av1->picture_parameter.frame_width, av1->picture_parameter.frame_height,
+             av1->picture_parameter.pic_info_fields.frame_type,
+             av1->picture_parameter.pic_info_fields.show_frame,
+             av1->picture_parameter.primary_ref_frame,
+             av1->picture_parameter.tile_cols, av1->picture_parameter.tile_rows,
+             av1->slice_parameter.slice_count, num_buffers);
+
+    codec->av1_capture_seq++;
+
+    /* Report success with no picture. ffmpeg keeps submitting frames because every
+     * descriptor comes from its own parse, not from anything we return. */
+    return 0;
+}
+
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
                                  struct virgl_video_buffer *target,
                                  const union virgl_picture_desc *desc,
@@ -565,6 +671,9 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
 
     if (!codec || !target || !desc || !buffers || !sizes)
         return -1;
+
+    if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN)
+        return av1_decode_bitstream(codec, desc, num_buffers, buffers, sizes);
 
     if (codec->profile != PIPE_VIDEO_PROFILE_VP9_PROFILE0)
         return -1;
@@ -632,6 +741,9 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     if (!codec || !target)
         return -1;
+
+    if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN)
+        return 0; /* phase 0 capture: nothing was accumulated and nothing decodes */
 
     VT_TRACE("end_frame: %zu bytes\n", codec->bitstream_len);
 
