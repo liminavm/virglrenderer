@@ -172,10 +172,14 @@ if with_render_server == 'thread'
    ]
 endif
 
-video_sources = [
-   'vrend/virgl_video.c',
-   'vrend/vrend_video.c',
-]
+# vrend_video.c is the protocol half and is shared; the file next to it is the
+# host codec backend, of which exactly one is built.
+video_sources = ['vrend/vrend_video.c']
+if host_machine.system() == 'darwin'
+   video_sources += ['vrend/virgl_video_vt.c']
+else
+   video_sources += ['vrend/virgl_video.c']
+endif
 
 virgl_depends = [
    gallium_dep,
@@ -254,7 +258,7 @@ endif
 
 if with_video
   virgl_sources += video_sources
-  virgl_depends += [libva_dep, libvadrm_dep]
+  virgl_depends += video_deps
 endif
 
 if with_host_windows

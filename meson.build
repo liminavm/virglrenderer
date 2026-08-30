@@ -135,7 +135,10 @@ if with_drm_renderers
   conf_data.set('ENABLE_DRM', 1)
 endif
 
-libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: with_drm_renderers or get_option('video'))
+# The video feature needs libdrm only for its VA-API backend; the darwin
+# (VideoToolbox) backend has neither libdrm nor a DRM device to talk to.
+video_needs_libdrm = get_option('video') and host_machine.system() != 'darwin'
+libdrm_dep = dependency('libdrm', version : '>=2.4.50', required: with_drm_renderers or video_needs_libdrm)
 libdrm_amdgpu_dep = dependency('libdrm_amdgpu', version : '>=2.4.121', required: with_drm_amdgpu)
 conf_data.set('ENABLE_LIBDRM', libdrm_dep.found())
 drm_uapi_dep = declare_dependency(
@@ -437,13 +440,20 @@ if with_venus
 endif
 
 with_video = get_option('video')
+video_deps = []
 if with_video
   if not have_egl
      error('video require EGL, but it is not available')
   endif
   conf_data.set('ENABLE_VIDEO', 1)
-  libva_dep = dependency('libva')
-  libvadrm_dep = dependency('libva-drm')
+  if with_host_darwin
+     # VideoToolbox stands in for VA-API here; see src/vrend/virgl_video_vt.c.
+     video_deps = [dependency('appleframeworks',
+                              modules : ['VideoToolbox', 'CoreMedia',
+                                         'CoreVideo', 'CoreFoundation'])]
+  else
+     video_deps = [dependency('libva'), dependency('libva-drm')]
+  endif
 endif
 
 with_tests = get_option('tests')
