@@ -5769,8 +5769,13 @@ static void vrend_draw_bind_const_shader(struct vrend_sub_context *sub_ctx,
     * a pipe_resource -- so every VA post-processing draw multiplied its texels by an all-zero
     * matrix and produced pure black.
     *
-    * Bridge it: read the data out of the bound resource and upload it as the uniforms the
-    * shader actually reads.
+    * Bridge it from the resource's guest-side backing, NOT by reading the GL buffer. Mapping
+    * the buffer here worked and was wrong: a map on the draw path is a synchronisation point,
+    * and a render thread parked in one does not answer the quiesce that suspend waits for --
+    * measured as a reproducible hang of the whole suspend bracket, long after the frame it
+    * belonged to had rendered correctly. The iov is the right source anyway: these constants
+    * are CPU-produced and reach the resource by transfer, so the backing store already holds
+    * them and reading it costs nothing and blocks on nothing.
     */
    if (!sub_ctx->consts[shader_type].consts && sub_ctx->shaders[shader_type] &&
        sub_ctx->prog->const_location[shader_type] != -1) {
@@ -5778,25 +5783,20 @@ static void vrend_draw_bind_const_shader(struct vrend_sub_context *sub_ctx,
       struct vrend_resource *res = (struct vrend_resource *)cb->buffer;
       unsigned num_consts = sub_ctx->shaders[shader_type]->sinfo.num_consts;
 
-      if (res && res->gl_id && num_consts) {
+      /* Bounded so the staging copy can live on the stack. Shaders shaped like this hold a
+       * colour-space matrix or similar -- a handful of vectors, never hundreds. */
+      const unsigned max_consts = 64;
+
+      if (res && res->iov && num_consts && num_consts <= max_consts) {
+         uint32_t tmp[64 * 4];
          unsigned want = num_consts * 4 * sizeof(uint32_t);
          unsigned avail = cb->buffer_size ? cb->buffer_size : want;
          unsigned len = MIN2(want, avail);
-         uint32_t *tmp = calloc(1, want);
 
-         if (tmp) {
-            void *ptr;
-
-            glBindBuffer(GL_UNIFORM_BUFFER, res->gl_id);
-            ptr = glMapBufferRange(GL_UNIFORM_BUFFER, cb->buffer_offset, len, GL_MAP_READ_BIT);
-            if (ptr) {
-               memcpy(tmp, ptr, len);
-               glUnmapBuffer(GL_UNIFORM_BUFFER);
-            }
-            glBindBuffer(GL_UNIFORM_BUFFER, 0);
+         memset(tmp, 0, want);
+         if (vrend_read_from_iovec(res->iov, res->num_iovs, cb->buffer_offset,
+                                   (char *)tmp, len) == len)
             glUniform4uiv(sub_ctx->prog->const_location[shader_type], num_consts, tmp);
-            free(tmp);
-         }
       }
    }
 }
