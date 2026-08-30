@@ -1572,8 +1572,15 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
       return n + r;
    }
 
-   /* A hidden frame waits one submission so its refresh can be exact. */
-   if (!p->pic_info_fields.show_frame) {
+   /* A hidden frame waits one submission so its refresh can be exact -- but only when it
+    * has to. While a slot is free the frame can be stored at once, evicting nothing, and
+    * whose picture landed there is learned a submission later like any other. It is only at
+    * the wall, where storing this frame means dropping a live one, that which slot the guest
+    * chose has to be waited for. Holding only there keeps most frames on the immediate path
+    * and shrinks the window in which a held picture has not reached its target. */
+   if (!p->pic_info_fields.show_frame && dead_slot(state, desc->ref) < 0) {
+      if (getenv("LIMINA_AV1_SLOT_TRACE"))
+         fprintf(stderr, "[AV1SLOT] oh=%3u held: every slot live\n", p->order_hint);
       if (!hold_frame(state, desc, tiles, tiles_size))
          return -1;
       return n;
