@@ -68,6 +68,24 @@ struct virgl_av1_obu_state {
     * warp parameters, which is what a decoder starting from a key frame also assumes. */
    uint8_t slot_valid;
 
+   /* refresh_frame_flags is NOT in the descriptor. VA-API does not carry it -- mesa writes a
+    * constant 1 (src/gallium/frontends/va/picture_av1.c) -- because a VA driver never needs
+    * it: the application hands it the whole reference list per frame and manages the DPB
+    * itself. A bitstream writer does need it, so the reference slots have to be assigned
+    * here and the guest's ref_frame_idx remapped onto them.
+    *
+    * What the descriptor does carry is ref[16], filled from VA's ref_frame_map: the surface
+    * occupying each of the *guest's* slots, before this frame. That is enough, with one
+    * subtlety -- which slots a frame refreshed only becomes visible in the *next* frame's
+    * ref[], where its surface has appeared. So a slot is chosen for each frame immediately
+    * (emission cannot wait), and which surface ended up there is learned one frame later.
+    * That is never too late: a frame cannot reference itself. */
+   uint32_t prev_ref[VIRGL_AV1_NUM_REF_FRAMES];  /* the previous frame's ref[] */
+   uint32_t slot_surface[VIRGL_AV1_NUM_REF_FRAMES]; /* surface we placed in each of our slots */
+   uint8_t pending_slot;      /* the slot the previous frame was given */
+   uint8_t next_slot;         /* round-robin cursor for eviction */
+   bool have_prev;
+
    /* Set once the first sequence header has been derived, so callers can build an av1C
     * record before the first frame is submitted. */
    bool seq_valid;
