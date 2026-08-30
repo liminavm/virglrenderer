@@ -5856,7 +5856,22 @@ iter_instruction(struct tgsi_iterate_context *iter,
    case TGSI_OPCODE_TXF:
    case TGSI_OPCODE_TG4:
    case TGSI_OPCODE_TXP:
-      translate_tex(ctx, inst, &sinfo, &dinfo, srcs, dsts[0], writemask);
+   {
+      /* Lower a 2D_ARRAY fetch to 2D when a 2D texture is what is actually bound. Rewriting the
+       * instruction rather than each use point also fixes the declaration: set_texture_reqs()
+       * records the declared sampler type straight off this instruction. */
+      struct tgsi_full_instruction linst;
+      const struct tgsi_full_instruction *tinst = inst;
+
+      if (inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY && sinfo.sreg_index >= 0 &&
+          vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_lower_array_mask,
+                                              sinfo.sreg_index)) {
+         linst = *inst;
+         linst.Texture.Texture = TGSI_TEXTURE_2D;
+         tinst = &linst;
+      }
+      translate_tex(ctx, tinst, &sinfo, &dinfo, srcs, dsts[0], writemask);
+   }
       break;
    case TGSI_OPCODE_LODQ:
       emit_lodq(ctx, inst, &sinfo, &dinfo, srcs, dsts[0], writemask);

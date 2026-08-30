@@ -219,6 +219,10 @@ struct vrend_shader_key {
 
    uint64_t sampler_views_lower_swizzle_mask[VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH];
    uint64_t sampler_views_emulated_rect_mask[VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH];
+   /* Samplers whose bound view is a plain 2D texture. A shader that declares the same
+    * sampler as 2D_ARRAY is sampling a target GLSL cannot express, so the declaration
+    * has to be lowered to match whatever is actually bound. */
+   uint64_t sampler_views_lower_array_mask[VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH];
    uint16_t tex_swizzle[PIPE_MAX_SHADER_SAMPLER_VIEWS];
 
    uint8_t ssbo_binding_offset;
