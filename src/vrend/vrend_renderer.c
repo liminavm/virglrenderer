@@ -8304,8 +8304,14 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    if (flags & VREND_USE_VIDEO) {
         if (vrend_clicbs->get_drm_fd)
             vrend_video_init(vrend_clicbs->get_drm_fd());
+#ifdef __APPLE__
+        /* VideoToolbox opens no device node, so there is no DRM fd to ask for. */
+        else
+            vrend_video_init(-1);
+#else
         else
             virgl_warn("Video disabled due to missing get_drm_fd\n");
+#endif
    }
 #endif
 
