@@ -96,6 +96,12 @@ struct virgl_video_dma_buf {
         int modifier;
         uint32_t offset;
         uint32_t pitch;
+
+        /* A backend with no dmabuf to hand over — the VideoToolbox one on macOS,
+         * where the decoded picture is a CVPixelBuffer — sets `fd` to -1 and points
+         * `map` at the plane's pixels for the lifetime of the callback instead.
+         * `pitch` is the stride of that mapping. */
+        const void *map;
     } planes[4];
 };
 

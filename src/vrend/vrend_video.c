@@ -66,6 +66,8 @@
  */
 
 
+#include "util/u_format.h"
+
 #include "virgl_video.h"
 #include "virgl_video_hw.h"
 
@@ -146,6 +148,37 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
+/* Upload one CPU-mapped plane of a decoded picture into the guest-visible resource.
+ *
+ * The dmabuf path below hands the picture over as an EGLImage and blits; a backend
+ * with no dmabuf to export — VideoToolbox, whose output is a CVPixelBuffer — maps
+ * the plane instead and we copy. */
+static void upload_mapped_plane(struct vrend_resource *res,
+                                const struct virgl_video_dma_buf_plane *plane)
+{
+    /* Ask vrend how this resource was actually created rather than deriving a GL
+     * format from the plane's size: an R8 luma plane and an RG8 chroma plane both
+     * arrive here, and a mismatched format silently uploads the wrong bytes. */
+    const struct vrend_format_table *entry = vrend_get_format_table_entry(res->base.format);
+    unsigned blocksize = util_format_get_blocksize(res->base.format);
+
+    if (!entry || !blocksize) {
+        virgl_error("%s: no format table entry for %d\n", __func__, res->base.format);
+        return;
+    }
+
+    /* VideoToolbox pads plane rows, so the source stride is not the width. */
+    glBindTexture(GL_TEXTURE_2D, res->gl_id);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, plane->pitch / blocksize);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                    res->base.width0, res->base.height0,
+                    entry->glformat, entry->gltype, plane->map);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
                                        const struct virgl_video_dma_buf *dmabuf)
 {
@@ -161,6 +194,11 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         res = vrend_renderer_ctx_res_lookup(buf->ctx->ctx, plane->res_handle);
         if (!res) {
             virgl_error("%s: res %d not found\n", __func__, plane->res_handle);
+            continue;
+        }
+
+        if (dmabuf->planes[i].fd < 0 && dmabuf->planes[i].map) {
+            upload_mapped_plane(res, &dmabuf->planes[i]);
             continue;
         }
 
@@ -354,8 +392,12 @@ static struct virgl_video_callbacks video_callbacks = {
 
 int vrend_video_init(int drm_fd)
 {
+#ifndef __APPLE__
+    /* The VA-API backend opens its display on this fd; the VideoToolbox one has
+     * no device node to open and is passed -1. */
     if (drm_fd < 0)
         return -1;
+#endif
 
     return virgl_video_init(drm_fd, &video_callbacks, 0);
 }
