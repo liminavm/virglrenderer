@@ -15,9 +15,10 @@ use std::cell::Cell;
 use crate::ids::{CtxId, RingIdx};
 
 use super::cs::Decoder;
+use super::cs::ObjectId;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
-use super::proto::types::{VkCommandTypeEXT, VkFlags};
+use super::proto::types::{VkCommandTypeEXT, VkFlags, VkObjectType};
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
 const GENERATE_REPLY: u32 = 0x1;
@@ -73,7 +74,7 @@ impl Context {
     /// Returns false when the context was poisoned -- by this batch or by an earlier one. The C
     /// bails early on an already-fatal context for the same reason: a stream we stopped trusting
     /// does not become trustworthy because the guest sent more of it.
-    pub fn submit(&mut self, buf: &[u8], h: &mut dyn Commands) -> bool {
+    pub fn submit(&mut self, buf: &[u8], todo: &mut Unimplemented) -> bool {
         if self.fatal.get() {
             return false;
         }
@@ -83,6 +84,7 @@ impl Context {
         // cap, not this arena, is what stops a guest from asking for all of memory.
         let temp = Bump::new();
         let mut dec = Decoder::new(buf, &temp, &self.objects, &self.fatal);
+        let mut h = Handlers { objects: &self.objects, todo, bad_id: false };
 
         while dec.has_command() {
             dec.clear_soft_fatal();
@@ -105,12 +107,18 @@ impl Context {
                 break;
             }
 
-            if vn_dispatch_command(&mut dec, None, cmd, h).is_none() {
+            if vn_dispatch_command(&mut dec, None, cmd, &mut h).is_none() {
                 // A command type this protocol does not define. We cannot even skip it: its length
                 // is only knowable by decoding it.
                 dec.set_fatal();
+                break;
             }
             self.dispatched += 1;
+            // A guest that named id zero, or reused one that is still live, is naming objects
+            // it cannot have. The handler had no decoder to say so; this is where it lands.
+            if h.bad_id {
+                dec.set_fatal();
+            }
 
             if self.fatal.get() {
                 return false;
@@ -122,23 +130,52 @@ impl Context {
     /// A ring-scoped submission. The ring the command belongs to is recorded but not yet acted on:
     /// the replay feed hands commands straight to the dispatcher, which is what makes a VM-free
     /// replay possible, and a real ring loop is what will need the index.
-    pub fn submit_ring(&mut self, _ring: RingIdx, buf: &[u8], h: &mut dyn Commands) -> bool {
-        self.submit(buf, h)
+    pub fn submit_ring(&mut self, _ring: RingIdx, buf: &[u8], todo: &mut Unimplemented) -> bool {
+        self.submit(buf, todo)
     }
 }
 
-/// A renderer that serves no commands yet: every one of them lands on `unsupported`.
-///
-/// It exists so the plumbing -- contexts, routing, the decode loop -- can be exercised over a whole
-/// corpus before a single Vulkan call is made. What it counts is the shape of the work left.
+/// The commands a build does not serve yet, counted.
 #[derive(Default)]
 pub struct Unimplemented {
     pub seen: std::collections::BTreeMap<i32, u64>,
 }
 
-impl Commands for Unimplemented {
+/// What a command reaches: the object table it registers into, and the tally of what this build
+/// cannot do yet.
+///
+/// Every command method is left at its generated default, so each lands on `unsupported` and is
+/// counted. What is *not* left to a default is the object bookkeeping: a create registers the id
+/// the guest chose, a destroy forgets it, and that is enough for the whole corpus to decode --
+/// every later command that names an object finds it.
+///
+/// **The host handle is the guest id, and only because nothing here has a real one.** Registering
+/// them equal is what lets a destroy work at all: the generated `_lookup` decode replaces the id
+/// in the arguments with the host handle before the handler sees it, so the destroy extraction
+/// reads back a host handle and calls it an id. When real handles arrive that identity breaks, and
+/// with it this shortcut -- the destroy path needs the guest id carried alongside, which is a
+/// change to what the generated argument structs hold.
+pub struct Handlers<'a> {
+    objects: &'a Shared,
+    todo: &'a mut Unimplemented,
+    /// A guest that reused a live id or named id zero. It cannot be reported from here -- the
+    /// handler has no decoder -- so the loop reads it back and poisons.
+    bad_id: bool,
+}
+
+impl Commands for Handlers<'_> {
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
-        *self.seen.entry(cmd.0).or_default() += 1;
+        *self.todo.seen.entry(cmd.0).or_default() += 1;
+    }
+
+    fn object_created(&mut self, ty: VkObjectType, id: ObjectId) {
+        if self.objects.borrow_mut().add(id, ty.0, id.0).is_err() {
+            self.bad_id = true;
+        }
+    }
+
+    fn object_destroyed(&mut self, _ty: VkObjectType, id: ObjectId) {
+        self.objects.borrow_mut().remove(id);
     }
 }
 

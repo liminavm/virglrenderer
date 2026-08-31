@@ -749,7 +749,7 @@ class RustGen:
                     if self.gen.is_serializable(c)]
         for ty in commands:
             out += self._command_fns(ty, gaps)
-        out += self._dispatch_fns(commands)
+        out += self._dispatch_fns(commands, gaps)
         return '\n'.join(out)
 
     def _handle_fns(self, ty):
@@ -938,7 +938,7 @@ class RustGen:
                         reply('encode'), gaps, n)
         return out
 
-    def _dispatch_fns(self, commands):
+    def _dispatch_fns(self, commands, gaps):
         """The command table, as a match the compiler turns into a jump table.
 
         The round trip lives here rather than in the harness because only the generator knows the
@@ -979,10 +979,74 @@ class RustGen:
             ]
         out += ['        _ => None,', '    }', '}', '']
 
-        out += self._handler_trait(commands)
+        out += self._handler_trait(commands, gaps)
         return out
 
-    def _handler_trait(self, commands):
+    def _lifecycle(self, ty, gaps):
+        """The objects a command creates or destroys, read out of its decoded arguments.
+
+        The emitter already knows this: an out-handle is a member whose validity is PARTIAL and
+        whose base type is a handle, which is the same attribute pass the serializer makes. Saying
+        it here rather than in thirty hand-written handlers is the same trade the C makes with
+        `vkr_device_object.py`, minus the C.
+
+        A destroy names its target with its *last* handle member. Every `vkDestroy*`/`vkFree*` in
+        Vulkan is shaped `(parent, ..., target)`, so the last one is the object and the earlier ones
+        are the device or pool it came from -- which must not be destroyed with it.
+        """
+        n = ty.name
+        destroys = n.startswith('vkDestroy') or n.startswith('vkFree')
+
+        handles = []
+        for var in ty.variables:
+            if not self.gen.is_serializable(var):
+                continue
+            if var.ty.base.category != VkType.HANDLE:
+                continue
+            validity = self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs)
+            handles.append((var, validity))
+
+        def emit(var, objtype, hook):
+            m = 'val.%s' % self.field_name(var.name)
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported as e:
+                gaps.append(str(e))
+                return ['/* gap: %s */' % e]
+            one = 'h.%s(%s, ObjectId(%%s));' % (hook, objtype)
+            if shape[0] == 'plain':
+                return [one % ('%s.0' % m)]
+            if shape[0] == 'pointer':
+                # A null out-pointer is the guest asking how many there would be, not creating one.
+                return ['if !%s.is_null() {' % m,
+                        '    // SAFETY: non-null, and the decoder allocated it in the arena.',
+                        '    ' + one % ('unsafe { (*%s).0 }' % m),
+                        '}']
+            if shape[0] == 'dynamic':
+                return ['if !%s.is_null() {' % m,
+                        '    for i in 0..(%s) as usize {' % shape[1],
+                        '        // SAFETY: the decoder allocated this array with that many',
+                        '        // elements, from the same count.',
+                        '        ' + one % ('unsafe { (*%s.add(i)).0 }' % m),
+                        '    }',
+                        '}']
+            gaps.append('%s.%s: %s handle' % (n, var.name, shape[0]))
+            return ['/* gap: %s.%s: %s handle */' % (n, var.name, shape[0])]
+
+        out = []
+        for var, validity in handles:
+            if validity != Gen_PARTIAL:
+                continue
+            out += emit(var, 'VkObjectType::%s' % var.ty.base.attrs['c_objtype'], 'object_created')
+
+        if destroys and handles:
+            var, validity = handles[-1]
+            if validity == Gen_VALID:
+                out += emit(var, 'VkObjectType::%s' % var.ty.base.attrs['c_objtype'],
+                            'object_destroyed')
+        return out
+
+    def _handler_trait(self, commands, gaps):
         """The renderer's side of the wire: one method per command, and the match that reaches it.
 
         Every method defaults to `unsupported`, so a renderer implements the commands it serves and
@@ -999,6 +1063,18 @@ class RustGen:
                '    /// an unimplemented command is answered the same way everywhere -- and the',
                '    /// renderer decides whether that is a poisoned context or a logged no-op.',
                '    fn unsupported(&mut self, cmd: VkCommandTypeEXT);',
+               '',
+               '    /// A command created this object under the id the guest chose. Called after',
+               '    /// the handler, so a real one has already made the host handle it registers.',
+               '    fn object_created(&mut self, ty: VkObjectType, id: ObjectId) {',
+               '        let _ = (ty, id);',
+               '    }',
+               '',
+               '    /// A command destroyed this object. Called after the handler, which still',
+               '    /// needed the host handle to destroy.',
+               '    fn object_destroyed(&mut self, ty: VkObjectType, id: ObjectId) {',
+               '        let _ = (ty, id);',
+               '    }',
                '']
         for ty in commands:
             n = ty.name
@@ -1024,6 +1100,7 @@ class RustGen:
                 '    match cmd {']
         for ty in commands:
             n = ty.name
+            life = self._lifecycle(ty, gaps)
             out += [
                 '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
                 '            let mut args = vn_command_%s::default();' % n,
@@ -1032,6 +1109,8 @@ class RustGen:
                 '                return Some(());',
                 '            }',
                 '            h.%s(&mut args);' % n,
+            ] + (['            let val = &args;']
+                 + ['            ' + l for l in life] if life else []) + [
                 '            if let Some(enc) = enc {',
                 '                vn_encode_%s_reply(enc, &args);' % n,
                 '            }',

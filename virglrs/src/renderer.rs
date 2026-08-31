@@ -290,13 +290,18 @@ impl Renderer {
     }
 }
 
-/// Whether the flag word asks for a renderer this build does not have yet.
+/// What this build cannot do for the flags it was given, in one phrase for the startup log.
+///
+/// venus decodes and dispatches but serves no command yet; vrend does not exist at all. Saying
+/// which is which is the difference between a log line that explains a failure and one that
+/// misleads about it.
 pub fn unsupported_renderers(flags: c_int) -> &'static str {
-    if flags & abi::VENUS != 0 && flags & abi::NO_VIRGL == 0 {
-        "venus and vrend"
-    } else if flags & abi::VENUS != 0 {
-        "venus"
-    } else {
-        "vrend"
+    let venus = flags & abi::VENUS != 0;
+    let vrend = flags & abi::NO_VIRGL == 0;
+    match (venus, vrend) {
+        (true, true) => "venus dispatches but serves no command; no vrend",
+        (true, false) => "venus dispatches but serves no command",
+        (false, true) => "no vrend",
+        (false, false) => "no renderer asked for",
     }
 }

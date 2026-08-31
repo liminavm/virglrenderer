@@ -225,6 +225,12 @@ impl<'a> Decoder<'a> {
     /// more. Anything else is a guest naming an object it was never given, or naming one it has
     /// under the wrong type, and that is a stream we can no longer trust: the ring stops.
     pub fn lookup_object(&self, id: ObjectId, ty: i32) -> u64 {
+        // `VK_NULL_HANDLE`. Vulkan spells "no object" as zero and a great many members are
+        // optional, so this is an ordinary value on the wire and not a miss at all -- an optional
+        // `VkPipelineCache` left null is what found this.
+        if id.0 == 0 {
+            return 0;
+        }
         match self.objects.lookup(id, ty) {
             Lookup::Found(handle) => handle,
             Lookup::Ghost => {
@@ -598,6 +604,24 @@ mod tests {
         assert!(dec.fatal());
         assert!(!dec.hard_fatal());
         dec.clear_soft_fatal();
+        assert!(!dec.fatal());
+    }
+
+    /// `VK_NULL_HANDLE` is an ordinary value, not a missing object: Vulkan spells "no object" as
+    /// zero, and every optional handle member on the wire carries it.
+    #[test]
+    fn the_null_handle_is_not_a_lookup_failure() {
+        struct Nothing;
+        impl Objects for Nothing {
+            fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
+                Lookup::Missing
+            }
+        }
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let buf = [0u8; 0];
+        let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
+        assert_eq!(dec.lookup_object(ObjectId(0), 0), 0);
         assert!(!dec.fatal());
     }
 
