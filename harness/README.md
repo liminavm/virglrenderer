@@ -33,7 +33,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `vrend-replay.c` — replays a classic-context stream: resource creates from the recorded
   arguments, transfer contents memcpy'd into synthesized backings, command batches submitted in
   captured order. Scores every colour offscreen at its unref — a content hash and an ink count
-  per readback, in stream order — with the same `--score`/`--expect` contract as the venus side.
+  per readback, in stream order — and every IOSurface-backed resource at end of stream, with the
+  same `--score`/`--expect` contract as the venus side.
   Run it with `vrend-replay.sh <corpus>`, which supplies the zink-on-KosmicKrisp environment the
   renderer needs; `build.sh` alone builds it, pointing `VIRGL_PREFIX` at the implementation under
   test.
@@ -46,8 +47,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   and exits non-zero, so `diff` is the whole comparison tool.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
   from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
-  the diff between the two — 19 resources that lose their ink — is the positive control: an empty
-  diff would mean the oracle measures nothing. `synoik.score` is the venus content fixture:
+  the diff between the two is the positive control: 19 offscreens lose their ink, and all three
+  1280x800 scanout IOSurfaces go from distinct fully-inked hashes to one shared all-zero hash. An
+  empty diff would mean the oracle measures nothing. `synoik.score` is the venus content fixture:
   its capture was taken mid-workload, so 22 device allocations are still live and half of them
   carry GPU-written bytes. `venus.score` is the lifecycle fixture: vkmark runs to completion, and
   every context censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there.
@@ -63,6 +65,29 @@ path nothing until it happens.
 The corpora themselves are NOT in git — they run from kilobytes to tens of megabytes, and a
 permanent home for them is still to be decided. Recapture them with `vm/capture.sh` (see
 `vm/README.md`); the pinned scores here only regress against the corpus they were recorded from.
+
+### The IOSurface leg
+
+IOSurface is the macOS dma-buf and the whole present path. vrend renders *into* the display
+surface — it is wrapped as an `EGL_IOSURFACE_LIMINA` EGLImage, so the framebuffer's storage IS the
+surface — and venus imports the guest image as an `MTLTexture` over one. So `transfer_read_iov`
+and `read_iosurface` are not two views of one thing; they are different paths, and a port can get
+either right while getting the other wrong.
+
+Classic scores the surface itself: `sync_iosurface` (a classic-only blit-and-wait — a venus blob
+renders into its surface directly and must never be synced), then `read_iosurface`, hashed. It is
+scored at END of stream because a capture never unrefs its scanout: the opposite end of the run
+from the colour offscreens, each read at the last moment it is both complete and still alive.
+
+Venus scores only a count of backed blobs. `read_iosurface` takes a byte stride and a row count,
+and the venus corpus carries no geometry — dimensions live in `SET_SCANOUT_BLOB`, a virtio-gpu
+control command, while the stream records ring traffic. Recording scanout geometry beside it is
+what would unlock hashing venus frames, and it is the only Layer 2 oracle for venus pixels there
+can be: a zero-copy scanout blob has no `transfer_read` at all.
+
+**No score contains an IOSurface id.** An id is host-private, recycled the instant its surface
+dies, and free to change across a snapshot restore. What a port owes is that a resource is backed
+and what its surface contains.
 
 ### What the venus score is, and is not
 
