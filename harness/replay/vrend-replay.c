@@ -623,8 +623,12 @@ int main(int argc, char **argv)
     * wrong now that the sweep scores every offscreen: a texture filled by a transfer has ink with
     * no draw involved, and 5 of this corpus's 310 do. The control is the DIFF between the two
     * pinned scores -- the resources that lose their ink when draws are dropped are exactly the
-    * ones drawing reaches, and an empty diff means the oracle is measuring nothing. */
-   int ok = scored_ink;
+    * ones drawing reaches, and an empty diff means the oracle is measuring nothing.
+    *
+    * The floor only applies when there is no golden. Against --expect the match IS the verdict:
+    * the golden carries its own ink lines, so a corpus whose expected score is legitimately
+    * inkless must still pass. */
+   int ok = expect_path ? 1 : scored_ink;
 
    if (score_path) {
       FILE *sf = fopen(score_path, "wb");
