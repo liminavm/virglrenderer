@@ -9,3 +9,4 @@
 //! code that is edited by hand is a bug in a place no one will look.
 
 pub mod cs;
+pub mod proto;
