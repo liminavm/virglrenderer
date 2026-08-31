@@ -30,6 +30,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "c11/threads.h"
 #include "util/os_file.h"
 #include "util/u_hash_table.h"
 #include "util/u_pointer.h"
@@ -38,6 +39,24 @@
 
 static struct util_hash_table *virgl_resource_table;
 static struct virgl_resource_pipe_callbacks pipe_callbacks;
+
+/* The table is not single-threaded. Its entries are created and removed by the VMM's
+ * virtio-gpu thread through the virgl_renderer_* entry points, and walked by whichever venus
+ * ring thread frees an IOSurface (virgl_resource_forget_iosurface). A remove frees the node a
+ * concurrent walk is standing on, which is how a vkDestroyImage storm at guest session teardown
+ * segfaulted the VMM. Every table operation takes this lock, so the invariant needs no caller
+ * to know which thread it is on. It covers the table only: a virgl_resource handed back by
+ * virgl_resource_lookup is the caller's to use unlocked, as before.
+ *
+ * It is RECURSIVE, and has to be. util_hash_table runs this table's destroy hook from inside
+ * a remove -- with the lock already held -- and that hook unrefs the pipe resource, which on
+ * macOS reaches vkr_mtl_iosurface_free and so virgl_resource_forget_iosurface, a table walk.
+ * A plain mutex self-deadlocks there: one thread, no race needed, the whole VMM wedged on the
+ * first RESOURCE_UNREF of an IOSurface-backed resource. Re-entering is safe because
+ * util_hash_table_remove calls destroy BEFORE unlinking the entry, so the table is intact for
+ * the duration of the callback; the walk visits the dying resource and clears an id on it,
+ * which is harmless while destroy_func still holds it. */
+static mtx_t virgl_resource_table_lock;
 
 static void
 virgl_resource_destroy_func(void *val)
@@ -62,6 +81,12 @@ virgl_resource_table_init(const struct virgl_resource_pipe_callbacks *callbacks)
    if (!virgl_resource_table)
       return ENOMEM;
 
+   if (mtx_init(&virgl_resource_table_lock, mtx_plain | mtx_recursive) != thrd_success) {
+      util_hash_table_destroy(virgl_resource_table);
+      virgl_resource_table = NULL;
+      return ENOMEM;
+   }
+
    if (callbacks)
       pipe_callbacks = *callbacks;
 
@@ -71,15 +96,20 @@ virgl_resource_table_init(const struct virgl_resource_pipe_callbacks *callbacks)
 void
 virgl_resource_table_cleanup(void)
 {
+   mtx_lock(&virgl_resource_table_lock);
    util_hash_table_destroy(virgl_resource_table);
    virgl_resource_table = NULL;
+   mtx_unlock(&virgl_resource_table_lock);
+   mtx_destroy(&virgl_resource_table_lock);
    memset(&pipe_callbacks, 0, sizeof(pipe_callbacks));
 }
 
 void
 virgl_resource_table_reset(void)
 {
+   mtx_lock(&virgl_resource_table_lock);
    util_hash_table_clear(virgl_resource_table);
+   mtx_unlock(&virgl_resource_table_lock);
 }
 
 static struct virgl_resource *
@@ -92,9 +122,11 @@ virgl_resource_create(uint32_t res_id)
    if (!res)
       return NULL;
 
+   mtx_lock(&virgl_resource_table_lock);
    err = util_hash_table_set(virgl_resource_table,
                              uintptr_to_pointer(res_id),
                              res);
+   mtx_unlock(&virgl_resource_table_lock);
    if (err != PIPE_OK) {
       free(res);
       return NULL;
@@ -209,13 +241,22 @@ virgl_resource_create_from_iov(uint32_t res_id,
 void
 virgl_resource_remove(uint32_t res_id)
 {
+   /* The remove runs virgl_resource_destroy_func inline, so the lock is held across the pipe
+    * unref -- which does come back to this table, through vkr_mtl_iosurface_free. That is why
+    * the lock is recursive; see its declaration. */
+   mtx_lock(&virgl_resource_table_lock);
    util_hash_table_remove(virgl_resource_table, uintptr_to_pointer(res_id));
+   mtx_unlock(&virgl_resource_table_lock);
 }
 
 struct virgl_resource *virgl_resource_lookup(uint32_t res_id)
 {
-   return util_hash_table_get(virgl_resource_table,
-                              uintptr_to_pointer(res_id));
+   mtx_lock(&virgl_resource_table_lock);
+   struct virgl_resource *res = util_hash_table_get(virgl_resource_table,
+                                                    uintptr_to_pointer(res_id));
+   mtx_unlock(&virgl_resource_table_lock);
+
+   return res;
 }
 
 #ifdef __APPLE__
@@ -250,8 +291,10 @@ virgl_resource_forget_iosurface(uint32_t iosurface_id)
    if (!virgl_resource_table || !iosurface_id)
       return;
 
+   mtx_lock(&virgl_resource_table_lock);
    util_hash_table_foreach(virgl_resource_table, virgl_resource_forget_iosurface_cb,
                            &iosurface_id);
+   mtx_unlock(&virgl_resource_table_lock);
 }
 #endif
 
