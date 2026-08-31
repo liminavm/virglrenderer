@@ -36,11 +36,31 @@
  * LIMINA_VKR_RECORD_OUT (default /tmp/limina-vkr-record.bin). Unarmed, every
  * hook is a predictable-branch no-op.
  *
- * THREADING. Ring threads dispatch concurrently. Sequence numbers are assigned
- * inside the same critical section that appends the bytes: assigning a seq
- * outside the lock lets two threads append in inverted seq order, and a replayer
- * that trusts stream order would then replay a serialization that never
- * happened.
+ * THREADING, AND THE ORDERING RULE. Ring threads, the context decoder and the VMM's control-path
+ * calls all record concurrently, so every record carries two numbers:
+ *
+ *   seq   append order, assigned inside the critical section that writes the bytes. A faithful
+ *         record of how the threads reached the lock, and nothing more.
+ *   tick  EXECUTION order, from one process-global atomic. THIS is what a replayer sorts on.
+ *
+ * They differ, and the difference is not a detail. A command's reply lands in guest-visible shared
+ * memory partway through its handler, so the guest can act on a command -- issue the ioctl that
+ * creates a blob from the memory it just allocated -- while the recording thread is still on its
+ * way to the lock. Append order then puts the dependent event FIRST, and a replayer following it
+ * creates a blob against memory that does not exist yet. The same window inverts two commands with
+ * no control event involved, so it cannot be papered over at the resource layer.
+ *
+ * The clock is therefore read at the last moment before the guest can observe the event:
+ *
+ *   KIND_CMD  BEFORE the command executes (at pre-dispatch). A post-dispatch stamp is exactly
+ *             the race above -- the reply is already written by then.
+ *   KIND_CTL  AFTER the effect, before the ABI call returns. The guest is blocked in the ioctl
+ *             until then and cannot have acted.
+ *
+ * That gives the proof: for any dependency A -> B, the guest can act on A only after A's stamp,
+ * and B's stamp is taken after the guest acted, so tick(A) < tick(B). Ticks are unique and
+ * increasing but NOT contiguous -- excluded commands and refused tees burn one -- so a reader
+ * checks uniqueness, never contiguity.
  */
 
 #ifndef VKR_RECORD_H
@@ -61,7 +81,7 @@ struct vkr_context;
  *   prologue section (ctx_count entries):
  *     u32 ctx_id, u32 generation, u64 size, <size bytes of a 'VKJR' journal export>
  *   stream section (record_count entries):
- *     u64 seq, u64 ring_id, u32 ctx_id, u32 generation, u32 kind, u32 op, u32 size,
+ *     u64 seq, u64 tick, u64 ring_id, u32 ctx_id, u32 generation, u32 kind, u32 op, u32 size,
  *     u32 reserved, <size bytes of payload>
  *
  * KIND splits the stream in two. VKR_RECORD_KIND_CMD records are venus wire bytes and `op` is
@@ -94,8 +114,9 @@ struct vkr_context;
  *   2. each context's journal blob per the vkr_journal export contract --
  *      entries with ring_key != 0 through replay_ring_cmd on that ring, the
  *      rest through replay_submit, in seq order;
- *   3. the stream in seq order across all contexts, applying each record AT ITS
- *      RECORDED POSITION and never hoisting one kind ahead of the other:
+ *   3. the stream in TICK order across all contexts (not seq order -- see the ordering rule
+ *      above), applying each record AT ITS RECORDED POSITION and never hoisting one kind ahead
+ *      of the other:
  *        KIND_CMD, ring_id != 0  -> replay_ring_cmd(ctx_id, ring_id, ...)
  *        KIND_CMD, ring_id == 0  -> replay_submit(ctx_id, ...)
  *        KIND_CTL                -> the matching public-ABI call (below);
@@ -128,7 +149,7 @@ struct vkr_context;
 #define VKR_RECORD_CTL_RESOURCE_UNREF 7u  /* res_handle, pad */
 
 #define VKR_RECORD_MAGIC 0x43524b56u /* 'VKRC' LE */
-#define VKR_RECORD_VERSION 3u
+#define VKR_RECORD_VERSION 4u
 
 #define VKR_RECORD_FLAG_TRUNC_FULL 0x1u  /* hit the cap */
 #define VKR_RECORD_FLAG_TRUNC_FATAL 0x2u /* a decode went fatal */
@@ -153,9 +174,14 @@ void
 vkr_record_dispatch(struct vkr_context *ctx,
                     uint64_t ring_id,
                     uint32_t cmd_type,
+                    uint64_t tick,
                     const void *data,
                     size_t size,
                     bool fatal);
+
+/* Take an execution-order stamp. Every recorded event carries one; see the ordering rule above. */
+uint64_t
+vkr_record_tick(void);
 
 /* Drop a context's prologue and stop recording it (called at context teardown,
  * so a dump never references a context that no longer exists). */
@@ -164,15 +190,13 @@ vkr_record_context_gone(uint32_t ctx_id);
 
 /*
  * Control-path tees, called from the public ABI entry points in virglrenderer.c. They append into
- * the same sequence as vkr_record_dispatch, under the same lock, which is the whole point: the
- * recorded interleaving IS the dependency order between resources and the commands that use them.
+ * the same sequence as vkr_record_dispatch, sharing one execution clock, which is the whole point:
+ * tick order across the two IS the dependency order between resources and the commands that use
+ * them.
  *
- * EACH IS CALLED AFTER ITS EFFECT, never before. The sequence is only worth having if it is the
- * true execution order, and a VMM thread blocks inside create_blob while a ring thread runs: a
- * blob exporting a VkDeviceMemory recorded on ENTRY lands ahead of the vkAllocateMemory that
- * created it, and a replayer following the recorded order then creates the blob against memory
- * that does not exist yet. Recording after the fact costs only the failed calls, which a replayer
- * should not replay anyway.
+ * EACH IS CALLED AFTER ITS EFFECT AND BEFORE THE ABI CALL RETURNS -- see the ordering rule on
+ * `tick` above. Recording after the fact also costs only the failed calls, which a replayer should
+ * not replay anyway.
  */
 void
 vkr_record_ctx_create(uint32_t ctx_id, uint32_t context_init, const char *name, uint32_t nlen);

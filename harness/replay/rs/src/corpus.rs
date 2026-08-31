@@ -13,7 +13,7 @@ use std::fmt;
 
 pub const MAGIC: u32 = 0x4352_4b56; // 'VKRC'
 pub const JOURNAL_MAGIC: u32 = 0x524a_4b56; // 'VKJR'
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 pub const FLAG_TRUNC_FULL: u32 = 0x1;
 pub const FLAG_TRUNC_FATAL: u32 = 0x2;
@@ -58,8 +58,18 @@ pub enum Ctl {
 /// place, so they are handed over as owned, mutable buffers.
 #[derive(Clone, Debug)]
 pub enum Record {
-    Cmd { ctx: CtxKey, ring_id: u64, cmd_type: u32, wire: Vec<u8> },
-    Ctl { ctx: CtxKey, event: Ctl },
+    Cmd { tick: u64, ctx: CtxKey, ring_id: u64, cmd_type: u32, wire: Vec<u8> },
+    Ctl { tick: u64, ctx: CtxKey, event: Ctl },
+}
+
+impl Record {
+    /// Execution-order stamp. The file is in append order, which is NOT execution order across
+    /// threads; see the ordering rule in vkr_record.h.
+    pub fn tick(&self) -> u64 {
+        match self {
+            Record::Cmd { tick, .. } | Record::Ctl { tick, .. } => *tick,
+        }
+    }
 }
 
 impl Record {
@@ -89,8 +99,9 @@ pub struct Prologue {
 pub struct Corpus {
     pub flags: u32,
     pub prologues: Vec<Prologue>,
-    /// In recorded order, which is seq order: the recorder assigns the sequence number inside the
-    /// same critical section that appends the bytes.
+    /// Sorted into execution order by `tick`. The file's own order is append order, which
+    /// inverts a dependency whenever the guest acts on a command's mid-dispatch reply before the
+    /// recording thread reaches the append lock.
     pub records: Vec<Record>,
 }
 
@@ -257,6 +268,7 @@ pub fn parse(blob: &[u8]) -> Result<Corpus> {
         }
         expect_seq += 1;
 
+        let tick = sc.u64()?;
         let ring_id = sc.u64()?;
         let ctx = CtxKey { id: sc.u32()?, generation: sc.u32()? };
         let kind = sc.u32()?;
@@ -266,8 +278,9 @@ pub fn parse(blob: &[u8]) -> Result<Corpus> {
         let payload = sc.payload(size).map_err(|e| format!("seq {seq}: {e}"))?;
 
         records.push(match kind {
-            0 => Record::Cmd { ctx, ring_id, cmd_type: op, wire: payload.to_vec() },
+            0 => Record::Cmd { tick, ctx, ring_id, cmd_type: op, wire: payload.to_vec() },
             1 => Record::Ctl {
+                tick,
                 ctx,
                 event: parse_ctl(op, payload).map_err(|e| format!("seq {seq}: {e}"))?,
             },
@@ -280,6 +293,13 @@ pub fn parse(blob: &[u8]) -> Result<Corpus> {
             record_count,
             records.len()
         ));
+    }
+
+    // Into execution order. Stable, so two records that somehow share a tick keep append order
+    // rather than swapping arbitrarily -- and a duplicate tick is a recorder bug, so say it.
+    records.sort_by_key(Record::tick);
+    if let Some(w) = records.windows(2).find(|w| w[0].tick() == w[1].tick()) {
+        return Err(format!("two records share tick {}: the execution clock is broken", w[0].tick()));
     }
 
     Ok(Corpus { flags, prologues, records })

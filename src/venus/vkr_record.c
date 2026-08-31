@@ -154,6 +154,16 @@ vkr_record_enabled(void)
    return rec_on;
 }
 
+/* The execution clock. One process-global counter, both paths, no lock: an atomic increment is
+ * cheap enough to sit in the per-command hot path, and uniqueness is all the ordering needs. */
+static atomic_uint_fast64_t rec_tick;
+
+uint64_t
+vkr_record_tick(void)
+{
+   return (uint64_t)atomic_fetch_add_explicit(&rec_tick, 1, memory_order_relaxed) + 1;
+}
+
 /* --- append --- */
 
 static inline size_t
@@ -212,20 +222,20 @@ rec_append_locked(uint32_t kind,
                   uint32_t ctx_id,
                   uint32_t generation,
                   uint32_t op,
+                  uint64_t tick,
                   const void *data,
                   size_t size)
 {
-   const size_t hdr = sizeof(uint64_t) * 2 + sizeof(uint32_t) * 6;
+   const size_t hdr = sizeof(uint64_t) * 3 + sizeof(uint32_t) * 6;
    const size_t need = hdr + rec_align4(size);
    if (rec.used + need > rec.cap) {
       rec.flags |= VKR_RECORD_FLAG_TRUNC_FULL;
       return false;
    }
 
-   /* The sequence number is assigned here, inside the same critical section that appends the
-    * bytes. Handing out sequence numbers outside the lock lets two threads append in inverted
-    * order, and a replayer that trusts stream order would then replay a serialization that never
-    * happened. */
+   /* seq is append order: assigned inside the same critical section that writes the bytes, so the
+    * file is a faithful record of how the threads reached this lock. It is NOT execution order --
+    * that is `tick` (see vkr_record_tick). */
    uint8_t *p = rec.buf + rec.used;
    const uint64_t seq = rec.seq++;
    const uint32_t sz = (uint32_t)size;
@@ -233,6 +243,8 @@ rec_append_locked(uint32_t kind,
 
    memcpy(p, &seq, sizeof seq);
    p += sizeof seq;
+   memcpy(p, &tick, sizeof tick);
+   p += sizeof tick;
    memcpy(p, &ring_id, sizeof ring_id);
    p += sizeof ring_id;
    memcpy(p, &ctx_id, sizeof ctx_id);
@@ -289,7 +301,10 @@ rec_ctl_begin(uint32_t ctx_id, uint32_t *out_ctx_id, uint32_t *out_generation)
 static void
 rec_ctl_end(uint32_t op, uint32_t ctx_id, uint32_t generation, const void *payload, size_t size)
 {
-   rec_append_locked(VKR_RECORD_KIND_CTL, 0, ctx_id, generation, op, payload, size);
+   /* A control event is stamped after its effect and before the ABI call returns, so the guest
+    * cannot have acted on it yet when the stamp is taken. */
+   rec_append_locked(VKR_RECORD_KIND_CTL, 0, ctx_id, generation, op, vkr_record_tick(), payload,
+                     size);
    pthread_mutex_unlock(&rec_lock);
 }
 
@@ -297,6 +312,7 @@ void
 vkr_record_dispatch(struct vkr_context *ctx,
                     uint64_t ring_id,
                     uint32_t cmd_type,
+                    uint64_t tick,
                     const void *data,
                     size_t size,
                     bool fatal)
@@ -335,8 +351,8 @@ vkr_record_dispatch(struct vkr_context *ctx,
    }
    rec_take_prologue_locked(rc, ctx);
 
-   rec_append_locked(VKR_RECORD_KIND_CMD, ring_id, rc->ctx_id, rc->generation, cmd_type, data,
-                     size);
+   rec_append_locked(VKR_RECORD_KIND_CMD, ring_id, rc->ctx_id, rc->generation, cmd_type, tick,
+                     data, size);
 
    pthread_mutex_unlock(&rec_lock);
 }

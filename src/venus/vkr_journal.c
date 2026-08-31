@@ -227,6 +227,10 @@ struct vkr_journal_frame {
    struct vn_dispatch_context *dctx;
    const uint8_t *start;
    uint32_t cmd_type; /* peeked from the wire in pre_dispatch */
+   /* full-stream recorder: execution-order stamp, taken BEFORE the dispatch. The handler writes
+    * its reply into guest-visible memory partway through, so a stamp taken after it returns can
+    * already be later than an event the guest triggered off that reply. See vkr_record.h. */
+   uint64_t rec_tick;
 
    uint64_t *created;
    VkObjectType *created_types;
@@ -946,6 +950,7 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
    frame->dctx = dctx;
    frame->start = ((struct vkr_cs_decoder *)dctx->decoder)->cur;
    frame->cmd_type = next_type;
+   frame->rec_tick = vkr_record_enabled() ? vkr_record_tick() : 0;
    frame->parent = vkr_journal_frame_cur;
    vkr_journal_frame_cur = frame;
 }
@@ -1086,7 +1091,7 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx)
          ring_id = ((const struct vkr_ring *)((const char *)dctx -
                                               offsetof(struct vkr_ring, dispatch)))
                       ->id;
-      vkr_record_dispatch(frame->ctx, ring_id, frame->cmd_type, frame->start,
+      vkr_record_dispatch(frame->ctx, ring_id, frame->cmd_type, frame->rec_tick, frame->start,
                           end > frame->start ? (size_t)(end - frame->start) : 0,
                           vkr_cs_decoder_get_fatal(dec));
    }
