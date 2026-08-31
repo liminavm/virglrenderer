@@ -494,10 +494,6 @@ vkr_journal_create(uint32_t ctx_id)
    if (!j)
       return NULL;
 
-   /* The recorder's prologue is a journal export, so arming it here guarantees
-    * a journal exists before any command can be recorded against it. */
-   vkr_record_init();
-
    j->ctx_id = ctx_id;
    list_inithead(&j->entries);
    j->keys =
