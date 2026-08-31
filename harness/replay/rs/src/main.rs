@@ -158,6 +158,15 @@ struct Replay<'a> {
     /// ordering is the LAST thing wrong with a corpus -- and how far off the order actually is.
     /// The real fix is a recorded dependency fence, not a retry loop.
     deferred: Vec<(Ctl, u64)>,
+    /// Blobs that came back IOSurface-backed, by the context that created them. IOSurface is the
+    /// whole present path on this host -- a venus scanout blob has no CPU transfer_read, so its
+    /// pixels exist nowhere but the surface -- and backing the wrong set of blobs is silent in
+    /// every other line of the score.
+    ///
+    /// Handles, never ids. An id is host-private, recycled the instant its surface dies, and free
+    /// to change across a snapshot restore, so pinning one would pin a number no implementation
+    /// owes us.
+    iosurf: BTreeMap<u32, BTreeSet<u32>>,
 }
 
 impl<'a> Replay<'a> {
@@ -247,6 +256,10 @@ impl<'a> Replay<'a> {
                 // The guest reuses context ids. This is a DIFFERENT context wearing the number of
                 // one already scored at its destroy, so it owes a score of its own.
                 self.scored.remove(ctx_id);
+                // Its blobs die with the context it replaced, so its IOSurface tally starts at
+                // zero too -- carrying the dead generation's count forward would report a port
+                // that backs nothing as backing everything the previous one did.
+                self.iosurf.remove(ctx_id);
                 (rc, format!("context_create {ctx_id} flags={context_init:#x} {name:?}"))
             }
             Ctl::CtxDestroy { ctx_id } => {
@@ -257,6 +270,7 @@ impl<'a> Replay<'a> {
                 // exists, and for a workload that exits cleanly it is the ONLY moment.
                 let lines = score_context(&self.r, *ctx_id);
                 self.score.extend(lines);
+                self.score.push(iosurf_line(&self.iosurf, *ctx_id));
                 self.scored.insert(*ctx_id);
                 self.r.context_destroy(*ctx_id);
                 (0, format!("context_destroy {ctx_id}"))
@@ -291,6 +305,9 @@ impl<'a> Replay<'a> {
                     num_iovs: iov_count,
                 };
                 let rc = self.r.create_blob(&args);
+                if rc == 0 && self.r.iosurface_id(*res_handle).is_some() {
+                    self.iosurf.entry(*ctx_id).or_default().insert(*res_handle);
+                }
                 (
                     rc,
                     format!(
@@ -412,6 +429,7 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         score: Vec::new(),
         scored: BTreeSet::new(),
         deferred: Vec::new(),
+        iosurf: BTreeMap::new(),
     };
 
     // 1-2. Contexts already alive when the recorder armed: they have a prologue and no CtxCreate
@@ -522,6 +540,7 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
             continue;
         }
         rp.score.extend(score_context(&rp.r, ctx_id));
+        rp.score.push(iosurf_line(&rp.iosurf, ctx_id));
     }
     let score = std::mem::take(&mut rp.score);
     rp.r.dump_state();
@@ -579,6 +598,19 @@ fn score_pass(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
 /// perfectly deterministic. Two consecutive agreeing passes are the evidence that what we hashed
 /// is the finished state; a context that never settles says so in its own score, because that is
 /// itself a difference between two implementations.
+/// How many of a context's blobs came back IOSurface-backed.
+///
+/// A count, not the pixels. Reading a surface needs its geometry -- `read_iosurface` takes a byte
+/// stride and a row count -- and the venus corpus does not carry it: the dimensions live in
+/// SET_SCANOUT_BLOB, a virtio-gpu control command, and what this stream records is ring traffic.
+/// Guessing them would read a surface out of bounds. Recording the scanout geometry alongside the
+/// ring stream is what unlocks hashing venus frames here, and it is the one Layer 2 oracle for
+/// venus pixels that exists at all.
+fn iosurf_line(map: &BTreeMap<u32, BTreeSet<u32>>, ctx_id: u32) -> String {
+    let n = map.get(&ctx_id).map_or(0, |s| s.len());
+    format!("iosurface ctx={ctx_id} backed={n}")
+}
+
 fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
     const SETTLE_TRIES: u32 = 20;
     const SETTLE_WAIT: Duration = Duration::from_millis(50);
