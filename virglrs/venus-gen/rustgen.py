@@ -146,11 +146,87 @@ class RustGen:
         return [(self.field_name(v.name), self.field_type(v)) for v in ty.variables]
 
     def command_params(self, ty):
-        """A command's arguments as the fields of its `vn_command_*` struct, reply included."""
+        """A command's arguments as the fields of its `vn_command_*` struct, reply included.
+
+        The wire's members first, then the host-side shadows -- see `shadows`, which is where the
+        reason they are separate members and the reason they come last are both written down.
+        """
         fields = [(self.field_name(v.name), self.field_type(v)) for v in ty.variables]
         if ty.ret:
             fields.append((self.field_name(ty.ret.name), self.field_type(ty.ret)))
+        fields += [(f, rs) for f, rs, _ in self.shadows(ty)]
         return fields
+
+    def destroy_target(self, ty):
+        """The object a `vkDestroy*`/`vkFree*` names, as `(var, shape)`, or None.
+
+        Its *last* handle argument. Every destroy in Vulkan is shaped `(parent, ..., target)`, so
+        the earlier handles are the device or pool it came from and must survive it.
+        """
+        if not (ty.name.startswith('vkDestroy') or ty.name.startswith('vkFree')):
+            return None
+        handles = [v for v in ty.variables
+                   if self.gen.is_serializable(v) and v.ty.base.category == VkType.HANDLE
+                   and self.gen._get_variable_validity(ty, v, 'var_in' in v.attrs) == Gen_VALID]
+        if not handles:
+            return None
+        var = handles[-1]
+        try:
+            return (var, self._shape(ty, var))
+        except self.Unsupported:
+            return None
+
+    def out_handles(self, ty):
+        """The objects a command creates, as `(var, shape)`.
+
+        An out-handle is a handle member the model calls PARTIAL, which is the same attribute pass
+        the serializer makes -- so the create list is derived, not a list of command names someone
+        has to keep current.
+        """
+        out = []
+        for var in ty.variables:
+            if not self.gen.is_serializable(var) or var.ty.base.category != VkType.HANDLE:
+                continue
+            if self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs) != Gen_PARTIAL:
+                continue
+            try:
+                out.append((var, self._shape(ty, var)))
+            except self.Unsupported:
+                continue
+        return out
+
+    def shadows(self, ty):
+        """The host-side members of a command's argument struct, as `(field, rust_type, shape)`.
+
+        **Visible members are the wire's side; shadow members are the host's.** The two cannot be
+        one member, because each direction needs both halves of the (guest id, host handle) pair at
+        the moment the object table is written:
+
+        - A destroy's target member is *replaced* by the host handle at lookup, which is what keeps
+          the argument struct callable by the driver with no conversion. `id_<name>` is the guest
+          id the decoder read before it was overwritten -- without it a destroy can only say which
+          host handle died, and the table is keyed by id.
+        - A create's out member must keep the guest id, because the reply re-encodes it and a host
+          handle there would leak a host pointer into the guest. `handle_<name>` is where the
+          driver writes instead: the decoder arena-allocates it, the handler passes it straight to
+          Vulkan, and the pairing is registered from the two together.
+
+        They are appended after every wire member, never interleaved. C struct layout is
+        prefix-stable, so venus-protocol's own encoder -- which reads `vn_command_*` through a
+        pointer and never sizeofs or allocates one -- sees the same offsets for every member it
+        knows about. The layout-parity oracle is what holds that to an `offsetof` rather than to
+        this paragraph.
+        """
+        out = []
+        target = self.destroy_target(ty)
+        if target:
+            var, shape = target
+            f = 'id_%s' % self.field_name(var.name)
+            out.append((f, 'ObjectId' if shape[0] == 'plain' else '*const ObjectId', shape))
+        for var, shape in self.out_handles(ty):
+            f = 'handle_%s' % self.field_name(var.name)
+            out.append((f, '*mut %s' % self.base_name(var.ty), shape))
+        return out
 
     def funcpointer(self, ty):
         params = ', '.join(self.field_type(v) for v in ty.variables)
@@ -310,8 +386,13 @@ class RustGen:
             return ('call', name, self._tag_arg(ty, var))
         return ('call', name, '')
 
-    def decode_member(self, ty, var, validity, alloc):
-        """Rust statements decoding one struct member or command argument."""
+    def decode_member(self, ty, var, validity, alloc, capture=None):
+        """Rust statements decoding one struct member or command argument.
+
+        `capture` names a shadow member to keep the guest ids in. A handle lookup replaces the id
+        with the host handle, and the wire position is gone afterwards, so an id a later step needs
+        has to be kept as it goes past. Only a destroy target asks for this; see `shadows`.
+        """
         if not self.gen.is_serializable(var):
             return self._dead_member('decode', ty, var)
 
@@ -324,6 +405,8 @@ class RustGen:
                 return ['/* skip %s */' % m]
             if elem_kind == 'scalar':
                 return ['%s = dec.decode_scalar::<%s>();' % (m, elem)]
+            if capture:
+                return ['val.%s = %s(dec, &mut %s);' % (capture, elem, m)]
             return ['%s(dec, &mut %s%s);' % (elem, m, tag)]
 
         if shape[0] == 'static':
@@ -399,6 +482,14 @@ class RustGen:
         if validity != Gen_INVALID:
             if elem_kind == 'scalar':
                 hit.append('dec.decode_scalar_array(a);')
+            elif capture:
+                # The ids and the handles are two arrays of the same length, filled in one pass:
+                # the lookup hands back the id it just overwrote.
+                hit.append('let Some(ids) = dec.alloc_temp_array::<ObjectId>(n) else { return };')
+                hit.append('for (e, id) in a.iter_mut().zip(ids.iter_mut()) {')
+                hit.append('    *id = %s(dec, e);' % elem)
+                hit.append('}')
+                hit.append('val.%s = ids.as_ptr();' % capture)
             else:
                 hit.append('for e in a.iter_mut() {')
                 hit.append('    %s(dec, e%s);' % (elem, tag))
@@ -642,9 +733,9 @@ class RustGen:
             out.append('size')
         return out
 
-    def _member(self, kind, ty, var, validity, alloc):
+    def _member(self, kind, ty, var, validity, alloc, capture=None):
         if kind == 'decode':
-            return self.decode_member(ty, var, validity, alloc)
+            return self.decode_member(ty, var, validity, alloc, capture)
         if kind == 'encode':
             return self.encode_member(ty, var, validity)
         return self.sizeof_member(ty, var, validity)
@@ -1153,9 +1244,15 @@ class RustGen:
             '',
             '/// Resolve the guest id to the host object, poisoning this command if it names one',
             '/// the host never created.',
-            'pub fn vn_decode_%s_lookup(dec: &mut Decoder<\'_>, val: &mut %s) {' % (n, n),
-            '    let id = dec.decode_scalar::<u64>();',
-            '    val.0 = dec.lookup_object(ObjectId(id), %s.0);' % objtype,
+            '///',
+            '/// The id is *replaced* by the host handle, so the argument struct is what the driver',
+            '/// is called with and nothing converts it. That is also why the id is returned rather',
+            '/// than dropped: after this the wire position is gone, and a destroy still has to say',
+            '/// which guest object died. See the shadow members on `vn_command_*`.',
+            'pub fn vn_decode_%s_lookup(dec: &mut Decoder<\'_>, val: &mut %s) -> ObjectId {' % (n, n),
+            '    let id = ObjectId(dec.decode_scalar::<u64>());',
+            '    val.0 = dec.lookup_object(id, %s.0);' % objtype,
+            '    id',
             '}',
             '',
         ]
@@ -1260,6 +1357,9 @@ class RustGen:
         cmd = 'VkCommandTypeEXT::%s' % ty.attrs['c_type']
         args = 'vn_command_%s' % n
 
+        target = self.destroy_target(ty)
+        target_var = target[0] if target else None
+
         def members(kind, reply):
             out = []
             for var in ([ty.ret] if reply and ty.ret else []) + list(ty.variables):
@@ -1270,7 +1370,29 @@ class RustGen:
                     validity = Gen_VALID
                 else:
                     validity = self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs)
-                out += self._member(kind, ty, var, validity, kind == 'decode')
+                capture = None
+                if kind == 'decode' and var is target_var:
+                    capture = 'id_%s' % self.field_name(var.name)
+                out += self._member(kind, ty, var, validity, kind == 'decode', capture)
+            return out
+
+        def out_handle_storage():
+            """Arena room for the host handles a create will produce.
+
+            Allocated here rather than by a handler because the length is a decoded value, and
+            because every handler then looks the same: pass `handle_<name>` where Vulkan wants the
+            out pointer, and the driver writes host handles somewhere the guest's ids are not.
+            """
+            out = []
+            for var, shape in self.out_handles(ty):
+                m = self.member_expr(var)
+                f = 'handle_%s' % self.field_name(var.name)
+                base = self.base_name(var.ty)
+                n = '1' if shape[0] == 'pointer' else '(%s) as usize' % shape[1]
+                out += ['if !%s.is_null() {' % m,
+                        '    let Some(a) = dec.alloc_temp_array::<%s>(%s) else { return };' % (base, n),
+                        '    val.%s = a.as_mut_ptr();' % f,
+                        '}']
             return out
 
         def request(kind):
@@ -1290,6 +1412,8 @@ class RustGen:
                     out += ['size += cs::sizeof_scalar::<VkCommandTypeEXT>();',
                             'size += cs::sizeof_scalar::<VkFlags>();']
                 out += members(kind, False)
+                if kind == 'decode':
+                    out += out_handle_storage()
                 return out + (['size'] if kind == 'sizeof' else [])
             return go
 
@@ -1362,65 +1486,66 @@ class RustGen:
     def _lifecycle(self, ty, gaps):
         """The objects a command creates or destroys, read out of its decoded arguments.
 
-        The emitter already knows this: an out-handle is a member whose validity is PARTIAL and
-        whose base type is a handle, which is the same attribute pass the serializer makes. Saying
-        it here rather than in thirty hand-written handlers is the same trade the C makes with
-        `vkr_device_object.py`, minus the C.
+        The emitter already knows which members these are -- an out-handle is a member the model
+        calls PARTIAL, a destroy's target is its last input handle -- so saying it here rather than
+        in thirty hand-written handlers is the same trade the C makes with `vkr_device_object.py`,
+        minus the C.
 
-        A destroy names its target with its *last* handle member. Every `vkDestroy*`/`vkFree*` in
-        Vulkan is shaped `(parent, ..., target)`, so the last one is the object and the earlier ones
-        are the device or pool it came from -- which must not be destroyed with it.
+        Each hook is handed *both* halves of the pairing, because neither member holds both: the
+        visible one is the wire's and the shadow is the host's. See `shadows`.
         """
         n = ty.name
-        destroys = n.startswith('vkDestroy') or n.startswith('vkFree')
-
-        handles = []
-        for var in ty.variables:
-            if not self.gen.is_serializable(var):
-                continue
-            if var.ty.base.category != VkType.HANDLE:
-                continue
-            validity = self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs)
-            handles.append((var, validity))
-
-        def emit(var, objtype, hook):
-            m = 'val.%s' % self.field_name(var.name)
-            try:
-                shape = self._shape(ty, var)
-            except self.Unsupported as e:
-                gaps.append(str(e))
-                return ['/* gap: %s */' % e]
-            one = 'h.%s(%s, ObjectId(%%s));' % (hook, objtype)
-            if shape[0] == 'plain':
-                return [one % ('%s.0' % m)]
-            if shape[0] == 'pointer':
-                # A null out-pointer is the guest asking how many there would be, not creating one.
-                return ['if !%s.is_null() {' % m,
-                        '    // SAFETY: non-null, and the decoder allocated it in the arena.',
-                        '    ' + one % ('unsafe { (*%s).0 }' % m),
-                        '}']
-            if shape[0] == 'dynamic':
-                return ['if !%s.is_null() {' % m,
-                        '    for i in 0..(%s) as usize {' % shape[1],
-                        '        // SAFETY: the decoder allocated this array with that many',
-                        '        // elements, from the same count.',
-                        '        ' + one % ('unsafe { (*%s.add(i)).0 }' % m),
-                        '    }',
-                        '}']
-            gaps.append('%s.%s: %s handle' % (n, var.name, shape[0]))
-            return ['/* gap: %s.%s: %s handle */' % (n, var.name, shape[0])]
-
         out = []
-        for var, validity in handles:
-            if validity != Gen_PARTIAL:
-                continue
-            out += emit(var, 'VkObjectType::%s' % var.ty.base.attrs['c_objtype'], 'object_created')
 
-        if destroys and handles:
-            var, validity = handles[-1]
-            if validity == Gen_VALID:
-                out += emit(var, 'VkObjectType::%s' % var.ty.base.attrs['c_objtype'],
-                            'object_destroyed')
+        for var, shape in self.out_handles(ty):
+            objtype = 'VkObjectType::%s' % var.ty.base.attrs['c_objtype']
+            m = 'val.%s' % self.field_name(var.name)
+            s = 'val.handle_%s' % self.field_name(var.name)
+            if shape[0] == 'pointer':
+                out += [
+                    '// A null out-pointer is the guest asking how many there would be, not',
+                    '// creating one. A null shadow means no handler ran.',
+                    'if !%s.is_null() && !%s.is_null() {' % (m, s),
+                    '    // SAFETY: both are non-null and the decoder allocated them in the arena,',
+                    '    // one element each.',
+                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), (*%s).0) };'
+                    % (objtype, m, s),
+                    '}']
+            elif shape[0] == 'dynamic':
+                out += [
+                    'if !%s.is_null() && !%s.is_null() {' % (m, s),
+                    '    for i in 0..(%s) as usize {' % shape[1],
+                    '        // SAFETY: the decoder allocated both arrays with that many elements,',
+                    '        // from the same count.',
+                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), (*%s.add(i)).0) };'
+                    % (objtype, m, s),
+                    '    }',
+                    '}']
+            else:
+                gaps.append('%s.%s: %s out handle' % (n, var.name, shape[0]))
+                out.append('/* gap: %s.%s: %s out handle */' % (n, var.name, shape[0]))
+
+        target = self.destroy_target(ty)
+        if target:
+            var, shape = target
+            objtype = 'VkObjectType::%s' % var.ty.base.attrs['c_objtype']
+            f = 'val.id_%s' % self.field_name(var.name)
+            if shape[0] == 'plain':
+                out.append('h.object_destroyed(%s, %s);' % (objtype, f))
+            elif shape[0] == 'dynamic':
+                m = 'val.%s' % self.field_name(var.name)
+                out += [
+                    'if !%s.is_null() {' % f,
+                    '    for i in 0..(%s) as usize {' % shape[1],
+                    '        // SAFETY: the decoder filled this array alongside the handles, from',
+                    '        // the same count.',
+                    '        h.object_destroyed(%s, unsafe { *%s.add(i) });' % (objtype, f),
+                    '    }',
+                    '}']
+            else:
+                gaps.append('%s.%s: %s destroy target' % (n, var.name, shape[0]))
+                out.append('/* gap: %s.%s: %s destroy target */' % (n, var.name, shape[0]))
+
         return out
 
     def _handler_trait(self, commands, gaps):
@@ -1441,14 +1566,22 @@ class RustGen:
                '    /// renderer decides whether that is a poisoned context or a logged no-op.',
                '    fn unsupported(&mut self, cmd: VkCommandTypeEXT);',
                '',
-               '    /// A command created this object under the id the guest chose. Called after',
-               '    /// the handler, so a real one has already made the host handle it registers.',
-               '    fn object_created(&mut self, ty: VkObjectType, id: ObjectId) {',
-               '        let _ = (ty, id);',
+               '    /// A command created this object: the id the guest chose, and the handle',
+               '    /// the driver returned into the shadow member beside it.',
+               '    ///',
+               '    /// Called after the handler, which is what makes `host` meaningful -- a',
+               '    /// handler that ran and failed leaves it zero, and one that never ran leaves',
+               '    /// the shadow null and this uncalled. Registering the pairing is the',
+               '    /// renderer\'s to do: the generator does not get to decide what a zero handle',
+               '    /// means.',
+               '    fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {',
+               '        let _ = (ty, id, host);',
                '    }',
                '',
-               '    /// A command destroyed this object. Called after the handler, which still',
-               '    /// needed the host handle to destroy.',
+               '    /// A command destroyed this object, named by the guest id the decoder kept',
+               '    /// when the lookup overwrote it with the host handle.',
+               '    ///',
+               '    /// Called after the handler, which still needed that host handle to destroy.',
                '    fn object_destroyed(&mut self, ty: VkObjectType, id: ObjectId) {',
                '        let _ = (ty, id);',
                '    }',

@@ -11,7 +11,7 @@
 
 use core::ffi::c_void;
 
-use crate::venus::cs::Scalar;
+use crate::venus::cs::{ObjectId, Scalar};
 
 /// Vulkan's handles are pointer-sized on every target this renderer supports.
 const _: () = assert!(size_of::<*const c_void>() == 8);

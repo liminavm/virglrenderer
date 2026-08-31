@@ -12,12 +12,17 @@
 //! off one instance tree. Nothing is shared between contexts: two guests may pick the same id and
 //! never see each other's objects.
 //!
-//! **An out-handle is a guest id, not a host handle.** A command that creates an object carries the
-//! id the guest picked, and the reply encoder sends that same field back. A handler that overwrote
-//! it with the host handle would leak a host pointer into the guest -- so handlers register the
-//! pairing here and leave the field alone. Input handles are the other way round: the generated
-//! `_lookup` decode replaces the id with the host handle in place, which is safe because a reply
-//! never re-encodes an input member.
+//! **A guest id and a host handle are never the same member.** A command that creates an object
+//! carries the id the guest picked, and the reply encoder sends that same field back -- a handler
+//! that overwrote it with the host handle would leak a host pointer into the guest. Input handles
+//! go the other way: the generated `_lookup` decode replaces the id with the host handle in place,
+//! which is what makes an argument struct callable by the driver with no conversion, and is safe
+//! because a reply never re-encodes an input member.
+//!
+//! Each direction is therefore missing one half of the pairing by the time this table is written,
+//! and the generator supplies it as a shadow member alongside: `handle_<name>` is where the driver
+//! writes a created object's handle, and `id_<name>` is the guest id the decoder kept as the
+//! lookup overwrote it. The two arrive together at `object_created` and `object_destroyed`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
