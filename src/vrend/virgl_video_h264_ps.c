@@ -230,7 +230,18 @@ static void write_sps(struct bs *w, const struct virgl_h264_picture_desc *desc,
          se(w, sps->offset_for_ref_frame[i]);
    }
 
-   ue(w, sps->max_num_ref_frames);
+   /*
+    * The DPB size, and a trap: struct virgl_h264_sps HAS a max_num_ref_frames field and it
+    * is dead on the decode path. mesa's VA frontend puts VA-API's num_ref_frames into the
+    * *picture descriptor* instead (picture_h264.c: `desc.h264.num_ref_frames`), and only
+    * the ENCODER frontend ever writes the SPS one. Reading the SPS field yields 0, which
+    * VideoToolbox honours: it sizes the DPB at zero, drops every reference, and rejects the
+    * third frame onward with kVTVideoDecoderBadDataErr while the first two decode fine.
+    *
+    * Clamped to at least 1: a stream with inter prediction needs somewhere to keep the
+    * picture it predicts from, and 0 is what "the guest did not say" looks like.
+    */
+   ue(w, desc->num_ref_frames ? desc->num_ref_frames : 1);
    flag(w, 0);                 /* gaps_in_frame_num_value_allowed_flag */
 
    /*
@@ -281,8 +292,20 @@ static void write_pps(struct bs *w, const struct virgl_h264_picture_desc *desc,
    ue(w, 0);                   /* num_slice_groups_minus1: FMO is Baseline-only and the
                                 * slice-group map syntax that follows a non-zero value is
                                 * not on the wire, so a stream using it is refused. */
-   ue(w, pps->num_ref_idx_l0_default_active_minus1);
-   ue(w, pps->num_ref_idx_l1_default_active_minus1);
+   /*
+    * Reference list sizes, and the same trap as max_num_ref_frames: the PPS fields
+    * num_ref_idx_l{0,1}_default_active_minus1 exist on the wire and are DEAD on the decode
+    * path. mesa fills the per-slice values into the picture descriptor instead
+    * (picture_h264.c: `desc.h264.num_ref_idx_l0_active_minus1`, from the slice parameter
+    * buffer). Emitting the PPS fields yields 0, so the decoder builds a one-entry list and
+    * every P slice that indexes past it is bad data.
+    *
+    * Using the per-slice value as the PPS default is correct in both directions: a slice
+    * that overrides it carries num_ref_idx_active_override_flag in its own header, which
+    * passes through untouched and still wins.
+    */
+   ue(w, desc->num_ref_idx_l0_active_minus1);
+   ue(w, desc->num_ref_idx_l1_active_minus1);
    flag(w, pps->weighted_pred_flag);
    u(w, 2, pps->weighted_bipred_idc);
    se(w, pps->pic_init_qp_minus26);
@@ -332,6 +355,13 @@ int virgl_h264_build_parameter_sets(const struct virgl_h264_picture_desc *desc,
    }
    if (desc->pps.sps.bit_depth_luma_minus8 || desc->pps.sps.bit_depth_chroma_minus8) {
       virgl_error("video: h264 bit depth > 8 is not supported\n");
+      return -1;
+   }
+   /* The height derivation below counts map units as whole-frame macroblock rows, which is
+    * only true for frame_mbs_only_flag == 1. A field-capable stream would need the map
+    * units halved and the crop scaled, so it is refused rather than mis-sized. */
+   if (!desc->pps.sps.frame_mbs_only_flag) {
+      virgl_error("video: h264 field-capable streams (frame_mbs_only_flag 0) are not supported\n");
       return -1;
    }
    if (desc->pps.num_slice_groups_minus1) {
