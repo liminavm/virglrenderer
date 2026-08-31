@@ -184,12 +184,12 @@ the wrong reason.
 Each phase ends with the harness green against the phase's scope; the C build stays
 buildable throughout as the A-side reference.
 
-- **P0 — Harness.** Layer 2 runner against the C dylib. Extend the Layer 1 corpus.
-  Add full-ring venus recording to the C vkr_journal. Record and pin every golden.
-  Tag the C tree (`pre-rust-baseline`) before anything else moves. The layer-2 seeds
-  are already in `harness/` — see `harness/README.md` for what P0 still owes it.
+- **P0 — Harness.** Done. Both replayers run against the C dylib and score into
+  pinned fixtures; the ABI's exported symbols and struct layouts are pinned too;
+  the C tree is tagged `virgl-pre-rewrite-2026-08-31`. See `harness/README.md`.
+  The corpora the replayers read are not in git and have no permanent home yet.
 - **P1 — Skeleton.** The virglrs tree scaffolded in this repository, producing a
-  dylib and a prefix layout interchangeable with the C build's. All 62 symbols
+  dylib and a prefix layout interchangeable with the C build's. All 69 symbols
   exported and stubbed; the ABI
   types, resource table, context table, fence tracking, and async fence retirement
   implemented for real. Boots to software-2D.
