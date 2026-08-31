@@ -60,6 +60,21 @@
 #include "virgl_resource.h"
 #include "virgl_util.h"
 
+/* The venus recorder's control-path tees (src/venus/vkr_record.h). Resources are created here, on
+ * the public ABI, and never in the command stream -- so a venus corpus that recorded only commands
+ * references resources that do not exist. Without venus there is nothing to record into. */
+#ifdef ENABLE_VENUS
+#include "vkr_record.h"
+#else
+#define vkr_record_ctx_create(a, b, c, d) ((void)0)
+#define vkr_record_ctx_destroy(a) ((void)0)
+#define vkr_record_create_blob(a, b, c, d, e, f, g) ((void)0)
+#define vkr_record_import_blob(a, b, c) ((void)0)
+#define vkr_record_attach_resource(a, b) ((void)0)
+#define vkr_record_detach_resource(a, b) ((void)0)
+#define vkr_record_resource_unref(a) ((void)0)
+#endif
+
 struct global_state {
    bool client_initialized;
    void *cookie;
@@ -208,6 +223,7 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
 
    /* Recorded so a replay can free the handle before it is reused. Handles ARE reused, and a
     * replay that keeps the first resource alive would bind the wrong one. */
+   vkr_record_resource_unref(res_handle);
    if (vrend_trace_enabled()) {
       struct vrend_trace_res tres = { .kind = VREND_TRACE_RES_UNREF, .handle = res_handle };
       vrend_trace_res_event(&tres);
@@ -285,6 +301,10 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       return ctx->capset_id == capset_id ? 0 : EINVAL;
    }
 
+   /* After the already-live check: a repeat create of a live id is a no-op here, and recording it
+    * would make the replayer retire a context that never went away. */
+   vkr_record_ctx_create(ctx_id, ctx_flags, name, nlen);
+
    switch (capset_id) {
    case VIRTGPU_DRM_CAPSET_VIRGL:
    case VIRTGPU_DRM_CAPSET_VIRGL2:
@@ -339,6 +359,7 @@ void virgl_renderer_context_destroy(uint32_t handle)
    TRACE_FUNC();
    if (virgl_fd_trace())
       virgl_error("[FDTRACE] context_destroy ctx=%u", handle);
+   vkr_record_ctx_destroy(handle);
    virgl_context_remove(handle);
 }
 
@@ -523,6 +544,7 @@ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!ctx || !res)
       return;
+   vkr_record_attach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
    ctx->attach_resource(ctx, res);
 }
 
@@ -536,6 +558,7 @@ void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
                   res_handle, ctx ? "" : " NO-CTX", res ? "" : " NO-RES");
    if (!ctx || !res)
       return;
+   vkr_record_detach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
    ctx->detach_resource(ctx, res);
 }
 
@@ -1255,6 +1278,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       };
       vrend_trace_res_event(&tres);
    }
+   vkr_record_create_blob(args->res_handle, args->ctx_id, args->blob_mem, args->blob_flags,
+                          args->blob_id, args->size, args->num_iovs);
 
    if (!has_host_storage) {
       res = virgl_resource_create_from_iov(args->res_handle,
@@ -1988,6 +2013,11 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
       return -EINVAL;
    if (args->size == 0)
       return -EINVAL;
+
+   /* Recorded, though a replayer cannot reproduce it: the fd came from outside the renderer. The
+    * point is that the replayer can say which resource it is missing and why, instead of failing
+    * obscurely on the first command that names the handle. */
+   vkr_record_import_blob(args->res_handle, args->fd_type, args->size);
 
    res = virgl_resource_create_from_fd(args->res_handle,
                                        fd_type,
