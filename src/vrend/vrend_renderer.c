@@ -2838,6 +2838,31 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
       else if (view->format != view->texture->base.format)
          needs_view = true;
 
+      /* A plane index, not a layer range. Sampling plane N of a planar video surface,
+       * the guest writes the index into the same dword the layer range is packed in
+       * (mesa, virgl_encode_sampler_view), so it arrives as first_layer = N,
+       * last_layer = 0. A genuine range never has last_layer below first_layer, which is
+       * what makes this unambiguous rather than a guess.
+       *
+       * Where the host keeps a separate image per plane -- aux_plane_egl_image, which
+       * only GBM fills -- the branch further down selects with it. There is no GBM on
+       * macOS and none is needed: virgl carries no planar formats, so each plane already
+       * arrives as its own resource with a component format (R8, R8G8), and sampling that
+       * resource is sampling the plane. So the index is spent, and clearing it is what
+       * this does.
+       *
+       * Left in place it reads as first_layer = 1, which is itself what sets needs_view
+       * just below; the texture-view path then refuses the view for having no layers, and
+       * a refused CREATE_OBJECT puts the whole context in error -- every later submission
+       * on it fails. One chroma plane is enough to take a browser down for its lifetime. */
+      if (view->u.tex.last_layer < view->u.tex.first_layer) {
+         const uint32_t plane = view->u.tex.first_layer;
+
+         if (!(plane < ARRAY_SIZE(res->aux_plane_egl_image) &&
+               res->aux_plane_egl_image[plane]))
+            view->u.tex.first_layer = view->u.tex.last_layer = 0;
+      }
+
       if (view->u.tex.first_layer > 0 || view->u.tex.first_level > 0)
          needs_view = true;
 
@@ -2850,10 +2875,27 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
         int num_layers = view->u.tex.last_layer - view->u.tex.first_layer + 1;
 
         if (view->levels == 0 || num_layers <= 0) {
+            /* Say what was asked for, not merely that it was refused. This rejection
+             * poisons the whole context -- every later submission on it fails -- so the
+             * one line it prints is the only evidence of which resource provoked it. */
+            virgl_error("%s: Invalid number of layers (%d) or zero levels requested: "
+                        "res %d target %d fmt %d %dx%dx%d array %d levels %d samples %d "
+                        "imported %d storage 0x%x | view target 0x%x fmt %d "
+                        "egl %d aux1 %d aux2 %d | "
+                        "layers %u..%u levels %u..%u (val0 0x%x val1 0x%x)\n",
+                        __func__, num_layers,
+                        view->texture->gl_id, view->texture->base.target,
+                        view->texture->base.format, view->texture->base.width0,
+                        view->texture->base.height0, view->texture->base.depth0,
+                        view->texture->base.array_size, view->texture->base.last_level,
+                        view->texture->base.nr_samples, res->is_imported,
+                        view->texture->storage_bits, view->target, view->format,
+                        !!view->texture->egl_image, !!view->texture->aux_plane_egl_image[1],
+                        !!view->texture->aux_plane_egl_image[2],
+                        view->u.tex.first_layer, view->u.tex.last_layer,
+                        view->u.tex.first_level, view->u.tex.last_level, val0, val1);
             vrend_resource_reference(&view->texture, NULL);
             FREE(view);
-            virgl_error("%s: Invalid number of layers (%d) or zero levels requested\n",
-                        __func__, num_layers);
             return EINVAL;
         }
 
