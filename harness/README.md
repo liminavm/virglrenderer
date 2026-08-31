@@ -81,13 +81,21 @@ every ring flow-control command, so nothing in the stream waits on the GPU: a ha
 instant `replay_end` returns can race queue work still executing and look nondeterministic when
 the renderer is perfectly deterministic.
 
-### What P0 still has to build
+## Layer 0 — the ABI itself (`abi/`)
 
-- **ABI fixtures.** The symbol list (`nm -gU` on the dylib ∩ what libkrun names — 62 today) and
-  the layouts of `virgl_renderer_callbacks`, `virgl_renderer_resource_create_args` and the
-  blob/import arg structs, pinned as files the Rust build is diffed against. A layout mismatch
-  compiles clean and corrupts at runtime, and nothing else here would catch it.
-- **Pinned goldens** recorded from the C build before any Rust lands.
+`abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, every symbol the
+dylib exports, and `layout.txt`, the size, alignment and field offsets of every struct that
+crosses the ABI. `VIRGL_PREFIX` selects the build under test, so pointing it at a Rust build is
+how the port gets checked; `--pin` re-records, and is only for a change to the ABI that is meant.
+
+Both failures are invisible to every other layer here. A missing symbol shows up at `dlopen` and
+nowhere earlier; a wrong field offset never shows up at all — it compiles clean on both sides and
+corrupts at runtime. The layout comes from the compiler (`abi-dump.c`, built against the header),
+not from a transcription anyone has to keep in step.
+
+The symbol fixture pins *everything exported*, not the subset libkrun happens to call. What the
+dylib exports is defined by this tree; who calls what is defined outside it and moves without
+warning, and a port that exports the whole list satisfies every consumer of it.
 
 ## The capture rig (`vm/`)
 
