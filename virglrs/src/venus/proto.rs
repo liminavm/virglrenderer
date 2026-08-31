@@ -144,6 +144,51 @@ mod tests {
         );
     }
 
+    /// A renderer implements the commands it serves and inherits `unsupported` for the rest.
+    /// The dispatcher has to reach the override for an implemented command and the default for
+    /// everything else, or vkr would grow six hundred stubs to say nothing.
+    #[test]
+    fn dispatch_reaches_the_override_and_defaults_to_unsupported() {
+        #[derive(Default)]
+        struct Only {
+            saw_create: bool,
+            unsupported: Vec<VkCommandTypeEXT>,
+        }
+        impl Commands for Only {
+            fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
+                self.unsupported.push(cmd);
+            }
+            fn vkCreateInstance(&mut self, _args: &mut vn_command_vkCreateInstance) {
+                self.saw_create = true;
+            }
+        }
+
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut h = Only::default();
+
+        // vkDestroyInstance: an instance id and an absent allocator.
+        let w = wire(&[&1u64.to_le_bytes(), &0u64.to_le_bytes()]);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        let hit = vn_dispatch_command(
+            &mut dec,
+            None,
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT,
+            &mut h,
+        );
+        assert_eq!(hit, Some(()));
+        assert!(!dec.fatal());
+        assert!(!h.saw_create);
+        assert_eq!(h.unsupported, [VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT]);
+
+        // A command type no protocol defines is a stream we cannot follow.
+        let mut dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
+        assert_eq!(
+            vn_dispatch_command(&mut dec, None, VkCommandTypeEXT(0x7fff_ffff), &mut h),
+            None
+        );
+    }
+
     #[test]
     fn a_blob_is_reproduced_with_its_padding() {
         let w = wire(&[

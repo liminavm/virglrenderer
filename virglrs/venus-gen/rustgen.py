@@ -907,6 +907,67 @@ class RustGen:
                 '        }',
             ]
         out += ['        _ => None,', '    }', '}', '']
+
+        out += self._handler_trait(commands)
+        return out
+
+    def _handler_trait(self, commands):
+        """The renderer's side of the wire: one method per command, and the match that reaches it.
+
+        Every method defaults to `unsupported`, so a renderer implements the commands it serves and
+        inherits a loud, uniform answer for the ~600 it does not. That default is what lets vkr grow
+        one command at a time without the generator being touched again.
+
+        The handler takes its arguments by `&mut` because a command's outputs are members of the
+        same struct its inputs came from -- the reply encoder reads back what the handler wrote,
+        exactly as the C does.
+        """
+        out = ['/// Every command venus defines, as a method a renderer overrides.',
+               'pub trait Commands {',
+               '    /// A command this renderer does not serve. The generated default calls it, so',
+               '    /// an unimplemented command is answered the same way everywhere -- and the',
+               '    /// renderer decides whether that is a poisoned context or a logged no-op.',
+               '    fn unsupported(&mut self, cmd: VkCommandTypeEXT);',
+               '']
+        for ty in commands:
+            n = ty.name
+            out += ['    fn %s(&mut self, args: &mut vn_command_%s) {' % (n, n),
+                    '        let _ = args;',
+                    '        self.unsupported(VkCommandTypeEXT::%s);' % ty.attrs['c_type'],
+                    '    }']
+        out += ['}', '']
+
+        out += ['/// Decode one command, run it, and encode its reply when the guest asked for one.',
+                '///',
+                '/// `enc` is `Some` exactly when the command header carried the reply flag. Replay',
+                '/// strips that flag, which is why a replayed stream needs no reply buffer at all.',
+                '///',
+                '/// `None` is a command type this protocol does not define -- a stream naming one',
+                '/// is a stream we cannot follow, and the caller poisons the ring.',
+                'pub fn vn_dispatch_command(',
+                '    dec: &mut Decoder<\'_>,',
+                '    enc: Option<&mut Encoder<\'_>>,',
+                '    cmd: VkCommandTypeEXT,',
+                '    h: &mut dyn Commands,',
+                ') -> Option<()> {',
+                '    match cmd {']
+        for ty in commands:
+            n = ty.name
+            out += [
+                '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
+                '            let mut args = vn_command_%s::default();' % n,
+                '            vn_decode_%s_args_temp(dec, &mut args);' % n,
+                '            if dec.fatal() {',
+                '                return Some(());',
+                '            }',
+                '            h.%s(&mut args);' % n,
+                '            if let Some(enc) = enc {',
+                '                vn_encode_%s_reply(enc, &args);' % n,
+                '            }',
+                '            Some(())',
+                '        }',
+            ]
+        out += ['        _ => None,', '    }', '}', '']
         return out
 
     def _chain_fns(self, ty, gaps, v=''):
