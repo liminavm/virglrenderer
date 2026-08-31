@@ -279,6 +279,21 @@ impl Handlers<'_> {
             Ok(_) => self.objects.borrow_mut().add_ghost(id),
         }
     }
+
+    /// Refuse a run of ids in an out-array the guest sent.
+    ///
+    /// The generated hook walks the whole array whatever the handler did with it, so every id it
+    /// will reach needs a decision recorded against it. The ones a short answer did not fill, and
+    /// all of them when the enumeration failed outright, are refusals: left alone they would be
+    /// registered as their own handles and the guest would hold objects that do not exist.
+    fn ghost_range<T: Handle>(&mut self, out: *const T, range: core::ops::Range<usize>) {
+        for i in range {
+            // SAFETY: `i` is inside the array, which the decoder allocated with `asked` elements.
+            if let Some(id) = self.out_id(unsafe { out.add(i) }) {
+                self.objects.borrow_mut().add_ghost(id);
+            }
+        }
+    }
 }
 
 impl Commands for Handlers<'_> {
@@ -347,6 +362,7 @@ impl Commands for Handlers<'_> {
         let out = unsafe { core::slice::from_raw_parts_mut(args.handle_pPhysicalDevices, asked) };
         let Ok(got) = self.driver.physical_devices(args.instance, out) else {
             args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+            self.ghost_range(args.pPhysicalDevices, 0..asked);
             return;
         };
         // SAFETY: as above.
@@ -356,15 +372,7 @@ impl Commands for Handlers<'_> {
         for pd in out.iter().take(got as usize) {
             self.driver.learn_extensions(*pd);
         }
-        // The generated hook walks the whole array the guest sent, so the ids past a short answer
-        // have to be refused explicitly. Left alone they would be registered as their own
-        // handles and the guest would hold devices that do not exist.
-        for i in got as usize..asked {
-            // SAFETY: `i` is inside the array the decoder allocated.
-            if let Some(id) = self.out_id(unsafe { args.pPhysicalDevices.add(i) }) {
-                self.objects.borrow_mut().add_ghost(id);
-            }
-        }
+        self.ghost_range(args.pPhysicalDevices, got as usize..asked);
     }
 
     fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice) {
@@ -624,5 +632,61 @@ mod tests {
             Lookup::Ghost,
             "the id the driver refused must not become an object"
         );
+    }
+
+    /// A failed enumeration refuses every id the guest offered, not just the tail.
+    ///
+    /// The out-handles arrive in the request, so the guest has already chosen ids for physical
+    /// devices the host may not have. When the enumeration itself fails there is no short answer
+    /// to bound -- every id it named is refused, and each has to say so, or the hook registers the
+    /// lot as their own handles and the guest holds a GPU per id it guessed at.
+    #[test]
+    fn a_failed_enumeration_refuses_every_id_the_guest_offered() {
+        use super::super::cs::{Lookup, Objects};
+
+        const INSTANCE: u64 = 2;
+        const IDS: [u64; 3] = [21, 22, 23];
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(ObjectId(INSTANCE), VkObjectType::VK_OBJECT_TYPE_INSTANCE.0, INSTANCE)
+            .unwrap();
+
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            bad_id: false,
+        };
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
+        w.extend_from_slice(&INSTANCE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pPhysicalDeviceCount: present
+        w.extend_from_slice(&(IDS.len() as u32).to_le_bytes());
+        w.extend_from_slice(&(IDS.len() as u64).to_le_bytes()); // pPhysicalDevices: the array size
+        for id in IDS {
+            w.extend_from_slice(&id.to_le_bytes());
+        }
+
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut dec = Decoder::new(&w, &temp, &objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
+
+        for id in IDS {
+            assert_eq!(
+                objects.lookup(ObjectId(id), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0),
+                Lookup::Ghost,
+                "id {id} was offered to a failed enumeration and must not become an object"
+            );
+        }
     }
 }
