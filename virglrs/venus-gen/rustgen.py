@@ -987,6 +987,125 @@ class RustGen:
         ]
         return '\n'.join(out)
 
+    # Not an entry point in a table: it is how every table is loaded, so it is the one symbol
+    # linked by name rather than resolved. MESA's commands are excluded for a different reason --
+    # they are venus's own protocol, served by a renderer and exported by no driver.
+    # `vkGetDeviceProcAddr` stays: it is device-level and reachable only through the instance.
+    PROC_SKIP = frozenset(['vkGetInstanceProcAddr'])
+
+    #: First-parameter types that make a command device-level. Anything reached through one of
+    #: these dispatches through the device, so it comes from `vkGetDeviceProcAddr` and skips the
+    #: loader's trampoline; everything else is instance-level or global.
+    PROC_DEVICE_FIRST = frozenset(['VkDevice', 'VkQueue', 'VkCommandBuffer'])
+    PROC_INSTANCE_FIRST = frozenset(['VkInstance', 'VkPhysicalDevice'])
+
+    def proc_level(self, ty):
+        """Which of the three tables a command belongs in.
+
+        Vulkan does not say this anywhere machine-readable, but it follows from the first
+        parameter: dispatch is on the handle, so a command taking a device-dispatchable handle is
+        device-level by construction. `vkGetDeviceProcAddr` is the exception the loader forces --
+        it is device-level and can only be found through the instance.
+        """
+        if ty.name == 'vkGetDeviceProcAddr':
+            return 'instance'
+        first = ty.variables[0].ty.name if ty.variables else ''
+        if first in self.PROC_DEVICE_FIRST:
+            return 'device'
+        if first in self.PROC_INSTANCE_FIRST:
+            return 'instance'
+        return 'global'
+
+    def proc_signature(self, ty):
+        """A command's real C signature -- the one the driver exports, not the wire's.
+
+        It comes from the same model the serializer is generated from, which is the point: a
+        proc table transcribed by hand can disagree with the decoder about a parameter, and the
+        disagreement is a stack smash rather than a compile error.
+        """
+        params = ', '.join(self.field_type(v) for v in ty.variables)
+        ret = ' -> %s' % self.field_type(ty.ret) if ty.ret else ''
+        return 'unsafe extern "C" fn(%s)%s' % (params, ret)
+
+    def render_proc_table(self):
+        """The driver's entry points, in three tables loaded the way Vulkan says to load them.
+
+        This is what replaces `ash`. The types are the ones the decoder already speaks, so a
+        command's arguments go from the wire to the driver with no conversion and no second
+        definition to keep in step -- and MESA's venus-private commands, which no bindings crate
+        has ever seen, are in the same model as the rest.
+        """
+        commands = [c for c in self.gen.supported_types[VkType.COMMAND]
+                    if 'MESA' not in c.name and c.name not in self.PROC_SKIP]
+        levels = {'global': [], 'instance': [], 'device': []}
+        for ty in commands:
+            levels[self.proc_level(ty)].append(ty)
+
+        out = []
+        for level, tys in [('global', levels['global']), ('instance', levels['instance']),
+                           ('device', levels['device'])]:
+            name = level.capitalize()
+            loader = 'vkGetInstanceProcAddr' if level != 'device' else 'vkGetDeviceProcAddr'
+            out += [
+                '/// The %s-level entry points, as `%s` hands them back.' % (level, loader),
+                '///',
+                '/// Every field is optional because the loader answers null for a command the',
+                '/// driver does not implement. Reading one through its accessor is what turns',
+                '/// that into a panic naming the command, at the call rather than at the crash.',
+                '#[derive(Default)]',
+                'pub struct %s {' % name,
+            ]
+            for ty in tys:
+                out.append('    fp_%s: Option<%s>,' % (ty.name, self.proc_signature(ty)))
+            out += ['}', '',
+                    'impl %s {' % name,
+                    '    /// Resolve every entry point through `get`.',
+                    '    ///',
+                    '    /// # Safety',
+                    '    ///',
+                    '    /// `get` must answer each name with null or with the address of the',
+                    '    /// Vulkan command of exactly that name. That is the loader\'s contract',
+                    '    /// for `%s`, and nothing else may be passed here: the returned' % loader,
+                    '    /// pointer is transmuted to the signature generated from vk.xml.',
+                    '    pub unsafe fn load(get: &mut dyn FnMut(&CStr) -> Option<ProcAddr>) -> %s {' % name,
+                    '        %s {' % name]
+            for ty in tys:
+                out.append('            fp_%s: get(c"%s").map(|p| unsafe { transmute(p) }),'
+                           % (ty.name, ty.name))
+            out += ['        }', '    }', '']
+            for ty in tys:
+                out += [
+                    '    /// `%s`, or a panic naming it if the driver has none.' % ty.name,
+                    '    #[inline]',
+                    '    pub fn %s(&self) -> %s {' % (ty.name, self.proc_signature(ty)),
+                    '        self.fp_%s.expect(' % ty.name,
+                    '            "%s: this build advertises it and the driver does not export it")'
+                    % ty.name,
+                    '    }',
+                    '',
+                    '    /// Whether the driver exports `%s` at all.' % ty.name,
+                    '    #[inline]',
+                    '    pub fn has_%s(&self) -> bool {' % ty.name,
+                    '        self.fp_%s.is_some()' % ty.name,
+                    '    }',
+                    '',
+                ]
+            out += ['}', '']
+
+            # The census a test can hold the loader to without naming three hundred commands.
+            out += ['impl %s {' % name,
+                    '    /// How many of this table\'s entry points the driver actually answered.',
+                    '    pub fn loaded(&self) -> (usize, usize) {',
+                    '        let got = [']
+            for ty in tys:
+                out.append('            self.fp_%s.is_some(),' % ty.name)
+            out += ['        ];',
+                    '        (got.iter().filter(|b| **b).count(), got.len())',
+                    '    }',
+                    '}', '']
+
+        return '\n'.join(out)
+
     def render_serialize(self, gaps):
         """The whole serializer: handles, structs, chains."""
         out = []

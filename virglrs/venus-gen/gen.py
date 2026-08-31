@@ -82,6 +82,10 @@ def main():
     (outdir / 'reply_oracle.c').write_bytes(
         c_banner.encode() + rust.render_reply_oracle().encode())
 
+    proc_head = (Path(HERE / 'templates' / 'proc.rs.head').read_text())
+    (outdir / 'proc.rs').write_bytes(
+        banner.encode() + proc_head.encode() + rust.render_proc_table().encode())
+
     gaps = []
     header = (Path(HERE / 'templates' / 'serialize.rs.head').read_text())
     (outdir / 'serialize.rs').write_bytes(

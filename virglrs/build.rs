@@ -33,8 +33,43 @@ fn main() {
         .expect("python3 must be on PATH to build the venus protocol");
     assert!(status.success(), "venus-gen failed");
 
+    link_vulkan_loader();
+
     #[cfg(feature = "reply-oracle")]
     reply_oracle(&manifest, &protocol, &out);
+}
+
+/// Link the Khronos loader.
+///
+/// Linked, not dlopened, and the reason is limina's: the worker is codesigned, so the hardened
+/// runtime strips `DYLD_*`, and the loader's directory is not on dyld's default search path -- a
+/// bare-name dlopen finds nothing and venus enumerates zero GPUs. `src/vulkan.rs` carries the
+/// rest of the argument.
+///
+/// The path comes from pkg-config rather than a constant, because a hardcoded Cellar path is
+/// wrong on the next loader upgrade and wrong for anyone who did not install it the same way.
+fn link_vulkan_loader() {
+    println!("cargo::rerun-if-env-changed=VULKAN_LOADER_LIB_DIR");
+
+    if let Ok(dir) = std::env::var("VULKAN_LOADER_LIB_DIR") {
+        println!("cargo::rustc-link-search=native={dir}");
+    } else {
+        let out = Command::new("pkg-config")
+            .args(["--libs-only-L", "vulkan"])
+            .output()
+            .expect("pkg-config must be on PATH to find the Vulkan loader");
+        assert!(
+            out.status.success(),
+            "pkg-config found no vulkan; install the loader or set VULKAN_LOADER_LIB_DIR"
+        );
+        for flag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            if let Some(dir) = flag.strip_prefix("-L") {
+                println!("cargo::rustc-link-search=native={dir}");
+            }
+        }
+    }
+
+    println!("cargo::rustc-link-lib=dylib=vulkan");
 }
 
 /// Build venus-protocol's own C renderer encoder for the tests to diff against.

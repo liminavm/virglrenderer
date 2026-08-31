@@ -17,3 +17,4 @@ pub mod ffi;
 pub mod ids;
 pub mod renderer;
 pub mod venus;
+pub mod vulkan;
