@@ -45,6 +45,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at the
   ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
   and exits non-zero, so `diff` is the whole comparison tool.
+- `rs/` also builds `venus-roundtrip`, the venus decoder's differential test. It decodes every
+  recorded command with the Rust decoder, encodes it straight back, and compares against the bytes
+  the guest sent. There is no C dump to diff against because there does not need to be one: the
+  recorded wire IS mesa's encoder output, so a byte-identical re-encode is a diff between the two
+  implementations over every command in the corpus. It needs no GPU and no ICD — run it as
+  `cargo run --release --bin venus-roundtrip -- <corpus>`, which is a second and a half over the
+  61 MB capture. Failure is per command: it names each command type, its outcome, and the first
+  divergent offset, so one unimplemented shape cannot hide the thousand commands behind it. Both
+  corpora reproduce exactly. It does not cover reply encoding — no recording contains one — and
+  it tolerates the guest's padding bytes, which mesa leaves uninitialised and this renderer zeroes
+  on purpose; the encoder reports exactly which ranges those are, so the tolerance is a set of
+  offsets rather than a loose comparison.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
   from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
   the diff between the two is the positive control: 19 offscreens lose their ink, and all three

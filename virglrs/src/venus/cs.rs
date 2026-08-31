@@ -44,6 +44,21 @@ pub struct ObjectId(pub u64);
 
 /// Resolves guest object ids to host objects. The decoder holds one by reference; what sits behind
 /// it is vkr's object table in the renderer and an identity map in the round-trip test.
+/// A pointer stored in an arena array -- an array of strings is an array of these.
+///
+/// It exists because the standard library gives a raw pointer no `Default`, and the arena needs
+/// one to hand back a fresh element. `repr(transparent)` is the point: `[Ptr]` and `[*const T]`
+/// have the same layout, so the decoded array can be handed to Vulkan as itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct Ptr(pub *const core::ffi::c_void);
+
+impl Default for Ptr {
+    fn default() -> Self {
+        Ptr(core::ptr::null())
+    }
+}
+
 pub trait Objects {
     /// The host handle for `id`, or `None` if the host never created it. `ty` is the
     /// `VkObjectType` the wire claims, and a mismatch is a miss -- the guest does not get to
@@ -170,6 +185,12 @@ impl<'a> Decoder<'a> {
             return None;
         };
         self.charge(bytes)?;
+        if count == 0 {
+            // The arena's cursor for a zero-byte request is wherever the last allocation left it,
+            // which need not be aligned for `T`. An empty array is a thing the guest sends often
+            // enough that this is the common path, not a corner.
+            return Some(&mut []);
+        }
         Some(self.temp.alloc_slice_fill_with(count, |_| T::default()))
     }
 
@@ -232,11 +253,36 @@ pub struct Encoder<'a> {
     pos: usize,
     fatal: bool,
     protocol: &'a dyn Protocol,
+    /// Offsets this encoder filled as padding rather than payload, once someone asks for them.
+    ///
+    /// Only the differential test does. A guest's encoder leaves its padding uninitialised, so no
+    /// faithful reproduction of its wire can match those bytes -- and this renderer will not copy
+    /// them, because padding a reply with whatever the host buffer held is how host memory leaks
+    /// into a guest. Knowing exactly which bytes those are is what keeps the comparison exact
+    /// instead of merely lenient.
+    padding: Option<Vec<core::ops::Range<usize>>>,
 }
 
 impl<'a> Encoder<'a> {
     pub fn new(buf: &'a mut [u8], protocol: &'a dyn Protocol) -> Self {
-        Encoder { buf, pos: 0, fatal: false, protocol }
+        Encoder { buf, pos: 0, fatal: false, protocol, padding: None }
+    }
+
+    /// Start recording padded byte ranges. See the `padding` field.
+    pub fn record_padding(&mut self) {
+        self.padding = Some(Vec::new());
+    }
+
+    pub fn padding(&self) -> &[core::ops::Range<usize>] {
+        self.padding.as_deref().unwrap_or(&[])
+    }
+
+    fn note_padding(&mut self, from: usize, to: usize) {
+        if from < to
+            && let Some(p) = &mut self.padding
+        {
+            p.push(from..to);
+        }
     }
 
     pub fn protocol(&self) -> &dyn Protocol {
@@ -266,6 +312,7 @@ impl<'a> Encoder<'a> {
         };
         dst[..val.len()].copy_from_slice(val);
         dst[val.len()..].fill(0);
+        self.note_padding(self.pos + val.len(), self.pos + advance);
         self.pos += advance;
     }
 }
@@ -357,6 +404,7 @@ impl<'a> Encoder<'a> {
             v.write_le(chunk);
         }
         dst[packed..].fill(0);
+        self.note_padding(self.pos + packed, self.pos + align4(packed));
         self.pos += align4(packed);
     }
 }

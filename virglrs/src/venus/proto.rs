@@ -118,6 +118,32 @@ mod tests {
         );
     }
 
+    /// An array of strings is an array of pointers, and the arena element has to be one pointer
+    /// wide. Allocating it a character wide compiles and then truncates every pointer it stores.
+    #[test]
+    fn an_array_of_strings_reproduces_the_wire() {
+        let w = wire(&[
+            &1u32.to_le_bytes(), // sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+            &0u64.to_le_bytes(), // pNext: absent
+            &0u32.to_le_bytes(), // flags
+            &0u64.to_le_bytes(), // pApplicationInfo: absent
+            &0u32.to_le_bytes(), // enabledLayerCount
+            &0u64.to_le_bytes(), // ppEnabledLayerNames: absent
+            &2u32.to_le_bytes(), // enabledExtensionCount
+            &2u64.to_le_bytes(), // ppEnabledExtensionNames: two of them
+            &4u64.to_le_bytes(),
+            b"one\0",
+            &4u64.to_le_bytes(),
+            b"two\0",
+        ]);
+        round_trip::<VkInstanceCreateInfo>(
+            &w,
+            vn_decode_VkInstanceCreateInfo_temp,
+            vn_sizeof_VkInstanceCreateInfo,
+            vn_encode_VkInstanceCreateInfo,
+        );
+    }
+
     #[test]
     fn a_blob_is_reproduced_with_its_padding() {
         let w = wire(&[
