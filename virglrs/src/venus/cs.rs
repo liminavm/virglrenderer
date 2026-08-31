@@ -197,6 +197,31 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// What the guest's protocol supports.
+///
+/// Encoding a `pNext` chain has to skip structs the guest's venus protocol does not know, or the
+/// reply is unreadable to it. The generated encoder asks this; vkr answers from what the guest
+/// negotiated at `vkSetReplyCommandStreamMESA` time.
+pub trait Protocol {
+    fn has_extension(&self, number: u32) -> bool;
+    fn has_api_version(&self, version: u32) -> bool;
+}
+
+/// A protocol that supports everything.
+///
+/// Correct for the wire round trip specifically: re-encoding a chain the guest itself sent cannot
+/// need to skip any of it. Not correct for replies, which is why vkr answers with the real one.
+pub struct AllOfIt;
+
+impl Protocol for AllOfIt {
+    fn has_extension(&self, _number: u32) -> bool {
+        true
+    }
+    fn has_api_version(&self, _version: u32) -> bool {
+        true
+    }
+}
+
 /// Writes a reply stream.
 ///
 /// Unlike the decoder this side is trusted -- the bytes come from us -- so the only failure it can
@@ -206,11 +231,16 @@ pub struct Encoder<'a> {
     buf: &'a mut [u8],
     pos: usize,
     fatal: bool,
+    protocol: &'a dyn Protocol,
 }
 
 impl<'a> Encoder<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
-        Encoder { buf, pos: 0, fatal: false }
+    pub fn new(buf: &'a mut [u8], protocol: &'a dyn Protocol) -> Self {
+        Encoder { buf, pos: 0, fatal: false, protocol }
+    }
+
+    pub fn protocol(&self) -> &dyn Protocol {
+        self.protocol
     }
 
     pub fn pos(&self) -> usize {
@@ -246,9 +276,6 @@ impl<'a> Encoder<'a> {
 /// arrays of sub-word scalars are packed and then padded as a whole. `vn_sizeof_*` in the C
 /// generator is this rule; implementing it once here keeps the generated code free of it.
 pub trait Scalar: Copy + Default {
-    /// Bytes this type occupies in a packed array, before the array's own padding.
-    const PACKED: usize = size_of::<Self>();
-
     fn from_le_bytes(b: &[u8]) -> Self;
     fn write_le(self, out: &mut [u8]);
 }
@@ -266,7 +293,9 @@ macro_rules! scalar {
     )*};
 }
 
-scalar!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+// `usize` is here because vk.xml has `size_t` members. It is eight bytes on every target
+// this renderer supports, which the wire assumes.
+scalar!(u8, i8, u16, i16, u32, i32, u64, i64, usize, isize, f32, f64);
 
 /// Wire size of a single scalar: padded up to a word.
 #[inline]
@@ -440,7 +469,7 @@ mod tests {
     #[test]
     fn scalar_round_trip_reproduces_the_wire_including_padding() {
         let mut buf = [0xaau8; 16];
-        let mut enc = Encoder::new(&mut buf);
+        let mut enc = Encoder::new(&mut buf, &AllOfIt);
         enc.encode_scalar::<u8>(0x5a);
         enc.encode_scalar::<u64>(0x0102_0304_0506_0708);
         enc.encode_scalar_array::<u8>(&[1, 2, 3]);

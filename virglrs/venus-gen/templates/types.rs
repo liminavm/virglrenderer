@@ -11,6 +11,8 @@
 
 use core::ffi::c_void;
 
+use crate::venus::cs::Scalar;
+
 /// Vulkan's handles are pointer-sized on every target this renderer supports.
 const _: () = assert!(size_of::<*const c_void>() == 8);
 
@@ -18,6 +20,15 @@ const _: () = assert!(size_of::<*const c_void>() == 8);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[repr(transparent)]
 pub struct ${name}(pub ${repr});
+
+impl Scalar for ${name} {
+    fn from_le_bytes(b: &[u8]) -> Self {
+        Self(<${repr}>::from_le_bytes(b.try_into().expect("caller sized the slice")))
+    }
+    fn write_le(self, out: &mut [u8]) {
+        out.copy_from_slice(&self.0.to_le_bytes());
+    }
+}
 </%def>\
 % for ty in GEN.supported_types[VkType.BASETYPE]:
 <%
