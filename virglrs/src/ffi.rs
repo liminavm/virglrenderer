@@ -82,7 +82,7 @@ pub extern "C" fn virgl_renderer_init(
         return EINVAL;
     }
     eprintln!(
-        "[virglrs] init flags={flags:#x} -- skeleton: no {} yet",
+        "[virglrs] init flags={flags:#x} -- {}",
         crate::renderer::unsupported_renderers(flags)
     );
     *g = Some(Renderer::new(cookie, cbs, flags));

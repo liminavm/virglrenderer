@@ -57,6 +57,14 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   it tolerates the guest's padding bytes, which mesa leaves uninitialised and this renderer zeroes
   on purpose; the encoder reports exactly which ranges those are, so the tolerance is a set of
   offsets rather than a loose comparison.
+- The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh` with
+  `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
+  feed, the decode loop, the object table — and every command is accounted for rather than merely
+  parsed, which is what separates it from `venus-roundtrip`. Both corpora reach `cmds N/N` with no
+  `FAIL` line. It cannot be compared against a pinned score: no command is served yet, so there is
+  no device memory to census and nothing to hash. What it catches is the layer between the bytes
+  and Vulkan, and it caught two things already — a `VK_NULL_HANDLE` treated as a missing object,
+  and every command after the first that named one.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
   from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
   the diff between the two is the positive control: 19 offscreens lose their ink, and all three
