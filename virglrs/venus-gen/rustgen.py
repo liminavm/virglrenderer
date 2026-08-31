@@ -220,14 +220,31 @@ class RustGen:
         expr = self._substitute_constants(expr)
         if not name:
             return '(%s) as u64' % expr
-        if '->' in name or '[' in name:
+        if '[' in name:
             raise self.Unsupported('%s.%s: indirect len %r' % (ty.name, var.name, name))
+
+        # A count can live behind a pointer -- `pPropertyCount` -- or inside a struct behind one
+        # -- `pAllocateInfo->commandBufferCount`. Either way the C guards the read with the
+        # pointer's own null check and calls a missing count zero, and so does this.
+        parts = name.split('->')
         holders = ty.find_variables(name)
-        holder = holders[-1]
-        access = 'val.%s' % self.field_name(name)
-        if holder.ty.base.category in (VkType.BASETYPE, VkType.ENUM, VkType.BITMASK):
-            access += '.0'
-        return '(%s) as u64' % expr.replace(name, access)
+        if not holders or len(holders) != len(parts) or len(parts) > 2:
+            raise self.Unsupported('%s.%s: len %r' % (ty.name, var.name, name))
+        access = 'val.%s' % self.field_name(parts[0])
+        guard = access if len(parts) > 1 or holders[0].ty.is_pointer() else None
+        newtype = holders[-1].ty.base.category in (VkType.BASETYPE, VkType.ENUM, VkType.BITMASK)
+        if len(parts) > 1:
+            access = '(*%s).%s' % (access, self.field_name(parts[1]))
+        elif guard:
+            access = '(*%s)' % access if newtype else '*%s' % access
+        if newtype:
+            access = '%s.0' % access
+        inner = expr.replace(name, access)
+        if guard:
+            # SAFETY, at every use: the pointer came out of the decoder's arena, and the decode of
+            # the member that holds it ran before the one this length belongs to.
+            return '(if %s.is_null() { 0 } else { unsafe { %s } }) as u64' % (guard, inner)
+        return '(%s) as u64' % inner
 
     def _shape(self, ty, var):
         """How a member is laid out: ('static', n) | ('dynamic', len) | ('pointer',) | ('plain',)."""
@@ -293,9 +310,8 @@ class RustGen:
             return ('call', name, self._tag_arg(ty, var))
         return ('call', name, '')
 
-    def decode_member(self, ty, var, partial, alloc):
+    def decode_member(self, ty, var, validity, alloc):
         """Rust statements decoding one struct member or command argument."""
-        validity = self.gen._get_variable_validity(ty, var, not partial)
         if not self.gen.is_serializable(var):
             return ['dec.set_fatal();']
 
@@ -329,6 +345,8 @@ class RustGen:
         null = 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
 
         if shape[0] == 'blob':
+            if validity == Gen_INVALID:
+                return ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]
             # Borrowed from the stream, not copied: the arena is for what the guest does not
             # already hold in a contiguous, correctly sized run of wire bytes.
             hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
@@ -399,21 +417,20 @@ class RustGen:
         return (['if dec.peek_array_size() != 0 {'] + ['    ' + l for l in hit]
                 + ['} else {'] + ['    ' + l for l in miss] + ['}'])
 
-    def encode_member(self, ty, var, partial):
+    def encode_member(self, ty, var, validity):
         """Rust statements encoding one struct member.
 
         Reads array members back through the raw pointer decode stored, which is the one place the
         generated code is unsafe. The invariant is the decoder's: it allocated exactly that many
         elements from its arena, and the arena outlives the encode.
         """
-        return self._out_member('encode', ty, var, partial)
+        return self._out_member('encode', ty, var, validity)
 
-    def sizeof_member(self, ty, var, partial):
+    def sizeof_member(self, ty, var, validity):
         """Rust statements accumulating one struct member's wire size into `size`."""
-        return self._out_member('sizeof', ty, var, partial)
+        return self._out_member('sizeof', ty, var, validity)
 
-    def _out_member(self, kind, ty, var, partial):
-        validity = self.gen._get_variable_validity(ty, var, not partial)
+    def _out_member(self, kind, ty, var, validity):
         if not self.gen.is_serializable(var):
             return ['unreachable!("not serializable");']
 
@@ -459,6 +476,9 @@ class RustGen:
 
         if shape[0] == 'blob':
             n = shape[1]
+            if validity == Gen_INVALID:
+                return ['enc.encode_array_size(%s); /* out */' % n] if kind == 'encode' \
+                    else ['size += cs::sizeof_scalar::<u64>(); /* out */']
             if kind == 'encode':
                 return ['if !%s.is_null() {' % m,
                         '    enc.encode_array_size(%s);' % n,
@@ -590,15 +610,18 @@ class RustGen:
         if skip:
             out.append('/* skip val.{sType,pNext} */')
         for var in ty.variables[skip:]:
-            if kind == 'decode':
-                out += self.decode_member(ty, var, partial, alloc)
-            elif kind == 'encode':
-                out += self.encode_member(ty, var, partial)
-            else:
-                out += self.sizeof_member(ty, var, partial)
+            validity = self.gen._get_variable_validity(ty, var, not partial)
+            out += self._member(kind, ty, var, validity, alloc)
         if kind == 'sizeof':
             out.append('size')
         return out
+
+    def _member(self, kind, ty, var, validity, alloc):
+        if kind == 'decode':
+            return self.decode_member(ty, var, validity, alloc)
+        if kind == 'encode':
+            return self.encode_member(ty, var, validity)
+        return self.sizeof_member(ty, var, validity)
 
     def _chain_condition(self, next_ty):
         """The C generator's protocol gate, as a Rust expression that is true when the struct must
@@ -616,11 +639,20 @@ class RustGen:
             out += self._handle_fns(ty)
         for ty in self.gen.supported_types[VkType.UNION]:
             out += self._union_fns(ty, gaps)
-        for ty in self.gen.supported_types[VkType.STRUCT]:
-            if ty.s_type:
-                out += self._chain_fns(ty, gaps)
-            else:
-                out += self._plain_struct_fns(ty, gaps)
+        # Both variants for every struct, rather than the C's `need_partial` bookkeeping: the
+        # partial one differs only in what an output member costs on the wire, and emitting it
+        # unconditionally trades generated lines -- which cost nothing -- for an attribute pass.
+        for v in ('', '_partial'):
+            for ty in self.gen.supported_types[VkType.STRUCT]:
+                if ty.s_type:
+                    out += self._chain_fns(ty, gaps, v)
+                else:
+                    out += self._plain_struct_fns(ty, gaps, v)
+        commands = [c for c in self.gen.supported_types[VkType.COMMAND]
+                    if self.gen.is_serializable(c)]
+        for ty in commands:
+            out += self._command_fns(ty, gaps)
+        out += self._dispatch_fns(commands)
         return '\n'.join(out)
 
     def _handle_fns(self, ty):
@@ -679,8 +711,9 @@ class RustGen:
         tag = ', tag: %s' % ty.sty.name if valid else ''
 
         def case(kind, var):
-            body = (self.decode_member(ty, var, False, True) if kind == 'decode'
-                    else self._out_member(kind, ty, var, False))
+            validity = self.gen._get_variable_validity(ty, var, True)
+            body = (self.decode_member(ty, var, validity, True) if kind == 'decode'
+                    else self._out_member(kind, ty, var, validity))
             return (['// SAFETY: the tag names this member.', 'unsafe {']
                     + ['    ' + l for l in body] + ['}'])
 
@@ -730,70 +763,181 @@ class RustGen:
                         body('decode'), gaps, n)
         return out
 
-    def _plain_struct_fns(self, ty, gaps):
+    def _plain_struct_fns(self, ty, gaps, v=''):
         n = ty.name
         out = []
         out += self._fn(
-            'vn_sizeof_%s(proto: &dyn cs::Protocol, val: &%s) -> usize' % (n, n),
-            lambda: self._struct_body('sizeof', ty, '', gaps), gaps, n)
-        out += self._fn('vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s)' % (n, n),
-                        lambda: self._struct_body('encode', ty, '', gaps), gaps, n)
-        out += self._fn('vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, n),
-                        lambda: self._struct_body('decode', ty, '_temp', gaps), gaps, n)
+            'vn_sizeof_%s%s(proto: &dyn cs::Protocol, val: &%s) -> usize' % (n, v, n),
+            lambda: self._struct_body('sizeof', ty, v, gaps), gaps, n)
+        out += self._fn('vn_encode_%s%s(enc: &mut Encoder<\'_>, val: &%s)' % (n, v, n),
+                        lambda: self._struct_body('encode', ty, v, gaps), gaps, n)
+        out += self._fn('vn_decode_%s%s_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, v, n),
+                        lambda: self._struct_body('decode', ty, v + '_temp', gaps), gaps, n)
         return out
 
-    def _chain_fns(self, ty, gaps):
+    def _command_fns(self, ty, gaps):
+        """One command's request decode, request encode and reply encode.
+
+        The request encode is the driver's side of the wire, which the C renderer never generates.
+        It is what makes the differential test a round trip: the recorded bytes came out of mesa's
+        encoder, so re-encoding a decoded command and comparing is a diff against the C.
+        """
+        n = ty.name
+        cmd = 'VkCommandTypeEXT::%s' % ty.attrs['c_type']
+        args = 'vn_command_%s' % n
+
+        def members(kind, reply):
+            out = []
+            for var in ([ty.ret] if reply and ty.ret else []) + list(ty.variables):
+                if reply:
+                    if 'var_out' not in var.attrs:
+                        out.append('/* skip val.%s */' % self.field_name(var.name))
+                        continue
+                    validity = Gen_VALID
+                else:
+                    validity = self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs)
+                out += self._member(kind, ty, var, validity, kind == 'decode')
+            return out
+
+        def request(kind):
+            def go():
+                if 'need_blob_encode' in ty.attrs:
+                    # The reply carries the blob, so its storage is an offset into the encoder the
+                    # renderer has not built yet. Nothing here needs it; the round trip does not
+                    # reach it, and vkr will want the offset plumbing rather than this shape.
+                    raise self.Unsupported('%s: blob storage rides the reply' % n)
+                out = ['let mut size = 0usize;'] if kind == 'sizeof' else []
+                if kind == 'decode':
+                    out += ['/* the header is the caller\'s: it chose this arm with it */']
+                elif kind == 'encode':
+                    out += ['enc.encode_scalar::<VkCommandTypeEXT>(%s);' % cmd,
+                            'enc.encode_scalar::<VkFlags>(cmd_flags);']
+                else:
+                    out += ['size += cs::sizeof_scalar::<VkCommandTypeEXT>();',
+                            'size += cs::sizeof_scalar::<VkFlags>();']
+                out += members(kind, False)
+                return out + (['size'] if kind == 'sizeof' else [])
+            return go
+
+        def reply(kind):
+            def go():
+                out = ['let mut size = 0usize;'] if kind == 'sizeof' else []
+                out += ['enc.encode_scalar::<VkCommandTypeEXT>(%s);' % cmd] if kind == 'encode' \
+                    else ['size += cs::sizeof_scalar::<VkCommandTypeEXT>();']
+                out += members(kind, True)
+                return out + (['size'] if kind == 'sizeof' else [])
+            return go
+
+        out = []
+        out += self._fn('vn_decode_%s_args_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, args),
+                        request('decode'), gaps, n)
+        out += self._fn('vn_sizeof_%s_args(proto: &dyn cs::Protocol, val: &%s) -> usize'
+                        % (n, args), request('sizeof'), gaps, n)
+        out += self._fn('vn_encode_%s_args(enc: &mut Encoder<\'_>, cmd_flags: VkFlags, val: &%s)'
+                        % (n, args), request('encode'), gaps, n)
+        out += self._fn('vn_sizeof_%s_reply(proto: &dyn cs::Protocol, val: &%s) -> usize'
+                        % (n, args), reply('sizeof'), gaps, n)
+        out += self._fn('vn_encode_%s_reply(enc: &mut Encoder<\'_>, val: &%s)' % (n, args),
+                        reply('encode'), gaps, n)
+        return out
+
+    def _dispatch_fns(self, commands):
+        """The command table, as a match the compiler turns into a jump table.
+
+        The round trip lives here rather than in the harness because only the generator knows the
+        arm list, and an arm that is merely missing has to be a named failure rather than a silent
+        pass.
+        """
+        out = ['/// The name of the command, for a message a human reads. `None` is a type',
+               '/// no version of this protocol defines.',
+               'pub fn vn_command_name(cmd: VkCommandTypeEXT) -> Option<&\'static str> {',
+               '    match cmd {']
+        for ty in commands:
+            out.append('        VkCommandTypeEXT::%s => Some("%s"),' % (ty.attrs['c_type'], ty.name))
+        out += ['        _ => None,', '    }', '}', '']
+
+        out += ['/// Decode one command\'s arguments and encode them straight back, returning the',
+                '/// size the encoder should have written. `None` is a command this protocol does',
+                '/// not define -- a stream that names one is a stream we cannot follow.',
+                'pub fn vn_round_trip_args(',
+                '    dec: &mut Decoder<\'_>,',
+                '    enc: &mut Encoder<\'_>,',
+                '    cmd: VkCommandTypeEXT,',
+                '    cmd_flags: VkFlags,',
+                ') -> Option<usize> {',
+                '    match cmd {']
+        for ty in commands:
+            n = ty.name
+            out += [
+                '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
+                '            let mut args = vn_command_%s::default();' % n,
+                '            vn_decode_%s_args_temp(dec, &mut args);' % n,
+                '            if dec.fatal() {',
+                '                return Some(0);',
+                '            }',
+                '            let size = vn_sizeof_%s_args(enc.protocol(), &args);' % n,
+                '            vn_encode_%s_args(enc, cmd_flags, &args);' % n,
+                '            Some(size)',
+                '        }',
+            ]
+        out += ['        _ => None,', '    }', '}', '']
+        return out
+
+    def _chain_fns(self, ty, gaps, v=''):
         n = ty.name
         next_types, skipped = self.gen.get_chain(ty)
         out = []
 
         out += self._fn(
-            'vn_sizeof_%s_self(proto: &dyn cs::Protocol, val: &%s) -> usize' % (n, n),
-            lambda: self._struct_body('sizeof', ty, '_self', gaps), gaps, n)
-        out += self._fn('vn_encode_%s_self(enc: &mut Encoder<\'_>, val: &%s)' % (n, n),
-                        lambda: self._struct_body('encode', ty, '_self', gaps), gaps, n)
-        out += self._fn('vn_decode_%s_self_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, n),
-                        lambda: self._struct_body('decode', ty, '_self_temp', gaps), gaps, n)
+            'vn_sizeof_%s_self%s(proto: &dyn cs::Protocol, val: &%s) -> usize' % (n, v, n),
+            lambda: self._struct_body('sizeof', ty, '_self' + v, gaps), gaps, n)
+        out += self._fn('vn_encode_%s_self%s(enc: &mut Encoder<\'_>, val: &%s)' % (n, v, n),
+                        lambda: self._struct_body('encode', ty, '_self' + v, gaps), gaps, n)
+        out += self._fn('vn_decode_%s_self%s_temp(dec: &mut Decoder<\'_>, val: &mut %s)'
+                        % (n, v, n),
+                        lambda: self._struct_body('decode', ty, '_self' + v + '_temp', gaps),
+                        gaps, n)
 
-        out += self._chain_pnext_sizeof(ty, next_types)
-        out += self._chain_pnext_encode(ty, next_types)
-        out += self._chain_pnext_decode(ty, next_types)
+        out += self._chain_pnext_sizeof(ty, next_types, v)
+        out += self._chain_pnext_encode(ty, next_types, v)
+        out += self._chain_pnext_decode(ty, next_types, v)
 
         out += [
-            'pub fn vn_sizeof_%s(proto: &dyn cs::Protocol, val: &%s) -> usize {' % (n, n),
+            'pub fn vn_sizeof_%s%s(proto: &dyn cs::Protocol, val: &%s) -> usize {' % (n, v, n),
             '    let mut size = cs::sizeof_scalar::<VkStructureType>();',
             '    // SAFETY: pNext points at the chain this struct was decoded with.',
-            '    size += unsafe { vn_sizeof_%s_pnext(proto, val.pNext as *const c_void) };' % n,
-            '    size += vn_sizeof_%s_self(proto, val);' % n,
+            '    size += unsafe { vn_sizeof_%s_pnext%s(proto, val.pNext as *const c_void) };'
+            % (n, v),
+            '    size += vn_sizeof_%s_self%s(proto, val);' % (n, v),
             '    size',
             '}',
             '',
-            'pub fn vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s) {' % (n, n),
+            'pub fn vn_encode_%s%s(enc: &mut Encoder<\'_>, val: &%s) {' % (n, v, n),
             '    enc.encode_scalar::<VkStructureType>(VkStructureType::%s);' % ty.s_type,
             '    // SAFETY: as above.',
-            '    unsafe { vn_encode_%s_pnext(enc, val.pNext as *const c_void) };' % n,
-            '    vn_encode_%s_self(enc, val);' % n,
+            '    unsafe { vn_encode_%s_pnext%s(enc, val.pNext as *const c_void) };' % (n, v),
+            '    vn_encode_%s_self%s(enc, val);' % (n, v),
             '}',
             '',
-            'pub fn vn_decode_%s_temp<\'a>(dec: &mut Decoder<\'a>, val: &mut %s) {' % (n, n),
+            'pub fn vn_decode_%s%s_temp<\'a>(dec: &mut Decoder<\'a>, val: &mut %s) {' % (n, v, n),
             '    let stype = dec.decode_scalar::<VkStructureType>();',
             '    if stype != VkStructureType::%s {' % ty.s_type,
             '        dec.set_fatal();',
             '    }',
             '    val.sType = stype;',
-            '    val.pNext = vn_decode_%s_pnext_temp(dec) as _;' % n,
-            '    vn_decode_%s_self_temp(dec, val);' % n,
+            '    val.pNext = vn_decode_%s_pnext%s_temp(dec) as _;' % (n, v),
+            '    vn_decode_%s_self%s_temp(dec, val);' % (n, v),
             '}',
             '',
         ]
         return out
 
-    def _chain_pnext_sizeof(self, ty, next_types):
+    def _chain_pnext_sizeof(self, ty, next_types, v=''):
         proto = 'proto'
         n = ty.name
         out = ['/// # Safety',
                '/// `val` is a `pNext` chain of structs this decoder allocated.',
-               'pub unsafe fn vn_sizeof_%s_pnext(proto: &dyn cs::Protocol, val: *const c_void) -> usize {' % n]
+               'pub unsafe fn vn_sizeof_%s_pnext%s(proto: &dyn cs::Protocol, val: *const c_void) -> usize {' % (n, v)]
         if not next_types:
             out += ['    let _ = (proto, val);',
                     '    return cs::sizeof_scalar::<u64>(); /* no known struct */',
@@ -817,9 +961,9 @@ class RustGen:
                 '                size += cs::sizeof_scalar::<VkStructureType>();',
                 '                let here = unsafe { &*(pnext as *const %s) };' % nt.name,
                 '                size += unsafe {',
-                '                    vn_sizeof_%s_pnext(proto, here.pNext as *const c_void)' % n,
+                '                    vn_sizeof_%s_pnext%s(proto, here.pNext as *const c_void)' % (n, v),
                 '                };',
-                '                size += vn_sizeof_%s_self(proto, here);' % nt.name,
+                '                size += vn_sizeof_%s_self%s(proto, here);' % (nt.name, v),
                 '                return size;',
                 '            }',
             ]
@@ -831,12 +975,12 @@ class RustGen:
                 '}', '']
         return out
 
-    def _chain_pnext_encode(self, ty, next_types):
+    def _chain_pnext_encode(self, ty, next_types, v=''):
         proto = 'enc.protocol()'
         n = ty.name
         out = ['/// # Safety',
                '/// `val` is a `pNext` chain of structs this decoder allocated.',
-               'pub unsafe fn vn_encode_%s_pnext(enc: &mut Encoder<\'_>, val: *const c_void) {' % n]
+               'pub unsafe fn vn_encode_%s_pnext%s(enc: &mut Encoder<\'_>, val: *const c_void) {' % (n, v)]
         if not next_types:
             out += ['    let _ = val;',
                     '    enc.encode_simple_pointer(false); /* no known struct */',
@@ -858,8 +1002,8 @@ class RustGen:
                 '                enc.encode_simple_pointer(true);',
                 '                enc.encode_scalar::<VkStructureType>(node.sType);',
                 '                let here = unsafe { &*(pnext as *const %s) };' % nt.name,
-                '                unsafe { vn_encode_%s_pnext(enc, here.pNext as *const c_void) };' % n,
-                '                vn_encode_%s_self(enc, here);' % nt.name,
+                '                unsafe { vn_encode_%s_pnext%s(enc, here.pNext as *const c_void) };' % (n, v),
+                '                vn_encode_%s_self%s(enc, here);' % (nt.name, v),
                 '                return;',
                 '            }',
             ]
@@ -871,9 +1015,9 @@ class RustGen:
                 '}', '']
         return out
 
-    def _chain_pnext_decode(self, ty, next_types):
+    def _chain_pnext_decode(self, ty, next_types, v=''):
         n = ty.name
-        out = ['pub fn vn_decode_%s_pnext_temp<\'a>(dec: &mut Decoder<\'a>) -> *mut c_void {' % n]
+        out = ['pub fn vn_decode_%s_pnext%s_temp<\'a>(dec: &mut Decoder<\'a>) -> *mut c_void {' % (n, v)]
         if not next_types:
             out += ['    if dec.decode_simple_pointer() {',
                     '        dec.set_fatal();',
@@ -893,8 +1037,8 @@ class RustGen:
                 '                return core::ptr::null_mut();',
                 '            };',
                 '            p.sType = stype;',
-                '            p.pNext = vn_decode_%s_pnext_temp(dec) as _;' % n,
-                '            vn_decode_%s_self_temp(dec, p);' % nt.name,
+                '            p.pNext = vn_decode_%s_pnext%s_temp(dec) as _;' % (n, v),
+                '            vn_decode_%s_self%s_temp(dec, p);' % (nt.name, v),
                 '            p as *mut %s as *mut c_void' % nt.name,
                 '        }',
             ]
