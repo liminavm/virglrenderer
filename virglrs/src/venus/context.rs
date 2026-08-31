@@ -174,12 +174,11 @@ pub struct Unimplemented {
 /// the guest chose, a destroy forgets it, and that is enough for the whole corpus to decode --
 /// every later command that names an object finds it.
 ///
-/// **The host handle is the guest id, and only because nothing here has a real one.** Registering
-/// them equal is what lets a destroy work at all: the generated `_lookup` decode replaces the id
-/// in the arguments with the host handle before the handler sees it, so the destroy extraction
-/// reads back a host handle and calls it an id. When real handles arrive that identity breaks, and
-/// with it this shortcut -- the destroy path needs the guest id carried alongside, which is a
-/// change to what the generated argument structs hold.
+/// **The host handle is the guest id, and only because nothing here has a real one.** No handler
+/// runs, so no driver writes a handle, and registering the id as its own handle is what lets the
+/// whole corpus decode: every later command that names an object finds it. Nothing else depends on
+/// the two being equal -- the generator carries both halves of the pairing separately, so the first
+/// real handler makes `host` real and this stops being a fiction. See `objects`.
 pub struct Handlers<'a> {
     objects: &'a Shared,
     todo: &'a mut Unimplemented,
@@ -193,8 +192,13 @@ impl Commands for Handlers<'_> {
         *self.todo.seen.entry(cmd.0).or_default() += 1;
     }
 
-    fn object_created(&mut self, ty: VkObjectType, id: ObjectId) {
-        if self.objects.borrow_mut().add(id, ty.0, id.0).is_err() {
+    fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {
+        // No handler has run, so the driver wrote nothing and `host` is zero. Registering the id
+        // as its own handle is what lets the corpus decode: every later command that names the
+        // object finds it. A real handler makes `host` real and this line stops lying -- see the
+        // identity note on `objects`.
+        let handle = if host == 0 { id.0 } else { host };
+        if self.objects.borrow_mut().add(id, ty.0, handle).is_err() {
             self.bad_id = true;
         }
     }
@@ -268,5 +272,100 @@ mod tests {
         assert!(!ctx.submit(&full, &mut todo));
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.unhandled, 0);
+    }
+
+    /// The pairing the whole shadow mechanism exists for: the guest names an object by an id it
+    /// chose, and the host knows it by a handle the driver chose. Until a handler runs the two are
+    /// the same number, which is exactly why a test that leaves them equal proves nothing -- this
+    /// one plants a handle that is not the id, and then destroys by id.
+    ///
+    /// Without the shadows the destroy reads the target member, which the lookup has already
+    /// replaced with the host handle, and removes nothing.
+    #[test]
+    fn an_object_is_registered_by_id_and_found_by_id_when_the_handle_differs() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{VkFence, VkStructureType, vn_command_vkCreateFence};
+
+        const HOST: u64 = 0xfeed_face_0000_0001;
+        const DEVICE: u64 = 9;
+        const FENCE: u64 = 4;
+
+        /// What a real handler will look like: it writes the shadow, never the wire member, and
+        /// the pairing it registers is the one the generator hands it.
+        struct Driver<'a> {
+            objects: &'a Shared,
+        }
+        impl Commands for Driver<'_> {
+            fn unsupported(&mut self, _cmd: VkCommandTypeEXT) {}
+
+            fn vkCreateFence(&mut self, args: &mut vn_command_vkCreateFence) {
+                assert!(!args.handle_pFence.is_null(), "the decoder owes a place to write");
+                // The guest id in `pFence` has to survive: the reply sends it back.
+                // SAFETY: the decoder allocated one element there.
+                unsafe { *args.handle_pFence = VkFence(HOST) };
+            }
+
+            fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {
+                self.objects.borrow_mut().add(id, ty.0, host).expect("a fresh id");
+            }
+
+            fn object_destroyed(&mut self, _ty: VkObjectType, id: ObjectId) {
+                self.objects.borrow_mut().remove(id).expect("a live id");
+            }
+        }
+
+        fn run(h: &mut Driver<'_>, objects: &Shared, wire: &[u8]) {
+            let temp = Bump::new();
+            let hard = Cell::new(false);
+            let mut dec = Decoder::new(wire, &temp, objects, &hard);
+            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _flags = dec.decode_scalar::<VkFlags>();
+            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, h), Some(()));
+            assert!(!dec.fatal(), "the command must decode");
+            assert_eq!(dec.pos(), wire.len(), "the command must be fully consumed");
+        }
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, 1)
+            .unwrap();
+        let mut h = Driver { objects: &objects };
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
+        w.extend_from_slice(&DEVICE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pCreateInfo: present
+        w.extend_from_slice(
+            &(VkStructureType::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO.0).to_le_bytes(),
+        );
+        w.extend_from_slice(&0u64.to_le_bytes()); // pNext: absent
+        w.extend_from_slice(&0u32.to_le_bytes()); // flags
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+        w.extend_from_slice(&1u64.to_le_bytes()); // pFence: present
+        w.extend_from_slice(&FENCE.to_le_bytes()); // the id the guest chose
+        run(&mut h, &objects, &w);
+
+        // Registered under the guest's id, holding the driver's handle. Neither half swapped.
+        assert_eq!(
+            objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
+            Lookup::Found(HOST)
+        );
+        assert_eq!(
+            objects.lookup(ObjectId(HOST), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
+            Lookup::Missing,
+            "a host handle is not an id the guest may name"
+        );
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyFence_EXT, 0);
+        w.extend_from_slice(&DEVICE.to_le_bytes());
+        w.extend_from_slice(&FENCE.to_le_bytes());
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+        run(&mut h, &objects, &w);
+
+        assert_eq!(
+            objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
+            Lookup::Missing,
+            "the destroy names the guest id, so it must have found it"
+        );
     }
 }
