@@ -19,6 +19,7 @@
 //! `_lookup` decode replaces the id with the host handle in place, which is safe because a reply
 //! never re-encodes an input member.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::cs::{Lookup, ObjectId, Objects};
@@ -177,5 +178,34 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, [(1, 10), (2, 20)]);
         assert!(t.is_empty());
+    }
+}
+
+/// The table as the decoder and the handlers both see it.
+///
+/// The decoder holds it while it reads a command, and the handler that command reaches writes to
+/// it -- so it cannot be an exclusive borrow on either side. Decoding finishes before the handler
+/// runs, so the two never overlap; the cell is what lets the compiler stop caring, and it will
+/// panic loudly rather than quietly if that stops being true.
+#[derive(Default)]
+pub struct Shared(RefCell<Table>);
+
+impl Shared {
+    pub fn new() -> Shared {
+        Shared::default()
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, Table> {
+        self.0.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, Table> {
+        self.0.borrow_mut()
+    }
+}
+
+impl Objects for Shared {
+    fn lookup(&self, id: ObjectId, ty: i32) -> Lookup {
+        self.0.borrow().lookup(id, ty)
     }
 }

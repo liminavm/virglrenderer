@@ -446,22 +446,42 @@ pub extern "C" fn virgl_renderer_transfer_write_iov(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_submit_cmd(
-    _buffer: *mut c_void,
-    _ctx_id: c_int,
-    _ndw: c_int,
+    buffer: *mut c_void,
+    ctx_id: c_int,
+    ndw: c_int,
 ) -> c_int {
-    todo_phase!("P3: the vrend decode loop")
+    let Some(buf) = cmd_slice(buffer, ndw) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.submit_cmd(CtxId(ctx_id as u32), buf) {
+        Ok(()) => 0,
+        Err(e) => e,
+    })
+}
+
+/// A submission as the ABI describes it: a pointer and a length in *dwords*, not bytes.
+///
+/// Returning `None` rather than an empty slice for a null pointer is deliberate -- a null buffer
+/// with a non-zero length is a caller bug, and treating it as "nothing to do" would hide it.
+fn cmd_slice<'a>(buffer: *mut c_void, ndw: c_int) -> Option<&'a [u8]> {
+    if buffer.is_null() || ndw < 0 {
+        return None;
+    }
+    // SAFETY: the caller owns this buffer and promised it holds `ndw` dwords. It is only read, and
+    // the borrow does not outlive the call the slice is passed into.
+    Some(unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), ndw as usize * 4) })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_submit_cmd2(
-    _buffer: *mut c_void,
-    _ctx_id: c_int,
-    _ndw: c_int,
+    buffer: *mut c_void,
+    ctx_id: c_int,
+    ndw: c_int,
     _in_fence_ids: *mut u64,
     _num_in_fences: u32,
 ) -> c_int {
-    todo_phase!("P3: the vrend decode loop")
+    // The in-fences are a vrend feature; venus carries its waits inside the command stream.
+    virgl_renderer_submit_cmd(buffer, ctx_id, ndw)
 }
 
 #[unsafe(no_mangle)]
@@ -619,33 +639,68 @@ pub extern "C" fn virgl_renderer_limina_journal_seq(_ctx_id: u32) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_journal_unpin(_ctx_id: u32, _key: u64) {}
 
+// The replay feed hands journal entries straight to the dispatcher, bypassing the ring buffer
+// entirely -- which is what makes a replay possible with no guest and no VM. The entries have had
+// their reply flag stripped by the recorder, so nothing below answers anything.
+
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_limina_replay_begin(_ctx_id: u32) -> c_int {
-    todo_phase!("P2: the venus replay feed")
+pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_begin(CtxId(ctx_id))) {
+        Some(Ok(())) => 0,
+        _ => EINVAL,
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_submit(
-    _ctx_id: u32,
-    _cmd: *mut c_void,
-    _size: u32,
+    ctx_id: u32,
+    cmd: *mut c_void,
+    size: u32,
 ) -> c_int {
-    todo_phase!("P2: the venus replay feed")
+    let Some(buf) = byte_slice(cmd, size) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(CtxId(ctx_id), buf)) {
+        Some(Ok(())) => 0,
+        _ => EINVAL,
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
-    _ctx_id: u32,
-    _ring_id: u64,
-    _cmd: *mut c_void,
-    _size: u32,
+    ctx_id: u32,
+    ring_id: u64,
+    cmd: *mut c_void,
+    size: u32,
 ) -> c_int {
-    todo_phase!("P2: the venus replay feed")
+    let Some(buf) = byte_slice(cmd, size) else {
+        return EINVAL;
+    };
+    // The ring id is the guest's 64-bit ring object; the index is what fences are keyed by. Until
+    // a ring loop exists there is nothing to key, so the command is dispatched directly.
+    let ring = RingIdx(ring_id as u32);
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(CtxId(ctx_id), ring, buf)) {
+        Some(Ok(())) => 0,
+        _ => EINVAL,
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_limina_replay_end(_ctx_id: u32) -> c_int {
-    todo_phase!("P2: the venus replay feed")
+pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_end(CtxId(ctx_id))) {
+        Some(Ok(())) => 0,
+        _ => EINVAL,
+    })
+}
+
+/// A buffer the caller owns, as bytes. See [`cmd_slice`] for why null is `None`.
+fn byte_slice<'a>(p: *mut c_void, size: u32) -> Option<&'a [u8]> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: the caller owns this buffer and promised it holds `size` bytes. It is only read, and
+    // the borrow does not outlive the call the slice is passed into.
+    Some(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), size as usize) })
 }
 
 #[unsafe(no_mangle)]

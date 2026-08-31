@@ -197,12 +197,22 @@ impl Renderer {
             return Err(-libc::EINVAL);
         }
         self.contexts.insert(id, Context { id, flags, name, last_fence: BTreeMap::new() });
+        // A venus context gets venus state. The capset the guest bound is the low byte of the
+        // flags, and it is the only thing that says which renderer a submission belongs to.
+        if flags & abi::CAPSET_MASK == abi::CAPSET_VENUS
+            && let Some(v) = self.venus.as_mut()
+        {
+            v.context_create(id);
+        }
         Ok(())
     }
 
     pub fn context_destroy(&mut self, id: CtxId) {
         if self.contexts.remove(&id).is_none() {
             return;
+        }
+        if let Some(v) = self.venus.as_mut() {
+            v.context_destroy(id);
         }
         // A destroyed context releases its claim on every resource; the resources themselves
         // survive, because the VMM unrefs them separately and may still be holding one.
@@ -250,6 +260,29 @@ impl Renderer {
 
     pub fn create_fence(&mut self, client_fence_id: u32) {
         self.fences.retire_global(client_fence_id);
+    }
+
+    // ---- venus ----
+
+    /// Route a submission to the renderer the context bound. `Err` is a context that named no
+    /// renderer we have, or a stream that poisoned the one it named.
+    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), c_int> {
+        let Some(c) = self.contexts.get(&ctx) else {
+            return Err(-libc::EINVAL);
+        };
+        match c.flags & abi::CAPSET_MASK {
+            abi::CAPSET_VENUS => {
+                let v = self.venus.as_mut().ok_or(-libc::EINVAL)?;
+                v.submit(ctx, buf).map_err(|_| -libc::EINVAL)
+            }
+            // vrend arrives in P3.
+            _ => Err(-libc::ENOTSUP),
+        }
+    }
+
+    /// The venus renderer, for the replay feed that drives it directly.
+    pub fn venus_mut(&mut self) -> Option<&mut venus::vkr::Vkr> {
+        self.venus.as_mut()
     }
 
     pub fn counts(&self) -> (usize, usize) {
