@@ -1,0 +1,11 @@
+use crate::venus::proto::types::*;
+use core::ffi::CStr;
+use core::mem::transmute;
+
+/// An entry point as the loader returns it, before it is given a signature.
+///
+/// Vulkan's own `PFN_vkVoidFunction`. It is never called through this type -- the tables below
+/// transmute it to the signature vk.xml gives the command it was asked for by name, which is the
+/// only thing that makes the transmute sound.
+pub type ProcAddr = unsafe extern "C" fn();
+
