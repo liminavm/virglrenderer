@@ -32,6 +32,24 @@
  * memory. */
 #define LIMINA_BLOB_SIZE_ALIGN (64 * 1024)
 
+
+/* LIMINA_VKR_MTLTEX_TRACE: per-import MTLTexture logging. Off by default — these fire once per
+ * imported texture, which is thousands a second at frame rate (1.4 GB of dogfood supervisor log
+ * in 45 minutes). The vkr_log() beside each one carries the same fact through the normal log
+ * level, so nothing is lost when this is off. */
+bool limina_mtltex_trace(void);
+
+bool
+limina_mtltex_trace(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("LIMINA_VKR_MTLTEX_TRACE");
+      on = e && e[0] && e[0] != '0';
+   }
+   return on;
+}
+
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
                                    const VkImportMemoryResourceInfoMESA *res_info,
@@ -368,7 +386,8 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
             if (dimg && limina_vkformat_to_mtl_exact((VkFormat)dimg->limina_vk_format, &mtl_fmt))
                limina_imported_texture = vkr_mtl_texture_from_iosurface(
                   dev->mtl_device, limina_imported_iosurface, mtl_fmt);
-            fprintf(stderr,
+            if (limina_mtltex_trace())
+               fprintf(stderr,
                     "[LIMINA-VKR-MTLTEX] import res %u IOSurface id=%u dedicated=%d "
                     "vkfmt=%u mtlfmt=%u -> tex=%p\n",
                     res_info->resourceId, limina_res->iosurface_id, dimg ? 1 : 0,
@@ -694,7 +713,8 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
             limina_metal_import.handle = limina_io->mtl_texture;
             limina_metal_import.pNext = alloc_info->pNext;
             alloc_info->pNext = &limina_metal_import;
-            fprintf(stderr,
+            if (limina_mtltex_trace())
+               fprintf(stderr,
                     "[LIMINA-VKR-MTLTEX] scanout memory <- MTLTEXTURE import of IOSurface "
                     "id=%u (tex=%p)\n",
                     limina_io->id, limina_io->mtl_texture);
