@@ -1,0 +1,19 @@
+// The venus wire, encoded and decoded.
+//
+// Decode is safe Rust: it allocates from the decoder's arena, fills through a `&mut`, and stores
+// the pointer last. The C generator fills *through* pointers instead, which is why its emitter
+// carries a deref algebra this one does not need.
+//
+// Encode is not, and cannot be: it reads arrays back through the raw pointers decode stored. Every
+// such block names the decoder's allocation as its invariant. That asymmetry is the point -- the
+// guest's bytes are on the decode side.
+
+use core::ffi::c_void;
+
+use super::types::*;
+use crate::venus::cs::{self, Decoder, Encoder, ObjectId};
+
+// Reply encoding skips `pNext` structs the guest's protocol does not know: `vn_sizeof_*` takes the
+// protocol as its first argument and `vn_encode_*` reads it off the encoder. The C reaches a global
+// for this; here it is passed, because a renderer serves more than one guest.
+
