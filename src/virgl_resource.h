@@ -113,8 +113,10 @@ struct virgl_resource {
 
    /* limina tier-2 (macOS): global IOSurface id backing this scanout resource, or 0.
     * Set from virgl_context_blob.iosurface_id at create time; read by
-    * virgl_renderer_resource_get_iosurface_id for zero-copy SET_SCANOUT_BLOB present. */
-   uint32_t iosurface_id;
+    * virgl_renderer_resource_get_iosurface_id for zero-copy SET_SCANOUT_BLOB present.
+    * Atomic because virgl_resource_forget_iosurface zeroes it from a venus ring thread while
+    * the virtio-gpu thread is reading it to present. */
+   _Atomic uint32_t iosurface_id;
 
    void *private_data;
 };
