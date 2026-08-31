@@ -39,7 +39,9 @@ un-vendoring venus-protocol), across 172 commits.
 ## The contract Limina depends on
 
 The C dylib exports 69 `virgl_*` symbols; libkrun references 62 of them (`nm -gU`
-on the dylib intersected with the symbols libkrun names). Those 62 are the contract:
+on the dylib intersected with the symbols libkrun names). The harness pins all 69 —
+what this tree exports is ours to define, while who calls what moves without warning —
+but these are the ones with known callers:
 
 - The classic surface bound by `rutabaga_gfx/src/generated/virgl_renderer_bindings.rs`
   — init, cleanup, contexts, fences, resources (create/blob/import/export/map/unmap/
@@ -161,15 +163,15 @@ makes the rewrite testable at subagent speed instead of boot speed.
   is the working seed; port it to Rust and make it a library.
 - **Venus corpus**: the `limina_journal_export` → `replay_begin/submit/ring_cmd/end`
   path, which already solves handle remapping.
-- **Oracle**: `resource_read_iosurface` and `transfer_read_iov` pixels, plus return
-  codes and fence-retirement *order*. Record goldens from the C build now; pin them
-  as fixtures in the repo.
-- **Named gap, the riskiest harness item**: there is no host-side capture of full
-  venus *frame* traffic — only the re-creation journal. Extending `vkr_journal` to a
-  full ring-stream recording mode is the cheapest route, and it must be done in the
-  **C** implementation first so the goldens are recorded from A. Flag it early; if it
-  turns out expensive, Layer 1 covers venus frames at boot speed and Layer 2 covers
-  venus object lifetime only.
+- **Oracle**: plain-text scores, diffed against fixtures pinned from the C build.
+  Classic scores a content hash and an ink count per offscreen via `transfer_read_iov`;
+  venus scores renderer *state* — accept counts plus the contents of the device memory
+  the commands left behind, read through `limina_memory_census`/`memory_read`. A
+  zero-allocation census at every context destroy is the venus leak oracle.
+- **Not covered by Layer 2**: the IOSurface family. `resource_get_iosurface_id`,
+  `resource_sync_iosurface`, `resource_read_iosurface`, `republish_iosurface` and
+  `resource_get_map_ptr` carry the zero-copy present and the Mach-port publish, and a
+  VM-free replay has no scanout to exercise them. Layer 1 is their only coverage.
 
 ### Layer 3 — carried over
 
