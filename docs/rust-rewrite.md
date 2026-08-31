@@ -119,16 +119,22 @@ invariants a port owes, none of which the C encodes as a type:
 ## Ranked by difficulty
 
 1. **The venus wire decoder (78k generated lines).** Decision: **fork
-   venus-protocol's mako templates to emit Rust.** The model layer
-   (`vkxml.py`, `vn_protocol.py`, 3.1k lines) is language-neutral; only
-   `templates/renderer_*.h` and `templates/types*.h` (~1.5k lines of the 2.5k) emit
-   the renderer-side C we need. Porting ~1.5k lines of template buys 78k lines of
-   *safe* generated decode — bounds-checked slices instead of pointer arithmetic
-   over guest memory. This is the highest-leverage item in the whole rewrite and it
-   is the crash-prone code the user wants gone. It is also the item most likely to
-   be underestimated: budget it as its own phase with its own differential test
-   (decode the same recorded ring bytes through C and Rust, compare the decoded
-   struct dumps).
+   venus-protocol's generator to emit Rust.** Only `vkxml.py` (the vk.xml model) is
+   language-neutral. `vn_protocol.py`'s `Gen` class emits C *statements* — the
+   `VariableInfo` machinery and `_sizeof/_encode/_decode_variable` are as much of the
+   backend as `templates/` is — so the fork is roughly 1k lines of emitter plus 1.5k
+   lines of template, not templates alone. The fork lives in this tree
+   (`virglrs/venus-gen/`) and imports the subproject's model over `sys.path`: the
+   subproject is wrap-managed and any edit inside it is eaten by the next re-clone.
+   The generated decode is *safe* Rust — bounds-checked slices over guest bytes,
+   poison instead of panic — with the raw Vulkan structs it fills handed to the
+   bindings module, which is where the unsafe already lives. This is the
+   highest-leverage item in the rewrite and the crash-prone code the user wants gone.
+   The differential test is a round trip, not a C dump: the recorded ring bytes *are*
+   C-encoder output from the guest's mesa driver, so Rust-decode → Rust-re-encode →
+   byte-compare against the original wire diffs the two implementations over every
+   recorded command for free. It does not cover reply encoding; the state score does
+   that indirectly once replay runs.
 2. **`vrend_shader.c` (8.6k).** TGSI→GLSL with variant keys. No crate exists; a
    direct port. Mechanical but unforgiving — the shader key logic is where subtle
    divergence hides, and it is exercised by every draw.
@@ -247,8 +253,8 @@ buildable throughout as the A-side reference.
   with `VIRGL_PREFIX` pointed at the Rust build, and both replayers loading that dylib
   and getting through init, context create and resource create without error. All of
   it VM-free — a phase whose point is going fast does not gate on a boot.
-- **P2 — venus.** Fork venus-protocol's templates to emit Rust; differential-test the
-  decoder against C on recorded ring bytes. Then vkr: instance/device/queue/memory/
+- **P2 — venus.** Fork venus-protocol's generator to emit Rust; gate the decoder on a
+  byte-identical wire round trip over both corpora. Then vkr: instance/device/queue/memory/
   image/buffer/descriptor/command-buffer, rings, budget, the Metal + IOSurface
   helpers. Ends at a seated venus GNOME desktop, booted with the existing venus-only
   `virgl_override` limina already has for forcing venus-only flags — no new
