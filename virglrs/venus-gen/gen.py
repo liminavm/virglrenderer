@@ -74,6 +74,9 @@ def main():
         body = template.render(GEN=gen, RUST=rust, VkType=VkType)
         (outdir / name).write_bytes(banner.encode() + body)
 
+    (outdir / 'info.rs').write_bytes(
+        banner.encode() + rust.render_info(vn_protocol).encode())
+
     gaps = []
     header = (Path(HERE / 'templates' / 'serialize.rs.head').read_text())
     (outdir / 'serialize.rs').write_bytes(
