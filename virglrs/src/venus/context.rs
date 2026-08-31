@@ -21,9 +21,10 @@ use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkCreateDevice,
-    vn_command_vkCreateInstance, vn_command_vkDestroyDevice, vn_command_vkDestroyInstance,
-    vn_command_vkEnumeratePhysicalDevices, vn_command_vkGetDeviceQueue2,
+    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateMemory,
+    vn_command_vkCreateDevice, vn_command_vkCreateInstance, vn_command_vkDestroyDevice,
+    vn_command_vkDestroyInstance, vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeMemory,
+    vn_command_vkGetDeviceQueue2,
 };
 use crate::vulkan::Global;
 
@@ -181,6 +182,11 @@ impl Context {
     /// The driver state, for the teardown that has to destroy what it holds.
     pub fn driver_mut(&mut self) -> &mut Driver {
         &mut self.driver
+    }
+
+    /// The driver state, for the census that has to read what it holds.
+    pub fn driver(&self) -> &Driver {
+        &self.driver
     }
 }
 
@@ -384,6 +390,28 @@ impl Commands for Handlers<'_> {
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice) {
         self.driver.destroy_device(args.device);
+    }
+
+    // ------------------------------------------------------------------- device memory
+    //
+    // What the memory census reads back, and the first thing the guest does with a device.
+
+    fn vkAllocateMemory(&mut self, args: &mut vn_command_vkAllocateMemory) {
+        // The id has to be read before the allocation, because it is the key the driver files it
+        // under -- and it is the guest's, chosen in the request, not anything the host picks.
+        let Some(id) = self.out_id(args.pMemory) else {
+            return;
+        };
+        let host =
+            self.driver.allocate_memory(args.device, id.0, args.pAllocateInfo, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkAllocateMemory", args.pMemory, args.handle_pMemory, host.map(|m| m.0));
+    }
+
+    fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory) {
+        // A null handle is a legal no-op in Vulkan, and the guest sends it: the id is then zero
+        // and the driver's table has nothing under it, so this needs no guard of its own.
+        self.driver.free_memory(args.id_memory.0);
     }
 
     fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2) {

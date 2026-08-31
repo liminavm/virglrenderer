@@ -15,10 +15,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::proto::types::{
-    VkAllocationCallbacks, VkDevice, VkDeviceCreateInfo, VkDeviceQueueInfo2, VkExtensionProperties,
-    VkInstance, VkInstanceCreateInfo, VkPhysicalDevice, VkQueue, VkResult,
+    VkAllocationCallbacks, VkBaseInStructure, VkDevice, VkDeviceCreateInfo, VkDeviceMemory,
+    VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
+    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkQueue, VkResult, VkStructureType,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
+
+/// `VK_WHOLE_SIZE`: map an allocation from an offset to its end.
+const VK_WHOLE_SIZE: VkDeviceSize = VkDeviceSize(!0);
 
 /// The extensions the guest asks for that this renderer *emulates* rather than forwards.
 ///
@@ -57,13 +62,39 @@ pub struct Driver {
     /// Keyed by *host* handle, not guest id. Every handler that needs a device's entry points
     /// reaches them through the `VkDevice` the lookup already resolved for it; only a destroy
     /// carries the guest id, and it does not need the table to find one.
-    devices: BTreeMap<u64, DeviceFns>,
+    devices: BTreeMap<u64, DeviceState>,
     /// What each physical device supports, by name, keyed by host handle.
     ///
     /// A set of names rather than the C's one bool per extension: the question asked of it is
     /// always "does this driver have <name>", and a hand-maintained struct of booleans is a list
     /// that has to be extended every time a new name matters.
     physical_device_exts: BTreeMap<u64, BTreeSet<String>>,
+    /// Live device memory, keyed by the *guest's* id -- because that is the name the census
+    /// reports and the VMM reads back by. See [`Memory`].
+    memory: BTreeMap<u64, Memory>,
+}
+
+/// One live `VkDevice`: its entry points, and what its allocations need to know.
+struct DeviceState {
+    fns: DeviceFns,
+    /// The property flags of each memory type, indexed by `memoryTypeIndex`. Read once at device
+    /// creation because it never changes, and because an allocation must not pay an instance
+    /// round trip to learn whether it is host-visible.
+    memory_types: Vec<VkMemoryPropertyFlags>,
+}
+
+/// One live `VkDeviceMemory`.
+///
+/// Tracked apart from the object table because the census needs two things the table does not
+/// hold: the size the guest asked for, and which device owns the allocation -- a device cannot be
+/// destroyed while its memory is live, so a teardown has to walk from one to the other.
+pub struct Memory {
+    /// The host `VkDevice` that owns it.
+    device: u64,
+    handle: u64,
+    /// `allocationSize` as the guest asked for it. The driver may have rounded up; the census
+    /// reports the guest's number because that is what the guest will read back.
+    size: u64,
 }
 
 // Every pointer these take is one the decoder allocated in the batch arena and handed to a
@@ -88,7 +119,7 @@ impl Driver {
     }
 
     pub fn device(&self, device: VkDevice) -> Option<&DeviceFns> {
-        self.devices.get(&device.0)
+        self.devices.get(&device.0).map(|d| &d.fns)
     }
 
     /// Destroy everything this context still holds, devices before the instance.
@@ -100,8 +131,11 @@ impl Driver {
     /// each destroy happen once.
     pub fn teardown(&mut self) {
         for (handle, d) in core::mem::take(&mut self.devices) {
+            // A device cannot be destroyed while its memory is live -- Vulkan calls that an
+            // application error, and the guest is under no obligation to have avoided it.
+            self.free_device_memory(&d.fns, handle);
             // SAFETY: a handle this context created, and the table was loaded from it.
-            unsafe { (d.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
+            unsafe { (d.fns.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
         }
         if let Some(inst) = self.instance.take() {
             let handle = VkInstance(core::mem::take(&mut self.instance_handle));
@@ -259,7 +293,14 @@ impl Driver {
             return Err(r);
         }
         assert!(out.0 != 0, "vkCreateDevice succeeded and returned a null device");
-        self.devices.insert(out.0, vulkan::device(inst, out));
+        let mut props = VkPhysicalDeviceMemoryProperties::default();
+        // SAFETY: `pd` is a handle this instance returned, and `props` is a local.
+        unsafe { (inst.vkGetPhysicalDeviceMemoryProperties())(pd, &mut props) };
+        let memory_types = props.memoryTypes[..props.memoryTypeCount.min(32) as usize]
+            .iter()
+            .map(|t| t.propertyFlags)
+            .collect();
+        self.devices.insert(out.0, DeviceState { fns: vulkan::device(inst, out), memory_types });
         Ok(out)
     }
 
@@ -311,7 +352,7 @@ impl Driver {
         let mut out = VkQueue(0);
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
-        unsafe { (d.vkGetDeviceQueue2())(device, info, &mut out) };
+        unsafe { (d.fns.vkGetDeviceQueue2())(device, info, &mut out) };
         (out.0 != 0).then_some(out)
     }
 
@@ -320,9 +361,178 @@ impl Driver {
         let Some(d) = self.devices.remove(&device.0) else {
             return;
         };
+        self.free_device_memory(&d.fns, device.0);
         // SAFETY: a handle this context created, destroyed once -- `remove` is what makes it once.
-        unsafe { (d.vkDestroyDevice())(device, core::ptr::null()) };
+        unsafe { (d.fns.vkDestroyDevice())(device, core::ptr::null()) };
     }
+
+    // ------------------------------------------------------------------- device memory
+
+    /// Allocate device memory and remember it, so the census can find it by the guest's id.
+    ///
+    /// `id` is the guest's, and it is what goes in the table: the census reports guest ids and the
+    /// VMM reads back by them. The host handle it returns is the one the guest's shadow gets.
+    pub fn allocate_memory(
+        &mut self,
+        device: VkDevice,
+        id: u64,
+        info: *const VkMemoryAllocateInfo,
+        alloc: *const VkAllocationCallbacks,
+    ) -> Result<VkDeviceMemory, VkResult> {
+        if info.is_null() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        let Some(d) = self.devices.get(&device.0) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        // A copy, not an edit in place: the decoder's struct is the guest's request, and the
+        // round trip re-encodes it. The `pNext` chain is carried over untouched.
+        // SAFETY: non-null, and the decoder allocated it in the arena for this batch.
+        let mut info = unsafe { *info };
+        info.allocationSize = VkDeviceSize(pad_for_blob(
+            info.allocationSize.0,
+            d.memory_types.get(info.memoryTypeIndex as usize).copied(),
+            imports_a_resource(info.pNext),
+        ));
+
+        let mut out = VkDeviceMemory(0);
+        // SAFETY: `info` is a local whose chain the decoder owns for the batch, `alloc` is another
+        // of its arena allocations, and `out` is a local.
+        let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, alloc, &mut out) };
+        if r != VkResult::VK_SUCCESS {
+            return Err(r);
+        }
+        assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
+        let size = info.allocationSize.0;
+        self.memory.insert(id, Memory { device: device.0, handle: out.0, size });
+        Ok(out)
+    }
+
+    /// Free device memory the guest named by id.
+    pub fn free_memory(&mut self, id: u64) {
+        let Some(mem) = self.memory.remove(&id) else {
+            return;
+        };
+        let Some(d) = self.devices.get(&mem.device) else {
+            return;
+        };
+        // SAFETY: a handle this context allocated, freed once -- `remove` is what makes it once.
+        unsafe {
+            (d.fns.vkFreeMemory())(
+                VkDevice(mem.device),
+                VkDeviceMemory(mem.handle),
+                core::ptr::null(),
+            )
+        };
+    }
+
+    /// Free every allocation belonging to one device, on the way to destroying it.
+    fn free_device_memory(&mut self, d: &DeviceFns, device: u64) {
+        let mine: Vec<u64> =
+            self.memory.iter().filter(|(_, m)| m.device == device).map(|(id, _)| *id).collect();
+        for id in mine {
+            let mem = self.memory.remove(&id).expect("just collected from this map");
+            // SAFETY: a handle this context allocated on `d`'s device, freed once.
+            unsafe {
+                (d.vkFreeMemory())(VkDevice(device), VkDeviceMemory(mem.handle), core::ptr::null())
+            };
+        }
+    }
+
+    /// Every live allocation as (guest id, size), for the memory census.
+    ///
+    /// The C also skips memory it has exported as a blob and memory imported from another
+    /// context's storage -- in both cases the bytes are captured where they actually live, not
+    /// here. Neither flag can be set yet: both are decided by the blob path, which does not exist,
+    /// so nothing is skipped and the count reads high against the C by exactly the blobs a corpus
+    /// exported.
+    pub fn memory_census(&self) -> Vec<(u64, u64)> {
+        self.memory.iter().map(|(id, m)| (*id, m.size)).collect()
+    }
+
+    /// Copy an allocation's contents out through a host mapping, returning whether it worked.
+    ///
+    /// Short buffers are the caller's business, not an error: the census reports whole sizes and
+    /// the VMM caps what it reads, so a prefix is the normal request.
+    ///
+    /// A map can be refused -- device-local memory is not the driver's to hand out, and a scanout
+    /// backed by an IOSurface lives in the surface rather than the allocation. Those bytes are
+    /// reachable by another path, and reaching them is the blob path's job; here it is a false.
+    pub fn memory_read(&self, id: u64, buf: &mut [u8]) -> bool {
+        let Some(mem) = self.memory.get(&id) else {
+            return false;
+        };
+        let Some(d) = self.devices.get(&mem.device) else {
+            return false;
+        };
+        let device = VkDevice(mem.device);
+        let handle = VkDeviceMemory(mem.handle);
+        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a device and an allocation this context made, and `ptr` is a local.
+        let r = unsafe {
+            (d.fns.vkMapMemory())(
+                device,
+                handle,
+                VkDeviceSize(0),
+                VK_WHOLE_SIZE,
+                VkFlags(0),
+                &mut ptr,
+            )
+        };
+        if r != VkResult::VK_SUCCESS || ptr.is_null() {
+            return false;
+        }
+        let n = buf.len().min(mem.size as usize);
+        // SAFETY: the driver mapped at least `mem.size` bytes at `ptr`, which is what `n` is
+        // clamped to, and `buf` is a live slice of at least `n`. The two cannot overlap: one is
+        // the driver's mapping and the other the caller's.
+        unsafe { core::ptr::copy_nonoverlapping(ptr.cast::<u8>(), buf.as_mut_ptr(), n) };
+        // SAFETY: the mapping this call just made, unmapped once.
+        unsafe { (d.fns.vkUnmapMemory())(device, handle) };
+        true
+    }
+}
+
+/// Round a host-visible allocation up to the size of the blob the guest may create from it.
+///
+/// A guest that maps memory does it by exporting the allocation as a virtio-gpu blob, and a blob
+/// is sized in 64 KiB units. An allocation smaller than its own blob leaves the guest with a
+/// mapping that runs off the end of what the driver actually reserved, which is a host
+/// out-of-bounds read on the guest's say-so.
+///
+/// Only host-visible memory, because only host-visible memory is ever mapped; and never an import,
+/// which aliases bytes that already exist at a size the exporter fixed.
+fn pad_for_blob(size: u64, flags: Option<VkMemoryPropertyFlags>, imported: bool) -> u64 {
+    /// Blobs are counted in 64 KiB units.
+    const BLOB_ALIGN: u64 = 64 * 1024;
+    const HOST_VISIBLE: VkMemoryPropertyFlagBits =
+        VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+
+    let Some(flags) = flags else {
+        // A memory type index the device never reported. The driver will reject it, and padding a
+        // size for an allocation that is about to fail would only obscure the failure.
+        return size;
+    };
+    if imported || flags.0 & HOST_VISIBLE.0 as u32 == 0 {
+        return size;
+    }
+    size.next_multiple_of(BLOB_ALIGN)
+}
+
+/// Whether an allocation's `pNext` chain imports another context's storage.
+///
+/// Walked rather than asked of the guest, because the chain is where the guest put it.
+fn imports_a_resource(mut node: *const core::ffi::c_void) -> bool {
+    while !node.is_null() {
+        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
+        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
+        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA {
+            return true;
+        }
+        node = base.pNext.cast();
+    }
+    false
 }
 
 /// Read a Vulkan `const char *const *` array into owned strings.
@@ -341,4 +551,38 @@ fn read_names(names: *const *const std::ffi::c_char, count: usize) -> Vec<String
             (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOST_VISIBLE: VkMemoryPropertyFlags =
+        VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32);
+    const DEVICE_LOCAL: VkMemoryPropertyFlags =
+        VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32);
+
+    /// The census reports the padded size, so this rule is directly what a score compares.
+    #[test]
+    fn only_a_mappable_allocation_is_padded_to_its_blob() {
+        // Host-visible memory is what the guest maps, and it maps it through a 64 KiB blob.
+        assert_eq!(pad_for_blob(1, Some(HOST_VISIBLE), false), 65536);
+        assert_eq!(pad_for_blob(245760, Some(HOST_VISIBLE), false), 262144);
+        assert_eq!(pad_for_blob(4096000, Some(HOST_VISIBLE), false), 4128768);
+        // A size that is already a whole number of blobs is left where it is.
+        assert_eq!(pad_for_blob(67108864, Some(HOST_VISIBLE), false), 67108864);
+
+        // Device-local memory is never mapped, so padding it would only waste it.
+        assert_eq!(pad_for_blob(4096, Some(DEVICE_LOCAL), false), 4096);
+        // An import aliases bytes the exporter sized; growing the request would run off them.
+        assert_eq!(pad_for_blob(4096, Some(HOST_VISIBLE), true), 4096);
+        // A memory type the device never reported: let the driver reject it as it is.
+        assert_eq!(pad_for_blob(4096, None, false), 4096);
+    }
+
+    /// A zero allocation is legal to ask for and must not become a blob-sized one.
+    #[test]
+    fn a_zero_allocation_stays_zero() {
+        assert_eq!(pad_for_blob(0, Some(HOST_VISIBLE), false), 0);
+    }
 }
