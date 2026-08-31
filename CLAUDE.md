@@ -53,5 +53,9 @@ it. Fix the template.
 ## Working here
 
 - Every behaviour fix carries a harness case that would have caught it (`harness/README.md`).
+- **A documented C limitation is a hypothesis until the harness reproduces it.** The C tree
+  carries workarounds whose comments assert things that are no longer true; porting one
+  faithfully carries the folklore forward and hides that the real bug was fixed elsewhere.
+  Reproduce it against a pinned score first, then port it or delete it.
 - Commit as work finishes. Never `git add -A` — this tree has untracked local files that must
   not be committed. Never push without asking.
