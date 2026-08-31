@@ -167,9 +167,12 @@ vkr_record_context_gone(uint32_t ctx_id);
  * the same sequence as vkr_record_dispatch, under the same lock, which is the whole point: the
  * recorded interleaving IS the dependency order between resources and the commands that use them.
  *
- * These record the ARGUMENTS, not the outcome, and are called before the work is attempted. A
- * recorded event for a call that then failed is harmless -- the replayer creates a resource
- * nothing references -- while a missed event is not.
+ * EACH IS CALLED AFTER ITS EFFECT, never before. The sequence is only worth having if it is the
+ * true execution order, and a VMM thread blocks inside create_blob while a ring thread runs: a
+ * blob exporting a VkDeviceMemory recorded on ENTRY lands ahead of the vkAllocateMemory that
+ * created it, and a replayer following the recorded order then creates the blob against memory
+ * that does not exist yet. Recording after the fact costs only the failed calls, which a replayer
+ * should not replay anyway.
  */
 void
 vkr_record_ctx_create(uint32_t ctx_id, uint32_t context_init, const char *name, uint32_t nlen);

@@ -491,10 +491,14 @@ rec_dump_locked(void)
       return;
    }
 
+   /* Every context whose prologue has been decided gets an entry, INCLUDING an empty one. A
+    * context created after the recorder armed starts from nothing, and an empty prologue says
+    * exactly that; omitting it instead makes the capture claim a stream whose commands belong to
+    * a context the corpus never introduces. */
    uint64_t prologue_bytes = 0;
    uint32_t ctx_count = 0;
    for (uint32_t i = 0; i < rec.nctx; i++) {
-      if (!rec.ctxs[i].journal_blob)
+      if (!rec.ctxs[i].prologue_taken)
          continue;
       ctx_count++;
       prologue_bytes +=
@@ -515,7 +519,7 @@ rec_dump_locked(void)
    static const uint8_t zeros[4] = { 0 };
    for (uint32_t i = 0; ok && i < rec.nctx; i++) {
       struct vkr_record_ctx *rc = &rec.ctxs[i];
-      if (!rc->journal_blob)
+      if (!rc->prologue_taken)
          continue;
       const uint64_t size = rc->journal_size;
       ok = rec_write_all(f, &rc->ctx_id, sizeof rc->ctx_id) &&

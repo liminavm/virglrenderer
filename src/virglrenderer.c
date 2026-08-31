@@ -73,6 +73,7 @@
 #ifdef ENABLE_VENUS
 #include "vkr_record.h"
 #else
+#define vkr_record_init() ((void)0)
 #define vkr_record_ctx_create(a, b, c, d) ((void)0)
 #define vkr_record_ctx_destroy(a) ((void)0)
 #define vkr_record_create_blob(a, b, c, d, e, f, g) ((void)0)
@@ -236,9 +237,6 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
    if (!res)
       return;
 
-   /* Recorded so a replay can free the handle before it is reused. Handles ARE reused, and a
-    * replay that keeps the first resource alive would bind the wrong one. */
-   vkr_record_resource_unref(res_handle);
    if (vrend_trace_enabled()) {
       struct vrend_trace_res tres = { .kind = VREND_TRACE_RES_UNREF, .handle = res_handle };
       vrend_trace_res_event(&tres);
@@ -258,6 +256,10 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
    virgl_context_foreach(&args);
 
    virgl_resource_remove(res->res_id);
+
+   /* Recorded so a replay can free the handle before it is reused. Handles ARE reused, and a
+    * replay that keeps the first resource alive would bind the wrong one. */
+   vkr_record_resource_unref(res_handle);
 }
 
 void virgl_renderer_fill_caps(uint32_t set, uint32_t version,
@@ -332,10 +334,6 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       return ctx->capset_id == capset_id ? 0 : EINVAL;
    }
 
-   /* After the already-live check: a repeat create of a live id is a no-op here, and recording it
-    * would make the replayer retire a context that never went away. */
-   vkr_record_ctx_create(ctx_id, ctx_flags, name, nlen);
-
    switch (capset_id) {
    case VIRTGPU_DRM_CAPSET_VIRGL:
    case VIRTGPU_DRM_CAPSET_VIRGL2:
@@ -375,6 +373,9 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       return ret;
    }
 
+   /* Recorded here, where the context exists and is in the table. */
+   vkr_record_ctx_create(ctx_id, ctx_flags, name, nlen);
+
    return 0;
 }
 
@@ -391,8 +392,8 @@ void virgl_renderer_context_destroy(uint32_t handle)
    TRACE_FUNC();
    if (virgl_fd_trace())
       virgl_error("[FDTRACE] context_destroy ctx=%u", handle);
-   vkr_record_ctx_destroy(handle);
    virgl_context_remove(handle);
+   vkr_record_ctx_destroy(handle);
 }
 
 int virgl_renderer_submit_cmd(void *buffer,
@@ -590,8 +591,8 @@ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
    if (!ctx || !res)
       return;
-   vkr_record_attach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
    ctx->attach_resource(ctx, res);
+   vkr_record_attach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
 }
 
 void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
@@ -604,8 +605,8 @@ void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
                   res_handle, ctx ? "" : " NO-CTX", res ? "" : " NO-RES");
    if (!ctx || !res)
       return;
-   vkr_record_detach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
    ctx->detach_resource(ctx, res);
+   vkr_record_detach_resource((uint32_t)ctx_id, (uint32_t)res_handle);
 }
 
 static int virgl_renderer_resource_get_info_common(int res_handle,
@@ -956,6 +957,13 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
    TRACE_FUNC();
 
    int ret;
+
+   /* Arm the venus recorder here and nowhere else. It used to arm when the first venus context
+    * built its journal, which made every control event before that point invisible -- including
+    * the blob a guest's first vkCreateRingMESA names, so the very first ring in a corpus was
+    * unreplayable. The recorder's arming point IS the corpus's starting point, so it has to be
+    * the earliest call the ABI has. */
+   vkr_record_init();
 
    /* VIRGL_RENDERER_THREAD_SYNC is a hint and can be silently ignored */
    if (!has_eventfd() || getenv("VIRGL_DISABLE_MT"))
@@ -1385,8 +1393,6 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
       };
       vrend_trace_res_event(&tres);
    }
-   vkr_record_create_blob(args->res_handle, args->ctx_id, args->blob_mem, args->blob_flags,
-                          args->blob_id, args->size, args->num_iovs);
 
    if (!has_host_storage) {
       res = virgl_resource_create_from_iov(args->res_handle,
@@ -1396,6 +1402,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
          return -ENOMEM;
 
       res->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+      vkr_record_create_blob(args->res_handle, args->ctx_id, args->blob_mem, args->blob_flags,
+                             args->blob_id, args->size, args->num_iovs);
       return 0;
    }
 
@@ -1436,6 +1444,9 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    /* limina tier-2 (macOS) #28: borrow MoltenVK's own mapping for a HOST_VISIBLE blob so the VMM
     * hv_vm_maps the exact memory the GPU binds (one mapping, guest+GPU coherent). 0 = fd path. */
    res->map_ptr = blob.map_ptr;
+
+   vkr_record_create_blob(args->res_handle, args->ctx_id, args->blob_mem, args->blob_flags,
+                          args->blob_id, args->size, args->num_iovs);
 
    return 0;
 }
@@ -2129,11 +2140,6 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
    if (args->size == 0)
       return -EINVAL;
 
-   /* Recorded, though a replayer cannot reproduce it: the fd came from outside the renderer. The
-    * point is that the replayer can say which resource it is missing and why, instead of failing
-    * obscurely on the first command that names the handle. */
-   vkr_record_import_blob(args->res_handle, args->fd_type, args->size);
-
    res = virgl_resource_create_from_fd(args->res_handle,
                                        fd_type,
                                        args->fd,
@@ -2145,6 +2151,11 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
 
    res->map_info = 0;
    res->map_size = args->size;
+
+   /* Recorded, though a replayer cannot reproduce it: the fd came from outside the renderer. The
+    * point is that the replayer can say which resource it is missing and why, instead of failing
+    * obscurely on the first command that names the handle. */
+   vkr_record_import_blob(args->res_handle, args->fd_type, args->size);
 
    return 0;
 }

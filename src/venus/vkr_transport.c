@@ -202,6 +202,11 @@ vkr_dispatch_vkCreateRingMESA(struct vn_dispatch_context *dispatch,
 
    const struct vkr_resource *res = vkr_context_get_resource(ctx, info->resourceId);
    if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM) {
+      /* Say which of the two it was. The ring resource arrives on the control path, not in the
+       * command stream, so "not attached to this context" and "attached but not shm" are
+       * different bugs in different layers -- and a bare fatal makes them indistinguishable. */
+      vkr_log_error("vkCreateRingMESA: resource %u is %s", info->resourceId,
+                    res ? "not shm" : "not in this context");
       vkr_context_set_fatal(ctx);
       return;
    }
