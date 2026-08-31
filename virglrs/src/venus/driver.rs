@@ -52,6 +52,8 @@ const HOST_EXTENSIONS: [&str; 6] = [
 #[derive(Default)]
 pub struct Driver {
     instance: Option<InstanceFns>,
+    /// The instance's own handle, so a teardown with no command behind it can still destroy it.
+    instance_handle: u64,
     /// Keyed by *host* handle, not guest id. Every handler that needs a device's entry points
     /// reaches them through the `VkDevice` the lookup already resolved for it; only a destroy
     /// carries the guest id, and it does not need the table to find one.
@@ -89,13 +91,24 @@ impl Driver {
         self.devices.get(&device.0)
     }
 
-    /// Every device this context still holds, for a teardown that has to destroy them.
-    pub fn take_devices(&mut self) -> BTreeMap<u64, DeviceFns> {
-        core::mem::take(&mut self.devices)
-    }
-
-    pub fn take_instance(&mut self) -> Option<InstanceFns> {
-        self.instance.take()
+    /// Destroy everything this context still holds, devices before the instance.
+    ///
+    /// Both the guest's `vkDestroyInstance` and the context's own teardown come here. A guest is
+    /// under no obligation to have destroyed its devices first, and a context can go away
+    /// mid-workload having sent no destroy at all -- which is the common case, because a guest
+    /// that is still drawing when its VM stops never unwinds. Emptying the maps is what makes
+    /// each destroy happen once.
+    pub fn teardown(&mut self) {
+        for (handle, d) in core::mem::take(&mut self.devices) {
+            // SAFETY: a handle this context created, and the table was loaded from it.
+            unsafe { (d.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
+        }
+        if let Some(inst) = self.instance.take() {
+            let handle = VkInstance(core::mem::take(&mut self.instance_handle));
+            // SAFETY: as above.
+            unsafe { (inst.vkDestroyInstance())(handle, core::ptr::null()) };
+        }
+        self.physical_device_exts.clear();
     }
 
     /// Create the context's instance, and load the entry points that hang off it.
@@ -109,6 +122,11 @@ impl Driver {
         info: *const VkInstanceCreateInfo,
         alloc: *const VkAllocationCallbacks,
     ) -> Result<VkInstance, VkResult> {
+        // One instance per context, as `objects` describes: a second would orphan the first's
+        // devices and leak it, and no guest has a reason to ask.
+        if self.instance.is_some() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
         let mut out = VkInstance(0);
         // SAFETY: `info` and `alloc` are the decoder's arena allocations, live for this call, and
         // `out` is a local. The guest cannot make them dangle: the arena outlives the batch.
@@ -118,6 +136,7 @@ impl Driver {
         }
         assert!(out.0 != 0, "vkCreateInstance succeeded and returned a null instance");
         self.instance = Some(vulkan::instance(out));
+        self.instance_handle = out.0;
         Ok(out)
     }
 
@@ -322,13 +341,4 @@ fn read_names(names: *const *const std::ffi::c_char, count: usize) -> Vec<String
             (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into())
         })
         .collect()
-}
-
-/// Destroy an instance with a table that has already been taken out of its `Driver`.
-///
-/// Free-standing because teardown runs after the context has given up its state, and because
-/// taking the table by value is what says the instance cannot be destroyed twice.
-pub fn destroy_instance(inst: &InstanceFns, instance: VkInstance) {
-    // SAFETY: a handle this context created, and the table was loaded from it.
-    unsafe { (inst.vkDestroyInstance())(instance, core::ptr::null()) };
 }

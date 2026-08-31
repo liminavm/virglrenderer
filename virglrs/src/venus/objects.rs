@@ -78,6 +78,11 @@ impl Table {
         Ok(())
     }
 
+    /// Whether the host refused this id, so a later registration must not resurrect it.
+    pub fn is_ghost(&self, id: ObjectId) -> bool {
+        self.ghosts.contains(&id)
+    }
+
     /// Record that the host refused to create this id. See [`Table::ghosts`].
     pub fn add_ghost(&mut self, id: ObjectId) {
         if id.0 != 0 {
