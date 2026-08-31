@@ -1,0 +1,57 @@
+# virglrenderer → virglrs
+
+This tree is being rewritten in Rust. The plan is `docs/rust-rewrite.md`; the test floor is
+`harness/README.md`. The C implementation still here is the reference the harness records
+goldens from, and nothing else — it is a hard fork with no obligation to upstream past the
+switch point, and no obligation to older users at any point.
+
+## Why Rust, and what follows from it
+
+We are not porting for fashion. The language is the point: it is meant to remove whole classes
+of the bugs this renderer has cost us. Every rule below is that reason, applied.
+
+**Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules — the Vulkan, GLES and
+Objective-C bindings, and the guest-memory mapping — and every unsafe block carries a `SAFETY:`
+comment naming the invariant and who upholds it. The rest of the renderer is safe Rust. An
+unsafe block outside those modules is a design failure, not a shortcut.
+
+**Make bad state unrepresentable; fail the build, not the run.** Use the type system in our
+favour. The concrete form this takes here: virgl is a soup of bare `uint32_t` — resource
+handles, context ids, fence ids, object handles, ring ids, blob ids, all mutually
+interchangeable and none of them checked. Each gets its own newtype. Where an operation is only
+valid in one state, that state is a distinct type, not a boolean someone must remember to test.
+
+**When the language can't enforce it, crash loudly.** `assert!` and `.expect()` are runtime
+safety nets that surface a problem at the moment it is introduced, not three frames later.
+Never silently ignore, never paper over, never `let _ =` a real error.
+
+**Except at the trust boundary, where a guest is never allowed to crash us.** An assert fires on
+a violated *host* invariant — something we got wrong. Malformed, hostile or nonsensical input
+from the guest is not that: a guest that sends a bad ring, an impossible descriptor or an
+out-of-range handle must be rejected and its context poisoned, never allowed to abort the
+worker. One guest must not be able to take down the process. Validate and reject at the
+boundary; assert behind it.
+
+**Panics abort; they never unwind into C.** Unwinding across `extern "C"` is undefined
+behaviour, so the crate builds with `panic = "abort"`. A loud abort is the behaviour we want
+anyway, and it means the FFI shim needs no unwind machinery.
+
+**No global mutable state.** virglrenderer's C is built on file-scope statics and an implicit
+current context (`force_ctx_0`), which is where the data races we have chased live. State hangs
+off an explicitly owned root and is reached through it. The C ABI's implicit global becomes a
+single owned root at the shim — one place, not a habit.
+
+**C and C++ disappear; FFI never dictates design.** The best case is that the C-ABI dylib is
+eventually replaced or disabled by default. So wherever the ABI is in tension with the Rust
+design, the ABI takes the hit — in performance, in efficiency, in ergonomics. Never the other
+way round.
+
+**Generated code is generated.** The venus decoder is emitted from templates. Fixing a bug by
+editing generated output puts it somewhere no one will find it and the next regeneration eats
+it. Fix the template.
+
+## Working here
+
+- Every behaviour fix carries a harness case that would have caught it (`harness/README.md`).
+- Commit as work finishes. Never `git add -A` — this tree has untracked local files that must
+  not be committed. Never push without asking.
