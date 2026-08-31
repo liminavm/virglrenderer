@@ -1230,9 +1230,34 @@ static bool sw_begin(struct virgl_video_codec *codec, const char *why)
 
 /* Every AV1 unit goes through here, so the replay history and the hardware/software
  * choice are decided in exactly one place. */
+/* Append every reconstructed temporal unit to one file, in submission order, so the
+ * rebuilt stream can be diffed field by field against the clip it came from
+ * (spikes/av1-obu-serializer/fhparse.py). A debugging aid, off unless asked for. */
+static void av1_dump_unit(const uint8_t *data, size_t len)
+{
+    static const char *path;
+    static bool looked;
+    FILE *f;
+
+    if (!looked) {
+        path = getenv("LIMINA_AV1_DUMP");
+        if (path && !*path)
+            path = NULL;
+        looked = true;
+    }
+    if (!path || !data || !len)
+        return;
+    if ((f = fopen(path, "ab"))) {
+        fwrite(data, len, 1, f);
+        fclose(f);
+    }
+}
+
 static int av1_route_unit(struct virgl_video_codec *codec, const uint8_t *data, size_t len,
                           struct virgl_video_buffer *target, bool starts_dpb)
 {
+    av1_dump_unit(data, len);
+
     if (starts_dpb)
         replay_reset(codec);
     replay_append(codec, data, len);
