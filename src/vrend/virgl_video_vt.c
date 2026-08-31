@@ -838,6 +838,25 @@ have_format:
         return -1;
     }
 
+    /*
+     * VTIsHardwareDecodeSupported answers for the CODEC at capability time; it says nothing
+     * about the session we just built, which VideoToolbox may still service in software.
+     * Guest CPU proves only that the work left the guest, so ask the session itself -- this
+     * is the one place the distinction is observable.
+     */
+    {
+        CFBooleanRef hw = NULL;
+        if (VTSessionCopyProperty(codec->session,
+                kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                kCFAllocatorDefault, &hw) == noErr && hw) {
+            VT_TRACE("ensure_session: hardware accelerated: %s\n",
+                     CFBooleanGetValue(hw) ? "yes" : "NO (VideoToolbox software path)");
+            CFRelease(hw);
+        } else {
+            VT_TRACE("ensure_session: hardware acceleration state unavailable\n");
+        }
+    }
+
     codec->session_width = codec->frame_width;
     codec->session_height = codec->frame_height;
     codec->session_profile = codec->frame_profile;
