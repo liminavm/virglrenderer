@@ -297,16 +297,20 @@ int virgl_video_fill_caps(union virgl_caps *caps)
         vcaps->max_temporal_layers = 0;
     }
 
-    /* AV1 needs M3-or-later silicon. A capture build forces the advertisement on hardware
-     * that cannot decode it, because capture never decodes: the picture descriptors are a
-     * pure function of the *guest's* own bitstream parse, so a machine with no AV1 silicon
-     * produces exactly the fixtures an M3 would. */
-    if (vt_can_decode(kCMVideoCodecType_AV1) || virgl_dav1d_available() ||
-        av1_capture_dir()) {
+    /* AV1 needs M3-or-later silicon. dav1d is present as the fallback for frames the
+     * hardware decoder returns wrongly -- super-resolution -- and not as a decoder in its
+     * own right: on a host with no AV1 silicon at all, offering AV1 would take the whole
+     * stream off the guest's own dav1d, which is better tested than ours, and onto a host
+     * software path for no gain. Such a host advertises nothing and the guest decodes AV1
+     * itself.
+     *
+     * A capture build forces the advertisement on anyway, because capture never decodes:
+     * the picture descriptors are a pure function of the *guest's* own bitstream parse, so
+     * a machine with no AV1 silicon produces exactly the fixtures an M3 would. */
+    if (vt_can_decode(kCMVideoCodecType_AV1) || av1_capture_dir()) {
         VT_TRACE("fill_caps: advertising AV1 main decode%s\n",
                  vt_can_decode(kCMVideoCodecType_AV1) ? ""
-                     : virgl_dav1d_available() ? " (no silicon; software)"
-                                               : " (capture build, no silicon)");
+                     : " (capture build, no silicon)");
         vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
         memset(vcaps, 0, sizeof(*vcaps));
         vcaps->profile = PIPE_VIDEO_PROFILE_AV1_MAIN;
