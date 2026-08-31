@@ -2846,10 +2846,15 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
        *
        * Where the host keeps a separate image per plane -- aux_plane_egl_image, which
        * only GBM fills -- the branch further down selects with it. There is no GBM on
-       * macOS and none is needed: virgl carries no planar formats, so each plane already
-       * arrives as its own resource with a component format (R8, R8G8), and sampling that
-       * resource is sampling the plane. So the index is spent, and clearing it is what
-       * this does.
+       * macOS, and on the path that gets here none is needed: a guest whose frontend
+       * lowered the surface imports each plane as its own resource in a component format
+       * (R8, R8G8), so sampling the resource is already sampling the plane and the index
+       * is spent. Clearing it is what this does.
+       *
+       * That lowered path is the one a guest takes when it cannot sample the composite
+       * format -- see yuv_planar_formats in vrend_formats.c, which advertises NV12 and
+       * friends precisely to keep a guest off it. Both are live: the composite path for a
+       * guest that consults that bitmask, this one for every guest that does not.
        *
        * Left in place it reads as first_layer = 1, which is itself what sets needs_view
        * just below; the texture-view path then refuses the view for having no layers, and
