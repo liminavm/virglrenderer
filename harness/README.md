@@ -57,6 +57,19 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   it tolerates the guest's padding bytes, which mesa leaves uninitialised and this renderer zeroes
   on purpose; the encoder reports exactly which ranges those are, so the tolerance is a set of
   offsets rather than a loose comparison.
+- `rs/` builds `venus-reply-oracle` for the half `venus-roundtrip` cannot reach. No recording holds
+  a reply — both replay entry points call `vkr_replay_strip_reply` — so the 326 per-command reply
+  wrappers have no witness in the corpus, and they are generated: one template mistake is 326
+  identical bugs, each reaching a guest as plausible garbage rather than as an error. The oracle
+  encodes every recorded command's reply twice, once with the generated Rust and once with
+  venus-protocol's own generated C renderer encoder, and compares the bytes. That C is ground truth
+  because it is what every venus guest in existence decodes. Both sides encode the *same*
+  `vn_command_*`: it is `#[repr(C)]`, so the C reads the memory the Rust decoder filled rather than
+  a second construction of it, and nothing has to agree about filling. It needs the C toolchain, so
+  it is behind a feature — `cargo run --release --features reply-oracle --bin venus-reply-oracle --
+  <corpus>`. Both corpora match on every command. What it does not reach is the populated-out path:
+  a recorded command carries the guest's request, so its output members are null and the wrappers
+  take their count-query branch. The filled branch needs synthesised arguments.
 - The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh` with
   `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
   feed, the decode loop, the object table — and every command is accounted for rather than merely

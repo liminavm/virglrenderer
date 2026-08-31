@@ -729,6 +729,59 @@ class RustGen:
                 '']
         return '\n'.join(out)
 
+    def render_reply_oracle(self):
+        """The C half of the reply differential, dispatched by command type.
+
+        The wire round trip proves the request path against bytes a real guest encoder wrote, but
+        no recording carries a reply: both replay entry points strip the reply flag, so the 326
+        per-command reply wrappers have no witness. The oracle is byte-identity against
+        venus-protocol's own renderer encoder, which is what every venus guest in existence
+        decodes.
+
+        Both sides encode the *same* `vn_command_*`, not two constructions of one: the generated
+        Rust structs are `#[repr(C)]` mirrors, so Rust passes a pointer and C reads that memory.
+        Nothing has to agree about filling -- including float bit patterns and padding, which two
+        constructions would be free to differ on.
+        """
+        commands = [c for c in self.gen.supported_types[VkType.COMMAND]
+                    if self.gen.is_serializable(c)]
+        out = [
+            '/* The reply oracle: venus-protocol\'s renderer encoder, reachable from Rust.',
+            ' * The generated C is `static inline`, so a wrapper per command is the only way to',
+            ' * take its address; a switch keeps the FFI surface at one symbol. */',
+            '',
+            '#include <stddef.h>',
+            '#include <stdint.h>',
+            '',
+            '#include "vn_protocol_renderer.h"',
+            '',
+            'size_t vn_oracle_reply(int32_t cmd, void *buf, size_t cap, const void *args);',
+            '',
+            'size_t vn_oracle_reply(int32_t cmd, void *buf, size_t cap, const void *args)',
+            '{',
+            '    struct vkr_cs_encoder enc;',
+            '    vn_oracle_encoder_init(&enc, buf, cap);',
+            '',
+            '    switch ((VkCommandTypeEXT)cmd) {',
+        ]
+        for ty in commands:
+            out += [
+                '    case %s:' % ty.attrs['c_type'],
+                '        vn_encode_%s_reply((struct vn_cs_encoder *)&enc,' % ty.name,
+                '            (const struct vn_command_%s *)args);' % ty.name,
+                '        break;',
+            ]
+        out += [
+            '    default:',
+            '        return (size_t)-1;',
+            '    }',
+            '',
+            '    return vn_oracle_encoder_len(&enc);',
+            '}',
+            '',
+        ]
+        return '\n'.join(out)
+
     def render_serialize(self, gaps):
         """The whole serializer: handles, structs, chains."""
         out = []
@@ -974,6 +1027,38 @@ class RustGen:
                 '            }',
                 '            let size = vn_sizeof_%s_args(enc.protocol(), &args);' % n,
                 '            vn_encode_%s_args(enc, cmd_flags, &args);' % n,
+                '            Some(size)',
+                '        }',
+            ]
+        out += ['        _ => None,', '    }', '}', '']
+
+        out += ['/// Decode one command\'s arguments, encode the reply, and hand the *same* struct',
+                '/// to `also`, which is the C renderer encoder the reply is diffed against.',
+                '///',
+                '/// One struct, two encoders. `vn_command_*` is `#[repr(C)]`, so the C reads the',
+                '/// memory Rust filled rather than a second construction of it, and there is',
+                '/// nothing for the two sides to disagree about before the encoding starts.',
+                '///',
+                '/// Returns what the sizeof said, so the caller can hold the encoder to it.',
+                'pub fn vn_reply_oracle_args(',
+                '    dec: &mut Decoder<\'_>,',
+                '    enc: &mut Encoder<\'_>,',
+                '    cmd: VkCommandTypeEXT,',
+                '    also: &mut dyn FnMut(*const core::ffi::c_void),',
+                ') -> Option<usize> {',
+                '    match cmd {']
+        for ty in commands:
+            n = ty.name
+            out += [
+                '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
+                '            let mut args = vn_command_%s::default();' % n,
+                '            vn_decode_%s_args_temp(dec, &mut args);' % n,
+                '            if dec.fatal() {',
+                '                return Some(0);',
+                '            }',
+                '            let size = vn_sizeof_%s_reply(enc.protocol(), &args);' % n,
+                '            vn_encode_%s_reply(enc, &args);' % n,
+                '            also(&raw const args as *const core::ffi::c_void);',
                 '            Some(size)',
                 '        }',
             ]

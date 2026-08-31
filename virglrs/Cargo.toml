@@ -17,6 +17,15 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[features]
+# Build venus-protocol's own C renderer encoder and link it into the tests, so the generated Rust
+# reply encoders can be diffed against it byte for byte. Off by default: the shipping dylib has no
+# C in it, and keeping it that way is the point of the rewrite.
+reply-oracle = ["dep:cc"]
+
 [dependencies]
 bumpalo = "3.20"
 libc = "0.2"
+
+[build-dependencies]
+cc = { version = "1.4", optional = true }

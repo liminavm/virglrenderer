@@ -12,6 +12,15 @@ path = "src/main.rs"
 name = "venus-roundtrip"
 path = "src/roundtrip.rs"
 
+# Needs venus-protocol's C renderer encoder built and linked, which the other two do not.
+[[bin]]
+name = "venus-reply-oracle"
+path = "src/reply_oracle.rs"
+required-features = ["reply-oracle"]
+
+[features]
+reply-oracle = ["virglrenderer/reply-oracle"]
+
 [dependencies]
 bumpalo = "3.20"
 libc = "0.2"
