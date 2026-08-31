@@ -1,4 +1,4 @@
-loop 0 created 521 failed 0 unrefs 407 submits 118 cmds 12179 xfers 654 copy-fed 492 copy-unmatched 0 submit-errors 0
+loop 0 created 521 failed 0 unrefs 407 submits 118 cmds 12179 xfers 654 copy-fed 492 copy-unmatched 0 submit-errors 0 iosurface-backed 5
 res=9 64x64 hash=be7fb0911be00383 ink=0/4096
 res=10 32x32 hash=b43a063055adc383 ink=0/1024
 res=11 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -309,3 +309,8 @@ res=332 144x64 hash=4b3133762633c383 ink=0/9216
 res=457 144x64 hash=8fd9f630c83a741b ink=6356/9216
 res=498 144x64 hash=b1ee2026b59d0f47 ink=6356/9216
 res=499 144x64 hash=8fd9f630c83a741b ink=6356/9216
+iosurface res=5 1280x800 sync=0 hash=a40c90765dc3c8b6 ink=1024000/1024000
+iosurface res=362 1280x800 sync=0 hash=a02f365ebfed5a38 ink=1024000/1024000
+iosurface res=371 1280x800 sync=0 hash=cc29d1c4fe5f8b6b ink=1024000/1024000
+iosurface res=466 1x1 sync=0 hash=315446a086a23133 ink=0/1
+iosurface res=467 48x48 sync=0 hash=0f8f2914f3c2b383 ink=0/2304
