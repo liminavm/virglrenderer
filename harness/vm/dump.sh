@@ -14,9 +14,9 @@ cd "$(dirname "$0")"
 RIG="$(pwd)"
 
 case "${1:-}" in
-  venus) FIFO="$RIG/captures/venus.fifo"; OUT="$RIG/captures/venus.vkrc" ;;
+  synoik|venus) FIFO="$RIG/captures/$1.fifo"; OUT="$RIG/captures/$1.vkrc" ;;
   vrend) FIFO="$RIG/captures/vrend.fifo"; OUT="$RIG/captures/vrend.bin" ;;
-  *) echo "usage: dump.sh {venus|vrend}" >&2; exit 2 ;;
+  *) echo "usage: dump.sh {synoik|venus|vrend}" >&2; exit 2 ;;
 esac
 
 [ -p "$FIFO" ] || { echo "no FIFO at $FIFO — is a capture running?" >&2; exit 1; }
@@ -29,7 +29,7 @@ done
 [ -s "$OUT" ] || { echo "nothing written to $OUT" >&2; exit 1; }
 
 ls -lh "$OUT"
-if [ "$1" = venus ]; then
+if [ "$1" != vrend ]; then
   python3 "$RIG/../replay/vkr-record-decode.py" "$OUT" --check
   python3 "$RIG/../replay/vkr-record-decode.py" "$OUT"
 else

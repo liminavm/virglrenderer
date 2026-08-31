@@ -27,8 +27,9 @@ FLAG_TRUNC_FATAL = 0x2
 
 # u32 magic, version, flags, ctx_count + u64 record_count, prologue_bytes, stream_bytes
 HEADER_SIZE = 40
-RECORD_HEADER_SIZE = 32   # u64 seq, ring_id + u32 ctx_id, cmd_type, size, pad
-PROLOGUE_HEADER_SIZE = 16  # u32 ctx_id, pad + u64 size
+RECORD_HEADER_SIZE = 32   # u64 seq, ring_id + u32 ctx_id, generation, cmd_type, size
+PROLOGUE_HEADER_SIZE = 16  # u32 ctx_id, generation + u64 size
+SUPPORTED_VERSION = 2
 JOURNAL_ENTRY_SIZE = 28    # u64 seq + u32 cmd_type + u8 klass + pad[3] + u64 ring_key + u32 size
 
 
@@ -45,6 +46,8 @@ class Corpus:
          self.prologue_bytes, self.stream_bytes) = struct.unpack_from("<IIIIQQQ", blob, 0)
         if magic != RECORD_MAGIC:
             raise ValueError(f"bad magic {magic:#x}, expected {RECORD_MAGIC:#x} ('VKRC')")
+        if self.version != SUPPORTED_VERSION:
+            raise ValueError(f"format version {self.version}, this tool reads {SUPPORTED_VERSION}")
         self.prologue_off = HEADER_SIZE
         self.stream_off = HEADER_SIZE + self.prologue_bytes
 
@@ -58,21 +61,21 @@ class Corpus:
         return why
 
     def prologues(self):
-        """(ctx_id, journal_blob) per context."""
+        """(ctx_id, generation, journal_blob) per context."""
         p, end = self.prologue_off, self.prologue_off + self.prologue_bytes
         while p + PROLOGUE_HEADER_SIZE <= end:
-            ctx_id, _pad, size = struct.unpack_from("<IIQ", self.blob, p)
+            ctx_id, generation, size = struct.unpack_from("<IIQ", self.blob, p)
             p += PROLOGUE_HEADER_SIZE
-            yield ctx_id, self.blob[p:p + size]
+            yield ctx_id, generation, self.blob[p:p + size]
             p += align4(size)
 
     def records(self):
-        """(seq, ring_id, ctx_id, cmd_type, payload) in stream order."""
+        """(seq, ring_id, ctx_id, generation, cmd_type, payload) in stream order."""
         p, end = self.stream_off, self.stream_off + self.stream_bytes
         while p + RECORD_HEADER_SIZE <= end:
-            seq, ring_id, ctx_id, cmd_type, size, _pad = struct.unpack_from("<QQIIII", self.blob, p)
+            seq, ring_id, ctx_id, gen, cmd_type, size = struct.unpack_from("<QQIIII", self.blob, p)
             p += RECORD_HEADER_SIZE
-            yield seq, ring_id, ctx_id, cmd_type, self.blob[p:p + size]
+            yield seq, ring_id, ctx_id, gen, cmd_type, self.blob[p:p + size]
             p += align4(size)
 
 
@@ -100,20 +103,22 @@ def summarize(c):
     if c.truncated:
         print(f"  TRUNCATED: {', '.join(c.truncated)} — this is a valid PREFIX, not a window")
 
-    for ctx_id, blob in c.prologues():
+    # Contexts are named (ctx_id, generation) throughout: the guest reuses ids, so a summary
+    # keyed on the id alone reports two unrelated contexts as one busy one.
+    for ctx_id, gen, blob in c.prologues():
         n = sum(1 for _ in journal_entries(blob))
-        print(f"  context {ctx_id}: prologue {len(blob)} bytes, {n} journal entries")
+        print(f"  context {ctx_id} gen {gen}: prologue {len(blob)} bytes, {n} journal entries")
 
     per_ctx = collections.Counter()
     per_ring = collections.Counter()
-    for _seq, ring_id, ctx_id, _cmd, _pay in c.records():
-        per_ctx[ctx_id] += 1
-        per_ring[(ctx_id, ring_id)] += 1
-    for ctx_id, n in sorted(per_ctx.items()):
-        print(f"  context {ctx_id}: {n} stream records")
-    for (ctx_id, ring_id), n in sorted(per_ring.items()):
+    for _seq, ring_id, ctx_id, gen, _cmd, _pay in c.records():
+        per_ctx[(ctx_id, gen)] += 1
+        per_ring[(ctx_id, gen, ring_id)] += 1
+    for (ctx_id, gen), n in sorted(per_ctx.items()):
+        print(f"  context {ctx_id} gen {gen}: {n} stream records")
+    for (ctx_id, gen, ring_id), n in sorted(per_ring.items()):
         where = "context decoder" if ring_id == 0 else f"ring {ring_id:#x}"
-        print(f"    ctx {ctx_id} / {where}: {n}")
+        print(f"    ctx {ctx_id} gen {gen} / {where}: {n}")
 
 
 def check(c):
@@ -127,8 +132,10 @@ def check(c):
 
     prologue_ctxs = set()
     n_prologue = 0
-    for ctx_id, blob in c.prologues():
-        prologue_ctxs.add(ctx_id)
+    for ctx_id, gen, blob in c.prologues():
+        if (ctx_id, gen) in prologue_ctxs:
+            bad.append(f"context {ctx_id} gen {gen} has two prologues")
+        prologue_ctxs.add((ctx_id, gen))
         n_prologue += 1
         try:
             list(journal_entries(blob))
@@ -142,7 +149,7 @@ def check(c):
     # trusts it. A gap or an inversion means the append path lost its lock discipline.
     n = 0
     prev = None
-    for seq, _ring, ctx_id, _cmd, payload in c.records():
+    for seq, _ring, ctx_id, gen, _cmd, payload in c.records():
         n += 1
         # Anchored at 0, not merely consecutive: the recorder's counter starts there, so a
         # stream whose first record is seq 1 lost a record before anything else was written —
@@ -152,9 +159,9 @@ def check(c):
         elif prev is not None and seq != prev + 1:
             bad.append(f"seq {seq} follows {prev}: the stream is not contiguous")
         prev = seq
-        if ctx_id not in prologue_ctxs:
-            bad.append(f"seq {seq}: context {ctx_id} has no prologue")
-            prologue_ctxs.add(ctx_id)  # report once
+        if (ctx_id, gen) not in prologue_ctxs:
+            bad.append(f"seq {seq}: context {ctx_id} gen {gen} has no prologue")
+            prologue_ctxs.add((ctx_id, gen))  # report once
         if len(payload) < 4:
             bad.append(f"seq {seq}: payload {len(payload)} bytes cannot hold a command type")
     if n != c.record_count:
@@ -179,18 +186,19 @@ def main():
     if mode == "--check":
         return 0 if check(c) else 1
     if mode == "--list":
-        for seq, ring_id, ctx_id, cmd_type, payload in c.records():
+        for seq, ring_id, ctx_id, gen, cmd_type, payload in c.records():
             where = "ctx" if ring_id == 0 else f"ring {ring_id:#x}"
-            print(f"{seq:8d} ctx={ctx_id} {where:>20} type={cmd_type:5d} {len(payload):6d} bytes")
+            print(f"{seq:8d} ctx={ctx_id}/{gen} {where:>20} type={cmd_type:5d} "
+                  f"{len(payload):6d} bytes")
         return 0
     if mode == "--types":
-        hist = collections.Counter(cmd for _s, _r, _c, cmd, _p in c.records())
+        hist = collections.Counter(cmd for _s, _r, _c, _g, cmd, _p in c.records())
         for cmd, n in hist.most_common():
             print(f"{n:8d}  cmd_type {cmd}")
         return 0
     if mode == "--prologue":
-        for ctx_id, blob in c.prologues():
-            print(f"== context {ctx_id} ({len(blob)} bytes)")
+        for ctx_id, gen, blob in c.prologues():
+            print(f"== context {ctx_id} gen {gen} ({len(blob)} bytes)")
             for seq, cmd_type, klass, ring_key, payload in journal_entries(blob):
                 ring = f" ring={ring_key:#x}" if ring_key else ""
                 print(f"  {seq:8d} type={cmd_type:5d} klass={klass}{ring} {len(payload):6d} bytes")

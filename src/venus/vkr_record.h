@@ -59,14 +59,22 @@ struct vkr_context;
  *     u32 magic 'VKRC', u32 version, u32 flags, u32 ctx_count,
  *     u64 record_count, u64 prologue_bytes, u64 stream_bytes
  *   prologue section (ctx_count entries):
- *     u32 ctx_id, u32 pad, u64 size, <size bytes of a 'VKJR' journal export>
+ *     u32 ctx_id, u32 generation, u64 size, <size bytes of a 'VKJR' journal export>
  *   stream section (record_count entries):
- *     u64 seq, u64 ring_id, u32 ctx_id, u32 cmd_type, u32 size, u32 pad,
+ *     u64 seq, u64 ring_id, u32 ctx_id, u32 generation, u32 cmd_type, u32 size,
  *     <size bytes of raw venus wire>
+ *
+ * GENERATION is what makes ctx_id usable. The guest reuses context ids -- a context is destroyed
+ * and the next one is handed the same number -- so a corpus keyed on ctx_id alone silently merges
+ * two unrelated contexts. One run of vulkaninfo followed by one of vkcube produced exactly that:
+ * two prologues both claiming context 8. The generation is a monotonic counter over adopted
+ * contexts, so (ctx_id, generation) names one context for the life of the capture, and a replayer
+ * must key on the pair.
  *
  * REPLAY CONTRACT, which the harness replayer is written against:
  *   1. virgl_renderer_limina_replay_begin(ctx) for every context in the
- *      prologue;
+ *      prologue, in generation order -- two prologues may share a ctx_id, and
+ *      the later generation is a DIFFERENT context that reused the number;
  *   2. each context's journal blob per the vkr_journal export contract —
  *      entries with ring_key != 0 through replay_ring_cmd on that ring, the
  *      rest through replay_submit, in seq order;
@@ -80,7 +88,7 @@ struct vkr_context;
  * different order than the one recorded.
  */
 #define VKR_RECORD_MAGIC 0x43524b56u /* 'VKRC' LE */
-#define VKR_RECORD_VERSION 1u
+#define VKR_RECORD_VERSION 2u
 
 #define VKR_RECORD_FLAG_TRUNC_FULL 0x1u  /* hit the cap */
 #define VKR_RECORD_FLAG_TRUNC_FATAL 0x2u /* a decode went fatal */
