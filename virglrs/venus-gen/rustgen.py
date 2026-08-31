@@ -313,7 +313,7 @@ class RustGen:
     def decode_member(self, ty, var, validity, alloc):
         """Rust statements decoding one struct member or command argument."""
         if not self.gen.is_serializable(var):
-            return ['dec.set_fatal();']
+            return self._dead_member('decode', ty, var)
 
         shape = self._shape(ty, var)
         m = self.member_expr(var)
@@ -363,13 +363,14 @@ class RustGen:
         if shape[0] == 'string_array':
             if not alloc:
                 raise self.Unsupported('%s.%s: strings without temp storage' % (ty.name, var.name))
+            # An array of strings is an array of *pointers*, so the arena element is one pointer
+            # wide -- not one character, which is what the base type would say.
             hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
-                   'let Some(a) = dec.alloc_temp_array::<%s>(n) else { return };'
-                   % self.base_name(var.ty),
+                   'let Some(a) = dec.alloc_temp_array::<cs::Ptr>(n) else { return };',
                    'for e in a.iter_mut() {',
                    '    let n = dec.decode_array_size_unchecked() as usize;',
                    '    let Some(t) = dec.decode_c_string(n) else { return };',
-                   '    *e = t.as_ptr() as _;',
+                   '    *e = cs::Ptr(t.as_ptr() as *const c_void);',
                    '}',
                    '%s = a.as_ptr() as %s _;' % (m, ptr)]
             return self._present(shape[1], var, m, null, hit)
@@ -406,6 +407,30 @@ class RustGen:
 
         return self._present(count, var, m, null, hit)
 
+    def _dead_member(self, kind, ty, var):
+        """A member venus refuses to serialize -- `pAllocator`, above all.
+
+        It still costs a word: the guest sends the pointer, and the renderer accepts it only when
+        it is absent. Emitting nothing here would leave that word on the stream and desynchronise
+        everything after it, which is how the first corpus run found this.
+        """
+        m = self.member_expr(var)
+        if not var.ty.is_pointer() or not var.maybe_null():
+            raise self.Unsupported('%s.%s: not serializable' % (ty.name, var.name))
+        null = 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
+        if kind == 'decode':
+            return ['if dec.decode_simple_pointer() {',
+                    '    dec.set_fatal();',
+                    '} else {',
+                    '    %s = %s;' % (m, null),
+                    '}']
+        if kind == 'encode':
+            return ['if enc.encode_simple_pointer(!%s.is_null()) {' % m,
+                    '    debug_assert!(false, "%s is not serializable");' % var.name,
+                    '}']
+        return ['size += cs::sizeof_scalar::<u64>();',
+                'debug_assert!(%s.is_null(), "%s is not serializable");' % (m, var.name)]
+
     def _present(self, count, var, m, null, hit):
         """The present/absent frame a wire array shares: peek the count, and on zero consume it
         anyway -- the guest sent it either way -- and leave the member null."""
@@ -432,7 +457,7 @@ class RustGen:
 
     def _out_member(self, kind, ty, var, validity):
         if not self.gen.is_serializable(var):
-            return ['unreachable!("not serializable");']
+            return self._dead_member(kind, ty, var)
 
         shape = self._shape(ty, var)
         m = self.member_expr(var)
@@ -467,12 +492,13 @@ class RustGen:
             return [one(m)]
 
         if shape[0] == 'static':
+            # A static array is skipped whole when it is an output: its extent is the struct's, so
+            # the count on the wire would tell the far side nothing it does not already know.
+            if validity == Gen_INVALID:
+                return ['/* skip %s */' % m]
             n = shape[1]
             flat = '%s.as_flattened()' % m if shape[2] else '&%s' % m
-            lines = [array_size('%s as u64' % n)]
-            if validity != Gen_INVALID:
-                lines += many(flat, n)
-            return lines
+            return [array_size('%s as u64' % n)] + many(flat, n)
 
         if shape[0] == 'blob':
             n = shape[1]

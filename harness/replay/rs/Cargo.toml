@@ -8,8 +8,14 @@ publish = false
 name = "vkr-replay"
 path = "src/main.rs"
 
+[[bin]]
+name = "venus-roundtrip"
+path = "src/roundtrip.rs"
+
 [dependencies]
+bumpalo = "3.20"
 libc = "0.2"
+virglrenderer = { package = "virglrs", path = "../../../virglrs" }
 
 [profile.release]
 panic = "abort"
