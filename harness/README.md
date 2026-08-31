@@ -83,10 +83,6 @@ the renderer is perfectly deterministic.
 
 ### What P0 still has to build
 
-- **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`. The full
-  sweep, which is now the default, reads every resource before the damage matters and reports no
-  submit errors; a narrowed run (`--readback`, `--sweep-w`) still does. Fixing it is what would
-  make a narrowed score trustworthy.
 - **ABI fixtures.** The symbol list (`nm -gU` on the dylib ∩ what libkrun names — 62 today) and
   the layouts of `virgl_renderer_callbacks`, `virgl_renderer_resource_create_args` and the
   blob/import arg structs, pinned as files the Rust build is diffed against. A layout mismatch

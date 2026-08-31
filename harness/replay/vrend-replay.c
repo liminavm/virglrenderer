@@ -33,16 +33,7 @@
 //
 // Env: REPLAY_DUMP_DIR (raw BGRA + manifest.txt), REPLAY_DUMP_W, REPLAY_NO_UNREF.
 //
-// Run it under the same KosmicKrisp/zink environment the worker uses.
-//
-// KNOWN LIMITS, both P0 work:
-//   - The default readback target is chosen by a glyph-pipeline heuristic inherited from the
-//     spike this grew out of. A corpus-driven harness wants the scored set named by the fixture,
-//     not guessed from the stream.
-//   - force_ctx_0 inside the readback switches the renderer away from the replayed context and
-//     the stream never switches back, so batches after the first score are damaged. A full
-//     --sweep scores from the start and reads each resource before that matters; a sparse run
-//     reports submit errors. Fixing this is a precondition for per-resource goldens.
+// Run it through vrend-replay.sh, which supplies the KosmicKrisp/zink environment the worker uses.
 //
 #include "virglrenderer.h"
 #include "virgl_hw.h"
@@ -286,13 +277,10 @@ static void score_resource(const struct res_ev *ev)
    struct iovec riov = { .iov_base = px, .iov_len = need };
    struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
 
-   /* force_ctx_0 is load-bearing: without it the readback segfaults. It is also why scoring is
-    * only trustworthy in a FULL --sweep. It switches the renderer away from the replayed context
-    * and the stream never switches back, so batches after the first score are damaged; a full
-    * sweep scores from the very start and reads each resource before that matters, while a sparse
-    * one (--sweep-w, or a single --readback) submits hundreds of batches after the switch and
-    * reports 373 submit errors. Narrowing the readbacks needs this fixed first. */
-   virgl_renderer_force_ctx_0();
+   /* No force_ctx_0 here. The context path does its own switch -- transfer_read_iov with a
+    * non-zero ctx_id reaches vrend_renderer_transfer_internal, which calls vrend_hw_switch_context
+    * on the replayed context and leaves it current -- so forcing ctx0 first only added a switch
+    * away and back. */
    int rr = virgl_renderer_transfer_read_iov(ev->handle, (uint32_t)want_ctx, 0, w * 4, 0,
                                              &box, 0, &riov, 1);
    if (rr) {
