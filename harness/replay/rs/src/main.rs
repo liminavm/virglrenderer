@@ -57,6 +57,10 @@ struct Args {
     score: Option<String>,
     /// Compare the score against this file and fail on any difference.
     expect: Option<String>,
+    /// Exercise only what a skeleton owes: init, context create, resource create. No replay feed,
+    /// no commands, no scoring. This is P1's gate -- a renderer that gets through it has a working
+    /// ABI, resource table and context table, which is all a skeleton claims.
+    smoke: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
     let mut verbose = false;
     let mut score = None;
     let mut expect = None;
+    let mut smoke = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -80,11 +85,17 @@ fn parse_args() -> Result<Args, String> {
             "--verbose" => verbose = true,
             "--score" => score = Some(it.next().ok_or("--score wants a path")?),
             "--expect" => expect = Some(it.next().ok_or("--expect wants a path")?),
+            "--smoke" => smoke = true,
             _ if corpus.is_none() => corpus = Some(a),
             _ => return Err(format!("unexpected argument {a}")),
         }
     }
 
+    if smoke && (score.is_some() || expect.is_some()) {
+        // A smoke score is a strict subset of a real one. Pinning it would replace a golden with
+        // a weaker one that still passes, which is the failure a fixture exists to prevent.
+        return Err("--smoke scores nothing; drop --score/--expect".into());
+    }
     Ok(Args {
         corpus: corpus.ok_or("no corpus given")?,
         renderer: renderer
@@ -94,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
         verbose,
         score,
         expect,
+        smoke,
     })
 }
 
@@ -102,6 +114,8 @@ fn parse_args() -> Result<Args, String> {
 /// census is reported beside the counts rather than instead of them.
 #[derive(Default)]
 struct Tally {
+    /// Smoke mode only: blob creates that export an object a command would have made.
+    smoke_skipped_exports: u64,
     prologue_ok: u64,
     prologue_fail: u64,
     cmd_ok: u64,
@@ -158,6 +172,7 @@ struct Replay<'a> {
     /// ordering is the LAST thing wrong with a corpus -- and how far off the order actually is.
     /// The real fix is a recorded dependency fence, not a retry loop.
     deferred: Vec<(Ctl, u64)>,
+    smoke: bool,
     /// Blobs that came back IOSurface-backed, by the context that created them. IOSurface is the
     /// whole present path on this host -- a venus scanout blob has no CPU transfer_read, so its
     /// pixels exist nowhere but the surface -- and backing the wrong set of blobs is silent in
@@ -179,7 +194,7 @@ impl<'a> Replay<'a> {
     }
 
     fn begin(&mut self, ctx_id: u32) {
-        if self.open.contains(&ctx_id) {
+        if self.smoke || self.open.contains(&ctx_id) {
             return;
         }
         // virgl_renderer_context_create returns as soon as the render-server socketpair is up; the
@@ -203,7 +218,7 @@ impl<'a> Replay<'a> {
     }
 
     fn end(&mut self, ctx_id: u32) {
-        if !self.open.remove(&ctx_id) {
+        if self.smoke || !self.open.remove(&ctx_id) {
             return;
         }
         let rc = self.r.replay_end(ctx_id);
@@ -231,6 +246,18 @@ impl<'a> Replay<'a> {
     fn ctl(&mut self, event: &Ctl) {
         if self.is_classic(event) {
             return;
+        }
+        // A blob with a non-zero blob_id EXPORTS an object a command created -- a VkDeviceMemory,
+        // usually. Smoke mode runs no commands, so there is nothing to export and the create
+        // rightly fails. Skipping it is not lowering the bar: the C renderer fails these in smoke
+        // mode too, identically, which is how we know the bar was in the wrong place.
+        if self.smoke {
+            if let Ctl::CreateBlob { blob_id, .. } = event {
+                if *blob_id != 0 {
+                    self.tally.smoke_skipped_exports += 1;
+                    return;
+                }
+            }
         }
         let (rc, what) = match event {
             Ctl::CtxCreate { ctx_id, context_init, name } => {
@@ -268,9 +295,11 @@ impl<'a> Replay<'a> {
                 self.end(*ctx_id);
                 // Score before destroying: this is the last moment the context's device memory
                 // exists, and for a workload that exits cleanly it is the ONLY moment.
-                let lines = score_context(&self.r, *ctx_id);
-                self.score.extend(lines);
-                self.score.push(iosurf_line(&self.iosurf, *ctx_id));
+                if !self.smoke {
+                    let lines = score_context(&self.r, *ctx_id);
+                    self.score.extend(lines);
+                    self.score.push(iosurf_line(&self.iosurf, *ctx_id));
+                }
                 self.scored.insert(*ctx_id);
                 self.r.context_destroy(*ctx_id);
                 (0, format!("context_destroy {ctx_id}"))
@@ -429,6 +458,7 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         score: Vec::new(),
         scored: BTreeSet::new(),
         deferred: Vec::new(),
+        smoke: args.smoke,
         iosurf: BTreeMap::new(),
     };
 
@@ -461,6 +491,9 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
             eprintln!("FAIL ctl: context_create {} for prologue -> {rc}", p.ctx);
         }
         rp.begin(p.ctx.id);
+        if rp.smoke {
+            continue;
+        }
 
         for (i, e) in p.entries.iter().enumerate() {
             let mut wire = e.wire.clone();
@@ -488,6 +521,9 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         match rec {
             Record::Ctl { event, .. } => rp.ctl(event),
             Record::Cmd { ctx, ring_id, cmd_type, wire, .. } => {
+                if rp.smoke {
+                    continue;
+                }
                 if rp.classic.contains(&ctx.id) {
                     continue;
                 }
@@ -537,6 +573,9 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
     ctxs.extend(c.records.iter().map(|rec| rec.seq_ctx().id).filter(|id| *id != 0));
     for ctx_id in ctxs {
         if rp.classic.contains(&ctx_id) || rp.scored.contains(&ctx_id) {
+            continue;
+        }
+        if rp.smoke {
             continue;
         }
         rp.score.extend(score_context(&rp.r, ctx_id));
@@ -665,7 +704,7 @@ fn main() -> ExitCode {
             eprintln!("vkr-replay: {e}");
             eprintln!(
                 "usage: vkr-replay <corpus.vkrc> --renderer <lib> [--flags N] [--verbose]\n\
-                 \x20               [--score <file>] [--expect <file>]"
+                 \x20               [--score <file>] [--expect <file>] [--smoke]"
             );
             return ExitCode::FAILURE;
         }
@@ -678,6 +717,21 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if args.smoke {
+        // A smoke run exercises a strict subset, so its output is not a score and must never be
+        // pinned as one: --score/--expect are refused above rather than writing a golden that
+        // silently means less than the one it replaces.
+        let ok = t.failed() == 0;
+        println!(
+            "smoke: ctl {} / {} ({} exporting blobs skipped) -- init, contexts and resources {}",
+            t.ctl_ok,
+            t.ctl_ok + t.ctl_fail,
+            t.smoke_skipped_exports,
+            if ok { "OK" } else { "FAILED" }
+        );
+        return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
 
     let score = score_text(&t, &census);
     print!("{score}");
