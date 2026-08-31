@@ -36,17 +36,22 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `build.sh`, pointing `VIRGL_PREFIX` at whichever implementation is under test.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
+- `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
+  structurally before it is pinned as a fixture).
 
-Corpora come from vrend's in-memory tracer, armed with `LIMINA_VREND_TRACE=<MB>`.
+Corpora come from vrend's in-memory tracer (`LIMINA_VREND_TRACE=<MB>`) for classic contexts, and
+from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) for venus. Both
+dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
+path nothing until it happens.
 
 ### What P0 still has to build
 
-- **A venus leg.** `vrend-replay` covers classic contexts only. The venus equivalent runs the
-  `limina_journal_export` → `replay_begin/submit/ring_cmd/end` path, which already solves handle
-  remapping. That path replays a context's *re-creation journal*, not its frame traffic — there
-  is no host-side capture of full venus ring streams today. Extending `vkr_journal` to a
-  full-ring recording mode is the cheapest route to one, and it must be done in the **C**
-  implementation first so the goldens are recorded from the reference.
+- **A venus replayer.** The capture side exists: `src/venus/vkr_record.[ch]` records a prologue
+  (each context's journal export, taken when its first command is recorded) plus the wire bytes
+  of every command dispatched after that, and `vkr_record.h` states the replay contract the
+  replayer must implement — prologue, then stream in seq order, ring commands through
+  `replay_ring_cmd` and the rest through `replay_submit`, all before `replay_end` starts the ring
+  threads. Nothing consumes it yet.
 - **Fixture-named scoring.** The default readback target is picked by a heuristic inherited from
   the debugging spike this grew out of. A corpus wants its scored resources named by the fixture.
 - **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`, which is a
