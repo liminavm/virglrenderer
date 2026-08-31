@@ -1321,7 +1321,7 @@ static int av1_flush_held(struct virgl_video_codec *codec,
 
     codec->held_target = NULL;
     VT_TRACE("av1: flushing the held frame, %zd bytes\n", n);
-    /* Never a full refresh: only a hidden frame is ever held. */
+    /* Never a full refresh: a key frame resets the model and is never held. */
     return av1_route_unit(codec, codec->unit, (size_t)n, target, false);
 }
 
