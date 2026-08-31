@@ -85,6 +85,37 @@ Not compiled today, or not needed once the C fork is gone:
   dlopened, for the same reason.
 - Upstream's tracing backends (percetto/perfetto/sysprof); keep `stderr`.
 
+## IOSurface is the present path, and it has rules
+
+There is no dma-buf on macOS; an IOSurface is the currency, and both renderers are
+built on it. vrend renders *into* the display surface through an `EGL_IOSURFACE_LIMINA`
+EGLImage — the framebuffer's storage *is* the surface, no readback, no blit — and venus
+presents via `SET_SCANOUT_BLOB`, importing the guest image as an `MTLTexture` over the
+same surface. Ids cross to the supervisor as Mach ports, not as global ids. The
+invariants a port owes, none of which the C encodes as a type:
+
+- **An id is worth nothing after its surface dies.** `get_iosurface_id` returns 0 for
+  "not backed", and must return 0 the instant the backing is freed; ids are recycled
+  immediately. A cached id names a stranger's surface, and releasing it frees *theirs*
+  irrecoverably — a non-global surface can only be re-minted by its creator. Nothing
+  may persist an id, across a call or across a snapshot restore.
+- **`sync_iosurface` is classic-only.** It is a blit-and-wait the VMM issues on
+  `RESOURCE_FLUSH` for ctx 0. A venus blob renders into its surface directly and must
+  never be synced.
+- **`read_iosurface` writes top-down BGRA and its stride is in BYTES.** Passing a pixel
+  width yields a quarter-width image tiled four across and squashed four down.
+- **`republish_iosurface` is keyed by id, not by resource** — the resource may be gone
+  while the surface lives — and the registry is process-global and mutex-guarded, so it
+  must be safe off the renderer thread.
+- **`get_map_ptr` is called eagerly at blob create** and its pointer feeds `hv_vm_map`,
+  so it must stay valid for the resource's whole life. `resource_unmap` is called
+  unconditionally at unref and must return a harmless `-EINVAL` when nothing was mapped.
+- **Scanout stride must be GPU-row-aligned.** `IOSurfaceCreate` accepts a tight
+  `width*4`, and CoreAnimation then composites blank.
+- **Charge the budget at the allocator, not the Vulkan entry point.** A scanout memory
+  that host-pointer-imports an IOSurface, or a cross-context import aliasing the
+  exporter's bytes, commits nothing new; billing it double is how the budget lies.
+
 ## Ranked by difficulty
 
 1. **The venus wire decoder (78k generated lines).** Decision: **fork
@@ -176,10 +207,13 @@ makes the rewrite testable at subagent speed instead of boot speed.
   venus scores renderer *state* — accept counts plus the contents of the device memory
   the commands left behind, read through `limina_memory_census`/`memory_read`. A
   zero-allocation census at every context destroy is the venus leak oracle.
-- **Not covered by Layer 2**: the IOSurface family. `resource_get_iosurface_id`,
-  `resource_sync_iosurface`, `resource_read_iosurface`, `republish_iosurface` and
-  `resource_get_map_ptr` carry the zero-copy present and the Mach-port publish, and a
-  VM-free replay has no scanout to exercise them. Layer 1 is their only coverage.
+- **The IOSurface leg.** Classic scores its scanout surfaces at end of stream —
+  `sync_iosurface` then `read_iosurface`, hashed like any other readback. That is a
+  different path from `transfer_read_iov`: the scanout is an `EGL_IOSURFACE_LIMINA`
+  EGLImage, so the surface *is* the framebuffer's storage, and a port can get one
+  right while getting the other wrong. Venus scores how many blobs came back backed.
+  `republish_iosurface` stays Layer 1 — it answers over a Mach port to a supervisor
+  that a VM-free replay does not have.
 
 ### Layer 3 — fuzz corpora and the perf ledger
 
@@ -218,6 +252,9 @@ buildable throughout as the A-side reference.
   machinery, and no classic stubs that have to lie about capsets. Carries the replay
   feed and `memory_census`/`memory_read` with it, because those are what the venus
   harness drives. This is where the crash pain is; it goes first among the renderers.
+  Recording scanout geometry beside the ring stream lands here too — it is what turns
+  the venus IOSurface score from a count into a frame hash, and a zero-copy blob has no
+  other CPU-readable copy of its pixels.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
