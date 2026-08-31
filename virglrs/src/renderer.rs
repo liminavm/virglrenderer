@@ -288,6 +288,15 @@ impl Renderer {
     pub fn counts(&self) -> (usize, usize) {
         (self.resources.len(), self.contexts.len())
     }
+
+    /// The venus commands a run asked for and this build did not serve, most-used first.
+    ///
+    /// This is the implementation order, and it has to come from a corpus rather than from
+    /// intuition: the commands a real desktop leans on are not the ones a reading of the Vulkan
+    /// spec would rank first.
+    pub fn venus_todo(&self) -> Vec<(&'static str, u64)> {
+        self.venus.as_ref().map(|v| v.todo.by_frequency()).unwrap_or_default()
+    }
 }
 
 /// What this build cannot do for the flags it was given, in one phrase for the startup log.

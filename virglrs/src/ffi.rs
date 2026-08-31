@@ -619,6 +619,14 @@ pub extern "C" fn virgl_renderer_limina_dump_state() {
     with((), |r| {
         let (res, ctx) = r.counts();
         eprintln!("[virglrs] {res} resources, {ctx} contexts, flags {:#x}", r.flags);
+        let todo = r.venus_todo();
+        if !todo.is_empty() {
+            let total: u64 = todo.iter().map(|(_, n)| n).sum();
+            eprintln!("[virglrs] {total} venus commands in {} kinds not served yet:", todo.len());
+            for (name, n) in &todo {
+                eprintln!("[virglrs]   {n:>8}  {name}");
+            }
+        }
     });
 }
 
