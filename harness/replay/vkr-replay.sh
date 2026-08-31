@@ -51,9 +51,21 @@ ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
 BIN="$HERE/rs/target/release/vkr-replay"
 cargo build --release --manifest-path "$HERE/rs/Cargo.toml" >/dev/null 2>&1
 
+# VIRGL_PREFIX selects the implementation under test, the same variable harness/abi and the vrend
+# replayer's build.sh use. It defaults to this tree's rig build; pointing it at the Rust prefix is
+# how the port gets driven. An explicit --renderer still wins.
+VIRGL_PREFIX="${VIRGL_PREFIX:-$ROOT/harness/vm/prefix}"
 case " $* " in
   *" --renderer "*) RENDERER=() ;;
-  *) RENDERER=(--renderer "$ROOT/harness/vm/prefix/lib/libvirglrenderer.1.dylib") ;;
+  *)
+    LIB=""
+    for cand in "$VIRGL_PREFIX/lib/libvirglrenderer.1.dylib" \
+                "$VIRGL_PREFIX/lib/libvirglrenderer.dylib"; do
+      [ -f "$cand" ] && LIB="$cand" && break
+    done
+    [ -n "$LIB" ] || { echo "no libvirglrenderer under $VIRGL_PREFIX" >&2; exit 1; }
+    RENDERER=(--renderer "$LIB")
+    ;;
 esac
 
 exec env VK_ICD_FILENAMES="$ICD" "$BIN" "$CORPUS" "${RENDERER[@]}" "$@"

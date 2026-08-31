@@ -170,6 +170,9 @@ static int scored, scored_ink;
  * restore. The count is the part a port owes us -- backing the wrong set of resources is
  * silent everywhere else, and it decides whether the present path is zero-copy at all. */
 static uint32_t iosurf_backed;
+/* Summed across loops, for the --smoke verdict; the per-loop counters stay per-loop so the
+ * counters line still says which pass a divergence appeared in. */
+static uint32_t made_total, failed_total;
 
 /* IOSurface-backed resources are scored at the END of the stream, not at their unref, because
  * they are the ones a capture never unrefs: the scanout outlives every frame in it. That is the
@@ -396,6 +399,10 @@ int main(int argc, char **argv)
    const char *path = NULL;
    int loops = 1;
    bool nodraw = false;
+   /* Exercise only what a skeleton owes: init, context create, resource create. No submits, no
+    * transfers, no scoring. This is P1's gate -- a renderer that gets through it has a working
+    * ABI, resource table and context table, which is all a skeleton claims. */
+   bool smoke = false;
    bool sweep = false;
    uint64_t draws_from = 0;
    uint32_t sweep_w = 0;
@@ -412,6 +419,7 @@ int main(int argc, char **argv)
          draws_from = strtoull(argv[++i], NULL, 10);
       else if (!strcmp(argv[i], "--loops") && i + 1 < argc) loops = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
+      else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
@@ -502,6 +510,7 @@ int main(int argc, char **argv)
 
          switch (h.type) {
          case T_SUBMIT:
+            if (smoke) { batch_dw = 0; break; }
             if (watch && batch_watch)
                fprintf(stderr, "[watch] submitting batch with a TRANSFER3D for res=%u at seq %llu\n",
                        watch, (unsigned long long)h.seq);
@@ -514,6 +523,7 @@ int main(int argc, char **argv)
             }
             break;
          case T_CMD: {
+            if (smoke) break;
             size_t dw = h.payload_len / 4;
             if (nodraw && h.cmd == VIRGL_CCMD_DRAW_VBO) break;   /* the positive control */
             /* --draws-from is the bounded form of --nodraw, and it asks the one question the
@@ -667,13 +677,25 @@ int main(int argc, char **argv)
          p += h.total_len;
       }
 
-      if (batch_dw && virgl_renderer_submit_cmd(batch, want_ctx, (int)batch_dw))
+      if (!smoke && batch_dw && virgl_renderer_submit_cmd(batch, want_ctx, (int)batch_dw))
          dropped++;
       free(batch);
       count_addf("loop %d created %u failed %u unrefs %u submits %u cmds %u xfers %u "
                  "copy-fed %u copy-unmatched %u submit-errors %u iosurface-backed %u\n",
                  loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped,
                  iosurf_backed);
+      made_total += made;
+      failed_total += failed;
+   }
+
+   /* A smoke score is a strict subset of a real one, so it is never written or compared: pinning
+    * it would replace a golden with a weaker one that still passes, which is the failure a fixture
+    * exists to prevent. The verdict is whether every create landed. */
+   if (smoke) {
+      printf("smoke: created %u failed %u contexts 1 iosurface-backed %u -- "
+             "init, contexts and resources %s\n",
+             made_total, failed_total, iosurf_backed, failed_total ? "FAILED" : "OK");
+      return failed_total ? 1 : 0;
    }
 
    for (uint32_t i = 0; i < iosurf_n; i++)

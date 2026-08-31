@@ -58,6 +58,7 @@ pub const DEFAULT_FLAGS: c_int =
 
 macro_rules! syms {
     ($($field:ident : $ty:ty = $name:literal),* $(,)?) => {
+        #[allow(dead_code)]
         struct Syms { $($field: $ty,)* }
 
         impl Syms {
@@ -265,12 +266,16 @@ impl Renderer {
 
     /// Copy a scanout resource's IOSurface out as top-down BGRA. `stride` is in BYTES.
     ///
+    /// Unused until the venus corpus carries scanout geometry -- kept because it is the shape that
+    /// work needs, and because a binding written later would be written without this note.
+    ///
     /// This is the only way a venus frame is readable on the CPU: a zero-copy scanout blob has
     /// no `transfer_read`, and its pixels exist nowhere but the surface's shared storage.
     ///
     /// Deliberately no `sync_iosurface` alongside it. The blit-and-wait is a classic-vrend
     /// operation the VMM issues for ctx 0 only; a venus blob renders into its surface directly,
     /// and syncing one would be a call the real path never makes.
+    #[allow(dead_code)]
     pub fn read_iosurface(&self, res_id: u32, buf: &mut [u8], stride: u32, height: u32) -> c_int {
         (self.syms.resource_read_iosurface)(res_id, buf.as_mut_ptr().cast(), stride, height)
     }
