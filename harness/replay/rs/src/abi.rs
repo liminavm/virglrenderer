@@ -10,9 +10,9 @@
 //! module writes `unsafe`.
 //!
 //! Layouts below are transcribed from `src/virglrenderer.h`. A layout that drifts from the header
-//! compiles clean and corrupts at run time, which is precisely the failure the plan's ABI fixtures
-//! exist to catch; until those land, [`Renderer::open`] at least refuses a library that is missing
-//! a symbol it needs.
+//! compiles clean and corrupts at run time, so they are cross-checked against `harness/abi/`,
+//! which pins size, alignment and every field offset straight from the compiler. `Renderer::open`
+//! covers the other half: it refuses a library missing a symbol it needs.
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
@@ -106,6 +106,10 @@ syms! {
         = "virgl_renderer_limina_memory_census",
     memory_read: extern "C" fn(u32, u64, *mut c_void, u64) -> c_int
         = "virgl_renderer_limina_memory_read",
+    resource_get_iosurface_id: extern "C" fn(u32, *mut u32) -> c_int
+        = "virgl_renderer_resource_get_iosurface_id",
+    resource_read_iosurface: extern "C" fn(u32, *mut c_void, u32, u32) -> c_int
+        = "virgl_renderer_resource_read_iosurface",
 }
 
 /// The renderer under test. Owns the `dlopen` handle for the process lifetime: the library is
@@ -245,5 +249,29 @@ impl Renderer {
     /// allocation size the census reported; the renderer copies min(size, allocation).
     pub fn memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> c_int {
         (self.syms.memory_read)(ctx_id, mem_id, buf.as_mut_ptr().cast(), buf.len() as u64)
+    }
+
+    /// Whether a resource is IOSurface-backed. `Some(id)` for backed, `None` otherwise.
+    ///
+    /// The id is for deciding *that* it is backed, never for pinning: an id is host-private,
+    /// recycled the instant its surface dies, and free to change across a snapshot restore.
+    pub fn iosurface_id(&self, res_id: u32) -> Option<u32> {
+        let mut id = 0u32;
+        match (self.syms.resource_get_iosurface_id)(res_id, &mut id) {
+            0 if id != 0 => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Copy a scanout resource's IOSurface out as top-down BGRA. `stride` is in BYTES.
+    ///
+    /// This is the only way a venus frame is readable on the CPU: a zero-copy scanout blob has
+    /// no `transfer_read`, and its pixels exist nowhere but the surface's shared storage.
+    ///
+    /// Deliberately no `sync_iosurface` alongside it. The blit-and-wait is a classic-vrend
+    /// operation the VMM issues for ctx 0 only; a venus blob renders into its surface directly,
+    /// and syncing one would be a call the real path never makes.
+    pub fn read_iosurface(&self, res_id: u32, buf: &mut [u8], stride: u32, height: u32) -> c_int {
+        (self.syms.resource_read_iosurface)(res_id, buf.as_mut_ptr().cast(), stride, height)
     }
 }
