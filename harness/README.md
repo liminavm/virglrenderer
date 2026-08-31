@@ -106,12 +106,27 @@ every ring flow-control command, so nothing in the stream waits on the GPU: a ha
 instant `replay_end` returns can race queue work still executing and look nondeterministic when
 the renderer is perfectly deterministic.
 
+### `--smoke`, the skeleton gate
+
+Both replayers take `--smoke`: apply the resource and context events, skip commands, transfers and
+the venus replay feed, and exit on whether every create landed. It is what a renderer that has an
+ABI, a resource table and a context table — and nothing else yet — can be held to, and it makes
+P1's exit condition a command rather than a judgement call.
+
+It refuses `--score`/`--expect`. A smoke score is a strict subset of a real one, so pinning it
+would replace a golden with a weaker one that still passes.
+
+Blob creates with a non-zero `blob_id` are skipped and counted: they export an object a command
+would have made, and smoke runs no commands. The C renderer fails them in smoke mode too, which is
+how we know the bar was in the wrong place rather than the port.
+
 ## Layer 0 — the ABI itself (`abi/`)
 
 `abi-fixture.sh` pins two files and checks a build against them: `symbols.txt`, every symbol the
 dylib exports, and `layout.txt`, the size, alignment and field offsets of every struct that
 crosses the ABI. `VIRGL_PREFIX` selects the build under test, so pointing it at a Rust build is
-how the port gets checked; `--pin` re-records, and is only for a change to the ABI that is meant.
+how the port gets checked — the same variable `vrend-replay.sh`, `vkr-replay.sh` and `build.sh`
+resolve, so one setting drives every layer at once; `--pin` re-records, and is only for a change to the ABI that is meant.
 
 Both failures are invisible to every other layer here. A missing symbol shows up at `dlopen` and
 nowhere earlier; a wrong field offset never shows up at all — it compiles clean on both sides and
