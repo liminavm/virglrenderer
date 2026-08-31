@@ -8,6 +8,7 @@
 #include "vn_protocol_renderer_device.h"
 
 #include <inttypes.h>
+#include <time.h>
 
 #include "vkr_budget.h"
 #include "vkr_context.h"
@@ -769,10 +770,14 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties2(
  *
  * Emission is deliberately asymmetric. A client may query the budget every frame, so the
  * full line is gated on LIMINA_GPU_MEM_BUDGET_TRACE; the clamp event itself is logged
- * untraced but only when the driver's number CHANGES, so a steady state stays silent while
- * the transition that moves the guest's budget is always on the record. The static
- * last-seen state is racy under concurrent queries and that is fine: the worst outcome is
- * a duplicate log line. */
+ * untraced, but only on the clamp TRANSITION plus a slow heartbeat while it holds.
+ *
+ * It used to log whenever the driver's reported number changed, on the theory that a steady
+ * state would stay silent. There is no steady state: the driver's figure moves every poll, so
+ * that fired at every query — ~10 lines a second, 12 MB of supervisor log in 83 minutes, and a
+ * dogfood SIGSEGV whose surrounding evidence had to be dug out from under it. Log the event,
+ * not the sample. The static last-seen state is racy under concurrent queries and that is fine:
+ * the worst outcome is a duplicate log line. */
 static void
 vkr_budget_trace_heap(uint32_t ctx_id,
                       uint32_t heap,
@@ -794,10 +799,22 @@ vkr_budget_trace_heap(uint32_t ctx_id,
    const bool clamped = driver && ours > driver;
    static uint64_t last_driver[VK_MAX_MEMORY_HEAPS];
    static bool last_clamped[VK_MAX_MEMORY_HEAPS];
+   static int64_t last_logged_us[VK_MAX_MEMORY_HEAPS];
+   /* While the clamp holds, one heartbeat per minute, and only if the driver's figure has
+    * actually moved materially (an eighth) rather than merely jittered. */
+   const int64_t heartbeat_us = 60 * 1000000;
    bool transition = false;
    if (heap < VK_MAX_MEMORY_HEAPS) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const int64_t now_us = (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+      const uint64_t prev = last_driver[heap];
+      const uint64_t delta = driver > prev ? driver - prev : prev - driver;
+      const bool moved = prev == 0 || delta > prev / 8;
       transition = clamped != last_clamped[heap] ||
-                   (clamped && driver != last_driver[heap]);
+                   (clamped && moved && now_us - last_logged_us[heap] >= heartbeat_us);
+      if (transition)
+         last_logged_us[heap] = now_us;
       last_clamped[heap] = clamped;
       last_driver[heap] = driver;
    }
