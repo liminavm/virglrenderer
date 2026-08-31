@@ -56,11 +56,13 @@ impl Vkr {
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
     /// not a guest that gets to keep host memory after it is gone.
     pub fn context_destroy(&mut self, id: CtxId) {
-        let Some(ctx) = self.contexts.remove(&id) else {
+        let Some(mut ctx) = self.contexts.remove(&id) else {
             return;
         };
-        // Destroying each host handle needs the driver, which arrives with the real handles. The
-        // drain is what says this is a deliberate teardown and not a dropped map.
+        // A context usually dies mid-workload, with the guest still holding everything it made,
+        // so this is the destroy that actually runs -- not a tidy-up after the guest's own.
+        ctx.driver_mut().teardown();
+        // The drain is what says this is a deliberate teardown and not a dropped map.
         for (_id, _obj) in ctx.objects().borrow_mut().drain() {}
     }
 

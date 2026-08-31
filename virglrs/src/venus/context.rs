@@ -17,14 +17,13 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
-use super::driver::{self, Driver};
+use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkDevice, VkFlags, VkObjectType, VkPhysicalDevice, VkResult,
-    vn_command_vkCreateDevice, vn_command_vkCreateInstance, vn_command_vkDestroyDevice,
-    vn_command_vkDestroyInstance, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkGetDeviceQueue2,
+    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkCreateDevice,
+    vn_command_vkCreateInstance, vn_command_vkDestroyDevice, vn_command_vkDestroyInstance,
+    vn_command_vkEnumeratePhysicalDevices, vn_command_vkGetDeviceQueue2,
 };
 use crate::vulkan::Global;
 
@@ -280,16 +279,6 @@ impl Handlers<'_> {
             Ok(_) => self.objects.borrow_mut().add_ghost(id),
         }
     }
-
-    /// Destroy every device this context still holds. Used by an instance teardown and by the
-    /// context's own, because a guest is under no obligation to have destroyed them itself.
-    fn destroy_devices(&mut self) {
-        for (handle, d) in self.driver.take_devices() {
-            // SAFETY: a handle this context created; `take_devices` emptied the map, so it is
-            // destroyed exactly once.
-            unsafe { (d.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
-        }
-    }
 }
 
 impl Commands for Handlers<'_> {
@@ -298,11 +287,17 @@ impl Commands for Handlers<'_> {
     }
 
     fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {
-        // A zero handle means no handler ran: this build does not serve the command, and the id
-        // stands in for a handle so the rest of the stream still decodes. A served command that
-        // failed has already ghosted the id and removed the shadow, so it never reaches here.
-        if self.objects.borrow().get(id).is_some() {
-            return;
+        // This hook runs for every create, served or not, and a zero handle means only that the
+        // shadow was never written -- it cannot tell "no handler ran" from "the handler ran and
+        // the driver refused". So a handler that already decided is not second-guessed here:
+        // registered stands, and a ghost stands. Only an id with no decision behind it gets the
+        // unserved command's fiction, where the id stands in for a handle so the rest of the
+        // stream still decodes.
+        {
+            let objects = self.objects.borrow();
+            if objects.get(id).is_some() || objects.is_ghost(id) {
+                return;
+            }
         }
         let handle = if host == 0 { id.0 } else { host };
         if self.objects.borrow_mut().add(id, ty.0, handle).is_err() {
@@ -327,13 +322,10 @@ impl Commands for Handlers<'_> {
         self.plant("vkCreateInstance", args.pInstance, args.handle_pInstance, host.map(|h| h.0));
     }
 
-    fn vkDestroyInstance(&mut self, args: &mut vn_command_vkDestroyInstance) {
+    fn vkDestroyInstance(&mut self, _args: &mut vn_command_vkDestroyInstance) {
         // Every device under it dies first: Vulkan's teardown order is not advisory, and a guest
         // that skipped its own destroys does not get to leak them onto the host.
-        self.destroy_devices();
-        if let Some(inst) = self.driver.take_instance() {
-            driver::destroy_instance(&inst, args.instance);
-        }
+        self.driver.teardown();
     }
 
     fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices) {
@@ -364,11 +356,14 @@ impl Commands for Handlers<'_> {
         for pd in out.iter().take(got as usize) {
             self.driver.learn_extensions(*pd);
         }
-        // The generated hook walks the full array, so a shorter answer must not leave stale
-        // handles behind it -- a zero shadow ghosts the id rather than registering a lie.
+        // The generated hook walks the whole array the guest sent, so the ids past a short answer
+        // have to be refused explicitly. Left alone they would be registered as their own
+        // handles and the guest would hold devices that do not exist.
         for i in got as usize..asked {
             // SAFETY: `i` is inside the array the decoder allocated.
-            unsafe { *args.handle_pPhysicalDevices.add(i) = VkPhysicalDevice(0) };
+            if let Some(id) = self.out_id(unsafe { args.pPhysicalDevices.add(i) }) {
+                self.objects.borrow_mut().add_ghost(id);
+            }
         }
     }
 
@@ -391,7 +386,7 @@ impl Commands for Handlers<'_> {
             "vkGetDeviceQueue2",
             args.pQueue,
             args.handle_pQueue,
-            host.map(|q| q.0).ok_or(VkResult(0)),
+            host.map(|q| q.0).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
         );
     }
 }
@@ -556,6 +551,78 @@ mod tests {
             objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
             Lookup::Missing,
             "the destroy names the guest id, so it must have found it"
+        );
+    }
+
+    /// A create the driver refused must stay refused.
+    ///
+    /// The generated hook runs for every create, served or not, and its only evidence is the
+    /// shadow -- which a refusal leaves zero, exactly as an unserved command does. If the hook
+    /// treats that as "nobody decided" it registers the id as its own handle, and the ghost the
+    /// handler just recorded is gone: the guest holds a device the driver never made, and every
+    /// command behind it resolves to a handle pointing at nothing.
+    #[test]
+    fn a_create_the_driver_refused_leaves_a_ghost_and_not_an_object() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::VkStructureType;
+
+        const PHYSICAL_DEVICE: u64 = 3;
+        const DEVICE: u64 = 11;
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(
+                ObjectId(PHYSICAL_DEVICE),
+                VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0,
+                PHYSICAL_DEVICE,
+            )
+            .unwrap();
+
+        // A driver with no instance refuses every device without reaching Vulkan, which is the
+        // refusal this test wants: the interesting half is what happens after the `Err`.
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            bad_id: false,
+        };
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateDevice_EXT, 0);
+        w.extend_from_slice(&PHYSICAL_DEVICE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pCreateInfo: present
+        w.extend_from_slice(
+            &(VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO.0).to_le_bytes(),
+        );
+        w.extend_from_slice(&0u64.to_le_bytes()); // pNext: absent
+        w.extend_from_slice(&0u32.to_le_bytes()); // flags
+        w.extend_from_slice(&0u32.to_le_bytes()); // queueCreateInfoCount
+        w.extend_from_slice(&0u64.to_le_bytes()); // pQueueCreateInfos: empty
+        w.extend_from_slice(&0u32.to_le_bytes()); // enabledLayerCount
+        w.extend_from_slice(&0u64.to_le_bytes()); // ppEnabledLayerNames: empty
+        w.extend_from_slice(&0u32.to_le_bytes()); // enabledExtensionCount
+        w.extend_from_slice(&0u64.to_le_bytes()); // ppEnabledExtensionNames: empty
+        w.extend_from_slice(&0u64.to_le_bytes()); // pEnabledFeatures: absent
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+        w.extend_from_slice(&1u64.to_le_bytes()); // pDevice: present
+        w.extend_from_slice(&DEVICE.to_le_bytes()); // the id the guest chose
+
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut dec = Decoder::new(&w, &temp, &objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
+
+        assert_eq!(
+            objects.lookup(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0),
+            Lookup::Ghost,
+            "the id the driver refused must not become an object"
         );
     }
 }
