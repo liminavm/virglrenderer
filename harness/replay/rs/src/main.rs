@@ -102,6 +102,10 @@ struct Tally {
     unreplayable_imports: Vec<u32>,
     /// Ring flow-control commands skipped; see RING_FLOW_CONTROL.
     skipped_flow_control: u64,
+    /// Device-memory blob creates that had to be parked and retried; see `deferred`.
+    parked: u64,
+    /// The largest number of stream records a parked event had to wait through.
+    park_depth: u64,
     /// Classic (VIRGL2) contexts in the corpus. A venus corpus captured on a real desktop carries
     /// them -- the synoik image runs X clients through classic virgl alongside its Vulkan
     /// compositor -- and this replayer initializes venus only.
@@ -130,6 +134,13 @@ struct Replay<'a> {
     backings: BTreeMap<u32, Backing>,
     /// Classic contexts, and every resource event naming one, are skipped rather than failed.
     classic: BTreeSet<u32>,
+    /// DIAGNOSTIC, not the shipped semantics. A create_blob that exports a VkDeviceMemory
+    /// (blob_id != 0) can be recorded ahead of the vkAllocateMemory that made it: the recorder
+    /// orders events by when each thread reached its lock, and that is not the order they
+    /// executed in. Parking such a create and retrying it as the stream advances tells us whether
+    /// ordering is the LAST thing wrong with a corpus -- and how far off the order actually is.
+    /// The real fix is a recorded dependency fence, not a retry loop.
+    deferred: Vec<(Ctl, u64)>,
 }
 
 impl<'a> Replay<'a> {
@@ -289,11 +300,64 @@ impl<'a> Replay<'a> {
             }
         };
 
+        if rc != 0 {
+            if let Ctl::CreateBlob { blob_id, .. } = event {
+                if *blob_id != 0 {
+                    self.deferred.push((event.clone(), 0));
+                    return;
+                }
+            }
+        }
         self.note(rc == 0, &what, rc, "ctl");
         if rc == 0 {
             self.tally.ctl_ok += 1;
         } else {
             self.tally.ctl_fail += 1;
+        }
+    }
+
+    /// Retry every parked event, in the order they were parked. One that still fails stays parked
+    /// with its age bumped, so the report can say how far the corpus's order is from the truth.
+    fn drain_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.deferred);
+        for (event, age) in pending {
+            let retry_ok = match &event {
+                Ctl::CreateBlob {
+                    res_handle,
+                    ctx_id,
+                    blob_mem,
+                    blob_flags,
+                    blob_id,
+                    size,
+                    ..
+                } => {
+                    let args = abi::CreateBlobArgs {
+                        res_handle: *res_handle,
+                        ctx_id: *ctx_id,
+                        blob_mem: *blob_mem,
+                        blob_flags: *blob_flags,
+                        blob_id: *blob_id,
+                        size: *size,
+                        iovecs: std::ptr::null(),
+                        num_iovs: 0,
+                    };
+                    self.r.create_blob(&args) == 0
+                }
+                _ => true,
+            };
+            if retry_ok {
+                self.tally.ctl_ok += 1;
+                self.tally.parked += 1;
+                self.tally.park_depth = self.tally.park_depth.max(age);
+                if self.verbose {
+                    println!("ok   ctl: parked event landed after {age} records");
+                }
+            } else {
+                self.deferred.push((event, age + 1));
+            }
         }
     }
 }
@@ -320,6 +384,7 @@ fn run(args: &Args) -> Result<Tally, String> {
         open: BTreeSet::new(),
         backings: BTreeMap::new(),
         classic: BTreeSet::new(),
+        deferred: Vec::new(),
     };
 
     // 1-2. Contexts already alive when the recorder armed: they have a prologue and no CtxCreate
@@ -405,8 +470,14 @@ fn run(args: &Args) -> Result<Tally, String> {
                     rp.tally.cmd_fail += 1;
                     eprintln!("FAIL cmd: {ctx} ring={ring_id:#x} type={cmd_type} -> {rc}");
                 }
+                rp.drain_deferred();
             }
         }
+    }
+
+    for (event, age) in std::mem::take(&mut rp.deferred) {
+        rp.tally.ctl_fail += 1;
+        eprintln!("FAIL ctl: still parked after {age} records: {event:?}");
     }
 
     // 4. replay_end last, for everything still open: it starts the deferred ring threads, and a
@@ -461,6 +532,12 @@ fn main() -> ExitCode {
                 t.ctl_ok,
                 t.ctl_ok + t.ctl_fail
             );
+            if t.parked != 0 {
+                println!(
+                    "REPLAY parked-and-retried blob creates: {} (deepest wait {} records)",
+                    t.parked, t.park_depth
+                );
+            }
             if t.skipped_flow_control != 0 {
                 println!(
                     "REPLAY skipped ring flow-control commands: {}",
