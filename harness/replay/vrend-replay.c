@@ -165,6 +165,32 @@ static size_t res_bytes(const struct res_ev *r)
  * exactly as captured. */
 static uint32_t readback_res;
 static int scored, scored_ink;
+/* How many created resources came back IOSurface-backed. A count, never the ids: an id is
+ * host-private, recycled the instant its surface dies, and free to change across a snapshot
+ * restore. The count is the part a port owes us -- backing the wrong set of resources is
+ * silent everywhere else, and it decides whether the present path is zero-copy at all. */
+static uint32_t iosurf_backed;
+
+/* IOSurface-backed resources are scored at the END of the stream, not at their unref, because
+ * they are the ones a capture never unrefs: the scanout outlives every frame in it. That is the
+ * mirror image of why the colour offscreens are scored AT their unref -- each is read at the last
+ * moment it is both complete and still alive, and for these two kinds of resource that moment is
+ * at opposite ends of the run. */
+static struct { uint32_t handle, w, h; } *iosurf_res;
+static uint32_t iosurf_n, iosurf_cap;
+
+static void iosurf_remember(uint32_t handle, uint32_t w, uint32_t h)
+{
+   if (iosurf_n == iosurf_cap) {
+      iosurf_cap = iosurf_cap ? iosurf_cap * 2 : 8;
+      iosurf_res = realloc(iosurf_res, iosurf_cap * sizeof *iosurf_res);
+      if (!iosurf_res) { fprintf(stderr, "OOM\n"); exit(2); }
+   }
+   iosurf_res[iosurf_n].handle = handle;
+   iosurf_res[iosurf_n].w = w ? w : 1;
+   iosurf_res[iosurf_n].h = h ? h : 1;
+   iosurf_n++;
+}
 static int want_ctx = -1;
 static const char *score_path, *expect_path;
 
@@ -267,6 +293,44 @@ static int copy_src_of_next_cmd(const uint8_t *blob, size_t flen, size_t p,
       p += h.total_len;
    }
    return 0;
+}
+
+/* The IOSurface leg. The readback above reads a resource's TEXTURE; this reads the display
+ * surface that texture renders into, which is what the present actually shows. On this stack they
+ * are not the same path -- the scanout is an EGL_IOSURFACE_LIMINA EGLImage, so the surface IS the
+ * framebuffer's storage -- and a port can get one right while getting the other wrong. For venus
+ * there is no choice at all: a scanout blob has no CPU transfer_read, and the surface is the only
+ * place its pixels exist.
+ *
+ * The id is deliberately NOT in the score. IOSurface ids are host-private, recycled the instant a
+ * surface dies, and free to change across a snapshot restore -- pinning one would pin a number no
+ * implementation owes us. What is pinned is that the resource IS backed, and what it contains.
+ *
+ * sync first, and only here: the blit-and-wait is a CLASSIC vrend operation (the VMM calls it on
+ * RESOURCE_FLUSH for ctx 0 only). A venus blob renders into its surface directly and must never
+ * be synced. */
+static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
+{
+   size_t need = (size_t)w * h * 4;
+   int sr = virgl_renderer_resource_sync_iosurface(handle);
+   uint8_t *sp = calloc(1, need);
+   if (!sp) { fprintf(stderr, "OOM\n"); exit(2); }
+
+   /* dst_stride is BYTES, not pixels. Passing the pixel width here is a known bug shape: the
+    * image comes out quarter-width, tiled four across and squashed four down. */
+   int ir = virgl_renderer_resource_read_iosurface(handle, sp, w * 4, h);
+   if (ir == 0) {
+      size_t ink = 0;
+      for (size_t i = 0; i < need; i += 4)
+         if (sp[i] | sp[i + 1] | sp[i + 2] | sp[i + 3]) ink++;
+      uint64_t hash = 1469598103934665603ull;
+      for (size_t i = 0; i < need; i++) { hash ^= sp[i]; hash *= 1099511628211ull; }
+      score_addf("iosurface res=%u %ux%u sync=%d hash=%016llx ink=%zu/%zu\n",
+                 handle, w, h, sr, (unsigned long long)hash, ink, need / 4);
+   } else {
+      score_addf("iosurface res=%u %ux%u sync=%d read-failed=%d\n", handle, w, h, sr, ir);
+   }
+   free(sp);
 }
 
 static void score_resource(const struct res_ev *ev)
@@ -569,6 +633,13 @@ int main(int argc, char **argv)
                   b->live = false; failed++; continue;
                }
                made++;
+               {
+                  uint32_t id = 0;
+                  if (virgl_renderer_resource_get_iosurface_id(r->handle, &id) == 0 && id) {
+                     iosurf_backed++;
+                     iosurf_remember(r->handle, r->width, r->height);
+                  }
+               }
             }
             if (watch && r->handle == watch) {
                /* set_priv/get_priv round-trip is a registration probe: both go through
@@ -600,9 +671,13 @@ int main(int argc, char **argv)
          dropped++;
       free(batch);
       count_addf("loop %d created %u failed %u unrefs %u submits %u cmds %u xfers %u "
-                 "copy-fed %u copy-unmatched %u submit-errors %u\n",
-                 loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped);
+                 "copy-fed %u copy-unmatched %u submit-errors %u iosurface-backed %u\n",
+                 loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped,
+                 iosurf_backed);
    }
+
+   for (uint32_t i = 0; i < iosurf_n; i++)
+      score_iosurface(iosurf_res[i].handle, iosurf_res[i].w, iosurf_res[i].h);
 
    if (!scored)
       fprintf(stderr, "nothing was read back: no scored resource was unref'd in the trace\n");
