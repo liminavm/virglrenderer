@@ -15,10 +15,18 @@ use std::cell::Cell;
 use crate::ids::{CtxId, RingIdx};
 
 use super::cs::Decoder;
+use super::cs::Handle;
 use super::cs::ObjectId;
+use super::driver::{self, Driver};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
-use super::proto::types::{VkCommandTypeEXT, VkFlags, VkObjectType};
+use super::proto::types::{
+    VkCommandTypeEXT, VkDevice, VkFlags, VkObjectType, VkPhysicalDevice, VkResult,
+    vn_command_vkCreateDevice, vn_command_vkCreateInstance, vn_command_vkDestroyDevice,
+    vn_command_vkDestroyInstance, vn_command_vkEnumeratePhysicalDevices,
+    vn_command_vkGetDeviceQueue2,
+};
+use crate::vulkan::Global;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
 const GENERATE_REPLY: u32 = 0x1;
@@ -29,6 +37,9 @@ pub struct Context {
     /// be trusted, nothing later in it can be either.
     fatal: Cell<bool>,
     objects: Shared,
+    /// The driver objects this context has stood up. Per context, because a context owns its
+    /// instance tree and shares nothing with another guest.
+    driver: Driver,
     /// Replay mode. The journal's entries are fed straight to the dispatcher with their reply flag
     /// stripped, so rings are never started and no reply is ever encoded.
     replay: bool,
@@ -44,6 +55,7 @@ impl Context {
             id,
             fatal: Cell::new(false),
             objects: Shared::new(),
+            driver: Driver::new(),
             replay: false,
             dispatched: 0,
             unhandled: 0,
@@ -69,25 +81,12 @@ impl Context {
         self.replay = false;
     }
 
-    /// Poison the context, naming the command that did it -- once. A ring the guest can no longer
-    /// use looks the same from inside the guest whatever caused it, so the command type is the
-    /// only thing that tells a bug report from a hostile stream apart.
-    fn poison(&self, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
-        if !self.fatal.get() {
-            let name = vn_command_name(cmd)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("command type {}", cmd.0));
-            eprintln!("[virglrs] ctx {}: {name} {why}, {} bytes in", self.id.0, dec.pos());
-        }
-        dec.set_fatal();
-    }
-
     /// Drain one submission, dispatching every command in it.
     ///
     /// Returns false when the context was poisoned -- by this batch or by an earlier one. The C
     /// bails early on an already-fatal context for the same reason: a stream we stopped trusting
     /// does not become trustworthy because the guest sent more of it.
-    pub fn submit(&mut self, buf: &[u8], todo: &mut Unimplemented) -> bool {
+    pub fn submit(&mut self, buf: &[u8], todo: &mut Unimplemented, global: &Global) -> bool {
         if self.fatal.get() {
             return false;
         }
@@ -95,9 +94,22 @@ impl Context {
         // One arena for the batch. Every temporary a command decodes into lives until the batch
         // ends, which is the same bargain the C makes with its temp pool -- and the decoder's own
         // cap, not this arena, is what stops a guest from asking for all of memory.
+        // Read out what the poison path needs before the handlers borrow the rest of the
+        // context: they hold the driver mutably for as long as the loop runs.
+        let id = self.id;
+        let replay = self.replay;
+        let fatal = &self.fatal;
+        let (mut dispatched, mut unhandled) = (0u64, 0u64);
+
         let temp = Bump::new();
-        let mut dec = Decoder::new(buf, &temp, &self.objects, &self.fatal);
-        let mut h = Handlers { objects: &self.objects, todo, bad_id: false };
+        let mut dec = Decoder::new(buf, &temp, &self.objects, fatal);
+        let mut h = Handlers {
+            objects: &self.objects,
+            todo,
+            driver: &mut self.driver,
+            global,
+            bad_id: false,
+        };
 
         while dec.has_command() {
             dec.clear_soft_fatal();
@@ -108,7 +120,7 @@ impl Context {
                 // The header itself was short: there is no command here to lose.
                 eprintln!(
                     "[virglrs] ctx {}: submission ends mid-header, {} bytes into {}",
-                    self.id.0,
+                    id.0,
                     dec.pos(),
                     buf.len()
                 );
@@ -120,33 +132,35 @@ impl Context {
             // dispatching and dropping the reply would leave the guest waiting on a reply that was
             // never written, which is a hang rather than an error. Replay never takes this branch:
             // the journal's entries have had their reply flag stripped already.
-            if flags.0 & GENERATE_REPLY != 0 && !self.replay {
-                self.unhandled += 1;
-                self.poison(&dec, cmd, "wants a reply, and there is no ring to answer into");
+            if flags.0 & GENERATE_REPLY != 0 && !replay {
+                unhandled += 1;
+                poison(fatal, id, &dec, cmd, "wants a reply, and there is no ring to answer into");
                 break;
             }
 
             if vn_dispatch_command(&mut dec, None, cmd, &mut h).is_none() {
                 // A command type this protocol does not define. We cannot even skip it: its length
                 // is only knowable by decoding it.
-                self.poison(&dec, cmd, "is not a command type this protocol defines");
+                poison(fatal, id, &dec, cmd, "is not a command type this protocol defines");
                 break;
             }
-            self.dispatched += 1;
+            dispatched += 1;
             // A guest that named id zero, or reused one that is still live, is naming objects
             // it cannot have. The handler had no decoder to say so; this is where it lands.
             if h.bad_id {
-                self.poison(&dec, cmd, "named an object it cannot have");
+                poison(fatal, id, &dec, cmd, "named an object it cannot have");
             }
 
-            if self.fatal.get() {
+            if fatal.get() {
                 // The decoder poisoned itself inside the command: a malformed argument, or a
                 // shape the generator has no decoder for. Either way the command is what a
                 // reader needs, because without it a gap reaches a user as a hung guest.
-                self.poison(&dec, cmd, "did not decode");
+                poison(fatal, id, &dec, cmd, "did not decode");
                 break;
             }
         }
+        self.dispatched += dispatched;
+        self.unhandled += unhandled;
         // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
         // success on the way out.
         !self.fatal.get()
@@ -155,9 +169,37 @@ impl Context {
     /// A ring-scoped submission. The ring the command belongs to is recorded but not yet acted on:
     /// the replay feed hands commands straight to the dispatcher, which is what makes a VM-free
     /// replay possible, and a real ring loop is what will need the index.
-    pub fn submit_ring(&mut self, _ring: RingIdx, buf: &[u8], todo: &mut Unimplemented) -> bool {
-        self.submit(buf, todo)
+    pub fn submit_ring(
+        &mut self,
+        _ring: RingIdx,
+        buf: &[u8],
+        todo: &mut Unimplemented,
+        global: &Global,
+    ) -> bool {
+        self.submit(buf, todo, global)
     }
+
+    /// The driver state, for the teardown that has to destroy what it holds.
+    pub fn driver_mut(&mut self) -> &mut Driver {
+        &mut self.driver
+    }
+}
+
+/// Poison a context, naming the command that did it -- once.
+///
+/// A ring the guest can no longer use looks the same from inside the guest whatever caused it, so
+/// the command type is the only thing that tells a bug report from a hostile stream apart.
+///
+/// Free-standing rather than a method because the dispatch loop has already lent the rest of the
+/// context to the handlers by the time it needs this.
+fn poison(fatal: &Cell<bool>, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
+    if !fatal.get() {
+        let name = vn_command_name(cmd)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("command type {}", cmd.0));
+        eprintln!("[virglrs] ctx {}: {name} {why}, {} bytes in", id.0, dec.pos());
+    }
+    dec.set_fatal();
 }
 
 /// The commands a build does not serve yet, counted.
@@ -174,17 +216,80 @@ pub struct Unimplemented {
 /// the guest chose, a destroy forgets it, and that is enough for the whole corpus to decode --
 /// every later command that names an object finds it.
 ///
-/// **The host handle is the guest id, and only because nothing here has a real one.** No handler
-/// runs, so no driver writes a handle, and registering the id as its own handle is what lets the
-/// whole corpus decode: every later command that names an object finds it. Nothing else depends on
-/// the two being equal -- the generator carries both halves of the pairing separately, so the first
-/// real handler makes `host` real and this stops being a fiction. See `objects`.
+/// **A command with no handler still registers its objects, and its handle is its own id.** That
+/// is what lets the whole corpus decode while most of the protocol is unserved: every later command
+/// that names the object finds it. A served command makes the handle real, and the two stop being
+/// equal -- nothing depends on them being the same number, because the generator carries both
+/// halves of the pairing separately. See `objects`.
 pub struct Handlers<'a> {
     objects: &'a Shared,
     todo: &'a mut Unimplemented,
+    /// The driver objects this context has stood up: its instance, and its devices.
+    driver: &'a mut Driver,
+    /// The entry points that exist before an instance does. Owned by the renderer root, because
+    /// they are the same for every context.
+    global: &'a Global,
     /// A guest that reused a live id or named id zero. It cannot be reported from here -- the
     /// handler has no decoder -- so the loop reads it back and poisons.
     bad_id: bool,
+}
+
+impl Handlers<'_> {
+    /// The guest id a single out-handle carries, or None when the guest asked for no object.
+    fn out_id<T: Handle>(&self, out: *const T) -> Option<ObjectId> {
+        if out.is_null() {
+            return None;
+        }
+        // SAFETY: non-null, and the decoder allocated one element in the arena.
+        Some(ObjectId(unsafe { *out }.raw()))
+    }
+
+    /// Write what the driver produced into the shadow the generated hook will read, or ghost the
+    /// id when it produced nothing.
+    ///
+    /// A guest pipelines: it sends a create and the commands using it without waiting for an
+    /// answer, so those are already in flight when the create fails. A ghost turns each of them
+    /// into one lost command instead of a poisoned ring -- see `objects::Table::ghosts`. Leaving
+    /// the shadow zero would instead register the id as its own handle, which is the unserved
+    /// command's fiction and a lie for a served one.
+    fn plant<T: Handle>(
+        &mut self,
+        what: &str,
+        out: *const T,
+        shadow: *mut T,
+        host: Result<u64, VkResult>,
+    ) {
+        let Some(id) = self.out_id(out) else {
+            return;
+        };
+        match host {
+            Ok(h) if h != 0 => {
+                if !shadow.is_null() {
+                    // SAFETY: non-null, and the decoder allocated one element in the arena.
+                    unsafe { *shadow = T::from_raw(h) };
+                }
+            }
+            Err(r) => {
+                // The guest recovers from this on its own -- it sees the failure in the reply and
+                // unwinds, exactly as it would on real hardware. What it cannot do is tell the
+                // host operator why, and a driver that refuses a create is not something to pass
+                // over in silence.
+                eprintln!("[virglrs] {what} refused by the driver: VkResult {}", r.0);
+                self.objects.borrow_mut().add_ghost(id);
+            }
+            Ok(_) => self.objects.borrow_mut().add_ghost(id),
+        }
+    }
+
+    /// Destroy every device this context still holds. Used by an instance teardown and by the
+    /// context's own, because a guest is under no obligation to have destroyed them itself.
+    fn destroy_devices(&mut self) {
+        for (handle, d) in self.driver.take_devices() {
+            // SAFETY: a handle this context created; `take_devices` emptied the map, so it is
+            // destroyed exactly once.
+            unsafe { (d.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
+        }
+    }
 }
 
 impl Commands for Handlers<'_> {
@@ -193,10 +298,12 @@ impl Commands for Handlers<'_> {
     }
 
     fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {
-        // No handler has run, so the driver wrote nothing and `host` is zero. Registering the id
-        // as its own handle is what lets the corpus decode: every later command that names the
-        // object finds it. A real handler makes `host` real and this line stops lying -- see the
-        // identity note on `objects`.
+        // A zero handle means no handler ran: this build does not serve the command, and the id
+        // stands in for a handle so the rest of the stream still decodes. A served command that
+        // failed has already ghosted the id and removed the shadow, so it never reaches here.
+        if self.objects.borrow().get(id).is_some() {
+            return;
+        }
         let handle = if host == 0 { id.0 } else { host };
         if self.objects.borrow_mut().add(id, ty.0, handle).is_err() {
             self.bad_id = true;
@@ -205,6 +312,87 @@ impl Commands for Handlers<'_> {
 
     fn object_destroyed(&mut self, _ty: VkObjectType, id: ObjectId) {
         self.objects.borrow_mut().remove(id);
+    }
+
+    // ------------------------------------------------------------- the instance tree
+    //
+    // The dependency spine, in the only order it can be built: nothing below reaches a driver
+    // without the instance above it. The corpus asks for these once or twice each, at the very
+    // bottom of the frequency table -- and every one of the hot commands is unreachable until
+    // they are served.
+
+    fn vkCreateInstance(&mut self, args: &mut vn_command_vkCreateInstance) {
+        let host = self.driver.create_instance(self.global, args.pCreateInfo, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateInstance", args.pInstance, args.handle_pInstance, host.map(|h| h.0));
+    }
+
+    fn vkDestroyInstance(&mut self, args: &mut vn_command_vkDestroyInstance) {
+        // Every device under it dies first: Vulkan's teardown order is not advisory, and a guest
+        // that skipped its own destroys does not get to leak them onto the host.
+        self.destroy_devices();
+        if let Some(inst) = self.driver.take_instance() {
+            driver::destroy_instance(&inst, args.instance);
+        }
+    }
+
+    fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices) {
+        if args.pPhysicalDeviceCount.is_null() {
+            return;
+        }
+        // A null array is the guest asking how many there are. Answering it needs no ids, so
+        // there is nothing to register and nothing to plant.
+        if args.pPhysicalDevices.is_null() {
+            if let Ok(n) = self.driver.physical_device_count(args.instance) {
+                // SAFETY: non-null, and the decoder allocated it in the arena.
+                unsafe { *args.pPhysicalDeviceCount = n };
+            }
+            return;
+        }
+
+        // SAFETY: both are non-null and the decoder allocated the arrays with this many elements.
+        let asked = unsafe { *args.pPhysicalDeviceCount } as usize;
+        let out = unsafe { core::slice::from_raw_parts_mut(args.handle_pPhysicalDevices, asked) };
+        let Ok(got) = self.driver.physical_devices(args.instance, out) else {
+            args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+            return;
+        };
+        // SAFETY: as above.
+        unsafe { *args.pPhysicalDeviceCount = got };
+        // What each one supports is asked once, here, because device creation is filtered against
+        // it and there is no later point where the guest is guaranteed to have named them all.
+        for pd in out.iter().take(got as usize) {
+            self.driver.learn_extensions(*pd);
+        }
+        // The generated hook walks the full array, so a shorter answer must not leave stale
+        // handles behind it -- a zero shadow ghosts the id rather than registering a lie.
+        for i in got as usize..asked {
+            // SAFETY: `i` is inside the array the decoder allocated.
+            unsafe { *args.handle_pPhysicalDevices.add(i) = VkPhysicalDevice(0) };
+        }
+    }
+
+    fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice) {
+        let host =
+            self.driver.create_device(args.physicalDevice, args.pCreateInfo, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateDevice", args.pDevice, args.handle_pDevice, host.map(|h| h.0));
+    }
+
+    fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice) {
+        self.driver.destroy_device(args.device);
+    }
+
+    fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2) {
+        // A queue is owned by its device and never created, so the guest's id is registered
+        // against a handle the driver merely hands back.
+        let host = self.driver.device_queue(args.device, args.pQueueInfo);
+        self.plant(
+            "vkGetDeviceQueue2",
+            args.pQueue,
+            args.handle_pQueue,
+            host.map(|q| q.0).ok_or(VkResult(0)),
+        );
     }
 }
 
@@ -239,14 +427,15 @@ mod tests {
         let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT;
         assert_eq!(vn_command_name(cmd), Some("vkGetPipelineCacheData"));
 
+        let g = crate::vulkan::global();
         let mut ctx = Context::new(CtxId(1));
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo), "a stubbed decoder must poison");
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g), "a stubbed decoder must poison");
         assert!(ctx.fatal());
 
         // The poison outlives the batch: a stream we stopped trusting stays untrusted.
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo));
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g));
     }
 
     /// A command that wants an answer has nowhere to be answered into, so it poisons -- but only
@@ -255,13 +444,14 @@ mod tests {
     fn a_reply_request_poisons_only_outside_replay() {
         let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT;
         let mut todo = Unimplemented::default();
+        let g = crate::vulkan::global();
 
         let mut ctx = Context::new(CtxId(1));
         let w = header(cmd, GENERATE_REPLY);
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
         full.extend_from_slice(&0u64.to_le_bytes()); // no allocator
-        assert!(!ctx.submit(&full, &mut todo));
+        assert!(!ctx.submit(&full, &mut todo, &g));
         assert_eq!(ctx.unhandled, 1);
 
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
@@ -269,7 +459,7 @@ mod tests {
         // what separates the two paths is whether the command was dispatched at all.
         let mut ctx = Context::new(CtxId(1));
         ctx.replay_begin();
-        assert!(!ctx.submit(&full, &mut todo));
+        assert!(!ctx.submit(&full, &mut todo, &g));
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.unhandled, 0);
     }
