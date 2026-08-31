@@ -52,3 +52,35 @@ struct virgl_renderer_resource_import_blob_args size=24 align=8
   virgl_renderer_resource_import_blob_args.fd_type offset=8 size=4
   virgl_renderer_resource_import_blob_args.fd offset=12 size=4
   virgl_renderer_resource_import_blob_args.size offset=16 size=8
+struct virgl_renderer_hdr size=12 align=4
+  virgl_renderer_hdr.stype offset=0 size=4
+  virgl_renderer_hdr.stype_version offset=4 size=4
+  virgl_renderer_hdr.size offset=8 size=4
+struct virgl_renderer_export_query size=88 align=8
+  virgl_renderer_export_query.hdr offset=0 size=12
+  virgl_renderer_export_query.in_resource_id offset=12 size=4
+  virgl_renderer_export_query.out_num_fds offset=16 size=4
+  virgl_renderer_export_query.in_export_fds offset=20 size=4
+  virgl_renderer_export_query.out_fourcc offset=24 size=4
+  virgl_renderer_export_query.out_fds offset=32 size=16
+  virgl_renderer_export_query.out_strides offset=48 size=16
+  virgl_renderer_export_query.out_offsets offset=64 size=16
+  virgl_renderer_export_query.out_modifier offset=80 size=8
+struct virgl_renderer_supported_structures size=20 align=4
+  virgl_renderer_supported_structures.hdr offset=0 size=12
+  virgl_renderer_supported_structures.in_stype_version offset=12 size=4
+  virgl_renderer_supported_structures.out_supported_structures_mask offset=16 size=4
+struct virgl_renderer_resource_info_ext size=72 align=8
+  virgl_renderer_resource_info_ext.version offset=0 size=4
+  virgl_renderer_resource_info_ext.base offset=4 size=40
+  virgl_renderer_resource_info_ext.has_dmabuf_export offset=44 size=1
+  virgl_renderer_resource_info_ext.planes offset=48 size=4
+  virgl_renderer_resource_info_ext.modifiers offset=56 size=8
+  virgl_renderer_resource_info_ext.d3d_tex2d offset=64 size=8
+struct virgl_box size=24 align=4
+  virgl_box.x offset=0 size=4
+  virgl_box.y offset=4 size=4
+  virgl_box.z offset=8 size=4
+  virgl_box.w offset=12 size=4
+  virgl_box.h offset=16 size=4
+  virgl_box.d offset=20 size=4
