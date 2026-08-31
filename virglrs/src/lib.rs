@@ -12,7 +12,8 @@
 //! later phase returns `-ENOTSUP` rather than a plausible success -- see `ffi::todo_phase`.
 
 pub mod abi;
-pub mod ffi;
 pub mod fence;
+pub mod ffi;
 pub mod ids;
 pub mod renderer;
+pub mod venus;

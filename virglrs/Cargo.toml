@@ -7,7 +7,7 @@ publish = false
 
 [lib]
 name = "virglrenderer"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 # Panics abort, never unwind. Unwinding across `extern "C"` is undefined behaviour, and a loud
 # abort is the behaviour we want from a violated host invariant anyway -- see CLAUDE.md.
@@ -18,4 +18,5 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
+bumpalo = "3.20"
 libc = "0.2"
