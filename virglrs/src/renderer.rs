@@ -13,6 +13,7 @@ use std::ffi::{c_int, c_void};
 use crate::abi::{self, Callbacks, CreateBlobArgs, GuestIov, ResourceCreateArgs, VmmPtr};
 use crate::fence::Retirement;
 use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::venus;
 
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
@@ -53,6 +54,8 @@ pub struct Renderer {
     resources: BTreeMap<ResourceHandle, Resource>,
     contexts: BTreeMap<CtxId, Context>,
     fences: Retirement,
+    /// The venus renderer, present only when this build was initialized to serve it.
+    venus: Option<venus::vkr::Vkr>,
 }
 
 impl Renderer {
@@ -62,6 +65,7 @@ impl Renderer {
             resources: BTreeMap::new(),
             contexts: BTreeMap::new(),
             fences: Retirement::start(cookie, cb),
+            venus: (flags & abi::VENUS != 0).then(|| venus::vkr::Vkr::new(flags)),
         }
     }
 
@@ -71,8 +75,26 @@ impl Renderer {
     /// A skeleton that claimed VIRGL2 would have the guest bind a classic context and submit
     /// commands into a renderer that cannot answer them.
     pub fn capset_max(&self, set: u32) -> Option<(u32, u32)> {
-        let _ = set;
-        None
+        match set {
+            abi::CAPSET_VENUS if self.venus.is_some() => {
+                Some((venus::capset::VERSION, venus::capset::size()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The capset's bytes, for a set this build advertises. `None` for anything else -- the caller
+    /// sized its buffer from `capset_max`, so writing into a buffer for a capset we reported as
+    /// absent would run off the end of it.
+    pub fn capset_bytes(&self, set: u32, version: u32) -> Option<Vec<u8>> {
+        match set {
+            abi::CAPSET_VENUS
+                if self.flags & abi::VENUS != 0 && version == venus::capset::VERSION =>
+            {
+                Some(venus::capset::Capset::new(self.flags).as_bytes().to_vec())
+            }
+            _ => None,
+        }
     }
 
     // ---- resources ----
