@@ -442,7 +442,7 @@ fn run(args: &Args) -> Result<Tally, String> {
     for rec in &c.records {
         match rec {
             Record::Ctl { event, .. } => rp.ctl(event),
-            Record::Cmd { ctx, ring_id, cmd_type, wire } => {
+            Record::Cmd { ctx, ring_id, cmd_type, wire, .. } => {
                 if rp.classic.contains(&ctx.id) {
                     continue;
                 }

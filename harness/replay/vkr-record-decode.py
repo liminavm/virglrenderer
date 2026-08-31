@@ -31,10 +31,10 @@ FLAG_TRUNC_FATAL = 0x2
 
 # u32 magic, version, flags, ctx_count + u64 record_count, prologue_bytes, stream_bytes
 HEADER_SIZE = 40
-# u64 seq, ring_id + u32 ctx_id, generation, kind, op, size, reserved
-RECORD_HEADER_SIZE = 40
+# u64 seq, tick, ring_id + u32 ctx_id, generation, kind, op, size, reserved
+RECORD_HEADER_SIZE = 48
 PROLOGUE_HEADER_SIZE = 16  # u32 ctx_id, generation + u64 size
-SUPPORTED_VERSION = 3
+SUPPORTED_VERSION = 4
 
 KIND_CMD = 0
 KIND_CTL = 1
@@ -119,13 +119,13 @@ class Corpus:
             p += align4(size)
 
     def records(self):
-        """(seq, ring_id, ctx_id, generation, kind, op, payload) in stream order."""
+        """(seq, tick, ring_id, ctx_id, generation, kind, op, payload) in file order."""
         p, end = self.stream_off, self.stream_off + self.stream_bytes
         while p + RECORD_HEADER_SIZE <= end:
-            seq, ring_id, ctx_id, gen, kind, op, size, _rsv = struct.unpack_from(
-                "<QQIIIIII", self.blob, p)
+            seq, tick, ring_id, ctx_id, gen, kind, op, size, _rsv = struct.unpack_from(
+                "<QQQIIIIII", self.blob, p)
             p += RECORD_HEADER_SIZE
-            yield seq, ring_id, ctx_id, gen, kind, op, self.blob[p:p + size]
+            yield seq, tick, ring_id, ctx_id, gen, kind, op, self.blob[p:p + size]
             p += align4(size)
 
 
@@ -162,7 +162,7 @@ def summarize(c):
     per_ctx = collections.Counter()
     per_ring = collections.Counter()
     per_ctl = collections.Counter()
-    for _seq, ring_id, ctx_id, gen, kind, op, _pay in c.records():
+    for _seq, _tick, ring_id, ctx_id, gen, kind, op, _pay in c.records():
         if kind == KIND_CTL:
             per_ctl[op] += 1
             continue
@@ -202,13 +202,24 @@ def check(c):
     if n_prologue != c.ctx_count:
         bad.append(f"header claims {c.ctx_count} prologues, found {n_prologue}")
 
-    # The stream must be totally ordered by seq: the recorder assigns the sequence number inside
-    # the same critical section that appends the bytes precisely so this holds, and a replayer
-    # trusts it. A gap or an inversion means the append path lost its lock discipline.
+    # seq is append order and must be contiguous from 0: the recorder assigns it inside the same
+    # critical section that writes the bytes, so a gap means a record was lost. tick is execution
+    # order and must be strictly increasing when the file is sorted by it -- but NOT contiguous,
+    # since excluded commands and refused tees burn one. Inversions between the two orders are
+    # normal and counted, not failed: they are what makes tick necessary (see vkr_record.h).
     n = 0
     prev = None
-    for seq, _ring, ctx_id, gen, kind, op, payload in c.records():
+    prev_tick = None
+    ticks = set()
+    inversions = 0
+    for seq, tick, _ring, ctx_id, gen, kind, op, payload in c.records():
         n += 1
+        if tick in ticks:
+            bad.append(f"seq {seq}: tick {tick} is not unique")
+        ticks.add(tick)
+        if prev_tick is not None and tick < prev_tick:
+            inversions += 1
+        prev_tick = tick
         # Anchored at 0, not merely consecutive: the recorder's counter starts there, so a
         # stream whose first record is seq 1 lost a record before anything else was written —
         # which a pairwise check alone reads as perfectly contiguous.
@@ -239,7 +250,8 @@ def check(c):
     for line in bad:
         print(f"FAIL: {line}")
     if not bad:
-        print(f"ok: {n} records, {n_prologue} prologues, contiguous and well-formed")
+        note = f", {inversions} recorded out of execution order" if inversions else ""
+        print(f"ok: {n} records, {n_prologue} prologues, contiguous and well-formed{note}")
     return not bad
 
 
@@ -255,7 +267,7 @@ def main():
     if mode == "--check":
         return 0 if check(c) else 1
     if mode == "--list":
-        for seq, ring_id, ctx_id, gen, kind, op, payload in c.records():
+        for seq, tick, ring_id, ctx_id, gen, kind, op, payload in c.records():
             if kind == KIND_CTL:
                 print(f"{seq:8d} ctx={ctx_id}/{gen} {'CTL':>20} {ctl_describe(op, payload)}")
                 continue
@@ -264,7 +276,7 @@ def main():
                   f"{len(payload):6d} bytes")
         return 0
     if mode == "--types":
-        hist = collections.Counter(op for _s, _r, _c, _g, k, op, _p in c.records()
+        hist = collections.Counter(op for _s, _t, _r, _c, _g, k, op, _p in c.records()
                                    if k == KIND_CMD)
         for cmd, n in hist.most_common():
             print(f"{n:8d}  cmd_type {cmd}")
