@@ -5,6 +5,8 @@
 
 #include "vkr_image.h"
 
+bool limina_mtltex_trace(void);
+
 #include "vkr_budget.h"
 #include "vkr_device_memory.h"
 #include "vkr_image_gen.h"
@@ -282,7 +284,8 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                   limina_surf = vkr_mtl_iosurface_alloc(dev->mtl_device, ci->extent.width,
                                                       ci->extent.height, limina_mtl_exact,
                                                       limina_fourcc, limina_bpe, 0);
-                  fprintf(stderr,
+                  if (limina_mtltex_trace())
+                     fprintf(stderr,
                           "[LIMINA-VKR-MTLTEX] KK MTLTEXTURE scanout %ux%u -> IOSurface "
                           "id=%u tex=%p\n",
                           ci->extent.width, ci->extent.height,
