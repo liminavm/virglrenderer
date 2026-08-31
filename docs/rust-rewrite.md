@@ -108,10 +108,17 @@ Not compiled today, or not needed once the C fork is gone:
    `vkr_device_memory.c`, `vkr_image.c`).** The semantics are subtle (cross-context
    shares, ghost containment, poisoned replay, budget accounting) but this is
    exactly where Rust's ownership model pays; our own ghost/poison containment
-   commits are C workarounds for problems Rust makes structural.
-5. **The journal/replay/snapshot family.** Subtlest behaviour, smallest code. Do it
-   **last** — it is ABI contract, libkrun calls it, and it has no meaning until the
-   thing it journals works.
+   commits are C workarounds for problems Rust makes structural. One constraint the
+   C encodes only by accident: a handler publishes its reply into guest-visible
+   memory *partway through* ring submit, so the guest can act on a reply before the
+   submit call returns. That visibility point is observable and must be reproduced —
+   see the ordering rule in `src/venus/vkr_record.h`. It is also the one place a
+   process-global ordering counter is not a design failure.
+5. **The snapshot family** — journal export, sync export/restore, classic content
+   export/restore. Subtlest behaviour, smallest code, and it has no meaning until
+   the thing it journals works. Its *siblings* do not wait: the replay feed
+   (`replay_begin/submit/ring_cmd/end`) and `memory_census`/`memory_read` are what
+   the venus harness drives, so they are P2 infrastructure, not P5 work.
 6. **The VideoToolbox backend + AV1/H.264 bitstream synthesis (4.1k).** Ours
    already, well understood, and it maps cleanly onto `objc2` +
    `objc2-video-toolbox` + `objc2-io-surface`. `dav1d` → `rav1d` (the Rust port).
@@ -142,13 +149,14 @@ the real seated gnome-shell and a gfxreconstruct capture of native Vulkan, compa
 pixels against an llvmpipe/lavapipe reference — pixel-exact today. Alongside it sit
 `venus*.rs`, `virgl*.rs`, `vkr_*.rs`, `vrend_session_restore.rs`,
 `l2_video_vaapi.rs`, `l2_stock_vulkan_window.rs`, `scanout_churn_retention.rs`.
-These are implementation-agnostic already. Work here is corpus, not framework:
+These are implementation-agnostic already. Work here is corpus, not framework, and
+each corpus is owed by the phase it gates — not collected up front:
 
-- classic-vrend capture on a **stock** guest (apitrace over virgl, not zink→venus) —
-  today's corpus only exercises the venus path;
-- a video clip per codec × path (H.264, HEVC, VP9 hardware; AV1 software), each with
-  a VPP conversion leg, since that is what `d1fdc034` shows is fragile;
-- a suspend/resume cycle taken **mid-workload**, not from idle.
+- **P3** — classic-vrend capture on a **stock** guest (apitrace over virgl, not
+  zink→venus); today's Layer 1 corpus only exercises the venus path.
+- **P4** — a video clip per codec × path (H.264, HEVC, VP9 hardware; AV1 software),
+  each with a VPP conversion leg, since that is what `d1fdc034` shows is fragile.
+- **P5** — a suspend/resume cycle taken **mid-workload**, not from idle.
 
 ### Layer 2 — host-side, VM-free replay (the real new work)
 
@@ -173,13 +181,18 @@ makes the rewrite testable at subagent speed instead of boot speed.
   `resource_get_map_ptr` carry the zero-copy present and the Mach-port publish, and a
   VM-free replay has no scanout to exercise them. Layer 1 is their only coverage.
 
-### Layer 3 — carried over
+### Layer 3 — fuzz corpora and the perf ledger
 
-Upstream's `tests/test_virgl_*` are ABI-level and should link against either
-implementation; keep them. Carry `tests/fuzzer/` corpora into `cargo-fuzz` once the
-decode paths exist. Keep the perf bench as a **trend ledger, not a gate** — a
-rewrite regresses performance invisibly, and gating on it this early stops work for
-the wrong reason.
+`tests/test_virgl_*` are **not** carried over. They are not ABI-level: every one of
+them includes internal headers and links the static library, so none can run against
+a Rust dylib, and they do not build on this platform anyway. Rewriting them
+public-ABI-only would duplicate Layer 2 at the same speed. They stay as C-side
+regression tests with no role in the rewrite.
+
+What is carried: `tests/fuzzer/` corpora move to `cargo-fuzz` once the Rust decode
+paths exist — corpora are data and survive the language change. And the perf bench
+stays a **trend ledger, never a gate** — a rewrite regresses performance invisibly,
+and gating on it stops work for the wrong reason.
 
 ## Phases
 
@@ -192,24 +205,27 @@ buildable throughout as the A-side reference.
   The corpora the replayers read are not in git and have no permanent home yet.
 - **P1 — Skeleton.** The virglrs tree scaffolded in this repository, producing a
   dylib and a prefix layout interchangeable with the C build's. All 69 symbols
-  exported and stubbed; the ABI
-  types, resource table, context table, fence tracking, and async fence retirement
-  implemented for real. Boots to software-2D.
+  exported and stubbed; the ABI types, resource table, context table, fence tracking,
+  and async fence retirement implemented for real. Gate: `abi/abi-fixture.sh` green
+  with `VIRGL_PREFIX` pointed at the Rust build, and both replayers loading that dylib
+  and getting through init, context create and resource create without error. All of
+  it VM-free — a phase whose point is going fast does not gate on a boot.
 - **P2 — venus.** Fork venus-protocol's templates to emit Rust; differential-test the
   decoder against C on recorded ring bytes. Then vkr: instance/device/queue/memory/
   image/buffer/descriptor/command-buffer, rings, budget, the Metal + IOSurface
   helpers. Ends at a seated venus GNOME desktop, booted with the existing venus-only
   `virgl_override` limina already has for forcing venus-only flags — no new
-  machinery, and no classic stubs that have to lie about capsets. This is where the crash pain is; it
-  goes first among the renderers.
+  machinery, and no classic stubs that have to lie about capsets. Carries the replay
+  feed and `memory_census`/`memory_read` with it, because those are what the venus
+  harness drives. This is where the crash pain is; it goes first among the renderers.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
-- **P5 — snapshot/replay.** Journal, replay, memory census/read/write, sync
-  export/restore, classic content export/restore. Ends at suspend/resume parity.
+- **P5 — snapshot.** Journal export, `memory_write`, sync export/restore, classic
+  content export/restore. Ends at suspend/resume parity.
 - **P6 — cutover.** Rust becomes the default prefix; limina's manifest and
   `build-virglrenderer.sh` are reconciled to it and the C tree is tagged and
   archived. Then the follow-up: delete rutabaga's FFI shim and depend on the crate

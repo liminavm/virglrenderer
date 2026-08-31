@@ -103,9 +103,14 @@ Layers 1 and 2 both need corpora, and a corpus comes from a real guest. `vm/` bu
 self-contained rig — limina's app bundle with this tree's renderer swapped in, plus APFS clones of
 an enhanced and a stock disk — so captures never mutate limina's working set. See `vm/README.md`.
 
-## Layer 3 — carried over
+## Layer 3 — fuzz corpora and the perf ledger
 
-`tests/test_virgl_*` in this tree are ABI-level and should link against either implementation.
-`tests/fuzzer/` corpora move to `cargo-fuzz` once the Rust decode paths exist. Performance is a
-trend ledger, never a gate — a rewrite regresses performance invisibly, and gating on it stops
-work for the wrong reason.
+`tests/test_virgl_*` are not part of the harness. They look ABI-level and are not: every one of
+them includes internal headers and links the static library, so none can run against a Rust
+dylib. They also need `check` and do not build on this platform. They stay as C-side regression
+tests with no role in the rewrite; Layer 2 covers the same ground through the ABI at the same
+speed.
+
+`tests/fuzzer/` corpora move to `cargo-fuzz` once the Rust decode paths exist — corpora are data
+and survive the language change. Performance is a trend ledger, never a gate — a rewrite regresses
+performance invisibly, and gating on it stops work for the wrong reason.
