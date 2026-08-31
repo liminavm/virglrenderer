@@ -755,6 +755,13 @@ class RustGen:
             '',
             '#include "vn_protocol_renderer.h"',
             '',
+            '/* Distinct because they mean opposite things: a reply that did not fit is retried at',
+            ' * a larger size, and a command this encoder has no arm for means the two generators',
+            ' * disagree about the command list. One sentinel for both would retry the second until',
+            ' * it hit the size ceiling, and name a generator mismatch as an oversized reply. */',
+            '#define VN_ORACLE_OVERRAN ((size_t)-1)',
+            '#define VN_ORACLE_NO_ARM  ((size_t)-2)',
+            '',
             'size_t vn_oracle_reply(int32_t cmd, void *buf, size_t cap, const void *args);',
             '',
             'size_t vn_oracle_reply(int32_t cmd, void *buf, size_t cap, const void *args)',
@@ -773,10 +780,10 @@ class RustGen:
             ]
         out += [
             '    default:',
-            '        return (size_t)-1;',
+            '        return VN_ORACLE_NO_ARM;',
             '    }',
             '',
-            '    return vn_oracle_encoder_len(&enc);',
+            '    return enc.fatal ? VN_ORACLE_OVERRAN : vn_oracle_encoder_len(&enc);',
             '}',
             '',
         ]

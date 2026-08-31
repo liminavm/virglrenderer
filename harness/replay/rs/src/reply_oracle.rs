@@ -35,10 +35,38 @@ use virglrenderer::venus::proto::serialize::{vn_command_name, vn_reply_oracle_ar
 use virglrenderer::venus::proto::types::{VkCommandTypeEXT, VkFlags};
 
 extern "C" {
-    /// venus-protocol's `vn_encode_<command>_reply`, dispatched by command type. Returns the
-    /// bytes written, or `usize::MAX` for a command type it has no arm for or a reply that
-    /// overran `cap`.
+    /// venus-protocol's `vn_encode_<command>_reply`, dispatched by command type. C has one return
+    /// slot, so the two failures come back as sentinels; nothing above [`CReply::from_raw`] sees
+    /// them as numbers.
     fn vn_oracle_reply(cmd: i32, buf: *mut c_void, cap: usize, args: *const c_void) -> usize;
+}
+
+/// What the C encoder did, with the sentinels resolved at the boundary they arrive on.
+///
+/// The two failures pull in opposite directions -- one wants a retry, the other must never be
+/// retried -- so leaving them as one `usize::MAX` would make a generator mismatch look like an
+/// oversized reply and spin until the size ceiling. The type is what keeps them apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CReply {
+    Wrote(usize),
+    /// The reply did not fit in `cap`. Nothing was written that can be compared.
+    Overran,
+    /// This encoder has no arm for the command type, though the Rust side had one: the two
+    /// generators disagree about the command list, which no buffer size will fix.
+    NoArm,
+}
+
+impl CReply {
+    const OVERRAN: usize = usize::MAX;
+    const NO_ARM: usize = usize::MAX - 1;
+
+    fn from_raw(raw: usize) -> Self {
+        match raw {
+            Self::OVERRAN => CReply::Overran,
+            Self::NO_ARM => CReply::NoArm,
+            n => CReply::Wrote(n),
+        }
+    }
 }
 
 /// Why one command failed. Ordered by how much it tells you: a decode that never ran says nothing
@@ -48,6 +76,7 @@ enum Outcome {
     Ok,
     Unknown,
     Poisoned,
+    NoArm,
     Mismatch,
     WrongSize,
 }
@@ -123,17 +152,22 @@ fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
     let cap = wire.len() + slack;
     let mut ours = vec![0u8; cap];
     let mut theirs = vec![0u8; cap];
-    let mut written = usize::MAX;
+    let mut reply = CReply::Overran;
 
     let mut enc = Encoder::new(&mut ours, &AllOfIt);
     let size = {
         let theirs = &mut theirs;
-        let written = &mut written;
+        let reply = &mut reply;
         // SAFETY: `args` points at the `vn_command_*` the decoder just filled, which is
         // `#[repr(C)]` and lives until this call returns; `theirs` is `cap` bytes we own and the
         // C writes no further than it is told.
         let mut also = |args: *const c_void| unsafe {
-            *written = vn_oracle_reply(cmd.0, theirs.as_mut_ptr() as *mut c_void, cap, args);
+            *reply = CReply::from_raw(vn_oracle_reply(
+                cmd.0,
+                theirs.as_mut_ptr() as *mut c_void,
+                cap,
+                args,
+            ));
         };
         let Some(size) = vn_reply_oracle_args(&mut dec, &mut enc, cmd, &mut also) else {
             tally.note(key, Outcome::Unknown, || "this protocol has no such command".into());
@@ -148,11 +182,18 @@ fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
         return true;
     }
 
-    // Either encoder running out of room says nothing about the other; retry both at a size that
-    // fits rather than diffing a truncated reply against a whole one.
-    if enc.fatal() || written == usize::MAX {
-        return false;
-    }
+    let written = match reply {
+        CReply::Wrote(n) if !enc.fatal() => n,
+        // Either encoder running out of room says nothing about the other; retry both at a size
+        // that fits rather than diffing a truncated reply against a whole one.
+        CReply::Wrote(_) | CReply::Overran => return false,
+        CReply::NoArm => {
+            tally.note(key, Outcome::NoArm, || {
+                "the Rust generator has this command and venus-protocol's does not".into()
+            });
+            return true;
+        }
+    };
 
     let got = enc.written();
     if got != &theirs[..written] {
