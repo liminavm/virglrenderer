@@ -16,9 +16,10 @@
 //! Two flavours of poison, mirroring `src/venus/vkr_cs.h`:
 //!
 //! * **hard** -- the stream is unusable. It is shared with the ring loop, which stops.
-//! * **soft** -- this one command named an object the host never created (a ghost). The command is
-//!   dropped, the ring keeps going. Generated code cannot tell the two apart, and must not: both
-//!   mean "do not call the handler, do not encode a reply".
+//! * **soft** -- this one command named an object whose creation the host refused, and which the
+//!   guest had already pipelined commands behind (a ghost). The command is dropped, the ring keeps
+//!   going. Generated code cannot tell the two apart, and must not: both mean "do not call the
+//!   handler, do not encode a reply". An id the guest simply invented is *hard*, not soft.
 
 use std::cell::Cell;
 
@@ -59,11 +60,24 @@ impl Default for Ptr {
     }
 }
 
+/// What the object table has to say about an id the guest named.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lookup {
+    /// The host handle.
+    Found(u64),
+    /// An id whose creation the host refused, and which the guest had already pipelined commands
+    /// behind. Those commands are lost; the ring is not.
+    Ghost,
+    /// No such object, or one of a different Vulkan type. Either way the guest named something it
+    /// was never given, which is a protocol violation and stops the ring.
+    Missing,
+}
+
 pub trait Objects {
-    /// The host handle for `id`, or `None` if the host never created it. `ty` is the
-    /// `VkObjectType` the wire claims, and a mismatch is a miss -- the guest does not get to
-    /// reinterpret one object as another.
-    fn lookup(&self, id: ObjectId, ty: i32) -> Option<u64>;
+    /// Resolve `id`, which the wire claims is of `VkObjectType` `ty`. A live object under a
+    /// different type is `Missing`, not `Found`: the guest does not get to reinterpret one object
+    /// as another by naming its id in the wrong command.
+    fn lookup(&self, id: ObjectId, ty: i32) -> Lookup;
 }
 
 /// An object table that resolves every id to itself. Used by the wire round-trip, where the point
@@ -71,8 +85,8 @@ pub trait Objects {
 pub struct IdentityObjects;
 
 impl Objects for IdentityObjects {
-    fn lookup(&self, id: ObjectId, _ty: i32) -> Option<u64> {
-        Some(id.0)
+    fn lookup(&self, id: ObjectId, _ty: i32) -> Lookup {
+        Lookup::Found(id.0)
     }
 }
 
@@ -204,34 +218,48 @@ impl<'a> Decoder<'a> {
         Some(())
     }
 
-    /// Resolve a guest object id, poisoning softly on a miss. The soft flavour is deliberate: a
-    /// guest whose own error handling left it naming a dead object must lose the command, not the
-    /// ring.
+    /// Resolve a guest object id to its host handle.
+    ///
+    /// The two failures are not the same failure. A ghost is a create the host refused with the
+    /// guest's later commands already in flight behind it -- it costs those commands and nothing
+    /// more. Anything else is a guest naming an object it was never given, or naming one it has
+    /// under the wrong type, and that is a stream we can no longer trust: the ring stops.
     pub fn lookup_object(&self, id: ObjectId, ty: i32) -> u64 {
         match self.objects.lookup(id, ty) {
-            Some(handle) => handle,
-            None => {
+            Lookup::Found(handle) => handle,
+            Lookup::Ghost => {
                 self.set_soft_fatal();
+                0
+            }
+            Lookup::Missing => {
+                self.set_fatal();
                 0
             }
         }
     }
 }
 
-/// What the guest's protocol supports.
+/// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
+/// cannot parse.
 ///
-/// Encoding a `pNext` chain has to skip structs the guest's venus protocol does not know, or the
-/// reply is unreadable to it. The generated encoder asks this; vkr answers from what the guest
-/// negotiated at `vkSetReplyCommandStreamMESA` time.
+/// **Nothing generated for this renderer asks it.** venus-protocol emits that gate on the *driver*
+/// side only -- the guest skips what the renderer cannot read, and by the time bytes arrive here
+/// the filtering has happened. What this build can serialize is fixed when it is generated, and it
+/// is published to the guest once, in the capset, from `proto::info`; there is no per-context
+/// negotiation to answer from.
+///
+/// The trait stays because it is threaded through every generated signature, and because a
+/// driver-side encoder generated from the same model -- the differential oracle for the shapes no
+/// corpus reaches -- would be the caller that needs it.
 pub trait Protocol {
     fn has_extension(&self, number: u32) -> bool;
     fn has_api_version(&self, version: u32) -> bool;
 }
 
-/// A protocol that supports everything.
+/// A protocol that supports everything -- which is every caller this renderer has.
 ///
-/// Correct for the wire round trip specifically: re-encoding a chain the guest itself sent cannot
-/// need to skip any of it. Not correct for replies, which is why vkr answers with the real one.
+/// Re-encoding a chain the guest itself sent cannot need to skip any of it, and no generated path
+/// consults this anyway. See [`Protocol`].
 pub struct AllOfIt;
 
 impl Protocol for AllOfIt {
@@ -556,21 +584,41 @@ mod tests {
 
     #[test]
     fn a_ghost_object_poisons_the_command_and_not_the_ring() {
-        struct Empty;
-        impl Objects for Empty {
-            fn lookup(&self, _id: ObjectId, _ty: i32) -> Option<u64> {
-                None
+        struct AllGhosts;
+        impl Objects for AllGhosts {
+            fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
+                Lookup::Ghost
             }
         }
         let temp = Bump::new();
         let hard = Cell::new(false);
         let buf = [0u8; 0];
-        let dec = Decoder::new(&buf, &temp, &Empty, &hard);
+        let dec = Decoder::new(&buf, &temp, &AllGhosts, &hard);
         assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);
         assert!(dec.fatal());
         assert!(!dec.hard_fatal());
         dec.clear_soft_fatal();
         assert!(!dec.fatal());
+    }
+
+    /// An id the guest never had is not a ghost. Losing one command per bad id would let a guest
+    /// name ids forever; the stream is untrustworthy from here, so the ring stops.
+    #[test]
+    fn an_object_the_guest_invented_stops_the_ring() {
+        struct Nothing;
+        impl Objects for Nothing {
+            fn lookup(&self, _id: ObjectId, _ty: i32) -> Lookup {
+                Lookup::Missing
+            }
+        }
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let buf = [0u8; 0];
+        let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);
+        assert!(dec.hard_fatal());
+        dec.clear_soft_fatal();
+        assert!(dec.fatal(), "a hard poison does not clear with the command");
     }
 
     #[test]

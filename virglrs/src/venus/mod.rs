@@ -10,5 +10,6 @@
 
 pub mod capset;
 pub mod cs;
+pub mod objects;
 pub mod proto;
 pub mod vkr;
