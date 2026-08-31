@@ -6,6 +6,10 @@
 #
 #   vkr-replay.sh <corpus.vkrc> [--renderer <libvirglrenderer.dylib>] [replayer options]
 #
+# --score <file> writes the score; --expect <file> compares against a pinned one and exits
+# non-zero on any difference. The score is renderer state, not pixels: a VM-free replay has no
+# scanout, so what it compares is the accept counts and the device memory the commands left.
+#
 # The renderer defaults to this tree's rig build (harness/vm/prefix). Point it at another build to
 # compare implementations against the same corpus -- which is the entire reason this layer exists.
 #
@@ -18,6 +22,23 @@ CORPUS="${1:-}"
 [ -n "$CORPUS" ] || { echo "usage: vkr-replay.sh <corpus.vkrc> [options]" >&2; exit 1; }
 case "$CORPUS" in /*) ;; *) CORPUS="$(pwd)/$CORPUS" ;; esac
 shift
+
+# Resolve --score/--expect against the caller's directory too: everything below runs from the
+# script's own, and a relative golden path would otherwise land somewhere the caller cannot see.
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --score|--expect)
+      case "${2:-}" in
+        /*) ARGS+=("$1" "$2") ;;
+        "") echo "$1 wants a path" >&2; exit 2 ;;
+        *)  ARGS+=("$1" "$PWD/$2") ;;
+      esac
+      shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 cd "$(dirname "$0")"
 HERE="$(pwd)"

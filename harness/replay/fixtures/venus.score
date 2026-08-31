@@ -1,0 +1,10 @@
+prologue 0 / 0
+cmds 506657 / 506657
+ctl 606 / 606
+skipped flow-control 72172
+skipped classic [2, 4, 5, 6, 7]
+unreplayable imports []
+parked 0
+census ctx=8 allocations=0
+census ctx=8 allocations=0
+census ctx=8 allocations=0
