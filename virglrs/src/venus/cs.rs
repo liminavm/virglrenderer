@@ -508,6 +508,20 @@ mod tests {
         assert_eq!(sizeof_scalar_array::<u32>(3), 12);
     }
 
+    /// An empty array is common on the wire, and the arena's cursor after an odd-sized allocation
+    /// is not aligned for anything. Handing that cursor back as a zero-length slice makes every
+    /// later `from_raw_parts` on it a misaligned read.
+    #[test]
+    fn a_zero_length_array_is_still_aligned() {
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
+        dec.alloc_temp_array::<u8>(1).unwrap();
+        let empty = dec.alloc_temp_array::<u64>(0).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.as_ptr().align_offset(align_of::<u64>()), 0);
+    }
+
     #[test]
     fn a_short_stream_poisons_instead_of_panicking() {
         let temp = Bump::new();
