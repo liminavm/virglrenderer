@@ -42,6 +42,12 @@ pub mod serialize {
     include!(concat!(env!("OUT_DIR"), "/venus/serialize.rs"));
 }
 
+/// What this build tells a guest it speaks: the wire format version, the vk.xml it was generated
+/// from, and the extension table the venus capset's bitmask is built out of.
+pub mod info {
+    include!(concat!(env!("OUT_DIR"), "/venus/info.rs"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::serialize::*;
@@ -187,6 +193,26 @@ mod tests {
             vn_dispatch_command(&mut dec, None, VkCommandTypeEXT(0x7fff_ffff), &mut h),
             None
         );
+    }
+
+    /// The capset hands the guest a bitmask indexed by extension number, and the guest reads it
+    /// to decide what it may send. A table that disagrees with what the serializer can actually
+    /// decode is a protocol mismatch that shows up as a corrupt stream, not as an error.
+    #[test]
+    fn the_extension_table_is_searchable_and_masks_by_number() {
+        use super::info;
+
+        assert!(info::EXTENSIONS.windows(2).all(|w| w[0].0 < w[1].0), "table must be sorted");
+
+        let venus = info::extension("VK_MESA_venus_protocol").expect("venus is serializable");
+        assert_eq!(venus.2, info::spec_version("VK_MESA_venus_protocol"));
+        assert_ne!(venus.2, 0);
+        assert_eq!(info::spec_version("VK_NOT_A_REAL_EXTENSION"), 0);
+
+        let mut mask = vec![0u32; (info::MAX_EXTENSION_NUMBER / 32 + 1) as usize];
+        info::extension_mask(&mut mask);
+        let n = venus.1;
+        assert_ne!(mask[(n / 32) as usize] & (1 << (n % 32)), 0, "venus must be in the mask");
     }
 
     #[test]

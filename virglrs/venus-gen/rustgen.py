@@ -658,6 +658,77 @@ class RustGen:
         out = stmt.replace('vn_cs_renderer_protocol_has_extension(', 'PROTO.has_extension(')
         return out.replace('vn_cs_renderer_protocol_has_api_version(', 'PROTO.has_api_version(')
 
+    @staticmethod
+    def _vk_version(macro):
+        """`VK_MAKE_API_VERSION(0, 1, 4, 357)` as the number Vulkan packs it into.
+
+        The model hands this out as the C macro text, because its only consumer until now emitted
+        C and let the preprocessor do the arithmetic. Rust has no preprocessor, so the generator
+        does it -- with Vulkan's own field widths, not a guess at them.
+        """
+        name, _, rest = macro.partition('(')
+        parts = [int(p.strip()) for p in rest.rstrip(')').split(',')]
+        if name == 'VK_MAKE_API_VERSION':
+            variant, major, minor, patch = parts
+        else:
+            assert name == 'VK_MAKE_VERSION', macro
+            variant = 0
+            major, minor, patch = parts
+        return (variant << 29) | (major << 22) | (minor << 12) | patch
+
+    def render_info(self, protocol_module):
+        """What the guest is told the renderer speaks, and what the renderer checks it against.
+
+        The venus capset carries a bitmask over extension *numbers*, so the guest and renderer agree
+        on a protocol before a single command is decoded. The same table answers
+        `Protocol::has_extension`, which is why it is generated rather than written: an extension
+        this build cannot serialize must not appear in the mask.
+        """
+        exts = sorted((e for e in self.gen.reg.extensions
+                       if e.name in protocol_module.VK_XML_EXTENSION_LIST),
+                      key=lambda e: e.name)
+        max_number = max(e.number for e in exts)
+        assert max_number > 0
+
+        out = ['/// The wire format venus-protocol pins. A guest speaking another one cannot be',
+               '/// served at all -- the bytes would parse into different structs.',
+               'pub const WIRE_FORMAT_VERSION: u32 = %d;' % protocol_module.VN_WIRE_FORMAT_VERSION,
+               '',
+               '/// The vk.xml this renderer was generated from. Reported to the guest so it can',
+               '/// refuse a renderer older than the structs it means to send.',
+               'pub const VK_XML_VERSION: u32 = %d;' % self._vk_version(
+                   self.gen.reg.vk_xml_version),
+               '',
+               '/// The highest extension number in the table, which is what sizes the capset mask.',
+               'pub const MAX_EXTENSION_NUMBER: u32 = %d;' % max_number,
+               '',
+               '/// Every extension this build can serialize: name, number, spec version.',
+               '/// Sorted by name, because `extension` binary-searches it.',
+               'pub static EXTENSIONS: &[(&str, u32, u32)] = &[']
+        for e in exts:
+            out.append('    ("%s", %d, %d),' % (e.name, e.number, e.version))
+        out += ['];', '']
+
+        out += ['/// The extension\'s entry, or `None` if this build does not serialize it.',
+                'pub fn extension(name: &str) -> Option<&\'static (&\'static str, u32, u32)> {',
+                '    EXTENSIONS.binary_search_by_key(&name, |e| e.0).ok().map(|i| &EXTENSIONS[i])',
+                '}',
+                '',
+                '/// The spec version the guest is told, or 0 for an extension we do not serialize.',
+                '/// Zero is the honest answer: the guest reads it as "not supported".',
+                'pub fn spec_version(name: &str) -> u32 {',
+                '    extension(name).map_or(0, |e| e.2)',
+                '}',
+                '',
+                '/// The capset\'s extension bitmask, indexed by extension number.',
+                'pub fn extension_mask(out: &mut [u32]) {',
+                '    for (_, number, _) in EXTENSIONS {',
+                '        out[(number / 32) as usize] |= 1 << (number % 32);',
+                '    }',
+                '}',
+                '']
+        return '\n'.join(out)
+
     def render_serialize(self, gaps):
         """The whole serializer: handles, structs, chains."""
         out = []
