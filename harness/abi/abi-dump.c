@@ -8,6 +8,7 @@
 //
 // Built and run by abi-fixture.sh. Sizes and offsets come from the compiler, so this is the
 // authority for the platform it is built on -- not a transcription anyone has to keep in step.
+#include "virgl_hw.h"
 #include "virglrenderer.h"
 
 #include <stddef.h>
@@ -81,6 +82,44 @@ int main(void)
    F(virgl_renderer_resource_import_blob_args, fd_type);
    F(virgl_renderer_resource_import_blob_args, fd);
    F(virgl_renderer_resource_import_blob_args, size);
+
+   S(virgl_renderer_hdr);
+   F(virgl_renderer_hdr, stype);
+   F(virgl_renderer_hdr, stype_version);
+   F(virgl_renderer_hdr, size);
+
+   S(virgl_renderer_export_query);
+   F(virgl_renderer_export_query, hdr);
+   F(virgl_renderer_export_query, in_resource_id);
+   F(virgl_renderer_export_query, out_num_fds);
+   F(virgl_renderer_export_query, in_export_fds);
+   F(virgl_renderer_export_query, out_fourcc);
+   F(virgl_renderer_export_query, out_fds);
+   F(virgl_renderer_export_query, out_strides);
+   F(virgl_renderer_export_query, out_offsets);
+   F(virgl_renderer_export_query, out_modifier);
+
+   S(virgl_renderer_supported_structures);
+   F(virgl_renderer_supported_structures, hdr);
+   F(virgl_renderer_supported_structures, in_stype_version);
+   F(virgl_renderer_supported_structures, out_supported_structures_mask);
+
+   S(virgl_renderer_resource_info_ext);
+   F(virgl_renderer_resource_info_ext, version);
+   F(virgl_renderer_resource_info_ext, base);
+   F(virgl_renderer_resource_info_ext, has_dmabuf_export);
+   F(virgl_renderer_resource_info_ext, planes);
+   F(virgl_renderer_resource_info_ext, modifiers);
+   F(virgl_renderer_resource_info_ext, d3d_tex2d);
+
+   /* Not in virglrenderer.h, but it crosses the ABI all the same: every transfer call takes one. */
+   S(virgl_box);
+   F(virgl_box, x);
+   F(virgl_box, y);
+   F(virgl_box, z);
+   F(virgl_box, w);
+   F(virgl_box, h);
+   F(virgl_box, d);
 
    return 0;
 }
