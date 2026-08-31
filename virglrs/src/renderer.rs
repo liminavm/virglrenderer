@@ -297,19 +297,36 @@ impl Renderer {
     pub fn venus_todo(&self) -> Vec<(&'static str, u64)> {
         self.venus.as_ref().map(|v| v.todo.by_frequency()).unwrap_or_default()
     }
+
+    /// One venus context's live device memory, as (guest id, size).
+    ///
+    /// `None` when there is no such venus context, which the ABI reports as a failure -- a census
+    /// of nothing and a census that could not be taken are different answers, and the VMM decides
+    /// whether to snapshot on the difference.
+    pub fn venus_memory_census(&self, ctx_id: CtxId) -> Option<Vec<(u64, u64)>> {
+        Some(self.venus.as_ref()?.context(ctx_id)?.driver().memory_census())
+    }
+
+    /// Copy one allocation's contents out. False when the context, the id, or the mapping fails.
+    pub fn venus_memory_read(&self, ctx_id: CtxId, mem_id: u64, buf: &mut [u8]) -> bool {
+        let Some(ctx) = self.venus.as_ref().and_then(|v| v.context(ctx_id)) else {
+            return false;
+        };
+        ctx.driver().memory_read(mem_id, buf)
+    }
 }
 
 /// What this build cannot do for the flags it was given, in one phrase for the startup log.
 ///
-/// venus decodes and dispatches but serves no command yet; vrend does not exist at all. Saying
-/// which is which is the difference between a log line that explains a failure and one that
-/// misleads about it.
+/// venus decodes and dispatches everything but serves only part of it -- `dump_state` prints
+/// which part -- and vrend does not exist at all. Saying which is which is the difference between
+/// a log line that explains a failure and one that misleads about it.
 pub fn unsupported_renderers(flags: c_int) -> &'static str {
     let venus = flags & abi::VENUS != 0;
     let vrend = flags & abi::NO_VIRGL == 0;
     match (venus, vrend) {
-        (true, true) => "venus dispatches but serves no command; no vrend",
-        (true, false) => "venus dispatches but serves no command",
+        (true, true) => "venus serves only part of the protocol; no vrend",
+        (true, false) => "venus serves only part of the protocol",
         (false, true) => "no vrend",
         (false, false) => "no renderer asked for",
     }

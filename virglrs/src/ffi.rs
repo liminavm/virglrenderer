@@ -46,6 +46,7 @@ fn with<T>(err: T, f: impl FnOnce(&mut Renderer) -> T) -> T {
 
 const ENOTSUP: c_int = -libc::ENOTSUP;
 const EINVAL: c_int = -libc::EINVAL;
+const ENOMEM: c_int = -libc::ENOMEM;
 
 /// A symbol that belongs to a phase this build has not reached.
 ///
@@ -731,21 +732,60 @@ pub extern "C" fn virgl_renderer_limina_sync_restore(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_memory_census(
-    _ctx_id: u32,
-    _out_pairs: *mut *mut u64,
-    _out_count: *mut u32,
+    ctx_id: u32,
+    out_pairs: *mut *mut u64,
+    out_count: *mut u32,
 ) -> c_int {
-    todo_phase!("P2: the venus memory census")
+    if out_pairs.is_null() || out_count.is_null() {
+        return EINVAL;
+    }
+    with(EINVAL, |r| {
+        let Some(pairs) = r.venus_memory_census(CtxId(ctx_id)) else {
+            return EINVAL;
+        };
+        // The array is the caller's to `free`, which is the ABI's contract and the reason this
+        // does not hand out a `Vec`: the VMM is C and frees it with `free`.
+        let n = pairs.len();
+        let buf = if n == 0 {
+            core::ptr::null_mut()
+        } else {
+            let p = unsafe { libc::malloc(n * 2 * size_of::<u64>()) }.cast::<u64>();
+            if p.is_null() {
+                return ENOMEM;
+            }
+            for (i, (id, size)) in pairs.iter().enumerate() {
+                // SAFETY: `p` holds 2*n u64s and `i` is below `n`.
+                unsafe {
+                    p.add(2 * i).write(*id);
+                    p.add(2 * i + 1).write(*size);
+                }
+            }
+            p
+        };
+        // SAFETY: both checked non-null above; the VMM's contract is that they are writable.
+        unsafe {
+            *out_pairs = buf;
+            *out_count = n as u32;
+        }
+        0
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_memory_read(
-    _ctx_id: u32,
-    _mem_id: u64,
-    _buf: *mut c_void,
-    _size: u64,
+    ctx_id: u32,
+    mem_id: u64,
+    buf: *mut c_void,
+    size: u64,
 ) -> c_int {
-    todo_phase!("P2: the venus memory census")
+    if buf.is_null() || size == 0 {
+        return EINVAL;
+    }
+    with(EINVAL, |r| {
+        // SAFETY: the VMM's contract is `size` writable bytes at `buf` for the length of the call.
+        let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize) };
+        if r.venus_memory_read(CtxId(ctx_id), mem_id, out) { 0 } else { EINVAL }
+    })
 }
 
 #[unsafe(no_mangle)]
