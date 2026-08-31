@@ -692,6 +692,50 @@ static int ensure_session(struct virgl_video_codec *codec,
         !memcmp(codec->session_config, codec->frame_config, codec->frame_config_len))
         return 0;
 
+    /*
+     * H.264's parameter sets are not constant across a stream, and tearing the session down
+     * when they change is not survivable. num_ref_idx_lX_active_minus1 reaches us as the
+     * EFFECTIVE per-slice count, so a slice that overrides the PPS default changes the PPS
+     * we synthesize by a byte or two mid-GOP; keying the session on those bytes rebuilt the
+     * decompression session there and took the DPB with it. Every frame after the first
+     * override then referenced an empty DPB -- decoding "succeeded" and the pixels were
+     * wrong, which is far quieter than a rejected parameter set.
+     *
+     * So the config bytes drive the FORMAT DESCRIPTION only. If VideoToolbox will accept the
+     * new description on the live session, swap it in and keep the session: end_frame hangs
+     * the current description on each sample buffer, so the next frame decodes against it.
+     * Falling through to the rebuild stays correct, just lossy, and says so.
+     */
+    if (is_h264(codec->profile) && codec->session && codec->format &&
+        codec->session_width == codec->frame_width &&
+        codec->session_height == codec->frame_height &&
+        codec->session_target_format == target_format &&
+        codec->h264_sps_len && codec->h264_pps_len) {
+        const uint8_t *sets[2] = {
+            codec->frame_config,
+            codec->frame_config + codec->h264_sps_len,
+        };
+        const size_t set_sizes[2] = { codec->h264_sps_len, codec->h264_pps_len };
+        CMVideoFormatDescriptionRef fresh = NULL;
+
+        status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            kCFAllocatorDefault, 2, sets, set_sizes, 4, &fresh);
+        if (status == noErr && fresh) {
+            if (VTDecompressionSessionCanAcceptFormatDescription(codec->session, fresh)) {
+                CFRelease(codec->format);
+                codec->format = fresh;
+                memcpy(codec->session_config, codec->frame_config, codec->frame_config_len);
+                codec->session_config_len = codec->frame_config_len;
+                VT_TRACE("h264: parameter sets changed (sps %zu pps %zu), session kept\n",
+                         codec->h264_sps_len, codec->h264_pps_len);
+                return 0;
+            }
+            CFRelease(fresh);
+            virgl_error("video: h264 parameter set change needs a new session;"
+                        " the reference picture buffer is lost across it\n");
+        }
+    }
+
     destroy_session(codec);
 
     /*
