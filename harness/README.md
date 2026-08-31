@@ -36,8 +36,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `build.sh`, pointing `VIRGL_PREFIX` at whichever implementation is under test.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
+- `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
+  then the whole stream in execution order through the limina replay ABI, and reports a per-kind
+  tally. Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at
+  the ICD under test.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
-  structurally before it is pinned as a fixture).
+  structurally before it is pinned as a fixture, and reports how many records were recorded out of
+  execution order — see the ordering rule in `src/venus/vkr_record.h`).
 
 Corpora come from vrend's in-memory tracer (`LIMINA_VREND_TRACE=<MB>`) for classic contexts, and
 from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) for venus. Both
@@ -46,12 +51,11 @@ path nothing until it happens.
 
 ### What P0 still has to build
 
-- **A venus replayer.** The capture side exists: `src/venus/vkr_record.[ch]` records a prologue
-  (each context's journal export, taken when its first command is recorded) plus the wire bytes
-  of every command dispatched after that, and `vkr_record.h` states the replay contract the
-  replayer must implement — prologue, then stream in seq order, ring commands through
-  `replay_ring_cmd` and the rest through `replay_submit`, all before `replay_end` starts the ring
-  threads. Nothing consumes it yet.
+- **Scoring for the venus replayer.** `replay/rs` replays a corpus end to end — a 580k-record
+  vkmark capture feeds 506657 commands and 606 control events with no failures — but what it
+  prints (an accepted/rejected tally, a per-context allocation count and byte total) is not
+  something two implementations can be diffed on, and none of it is pinned. It can fail a crash,
+  not a regression.
 - **Fixture-named scoring.** The default readback target is picked by a heuristic inherited from
   the debugging spike this grew out of. A corpus wants its scored resources named by the fixture.
 - **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`, which is a
