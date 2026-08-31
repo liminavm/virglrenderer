@@ -61,10 +61,8 @@ impl Retirement {
             write_fence: cb.write_fence,
             write_context_fence: cb.write_context_fence,
         };
-        let q = Arc::new((
-            Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }),
-            Condvar::new(),
-        ));
+        let q =
+            Arc::new((Mutex::new(Queue { jobs: VecDeque::new(), stopped: false }), Condvar::new()));
         let qt = Arc::clone(&q);
         let thread = std::thread::Builder::new()
             .name("virglrs-fence".into())
