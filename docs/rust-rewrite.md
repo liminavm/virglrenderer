@@ -122,8 +122,8 @@ invariants a port owes, none of which the C encodes as a type:
    venus-protocol's generator to emit Rust.** Only `vkxml.py` (the vk.xml model) is
    language-neutral. `vn_protocol.py`'s `Gen` class emits C *statements* — the
    `VariableInfo` machinery and `_sizeof/_encode/_decode_variable` are as much of the
-   backend as `templates/` is — so the fork is roughly 1k lines of emitter plus 1.5k
-   lines of template, not templates alone. The fork lives in this tree
+   backend as `templates/` is — so the fork is emitter plus template, not templates
+   alone: 1.4k lines of Python emitting 161k lines of Rust. The fork lives in this tree
    (`virglrs/venus-gen/`) and imports the subproject's model over `sys.path`: the
    subproject is wrap-managed and any edit inside it is eaten by the next re-clone.
    The generated decode is *safe* Rust — bounds-checked slices over guest bytes,
@@ -133,8 +133,15 @@ invariants a port owes, none of which the C encodes as a type:
    The differential test is a round trip, not a C dump: the recorded ring bytes *are*
    C-encoder output from the guest's mesa driver, so Rust-decode → Rust-re-encode →
    byte-compare against the original wire diffs the two implementations over every
-   recorded command for free. It does not cover reply encoding; the state score does
-   that indirectly once replay runs.
+   recorded command for free. It does not cover reply encoding, and **nothing else
+   does either**: both replay entry points call `vkr_replay_strip_reply`, so a replay
+   never encodes a reply, and the state score measures what commands did rather than
+   what was said back. The oracle for that is the same generator run the other way —
+   `is_driver=True` emits mesa's C driver decoder, and the subproject's
+   `tests/vn_cs.h` already ships its interface as no-op stubs. Feeding Rust-encoded
+   reply bytes to the C driver decoder is a differential test over the 326 per-command
+   reply wrappers, which the round trip never touches. Without it, reply encoding is
+   first exercised by a booting guest.
 2. **`vrend_shader.c` (8.6k).** TGSI→GLSL with variant keys. No crate exists; a
    direct port. Mechanical but unforgiving — the shader key logic is where subtle
    divergence hides, and it is exercised by every draw.
@@ -151,6 +158,14 @@ invariants a port owes, none of which the C encodes as a type:
    submit call returns. That visibility point is observable and must be reproduced —
    see the ordering rule in `src/venus/vkr_record.h`. It is also the one place a
    process-global ordering counter is not a design failure.
+   This is also where the guest stops being able to kill the VM. Mesa's Vulkan runtime
+   and KosmicKrisp carry ~820 `assert()`s, many on values a guest controls, and an
+   assert on the vkr ring thread aborts the whole worker — limina compiles them out
+   with `-Db_ndebug=true` because it has no better lever. The lever belongs here:
+   reject at the boundary and poison the context. Four cases have already killed a VM
+   and are the first validation rules and harness cases: degenerate
+   `vkCmdClearAttachments` rects, `vkCreateBuffer` with `size == 0`, a render-pass
+   format mismatch, and an attachment-less pass with `defaultRasterSampleCount == 0`.
 5. **The snapshot family** — journal export, sync export/restore, classic content
    export/restore. Subtlest behaviour, smallest code, and it has no meaning until
    the thing it journals works. Its *siblings* do not wait: the replay feed
@@ -160,9 +175,32 @@ invariants a port owes, none of which the C encodes as a type:
    already, well understood, and it maps cleanly onto `objc2` +
    `objc2-video-toolbox` + `objc2-io-surface`. `dav1d` → `rav1d` (the Rust port).
 
-Crates that carry weight: `ash` (Vulkan), `objc2` family (IOSurface, Metal,
-VideoToolbox, Mach ports), `rav1d`. `u_format`'s table is already generated from
-Mesa's XML — port that generator to emit Rust alongside the venus one.
+Crates that carry weight: `objc2` family (IOSurface, Metal, VideoToolbox, Mach
+ports), `rav1d`. `u_format`'s table is already generated from Mesa's XML — port that
+generator to emit Rust alongside the venus one.
+
+**Vulkan is reached through a generated proc table, not `ash`.** The decoder fills our
+own `#[repr(C)]` structs from the pinned vk.xml; ash's are different Rust types for
+the same layout, so using it means either generating a field-by-field conversion for
+~200 struct types or transmuting on a layout equality nothing checks — the exact class
+of bug this rewrite exists to delete. The C already does the right thing: decoded
+struct pointer straight to the ICD through a resolved proc pointer. We generate that
+table from the same vk.xml, which also covers the private MESA commands ash has never
+seen. Layout parity gets pinned the way the capset is, with `cc` and `offsetof`
+against `subprojects/venus-protocol-1.0/include/vulkan/vulkan.h` — the header matching
+the pinned vk.xml. Skew is bounded: Vulkan extends through `pNext` and never adds
+fields to an existing struct.
+
+**The Khronos loader is linked, not dlopened, and it picks the driver.** KosmicKrisp
+exports only `vk_icdGetInstanceProcAddr` and `vk_icdNegotiateLoaderICDInterfaceVersion`
+— it is an ICD, and talking to it directly would mean implementing a loader. Driver
+selection is therefore the loader's `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`, which is what
+limina already sets; virglrs hardcodes no driver. The loader is *linked* rather than
+dlopened for the reason limina's C build passes `-Dvulkan-dload=false`: the worker is
+codesigned with a hardened runtime, which strips `DYLD_*`, so a bare-name runtime
+dlopen resolves nothing and venus silently enumerates zero GPUs. Going through the
+loader also buys the validation layers and vulkan-tools' mock ICD, which keeps the
+GPU-free replay gate alive once real handlers exist.
 
 ## Why vrend is pass-1 scope
 
@@ -256,7 +294,11 @@ buildable throughout as the A-side reference.
 - **P2 — venus.** Fork venus-protocol's generator to emit Rust; gate the decoder on a
   byte-identical wire round trip over both corpora. Then vkr: instance/device/queue/memory/
   image/buffer/descriptor/command-buffer, rings, budget, the Metal + IOSurface
-  helpers. Ends at a seated venus GNOME desktop, booted with the existing venus-only
+  helpers. Midpoint gate, before any VM: both corpora replay to completion and their
+  scores match the fixtures pinned from the C build. Replay strips replies and needs
+  no display, so score parity is reachable with handlers alone and catches a wrong
+  handler where a boot only reports that something is broken. Ends at a seated venus
+  GNOME desktop, booted with the existing venus-only
   `virgl_override` limina already has for forcing venus-only flags — no new
   machinery, and no classic stubs that have to lie about capsets. Carries the replay
   feed and `memory_census`/`memory_read` with it, because those are what the venus
