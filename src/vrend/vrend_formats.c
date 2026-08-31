@@ -541,9 +541,11 @@ static void vrend_add_compressed_formats(struct vrend_format_table *table, int n
  * That is exactly the contract gallium expects from a driver that advertises
  * native YUV sampling: one sampler view in the composite format, returning
  * RGB. Advertising these is what keeps the guest OFF the "lowered" path, where
- * it would import each plane as its own R8/RG8 pipe_resource -- all sharing one
- * virtio resource handle, which the protocol cannot tell apart (I420's two
- * chroma planes are identical in format AND size).
+ * it imports each plane as its own R8/RG8 pipe_resource. That path is not
+ * unworkable -- the sampler view carries a plane index beside the format, which
+ * is what separates two chroma planes of identical format and size -- but it
+ * costs a resource and a view per plane, and it leans on an index the host can
+ * only act on where it holds a per-plane image to select with.
  *
  * SAMPLER_VIEW only, never a render target: nothing renders into a YUV
  * surface, and the storage is a lie we only maintain in one direction.
