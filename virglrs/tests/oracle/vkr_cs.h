@@ -50,12 +50,12 @@ vn_oracle_encoder_init(struct vkr_cs_encoder *enc, void *buf, size_t cap)
     enc->fatal = false;
 }
 
-/* `(size_t)-1` rather than a short count: a reply that overran its buffer wrote nothing
- * trustworthy, and the caller must not diff it against ours as though it had. */
+/* How far the encoder got. Only meaningful when it did not overrun -- the caller checks `fatal`
+ * first, because a truncated reply must never be diffed against a whole one. */
 static inline size_t
 vn_oracle_encoder_len(const struct vkr_cs_encoder *enc)
 {
-    return enc->fatal ? (size_t)-1 : (size_t)(enc->cur - enc->base);
+    return (size_t)(enc->cur - enc->base);
 }
 
 static inline bool
