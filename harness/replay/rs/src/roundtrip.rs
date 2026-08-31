@@ -109,6 +109,10 @@ fn round_trip(wire: &[u8], tally: &mut Tally) {
     // bytes uninitialised, and this one zeroes them on purpose. Compare everything else.
     let mut got = enc.written().to_vec();
     for span in enc.padding() {
+        // Every pad this encoder writes is sub-word alignment, and each one sits behind a length
+        // word that already had to match. A longer span would mean it padded something that is
+        // not alignment -- a mis-sized write, the one thing this tolerance must never hide.
+        assert!(span.len() <= 3, "padded {} bytes, which is not alignment", span.len());
         if span.end <= got.len() && span.end <= wire.len() {
             got[span.clone()].copy_from_slice(&wire[span.clone()]);
         }
