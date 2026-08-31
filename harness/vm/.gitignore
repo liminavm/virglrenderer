@@ -1,0 +1,6 @@
+# Everything in this directory is a large local artifact — bundles, disk images,
+# build prefixes, captures. Only the scripts and the README are tracked.
+*
+!.gitignore
+!README.md
+!*.sh
