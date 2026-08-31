@@ -25,9 +25,13 @@ SRC_APP="$LIMINA/target/Limina.app"
 APP="$RIG/Limina.app"
 DISKS="$RIG/disks"
 
-# The enhanced image boots the venus desktop (the venus corpus); the stock image exercises
-# classic vrend and the VA-API video path (the vrend corpus). Two tiers, two capture legs.
+# Three guests, because the corpus needs three different renderers exercised:
+#   synoik    a Vulkan compositor — the desktop workload that is venus end to end
+#   enhanced  GNOME, whose shell runs on classic virgl (GALLIUM_DRIVER=virgl); venus here comes
+#             from Vulkan clients, so it is the mixed vrend+venus case
+#   stock     an unmodified guest: classic vrend and the VA-API video path
 SRC_DISKS=(
+  "$LIMINA/Fedora-Workstation-44.enhanced.synoik.raw"
   "$LIMINA/Fedora-Workstation-44.enhanced.test.raw"
   "$LIMINA/Fedora-Workstation-44.stock.test.raw"
 )

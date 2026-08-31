@@ -4,14 +4,19 @@
 #
 # Boot a rig guest with a recorder armed, so a real workload becomes a replay corpus.
 #
-#   capture.sh venus  [options]   enhanced guest, venus full-stream recorder (vkr_record)
+#   capture.sh synoik [options]   synoik (a Vulkan compositor), venus recorder — the desktop
+#                                 workload that is venus end to end
+#   capture.sh venus  [options]   enhanced GNOME guest, venus recorder. Its shell renders through
+#                                 classic virgl, so venus traffic here comes from Vulkan clients
 #   capture.sh vrend  [options]   stock guest, classic command tracer (vrend_trace)
 #
 #   --mb N        recorder capacity, MB (default 256). The venus recorder STOPS at the cap and
 #                 says so — a truncated corpus is a valid prefix, so a small cap costs coverage,
 #                 never validity.
 #   --window      show the guest in a window (default: headless, so a capture does not take over
-#                 the screen)
+#                 the screen). Headless still attaches a virtio-gpu and drives the whole renderer
+#                 -- presented frames go to a PNG instead of a window. Omitting BOTH would attach
+#                 no GPU at all and record nothing, which is what --display-capture prevents.
 #   --seconds N   dump automatically N seconds after boot, then leave the VM running
 #   --            everything after is passed to the limina binary
 #
@@ -38,11 +43,13 @@ APP="$RIG/Limina.app/Contents/MacOS/limina"
 [ -x "$APP" ] || { echo "no rig — run make-rig.sh" >&2; exit 1; }
 
 case "$MODE" in
-  venus)
-    DISK="$RIG/disks/Fedora-Workstation-44.enhanced.test.raw"
+  synoik|venus)
+    [ "$MODE" = synoik ] \
+      && DISK="$RIG/disks/Fedora-Workstation-44.enhanced.synoik.raw" \
+      || DISK="$RIG/disks/Fedora-Workstation-44.enhanced.test.raw"
     export LIMINA_VKR_RECORD="$MB"
-    export LIMINA_VKR_RECORD_OUT="$RIG/captures/venus.vkrc"
-    export LIMINA_VKR_RECORD_FIFO="$RIG/captures/venus.fifo"
+    export LIMINA_VKR_RECORD_OUT="$RIG/captures/$MODE.vkrc"
+    export LIMINA_VKR_RECORD_FIFO="$RIG/captures/$MODE.fifo"
     OUT="$LIMINA_VKR_RECORD_OUT" ;;
   vrend)
     DISK="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
@@ -50,7 +57,8 @@ case "$MODE" in
     export LIMINA_VREND_TRACE_OUT="$RIG/captures/vrend.bin"
     export LIMINA_VREND_TRACE_FIFO="$RIG/captures/vrend.fifo"
     OUT="$LIMINA_VREND_TRACE_OUT" ;;
-  *) echo "usage: capture.sh {venus|vrend} [--mb N] [--window] [--seconds N]" >&2; exit 2 ;;
+  *) echo "usage: capture.sh {synoik|venus|vrend} [--mb N] [--window] [--seconds N]" >&2
+     exit 2 ;;
 esac
 
 [ -f "$DISK" ] || { echo "missing disk: $DISK — run make-rig.sh" >&2; exit 1; }
@@ -60,9 +68,13 @@ ARGS=(--disk "$DISK" --net)
 if [ "$WINDOW" = 1 ]; then
   ARGS+=(--window)
 else
-  # A headless boot still drives the whole renderer: the display sink reads the scanout
-  # IOSurface back rather than presenting it, so venus and vrend see the same traffic.
-  ARGS+=(--firmware "$RIG/Limina.app/Contents/Resources/KRUN_EFI.gop.fd")
+  # --display-capture is what makes a headless boot still a GRAPHICS boot: it attaches the
+  # virtio-gpu and writes presented frames to a PNG rather than a window. A boot with neither
+  # --window nor --display-capture gets no virtio-gpu at all -- the guest comes up with an empty
+  # /sys/class/drm, no venus context is ever created, and the recorder never even arms.
+  ARGS+=(--display-capture "$RIG/captures/$MODE-frame.png"
+         --display-size "${LIMINA_DISPLAY_SIZE:-1280x800}"
+         --firmware "$RIG/Limina.app/Contents/Resources/KRUN_EFI.gop.fd")
 fi
 
 echo "==> $MODE capture, ${MB} MB -> $OUT"

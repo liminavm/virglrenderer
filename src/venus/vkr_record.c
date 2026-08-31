@@ -28,6 +28,7 @@
  * recorded. Owned here, freed at teardown. */
 struct vkr_record_ctx {
    uint32_t ctx_id;
+   uint32_t generation;
    bool live;
    void *journal_blob;
    size_t journal_size;
@@ -42,6 +43,7 @@ static struct {
    uint32_t flags;
    struct vkr_record_ctx ctxs[VKR_RECORD_MAX_CTX];
    uint32_t nctx;
+   uint32_t next_generation;
    char out_path[512];
    char fifo_path[512];
 } rec;
@@ -173,6 +175,10 @@ rec_ctx_locked(struct vkr_context *ctx)
 
    struct vkr_record_ctx *rc = &rec.ctxs[rec.nctx];
    rc->ctx_id = ctx_id;
+   /* Monotonic over adopted contexts, never reset. The guest reuses context ids, so this is the
+    * half of the identity that makes a record attributable to one context rather than to a number
+    * two contexts happened to share. */
+   rc->generation = rec.next_generation++;
    rc->live = true;
 
    /* The prologue is the state this context's stream starts from, so it must be
@@ -250,8 +256,8 @@ vkr_record_dispatch(struct vkr_context *ctx,
    uint8_t *p = rec.buf + rec.used;
    const uint64_t seq = rec.seq++;
    const uint32_t ctx_id = rc->ctx_id;
+   const uint32_t generation = rc->generation;
    const uint32_t sz = (uint32_t)size;
-   const uint32_t pad = 0;
 
    memcpy(p, &seq, sizeof seq);
    p += sizeof seq;
@@ -259,12 +265,12 @@ vkr_record_dispatch(struct vkr_context *ctx,
    p += sizeof ring_id;
    memcpy(p, &ctx_id, sizeof ctx_id);
    p += sizeof ctx_id;
+   memcpy(p, &generation, sizeof generation);
+   p += sizeof generation;
    memcpy(p, &cmd_type, sizeof cmd_type);
    p += sizeof cmd_type;
    memcpy(p, &sz, sizeof sz);
    p += sizeof sz;
-   memcpy(p, &pad, sizeof pad);
-   p += sizeof pad;
    memcpy(p, data, size);
    memset(p + size, 0, rec_align4(size) - size);
 
@@ -342,10 +348,10 @@ rec_dump_locked(void)
       struct vkr_record_ctx *rc = &rec.ctxs[i];
       if (!rc->journal_blob)
          continue;
-      const uint32_t pad = 0;
       const uint64_t size = rc->journal_size;
       ok = rec_write_all(f, &rc->ctx_id, sizeof rc->ctx_id) &&
-           rec_write_all(f, &pad, sizeof pad) && rec_write_all(f, &size, sizeof size) &&
+           rec_write_all(f, &rc->generation, sizeof rc->generation) &&
+           rec_write_all(f, &size, sizeof size) &&
            rec_write_all(f, rc->journal_blob, rc->journal_size) &&
            rec_write_all(f, zeros, rec_align4(rc->journal_size) - rc->journal_size);
    }
