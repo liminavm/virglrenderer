@@ -240,7 +240,10 @@ buildable throughout as the A-side reference.
 - **P1 — Skeleton.** The virglrs tree scaffolded in this repository, producing a
   dylib and a prefix layout interchangeable with the C build's. All 69 symbols
   exported and stubbed; the ABI types, resource table, context table, fence tracking,
-  and async fence retirement implemented for real. Gate: `abi/abi-fixture.sh` green
+  and async fence retirement implemented for real. Vendored into limina the way this
+  tree already is — pinned in `third_party/manifest.toml`, with
+  `build-virglrenderer.sh` grown a `VIRGL_IMPL=rust` leg producing the same prefix
+  layout — so the switch is a manifest edit, not a build-system change. Gate: `abi/abi-fixture.sh` green
   with `VIRGL_PREFIX` pointed at the Rust build, and both replayers loading that dylib
   and getting through init, context create and resource create without error. All of
   it VM-free — a phase whose point is going fast does not gate on a boot.
@@ -278,3 +281,6 @@ buildable throughout as the A-side reference.
   upstream's future vrend and vkr work stops being something we can merge.
 - The C tree stays buildable for the whole rewrite. It is the reference the harness
   records goldens from, and the fallback if a phase stalls.
+- **Fork discipline still applies.** This tree is pinned by revision in limina's
+  `third_party/manifest.toml`, so tag before any branch rewrite — every pinned rev has
+  to stay reachable, and a rebase that orphans one breaks a build nobody is watching.
