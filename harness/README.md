@@ -62,6 +62,12 @@ path nothing until it happens.
   compiles clean and corrupts at runtime, and nothing else here would catch it.
 - **Pinned goldens** recorded from the C build before any Rust lands.
 
+## The capture rig (`vm/`)
+
+Layers 1 and 2 both need corpora, and a corpus comes from a real guest. `vm/` builds a
+self-contained rig — limina's app bundle with this tree's renderer swapped in, plus APFS clones of
+an enhanced and a stock disk — so captures never mutate limina's working set. See `vm/README.md`.
+
 ## Layer 3 — carried over
 
 `tests/test_virgl_*` in this tree are ABI-level and should link against either implementation.
