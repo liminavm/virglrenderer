@@ -48,6 +48,15 @@ pub mod info {
     include!(concat!(env!("OUT_DIR"), "/venus/info.rs"));
 }
 
+/// Deterministic contents for a reply's output members, and the entry point the reply oracle
+/// drives. Test scaffolding, behind the feature that builds the C encoder it exists to diff
+/// against -- a renderer never plants values in its own replies.
+#[cfg(feature = "reply-oracle")]
+#[allow(non_camel_case_types, non_snake_case, dead_code)]
+pub mod fill {
+    include!(concat!(env!("OUT_DIR"), "/venus/fill.rs"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::serialize::*;

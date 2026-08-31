@@ -729,6 +729,204 @@ class RustGen:
                 '']
         return '\n'.join(out)
 
+    # --- the reply oracle's fill ---
+
+    # `pNext` stays null: chaining the outputs takes the reachable type set from 42 structs to
+    # 235, and the null branch is the one a recorded command already exercises. `sType` is not
+    # skipped but pinned -- the C encoder asserts on it, and a fresh output struct has no guest
+    # request behind it to have set it.
+    FILL_SKIP = frozenset(['pNext'])
+
+    def _out_types(self, commands):
+        """Every type a reply encoder can reach, walked from the out members inward.
+
+        Far smaller than the serializer's world -- outputs are handles, results and property
+        structs -- which is what makes a typed fill an afternoon rather than a second generator.
+        """
+        by_name = {t.name: t for cats in self.gen.supported_types.values() for t in cats}
+        seen, work = {}, []
+        for ty in commands:
+            work += [v.ty.base.name for v in self._out_vars(ty)]
+        while work:
+            name = work.pop()
+            if name in seen:
+                continue
+            ty = by_name.get(name)
+            seen[name] = ty
+            if ty is not None and ty.category in (VkType.STRUCT, VkType.UNION):
+                work += [m.ty.base.name for m in ty.variables]
+        return [t for t in seen.values()
+                if t is not None and t.category in (VkType.STRUCT, VkType.UNION)]
+
+    @staticmethod
+    def _out_vars(ty):
+        """A command's reply members: what it returns, and what it was asked to write."""
+        return ([ty.ret] if ty.ret else []) + [v for v in ty.variables if 'var_out' in v.attrs]
+
+    @staticmethod
+    def _length_members(ty):
+        """Members some other member's length names, which must be planted small rather than
+        counted out of the same sequence as everything else."""
+        names = set()
+        for var in ty.variables:
+            for name in var.attrs.get('len_names') or []:
+                if name:
+                    names.add(name.split('->')[0])
+        return names
+
+    def _fill_leaf(self, ty, value):
+        """Fill one scalar, as an expression of `ty`'s Rust type.
+
+        `as _` rather than a named cast: every one of these is a newtype over a scalar or a
+        primitive, and the field it is assigned to already says which.
+        """
+        base = ty.base
+        if base.category == VkType.DEFAULT:
+            return '%s as _' % value
+        if base.category == VkType.FUNCPOINTER:
+            return 'None'
+        if base.category == VkType.BITMASK:
+            return '%s(%s as _)' % (base.typedef.name if base.typedef else 'VkFlags', value)
+        return '%s(%s as _)' % (base.name, value)
+
+    def _fill_one(self, ty, var, target, value):
+        """Fill a single element of `var`'s base type, reached through `target`."""
+        base = var.ty.base
+        if base.category in (VkType.STRUCT, VkType.UNION):
+            return ['vn_fill_%s(a, f, %s);' % (base.name, target)]
+        return ['*%s = %s;' % (target, self._fill_leaf(var.ty, value))]
+
+    def _fill_member(self, ty, var, small, gaps):
+        """Plant a value in one member, whatever shape it is."""
+        m = 'val.%s' % self.field_name(var.name)
+        base = var.ty.base
+        # The one member whose value is dictated rather than invented. venus-protocol's encoder
+        # asserts a chained struct carries its own tag, and an output struct is allocated here
+        # rather than decoded, so nothing else would set it.
+        if var.name == 'sType' and ty.s_type:
+            return ['%s = VkStructureType::%s;' % (m, ty.s_type)]
+        # A length is read back by the member it sizes, so it decides how much gets allocated.
+        value = 'FILL_COUNT' if var.name in small else 'f.take()'
+
+        try:
+            shape = self._shape(ty, var)
+        except self.Unsupported as e:
+            gaps.append(str(e))
+            return ['/* gap: %s */' % e]
+
+        if not self.gen.is_serializable(var):
+            return ['/* not serializable: %s */' % m]
+
+        if shape[0] == 'plain':
+            if base.category in (VkType.STRUCT, VkType.UNION):
+                return ['vn_fill_%s(a, f, &mut %s);' % (base.name, m)]
+            return ['%s = %s;' % (m, self._fill_leaf(var.ty, value))]
+
+        if shape[0] == 'static':
+            flat = '%s.as_flattened_mut()' % m if shape[2] else '%s' % m
+            return (['for e in %s.iter_mut() {' % flat]
+                    + ['    ' + l for l in self._fill_one(ty, var, 'e', value)]
+                    + ['}'])
+
+        if shape[0] == 'pointer':
+            return (['{',
+                     '    let p = a.alloc(%s);' % self._zero_base(var.ty)]
+                    + ['    ' + l for l in self._fill_one(ty, var, 'p', value)]
+                    + ['    %s = p;' % m,
+                       '}'])
+
+        if shape[0] == 'dynamic':
+            # The length expression carries its own `unsafe` where it derefs a count pointer.
+            # SAFETY, there: the member holding that count is declared before this one and has
+            # already been planted, so the pointer it reads is ours.
+            return (['{',
+                     '    let n = (%s) as usize;' % shape[1],
+                     '    let s = a.alloc_slice_fill_with(n, |_| %s);' % self._zero_base(var.ty),
+                     '    for e in s.iter_mut() {']
+                    + ['        ' + l for l in self._fill_one(ty, var, 'e', value)]
+                    + ['    }',
+                       '    %s = s.as_mut_ptr();' % m,
+                       '}'])
+
+        # Blobs and strings carry their own length rules and no recorded reply exercises one, so
+        # they are named gaps rather than a guess. They stay zeroed, which the oracle can still
+        # compare -- it just cannot tell those bytes apart.
+        gaps.append('%s.%s: fill %s' % (ty.name, var.name, shape[0]))
+        return ['/* gap: fill %s */' % shape[0]]
+
+    def render_fill(self, gaps):
+        """Deterministic contents for a reply's output members.
+
+        Without this the oracle is sensitive to a reply's *shape* -- framing, branch selection,
+        skip order -- and blind to its content: a recorded command's outputs are null or zeroed, so
+        an encoder reading the wrong member of two same-typed outputs writes identical bytes. This
+        is the fourth walk over the model, and the one that makes a swap visible.
+        """
+        commands = [c for c in self.gen.supported_types[VkType.COMMAND]
+                    if self.gen.is_serializable(c)]
+        out = []
+
+        for ty in self._out_types(commands):
+            small = self._length_members(ty)
+            body = []
+            for var in ty.variables:
+                if var.name in self.FILL_SKIP:
+                    continue
+                body += self._fill_member(ty, var, small, gaps)
+            out += ['#[allow(unused_variables)]',
+                    'pub fn vn_fill_%s(a: &Bump, f: &mut Fill, val: &mut %s) {' % (ty.name, ty.name)]
+            out += ['    ' + l for l in body]
+            out += ['}', '']
+
+        for ty in commands:
+            small = self._length_members(ty)
+            body = []
+            for var in self._out_vars(ty):
+                body += self._fill_member(ty, var, small, gaps)
+            out += ['#[allow(unused_variables)]',
+                    'pub fn vn_fill_%s_outs(a: &Bump, f: &mut Fill, val: &mut vn_command_%s) {'
+                    % (ty.name, ty.name)]
+            out += ['    ' + l for l in body]
+            out += ['}', '']
+
+        out += ['/// Decode one command\'s arguments, plant contents in its outputs, encode the',
+                '/// reply, and hand the *same* struct to `also` -- the C encoder it is diffed',
+                '/// against.',
+                '///',
+                '/// One struct, two encoders. `vn_command_*` is `#[repr(C)]`, so the C reads the',
+                '/// memory this filled rather than a second construction of it, and there is',
+                '/// nothing for the two sides to disagree about before the encoding starts.',
+                '///',
+                '/// Returns what the sizeof said, so the caller can hold the encoder to it.',
+                'pub fn vn_reply_oracle_args(',
+                '    dec: &mut Decoder<\'_>,',
+                '    enc: &mut Encoder<\'_>,',
+                '    a: &Bump,',
+                '    f: &mut Fill,',
+                '    cmd: VkCommandTypeEXT,',
+                '    also: &mut dyn FnMut(*const core::ffi::c_void),',
+                ') -> Option<usize> {',
+                '    match cmd {']
+        for ty in commands:
+            n = ty.name
+            out += [
+                '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
+                '            let mut args = vn_command_%s::default();' % n,
+                '            vn_decode_%s_args_temp(dec, &mut args);' % n,
+                '            if dec.fatal() {',
+                '                return Some(0);',
+                '            }',
+                '            vn_fill_%s_outs(a, f, &mut args);' % n,
+                '            let size = vn_sizeof_%s_reply(enc.protocol(), &args);' % n,
+                '            vn_encode_%s_reply(enc, &args);' % n,
+                '            also(&raw const args as *const core::ffi::c_void);',
+                '            Some(size)',
+                '        }',
+            ]
+        out += ['        _ => None,', '    }', '}', '']
+
+        return '\n'.join(out)
+
     def render_reply_oracle(self):
         """The C half of the reply differential, dispatched by command type.
 
@@ -1034,38 +1232,6 @@ class RustGen:
                 '            }',
                 '            let size = vn_sizeof_%s_args(enc.protocol(), &args);' % n,
                 '            vn_encode_%s_args(enc, cmd_flags, &args);' % n,
-                '            Some(size)',
-                '        }',
-            ]
-        out += ['        _ => None,', '    }', '}', '']
-
-        out += ['/// Decode one command\'s arguments, encode the reply, and hand the *same* struct',
-                '/// to `also`, which is the C renderer encoder the reply is diffed against.',
-                '///',
-                '/// One struct, two encoders. `vn_command_*` is `#[repr(C)]`, so the C reads the',
-                '/// memory Rust filled rather than a second construction of it, and there is',
-                '/// nothing for the two sides to disagree about before the encoding starts.',
-                '///',
-                '/// Returns what the sizeof said, so the caller can hold the encoder to it.',
-                'pub fn vn_reply_oracle_args(',
-                '    dec: &mut Decoder<\'_>,',
-                '    enc: &mut Encoder<\'_>,',
-                '    cmd: VkCommandTypeEXT,',
-                '    also: &mut dyn FnMut(*const core::ffi::c_void),',
-                ') -> Option<usize> {',
-                '    match cmd {']
-        for ty in commands:
-            n = ty.name
-            out += [
-                '        VkCommandTypeEXT::%s => {' % ty.attrs['c_type'],
-                '            let mut args = vn_command_%s::default();' % n,
-                '            vn_decode_%s_args_temp(dec, &mut args);' % n,
-                '            if dec.fatal() {',
-                '                return Some(0);',
-                '            }',
-                '            let size = vn_sizeof_%s_reply(enc.protocol(), &args);' % n,
-                '            vn_encode_%s_reply(enc, &args);' % n,
-                '            also(&raw const args as *const core::ffi::c_void);',
                 '            Some(size)',
                 '        }',
             ]

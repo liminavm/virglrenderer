@@ -87,6 +87,10 @@ def main():
     (outdir / 'serialize.rs').write_bytes(
         banner.encode() + header.encode() + rust.render_serialize(gaps).encode())
 
+    fill_head = (Path(HERE / 'templates' / 'fill.rs.head').read_text())
+    (outdir / 'fill.rs').write_bytes(
+        banner.encode() + fill_head.encode() + rust.render_fill(gaps).encode())
+
     # Shapes the emitter has not been taught, named where a reader will find them. A gap emits a
     # stub that poisons the stream, so the wire round trip fails on the first command needing one.
     (outdir / 'gaps.txt').write_text('\n'.join(sorted(set(gaps))) + '\n')
