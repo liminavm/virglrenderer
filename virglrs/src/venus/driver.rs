@@ -516,7 +516,11 @@ fn pad_for_blob(size: u64, flags: Option<VkMemoryPropertyFlags>, imported: bool)
     if imported || flags.0 & HOST_VISIBLE.0 as u32 == 0 {
         return size;
     }
-    size.next_multiple_of(BLOB_ALIGN)
+    // Checked, because `size` is the guest's own number and nothing has bounded it yet. A size with
+    // no next multiple goes to the driver as it stands: the driver refuses it, `plant` ghosts the
+    // id, and the guest gets a clean failure -- which is what padding it into a wrap would have
+    // taken away, by handing the driver a small allocation the guest believes is enormous.
+    size.checked_next_multiple_of(BLOB_ALIGN).unwrap_or(size)
 }
 
 /// Whether an allocation's `pNext` chain imports another context's storage.
@@ -578,6 +582,9 @@ mod tests {
         assert_eq!(pad_for_blob(4096, Some(HOST_VISIBLE), true), 4096);
         // A memory type the device never reported: let the driver reject it as it is.
         assert_eq!(pad_for_blob(4096, None, false), 4096);
+        // A size with no next multiple. The guest chooses this number, so rounding it must not
+        // wrap it to zero and hand the driver a tiny allocation the guest thinks is enormous.
+        assert_eq!(pad_for_blob(u64::MAX, Some(HOST_VISIBLE), false), u64::MAX);
     }
 
     /// A zero allocation is legal to ask for and must not become a blob-sized one.
