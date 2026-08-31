@@ -15,6 +15,10 @@
 #   vkr-record-decode.py <file> --types      command-type histogram
 #   vkr-record-decode.py <file> --prologue   the journal entries of each context's prologue
 #   vkr-record-decode.py <file> --check      structural checks only; exit 1 on any failure
+#
+# A stream carries two kinds of record: venus wire commands, and the host control-path events
+# (blob creates, attaches, unrefs) that build the resources those commands name. Both share one
+# sequence, and the interleaving is the dependency order -- see vkr_record.h.
 import collections
 import struct
 import sys
@@ -27,9 +31,54 @@ FLAG_TRUNC_FATAL = 0x2
 
 # u32 magic, version, flags, ctx_count + u64 record_count, prologue_bytes, stream_bytes
 HEADER_SIZE = 40
-RECORD_HEADER_SIZE = 32   # u64 seq, ring_id + u32 ctx_id, generation, cmd_type, size
+# u64 seq, ring_id + u32 ctx_id, generation, kind, op, size, reserved
+RECORD_HEADER_SIZE = 40
 PROLOGUE_HEADER_SIZE = 16  # u32 ctx_id, generation + u64 size
-SUPPORTED_VERSION = 2
+SUPPORTED_VERSION = 3
+
+KIND_CMD = 0
+KIND_CTL = 1
+
+CTL_NAMES = {
+    1: "ctx_create",
+    2: "ctx_destroy",
+    3: "create_blob",
+    4: "import_blob",
+    5: "attach_resource",
+    6: "detach_resource",
+    7: "resource_unref",
+}
+
+
+def ctl_describe(op, payload):
+    """Render a control record's payload per the layouts in vkr_record.h."""
+    name = CTL_NAMES.get(op, f"ctl-{op}")
+    try:
+        if op == 1:
+            ctx_id, init, nlen, _pad = struct.unpack_from("<IIII", payload, 0)
+            # The ABI's nlen is the caller's buffer, not the string: libkrun passes a
+            # fixed 64-byte field. Trim at the first NUL for display.
+            raw = payload[16:16 + nlen].split(b"\x00", 1)[0]
+            who = raw.decode("utf-8", "replace")
+            return f"{name} ctx={ctx_id} init={init:#x} name={who!r}"
+        if op == 2:
+            return f"{name} ctx={struct.unpack_from('<I', payload, 0)[0]}"
+        if op == 3:
+            res, ctx_id, mem, flags, blob_id, size, niov, _p = struct.unpack_from(
+                "<IIIIQQII", payload, 0)
+            return (f"{name} res={res} ctx={ctx_id} mem={mem} flags={flags:#x} "
+                    f"blob_id={blob_id} size={size} iovs={niov}")
+        if op == 4:
+            res, fd_type, size = struct.unpack_from("<IIQ", payload, 0)
+            return f"{name} res={res} fd_type={fd_type} size={size}"
+        if op in (5, 6):
+            ctx_id, res = struct.unpack_from("<II", payload, 0)
+            return f"{name} ctx={ctx_id} res={res}"
+        if op == 7:
+            return f"{name} res={struct.unpack_from('<I', payload, 0)[0]}"
+    except struct.error:
+        return f"{name} TRUNCATED ({len(payload)} bytes)"
+    return f"{name} ({len(payload)} bytes)"
 JOURNAL_ENTRY_SIZE = 28    # u64 seq + u32 cmd_type + u8 klass + pad[3] + u64 ring_key + u32 size
 
 
@@ -70,12 +119,13 @@ class Corpus:
             p += align4(size)
 
     def records(self):
-        """(seq, ring_id, ctx_id, generation, cmd_type, payload) in stream order."""
+        """(seq, ring_id, ctx_id, generation, kind, op, payload) in stream order."""
         p, end = self.stream_off, self.stream_off + self.stream_bytes
         while p + RECORD_HEADER_SIZE <= end:
-            seq, ring_id, ctx_id, gen, cmd_type, size = struct.unpack_from("<QQIIII", self.blob, p)
+            seq, ring_id, ctx_id, gen, kind, op, size, _rsv = struct.unpack_from(
+                "<QQIIIIII", self.blob, p)
             p += RECORD_HEADER_SIZE
-            yield seq, ring_id, ctx_id, gen, cmd_type, self.blob[p:p + size]
+            yield seq, ring_id, ctx_id, gen, kind, op, self.blob[p:p + size]
             p += align4(size)
 
 
@@ -111,7 +161,11 @@ def summarize(c):
 
     per_ctx = collections.Counter()
     per_ring = collections.Counter()
-    for _seq, ring_id, ctx_id, gen, _cmd, _pay in c.records():
+    per_ctl = collections.Counter()
+    for _seq, ring_id, ctx_id, gen, kind, op, _pay in c.records():
+        if kind == KIND_CTL:
+            per_ctl[op] += 1
+            continue
         per_ctx[(ctx_id, gen)] += 1
         per_ring[(ctx_id, gen, ring_id)] += 1
     for (ctx_id, gen), n in sorted(per_ctx.items()):
@@ -119,6 +173,10 @@ def summarize(c):
     for (ctx_id, gen, ring_id), n in sorted(per_ring.items()):
         where = "context decoder" if ring_id == 0 else f"ring {ring_id:#x}"
         print(f"    ctx {ctx_id} gen {gen} / {where}: {n}")
+    if per_ctl:
+        print(f"  control-path events ({sum(per_ctl.values())}):")
+        for op, n in sorted(per_ctl.items()):
+            print(f"    {CTL_NAMES.get(op, f'ctl-{op}'):>16}: {n}")
 
 
 def check(c):
@@ -149,7 +207,7 @@ def check(c):
     # trusts it. A gap or an inversion means the append path lost its lock discipline.
     n = 0
     prev = None
-    for seq, _ring, ctx_id, gen, _cmd, payload in c.records():
+    for seq, _ring, ctx_id, gen, kind, op, payload in c.records():
         n += 1
         # Anchored at 0, not merely consecutive: the recorder's counter starts there, so a
         # stream whose first record is seq 1 lost a record before anything else was written —
@@ -159,6 +217,17 @@ def check(c):
         elif prev is not None and seq != prev + 1:
             bad.append(f"seq {seq} follows {prev}: the stream is not contiguous")
         prev = seq
+        if kind == KIND_CTL:
+            # A control record needs no prologue: it names a context only to place itself in that
+            # context's history, and some (a resource unref) name none at all.
+            if op not in CTL_NAMES:
+                bad.append(f"seq {seq}: unknown control op {op}")
+            elif ctl_describe(op, payload).endswith(f"TRUNCATED ({len(payload)} bytes)"):
+                bad.append(f"seq {seq}: {CTL_NAMES[op]} payload is {len(payload)} bytes")
+            continue
+        if kind != KIND_CMD:
+            bad.append(f"seq {seq}: unknown record kind {kind}")
+            continue
         if (ctx_id, gen) not in prologue_ctxs:
             bad.append(f"seq {seq}: context {ctx_id} gen {gen} has no prologue")
             prologue_ctxs.add((ctx_id, gen))  # report once
@@ -186,13 +255,17 @@ def main():
     if mode == "--check":
         return 0 if check(c) else 1
     if mode == "--list":
-        for seq, ring_id, ctx_id, gen, cmd_type, payload in c.records():
+        for seq, ring_id, ctx_id, gen, kind, op, payload in c.records():
+            if kind == KIND_CTL:
+                print(f"{seq:8d} ctx={ctx_id}/{gen} {'CTL':>20} {ctl_describe(op, payload)}")
+                continue
             where = "ctx" if ring_id == 0 else f"ring {ring_id:#x}"
-            print(f"{seq:8d} ctx={ctx_id}/{gen} {where:>20} type={cmd_type:5d} "
+            print(f"{seq:8d} ctx={ctx_id}/{gen} {where:>20} type={op:5d} "
                   f"{len(payload):6d} bytes")
         return 0
     if mode == "--types":
-        hist = collections.Counter(cmd for _s, _r, _c, _g, cmd, _p in c.records())
+        hist = collections.Counter(op for _s, _r, _c, _g, k, op, _p in c.records()
+                                   if k == KIND_CMD)
         for cmd, n in hist.most_common():
             print(f"{n:8d}  cmd_type {cmd}")
         return 0

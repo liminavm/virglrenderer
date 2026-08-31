@@ -30,6 +30,10 @@ struct vkr_record_ctx {
    uint32_t ctx_id;
    uint32_t generation;
    bool live;
+   /* The prologue is taken from a struct vkr_context, which the control-path tees do not have.
+    * A context first seen through a control event is therefore adopted without one, and the flag
+    * keeps its first dispatch from skipping the capture. */
+   bool prologue_taken;
    void *journal_blob;
    size_t journal_size;
 };
@@ -158,14 +162,11 @@ rec_align4(size_t n)
    return (n + 3u) & ~(size_t)3u;
 }
 
-/* Find (or adopt) the per-context slot, capturing its prologue on first sight.
- * Called with rec_lock held. Returns NULL when the context table is full, which
- * stops recording rather than silently dropping a context's commands. */
+/* Find (or adopt) the per-context slot. Called with rec_lock held. Returns NULL when the context
+ * table is full, which stops recording rather than silently dropping a context's commands. */
 static struct vkr_record_ctx *
-rec_ctx_locked(struct vkr_context *ctx)
+rec_ctx_locked(uint32_t ctx_id)
 {
-   const uint32_t ctx_id = ctx->ctx_id;
-
    for (uint32_t i = 0; i < rec.nctx; i++)
       if (rec.ctxs[i].live && rec.ctxs[i].ctx_id == ctx_id)
          return &rec.ctxs[i];
@@ -173,31 +174,123 @@ rec_ctx_locked(struct vkr_context *ctx)
    if (rec.nctx == VKR_RECORD_MAX_CTX)
       return NULL;
 
-   struct vkr_record_ctx *rc = &rec.ctxs[rec.nctx];
+   struct vkr_record_ctx *rc = &rec.ctxs[rec.nctx++];
    rc->ctx_id = ctx_id;
    /* Monotonic over adopted contexts, never reset. The guest reuses context ids, so this is the
     * half of the identity that makes a record attributable to one context rather than to a number
     * two contexts happened to share. */
    rc->generation = rec.next_generation++;
    rc->live = true;
+   return rc;
+}
 
-   /* The prologue is the state this context's stream starts from, so it must be
-    * taken BEFORE the command that triggered this — which it is: the journal
-    * does not learn about that command until post_dispatch pushes it, after the
-    * recorder tee has run.
-    *
-    * vkr_journal_export quiesces the journal thread first, so pending messages
-    * from other threads' earlier commands are applied. What it cannot see is a
-    * RECORDING block still buffered on some thread's TLS batch; arming at
-    * process start (the intended use) makes that empty, and arming mid-run
-    * therefore gives a best-effort prologue rather than an exact one. */
+/* Capture the prologue: the state this context's stream starts from. It must be taken BEFORE the
+ * command that triggered it -- which it is: the journal does not learn about that command until
+ * post_dispatch pushes it, after the recorder tee has run.
+ *
+ * vkr_journal_export quiesces the journal thread first, so pending messages from other threads'
+ * earlier commands are applied. What it cannot see is a RECORDING block still buffered on some
+ * thread's TLS batch; arming at process start (the intended use) makes that empty, and arming
+ * mid-run therefore gives a best-effort prologue rather than an exact one. */
+static void
+rec_take_prologue_locked(struct vkr_record_ctx *rc, struct vkr_context *ctx)
+{
+   if (rc->prologue_taken)
+      return;
+   rc->prologue_taken = true;
    if (!vkr_journal_export(ctx->journal, &rc->journal_blob, &rc->journal_size)) {
       rc->journal_blob = NULL;
       rc->journal_size = 0;
    }
+}
 
-   rec.nctx++;
-   return rc;
+/* The one append. Called with rec_lock held; returns false having set a truncation flag when the
+ * record does not fit, so every caller stops rather than writing a stream with a hole in it. */
+static bool
+rec_append_locked(uint32_t kind,
+                  uint64_t ring_id,
+                  uint32_t ctx_id,
+                  uint32_t generation,
+                  uint32_t op,
+                  const void *data,
+                  size_t size)
+{
+   const size_t hdr = sizeof(uint64_t) * 2 + sizeof(uint32_t) * 6;
+   const size_t need = hdr + rec_align4(size);
+   if (rec.used + need > rec.cap) {
+      rec.flags |= VKR_RECORD_FLAG_TRUNC_FULL;
+      return false;
+   }
+
+   /* The sequence number is assigned here, inside the same critical section that appends the
+    * bytes. Handing out sequence numbers outside the lock lets two threads append in inverted
+    * order, and a replayer that trusts stream order would then replay a serialization that never
+    * happened. */
+   uint8_t *p = rec.buf + rec.used;
+   const uint64_t seq = rec.seq++;
+   const uint32_t sz = (uint32_t)size;
+   const uint32_t reserved = 0;
+
+   memcpy(p, &seq, sizeof seq);
+   p += sizeof seq;
+   memcpy(p, &ring_id, sizeof ring_id);
+   p += sizeof ring_id;
+   memcpy(p, &ctx_id, sizeof ctx_id);
+   p += sizeof ctx_id;
+   memcpy(p, &generation, sizeof generation);
+   p += sizeof generation;
+   memcpy(p, &kind, sizeof kind);
+   p += sizeof kind;
+   memcpy(p, &op, sizeof op);
+   p += sizeof op;
+   memcpy(p, &sz, sizeof sz);
+   p += sizeof sz;
+   memcpy(p, &reserved, sizeof reserved);
+   p += sizeof reserved;
+   if (size)
+      memcpy(p, data, size);
+   memset(p + size, 0, rec_align4(size) - size);
+
+   rec.used += need;
+   rec.records++;
+   return true;
+}
+
+/* Shared prologue of every control-path tee: take the lock, refuse if recording has stopped, and
+ * resolve the owning context. `ctx_id` 0 means the event names no context. Returns false with the
+ * lock RELEASED when there is nothing to record. */
+static bool
+rec_ctl_begin(uint32_t ctx_id, uint32_t *out_ctx_id, uint32_t *out_generation)
+{
+   if (!rec_on)
+      return false;
+
+   pthread_mutex_lock(&rec_lock);
+   if (rec.flags) {
+      pthread_mutex_unlock(&rec_lock);
+      return false;
+   }
+
+   *out_ctx_id = 0;
+   *out_generation = 0;
+   if (ctx_id) {
+      struct vkr_record_ctx *rc = rec_ctx_locked(ctx_id);
+      if (!rc) {
+         rec.flags |= VKR_RECORD_FLAG_TRUNC_FULL;
+         pthread_mutex_unlock(&rec_lock);
+         return false;
+      }
+      *out_ctx_id = rc->ctx_id;
+      *out_generation = rc->generation;
+   }
+   return true;
+}
+
+static void
+rec_ctl_end(uint32_t op, uint32_t ctx_id, uint32_t generation, const void *payload, size_t size)
+{
+   rec_append_locked(VKR_RECORD_KIND_CTL, 0, ctx_id, generation, op, payload, size);
+   pthread_mutex_unlock(&rec_lock);
 }
 
 void
@@ -234,50 +327,126 @@ vkr_record_dispatch(struct vkr_context *ctx,
       return;
    }
 
-   struct vkr_record_ctx *rc = rec_ctx_locked(ctx);
+   struct vkr_record_ctx *rc = rec_ctx_locked(ctx->ctx_id);
    if (!rc) {
       rec.flags |= VKR_RECORD_FLAG_TRUNC_FULL;
       pthread_mutex_unlock(&rec_lock);
       return;
    }
+   rec_take_prologue_locked(rc, ctx);
 
-   const size_t hdr = sizeof(uint64_t) * 2 + sizeof(uint32_t) * 4;
-   const size_t need = hdr + rec_align4(size);
-   if (rec.used + need > rec.cap) {
-      rec.flags |= VKR_RECORD_FLAG_TRUNC_FULL;
-      pthread_mutex_unlock(&rec_lock);
-      return;
-   }
-
-   /* The sequence number is assigned here, inside the same critical section
-    * that appends the bytes. Handing out sequence numbers outside the lock lets
-    * two threads append in inverted order, and a replayer that trusts stream
-    * order would then replay a serialization that never happened. */
-   uint8_t *p = rec.buf + rec.used;
-   const uint64_t seq = rec.seq++;
-   const uint32_t ctx_id = rc->ctx_id;
-   const uint32_t generation = rc->generation;
-   const uint32_t sz = (uint32_t)size;
-
-   memcpy(p, &seq, sizeof seq);
-   p += sizeof seq;
-   memcpy(p, &ring_id, sizeof ring_id);
-   p += sizeof ring_id;
-   memcpy(p, &ctx_id, sizeof ctx_id);
-   p += sizeof ctx_id;
-   memcpy(p, &generation, sizeof generation);
-   p += sizeof generation;
-   memcpy(p, &cmd_type, sizeof cmd_type);
-   p += sizeof cmd_type;
-   memcpy(p, &sz, sizeof sz);
-   p += sizeof sz;
-   memcpy(p, data, size);
-   memset(p + size, 0, rec_align4(size) - size);
-
-   rec.used += need;
-   rec.records++;
+   rec_append_locked(VKR_RECORD_KIND_CMD, ring_id, rc->ctx_id, rc->generation, cmd_type, data,
+                     size);
 
    pthread_mutex_unlock(&rec_lock);
+}
+
+/* --- control path --- */
+
+void
+vkr_record_ctx_create(uint32_t ctx_id, uint32_t context_init, const char *name, uint32_t nlen)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(ctx_id, &id, &gen))
+      return;
+
+   /* A context adopted here is brand new, so its prologue is empty by construction and taking one
+    * later would wrongly describe state the stream itself builds. */
+   for (uint32_t i = 0; i < rec.nctx; i++)
+      if (rec.ctxs[i].live && rec.ctxs[i].ctx_id == ctx_id)
+         rec.ctxs[i].prologue_taken = true;
+
+   if (nlen > 256)
+      nlen = 256;
+   uint8_t payload[16 + 256];
+   const uint32_t words[4] = { ctx_id, context_init, nlen, 0 };
+   memcpy(payload, words, sizeof words);
+   if (nlen && name)
+      memcpy(payload + sizeof words, name, nlen);
+   rec_ctl_end(VKR_RECORD_CTL_CTX_CREATE, id, gen, payload, sizeof words + nlen);
+}
+
+void
+vkr_record_ctx_destroy(uint32_t ctx_id)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(ctx_id, &id, &gen))
+      return;
+
+   /* Retire the slot here rather than waiting for vkr_journal_destroy: the guest may create a new
+    * context under the same id immediately, and it must be adopted as a new generation. The
+    * prologue stays -- the stream up to this point still references it. */
+   for (uint32_t i = 0; i < rec.nctx; i++)
+      if (rec.ctxs[i].live && rec.ctxs[i].ctx_id == ctx_id)
+         rec.ctxs[i].live = false;
+
+   const uint32_t payload[2] = { ctx_id, 0 };
+   rec_ctl_end(VKR_RECORD_CTL_CTX_DESTROY, id, gen, payload, sizeof payload);
+}
+
+void
+vkr_record_create_blob(uint32_t res_handle,
+                       uint32_t ctx_id,
+                       uint32_t blob_mem,
+                       uint32_t blob_flags,
+                       uint64_t blob_id,
+                       uint64_t size,
+                       uint32_t num_iovs)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(ctx_id, &id, &gen))
+      return;
+   struct {
+      uint32_t res_handle, ctx_id, blob_mem, blob_flags;
+      uint64_t blob_id, size;
+      uint32_t num_iovs, pad;
+   } payload = { res_handle, ctx_id, blob_mem, blob_flags, blob_id, size, num_iovs, 0 };
+   rec_ctl_end(VKR_RECORD_CTL_CREATE_BLOB, id, gen, &payload, sizeof payload);
+}
+
+void
+vkr_record_import_blob(uint32_t res_handle, uint32_t fd_type, uint64_t size)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(0, &id, &gen))
+      return;
+   struct {
+      uint32_t res_handle, fd_type;
+      uint64_t size;
+   } payload = { res_handle, fd_type, size };
+   rec_ctl_end(VKR_RECORD_CTL_IMPORT_BLOB, id, gen, &payload, sizeof payload);
+}
+
+static void
+rec_ctl_ctx_res_pair(uint32_t op, uint32_t ctx_id, uint32_t res_handle)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(ctx_id, &id, &gen))
+      return;
+   const uint32_t payload[2] = { ctx_id, res_handle };
+   rec_ctl_end(op, id, gen, payload, sizeof payload);
+}
+
+void
+vkr_record_attach_resource(uint32_t ctx_id, uint32_t res_handle)
+{
+   rec_ctl_ctx_res_pair(VKR_RECORD_CTL_ATTACH_RESOURCE, ctx_id, res_handle);
+}
+
+void
+vkr_record_detach_resource(uint32_t ctx_id, uint32_t res_handle)
+{
+   rec_ctl_ctx_res_pair(VKR_RECORD_CTL_DETACH_RESOURCE, ctx_id, res_handle);
+}
+
+void
+vkr_record_resource_unref(uint32_t res_handle)
+{
+   uint32_t id, gen;
+   if (!rec_ctl_begin(0, &id, &gen))
+      return;
+   const uint32_t payload[2] = { res_handle, 0 };
+   rec_ctl_end(VKR_RECORD_CTL_RESOURCE_UNREF, id, gen, payload, sizeof payload);
 }
 
 void
