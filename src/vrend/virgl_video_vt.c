@@ -72,6 +72,15 @@
 #include "virgl_video.h"
 #include "virgl_video_av1_obu.h"
 #include "virgl_video_dav1d.h"
+#include "virgl_video_h264_ps.h"
+
+/* H.264 arrives as a family of profiles rather than one, and every one of them takes the
+ * same path here -- only profile_idc in the synthesized SPS differs. */
+static bool is_h264(enum pipe_video_profile profile)
+{
+    return profile >= PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE &&
+           profile <= PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH444;
+}
 
 /* Advertised ceiling. VideoToolbox's VP9 decoder goes higher on current silicon,
  * but nothing we can query says by how much, and the guest only uses this to size
@@ -132,11 +141,19 @@ struct virgl_video_codec {
     size_t unit_cap;
 
     /* Codec configuration record (vpcC or av1C), and the one the live session was built
-     * from -- an AV1 sequence header can change mid-stream. */
+     * from -- an AV1 sequence header can change mid-stream.
+     *
+     * H.264 reuses this as the carrier for its synthesized SPS followed by its PPS, so the
+     * existing "config changed => rebuild the session" comparison covers a mid-stream
+     * parameter-set change for free. The two lengths below say where the split is. */
     uint8_t frame_config[256];
     size_t frame_config_len;
     uint8_t session_config[256];
     size_t session_config_len;
+
+    /* H.264 only: the split of frame_config into its SPS and PPS halves. */
+    size_t h264_sps_len;
+    size_t h264_pps_len;
 
     /* The picture in flight: the bitstream accumulated across decode_bitstream calls. The
      * target is not kept here -- every path that needs one is handed it explicitly, because
@@ -297,6 +314,44 @@ int virgl_video_fill_caps(union virgl_caps *caps)
         vcaps->max_temporal_layers = 0;
     }
 
+    /*
+     * H.264. Every Apple silicon Mac decodes it, but the advertisement is still gated on
+     * the query rather than assumed -- a host that says no must not be told otherwise.
+     *
+     * Only the profiles this backend can actually serialize a parameter set for are
+     * offered. High covers Baseline and Main streams too (a decoder for High decodes
+     * both), and offering High10/422/444 would promise bit depths and chroma formats
+     * virgl_h264_build_parameter_sets refuses.
+     */
+    if (vt_can_decode(kCMVideoCodecType_H264)) {
+        static const enum pipe_video_profile h264_profiles[] = {
+            PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE,
+            PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE,
+            PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN,
+            PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH,
+        };
+
+        VT_TRACE("fill_caps: advertising H.264 decode\n");
+        for (unsigned i = 0; i < ARRAY_SIZE(h264_profiles); i++) {
+            vcaps = &caps->v2.video_caps[caps->v2.num_video_caps++];
+            memset(vcaps, 0, sizeof(*vcaps));
+            vcaps->profile = h264_profiles[i];
+            vcaps->entrypoint = PIPE_VIDEO_ENTRYPOINT_BITSTREAM;
+            vcaps->max_level = 52;      /* 5.2: above 4K; VideoToolbox parses the real
+                                         * stream anyway, so this only sizes the guest. */
+            vcaps->stacked_frames = 0;
+            vcaps->max_width = VT_MAX_WIDTH;
+            vcaps->max_height = VT_MAX_HEIGHT;
+            vcaps->prefered_format = PIPE_FORMAT_NV12;
+            vcaps->max_macroblocks = 1;
+            vcaps->npot_texture = 1;
+            vcaps->supports_progressive = 1;
+            vcaps->supports_interlaced = 0;   /* field coding is refused by the serializer */
+            vcaps->prefers_interlaced = 0;
+            vcaps->max_temporal_layers = 0;
+        }
+    }
+
     /* AV1 needs M3-or-later silicon. dav1d is present as the fallback for frames the
      * hardware decoder returns wrongly -- super-resolution -- and not as a decoder in its
      * own right: on a host with no AV1 silicon at all, offering AV1 would take the whole
@@ -346,7 +401,8 @@ struct virgl_video_codec *virgl_video_create_codec(
         return NULL;
     }
     if (args->profile != PIPE_VIDEO_PROFILE_VP9_PROFILE0 &&
-        args->profile != PIPE_VIDEO_PROFILE_AV1_MAIN) {
+        args->profile != PIPE_VIDEO_PROFILE_AV1_MAIN &&
+        !is_h264(args->profile)) {
         virgl_error("video: profile %d not supported by the VideoToolbox backend\n",
                     args->profile);
         return NULL;
@@ -638,6 +694,36 @@ static int ensure_session(struct virgl_video_codec *codec,
 
     destroy_session(codec);
 
+    /*
+     * H.264 does not go through a config atom at all: VideoToolbox takes the parameter set
+     * NALs themselves and derives the format description (including the dimensions) from
+     * them. nal_length_size 4 must match the framing end_frame produces.
+     */
+    if (is_h264(codec->profile)) {
+        const uint8_t *sets[2] = {
+            codec->frame_config,
+            codec->frame_config + codec->h264_sps_len,
+        };
+        const size_t set_sizes[2] = { codec->h264_sps_len, codec->h264_pps_len };
+
+        if (!codec->h264_sps_len || !codec->h264_pps_len) {
+            virgl_error("video: h264 session asked for before any parameter set\n");
+            return -1;
+        }
+
+        status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            kCFAllocatorDefault, 2, sets, set_sizes, 4, &codec->format);
+        if (status != noErr) {
+            /* A rejection here is the loud half of a malformed parameter set. The quiet
+             * half -- accepted but subtly wrong -- is what the serializer's spike guards
+             * against; see spikes/h264-ps-synth. */
+            virgl_error("video: CMVideoFormatDescriptionCreateFromH264ParameterSets"
+                        " failed, status %d\n", (int)status);
+            return -1;
+        }
+        goto have_format;
+    }
+
     /* AV1 carries a whole sequence header OBU in its av1C, so unlike VP9's six scalars it
      * is built by the serializer and simply handed over here. */
     if (av1)
@@ -673,6 +759,8 @@ static int ensure_session(struct virgl_video_codec *codec,
         virgl_error("video: CMVideoFormatDescriptionCreate failed, status %d\n", (int)status);
         return -1;
     }
+
+have_format:
 
     /* The target's own layout, with an IOSurface behind it: the planes map straight
      * onto the guest's video buffer resources, and the IOSurface backing is what a
@@ -850,6 +938,82 @@ static int av1_decode_bitstream(struct virgl_video_codec *codec,
     return 0;
 }
 
+/*
+ * H.264: accumulate the guest's slice NALs and synthesize the parameter sets they need.
+ *
+ * Unlike AV1, the bitstream itself is real -- mesa's VA frontend prepends an Annex-B start
+ * code to every slice, so what arrives is the encoder's own slice layer. Only the SPS and
+ * PPS are missing, and they can only be built once the slices are here: the id the slice
+ * headers reference is not on the wire and has to be read back out of them.
+ */
+static int h264_decode_bitstream(struct virgl_video_codec *codec,
+                                 const union virgl_picture_desc *desc,
+                                 unsigned num_buffers,
+                                 const void * const *buffers,
+                                 const unsigned *sizes)
+{
+    struct virgl_h264_parameter_sets ps;
+    size_t needed = codec->bitstream_len;
+    unsigned pps_id;
+
+    for (unsigned i = 0; i < num_buffers; i++)
+        needed += sizes[i];
+
+    if (needed > codec->bitstream_cap) {
+        uint8_t *grown = realloc(codec->bitstream, needed);
+        if (!grown) {
+            virgl_error("video: out of memory growing the bitstream buffer\n");
+            return -1;
+        }
+        codec->bitstream = grown;
+        codec->bitstream_cap = needed;
+    }
+
+    for (unsigned i = 0; i < num_buffers; i++) {
+        if (!buffers[i] || !sizes[i])
+            continue;
+        memcpy(codec->bitstream + codec->bitstream_len, buffers[i], sizes[i]);
+        codec->bitstream_len += sizes[i];
+    }
+
+    /* The session key. H.264 has no per-frame profile or bit depth to track the way VP9
+     * does -- those live in the SPS, and a change there changes the config below. */
+    codec->frame_profile = 0;
+    codec->frame_bit_depth = 8;
+    codec->frame_subsampling = 1;
+    codec->frame_width = codec->width;
+    codec->frame_height = codec->height;
+    codec->frame_superres = false;
+
+    if (virgl_h264_slice_pps_id(codec->bitstream, codec->bitstream_len, &pps_id)) {
+        /* No slice NAL yet: this call carried only a fragment. Leave the config alone and
+         * wait -- guessing an id would produce a PPS the slices never reference. */
+        VT_TRACE("h264: no slice header yet, %zu bytes buffered\n", codec->bitstream_len);
+        return 0;
+    }
+
+    if (virgl_h264_build_parameter_sets(&desc->h264, codec->width, codec->height,
+                                        codec->profile, pps_id, &ps))
+        return -1;
+
+    if (ps.sps_len + ps.pps_len > sizeof(codec->frame_config)) {
+        virgl_error("video: h264 parameter sets are %zu bytes, over the %zu-byte config\n",
+                    ps.sps_len + ps.pps_len, sizeof(codec->frame_config));
+        return -1;
+    }
+
+    memcpy(codec->frame_config, ps.sps, ps.sps_len);
+    memcpy(codec->frame_config + ps.sps_len, ps.pps, ps.pps_len);
+    codec->frame_config_len = ps.sps_len + ps.pps_len;
+    codec->h264_sps_len = ps.sps_len;
+    codec->h264_pps_len = ps.pps_len;
+
+    VT_TRACE("h264: %u buffers, %zu bytes, pps_id %u, sps %zu pps %zu, %ux%u\n",
+             num_buffers, codec->bitstream_len, pps_id, ps.sps_len, ps.pps_len,
+             codec->frame_width, codec->frame_height);
+    return 0;
+}
+
 int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
                                  struct virgl_video_buffer *target,
                                  const union virgl_picture_desc *desc,
@@ -865,6 +1029,9 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
 
     if (codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN)
         return av1_decode_bitstream(codec, desc, num_buffers, buffers, sizes);
+
+    if (is_h264(codec->profile))
+        return h264_decode_bitstream(codec, desc, num_buffers, buffers, sizes);
 
     if (codec->profile != PIPE_VIDEO_PROFILE_VP9_PROFILE0)
         return -1;
@@ -1380,6 +1547,41 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     if (!codec->bitstream_len)
         return 0;
+
+    /*
+     * H.264 arrives Annex-B (mesa prepends a start code per slice) and VideoToolbox accepts
+     * only length-prefixed NALs, so the access unit is re-framed here. This rewrites the
+     * framing and nothing else -- emulation-prevention bytes inside each NAL stay as the
+     * encoder wrote them.
+     */
+    if (is_h264(codec->profile)) {
+        const size_t len = codec->bitstream_len;
+        ssize_t need, got;
+
+        codec->bitstream_len = 0;
+
+        if (!codec->h264_sps_len) {
+            virgl_error("video: h264 access unit with no parameter set; dropping\n");
+            return -1;
+        }
+
+        need = virgl_h264_annexb_to_avcc(codec->bitstream, len, NULL, 0);
+        if (need < 0) {
+            virgl_error("video: h264 access unit is not Annex-B framed\n");
+            return -1;
+        }
+        if (!ensure_unit(codec, (size_t)need))
+            return -1;
+
+        got = virgl_h264_annexb_to_avcc(codec->bitstream, len, codec->unit, codec->unit_cap);
+        if (got < 0) {
+            virgl_error("video: h264 re-framing overflowed a %zu-byte unit\n", codec->unit_cap);
+            return -1;
+        }
+
+        VT_TRACE("h264: %zu annexb -> %zd avcc bytes\n", len, got);
+        return submit_unit(codec, codec->unit, (size_t)got, target);
+    }
 
     {
         const size_t len = codec->bitstream_len;
