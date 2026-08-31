@@ -54,6 +54,38 @@ fn main() {
     let name = props.deviceName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char);
     println!("device 0: {}", name.collect::<String>());
 
+    let mut n: u32 = 0;
+    // SAFETY: the count query with a null array is the spec's two-call idiom.
+    unsafe {
+        (i.vkEnumerateDeviceExtensionProperties())(
+            pd,
+            core::ptr::null(),
+            &mut n,
+            core::ptr::null_mut(),
+        )
+    };
+    let mut props = vec![VkExtensionProperties::default(); n as usize];
+    // SAFETY: `props` has room for `n`, which the count query just supplied.
+    unsafe {
+        (i.vkEnumerateDeviceExtensionProperties())(
+            pd,
+            core::ptr::null(),
+            &mut n,
+            props.as_mut_ptr(),
+        )
+    };
+    let mut names: Vec<String> = props
+        .iter()
+        .map(|p| {
+            p.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+        })
+        .collect();
+    names.sort();
+    println!("device extensions {n}:");
+    for name in &names {
+        println!("  {name}");
+    }
+
     let prio = 1.0f32;
     let q = VkDeviceQueueCreateInfo {
         sType: VkStructureType::VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,

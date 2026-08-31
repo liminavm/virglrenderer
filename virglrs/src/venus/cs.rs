@@ -61,6 +61,17 @@ impl Default for Ptr {
 }
 
 /// What the object table has to say about an id the guest named.
+/// A Vulkan handle, as a value that can be moved between the wire's side and the host's.
+///
+/// Every handle newtype is one `u64`, but they are deliberately *not* interchangeable -- that is
+/// the whole point of the newtypes. A handler still has to move a raw handle from the driver into
+/// a typed shadow member, so the conversion is named here rather than done with a cast at every
+/// call site, and the generator implements it for every handle type.
+pub trait Handle: Copy {
+    fn raw(self) -> u64;
+    fn from_raw(raw: u64) -> Self;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lookup {
     /// The host handle.

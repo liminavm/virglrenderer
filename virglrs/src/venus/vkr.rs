@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use crate::ids::{CtxId, RingIdx};
 
 use super::context::{Context, Unimplemented};
+use crate::vulkan::Global;
 
 /// Why a venus call could not be served. Both are the caller's mistake, not ours: a context that
 /// was never created for venus, or one whose stream we already stopped trusting.
@@ -33,11 +34,19 @@ pub struct Vkr {
     /// The commands this build does not serve yet, counted across every context. Kept on the root
     /// because it answers a question about the build, not about a guest.
     pub todo: Unimplemented,
+    /// The entry points that exist before any instance does. One per renderer rather than one per
+    /// context: they are the loader's, identical for every guest, and immutable once resolved.
+    global: Global,
 }
 
 impl Vkr {
     pub fn new(flags: i32) -> Vkr {
-        Vkr { flags, contexts: BTreeMap::new(), todo: Unimplemented::default() }
+        Vkr {
+            flags,
+            contexts: BTreeMap::new(),
+            todo: Unimplemented::default(),
+            global: crate::vulkan::global(),
+        }
     }
 
     pub fn context_create(&mut self, id: CtxId) {
@@ -62,12 +71,16 @@ impl Vkr {
     /// Run a submission on one context.
     pub fn submit(&mut self, id: CtxId, buf: &[u8]) -> Result<(), Error> {
         let ctx = self.contexts.get_mut(&id).ok_or(Error::NoContext)?;
-        if ctx.submit(buf, &mut self.todo) { Ok(()) } else { Err(Error::Poisoned) }
+        if ctx.submit(buf, &mut self.todo, &self.global) { Ok(()) } else { Err(Error::Poisoned) }
     }
 
     pub fn submit_ring(&mut self, id: CtxId, ring: RingIdx, buf: &[u8]) -> Result<(), Error> {
         let ctx = self.contexts.get_mut(&id).ok_or(Error::NoContext)?;
-        if ctx.submit_ring(ring, buf, &mut self.todo) { Ok(()) } else { Err(Error::Poisoned) }
+        if ctx.submit_ring(ring, buf, &mut self.todo, &self.global) {
+            Ok(())
+        } else {
+            Err(Error::Poisoned)
+        }
     }
 
     pub fn replay_begin(&mut self, id: CtxId) -> Result<(), Error> {

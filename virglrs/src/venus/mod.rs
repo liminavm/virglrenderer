@@ -11,6 +11,7 @@
 pub mod capset;
 pub mod context;
 pub mod cs;
+pub mod driver;
 pub mod objects;
 pub mod proto;
 pub mod vkr;
