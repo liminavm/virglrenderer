@@ -136,12 +136,13 @@ invariants a port owes, none of which the C encodes as a type:
    recorded command for free. It does not cover reply encoding, and **nothing else
    does either**: both replay entry points call `vkr_replay_strip_reply`, so a replay
    never encodes a reply, and the state score measures what commands did rather than
-   what was said back. The oracle for that is the same generator run the other way —
-   `is_driver=True` emits mesa's C driver decoder, and the subproject's
-   `tests/vn_cs.h` already ships its interface as no-op stubs. Feeding Rust-encoded
-   reply bytes to the C driver decoder is a differential test over the 326 per-command
-   reply wrappers, which the round trip never touches. Without it, reply encoding is
-   first exercised by a booting guest.
+   what was said back. That is what `venus-reply-oracle` covers: the same command
+   struct handed to both the generated Rust reply encoder and venus-protocol's own
+   generated C renderer encoder, and the bytes compared. One struct, two encoders —
+   `vn_command_*` is `#[repr(C)]`, so the C reads the memory Rust filled rather than a
+   second construction of it. It reaches the 326 per-command reply wrappers, which the
+   round trip never touches, and its ground truth is what every venus guest in
+   existence decodes.
 2. **`vrend_shader.c` (8.6k).** TGSI→GLSL with variant keys. No crate exists; a
    direct port. Mechanical but unforgiving — the shader key logic is where subtle
    divergence hides, and it is exercised by every draw.
