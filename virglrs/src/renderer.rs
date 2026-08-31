@@ -195,10 +195,10 @@ impl Renderer {
 
     pub fn ctx_attach_resource(&mut self, ctx: CtxId, handle: ResourceHandle) {
         let known = self.contexts.contains_key(&ctx);
-        if let (true, Some(r)) = (known, self.resources.get_mut(&handle)) {
-            if !r.attached.contains(&ctx) {
-                r.attached.push(ctx);
-            }
+        if let (true, Some(r)) = (known, self.resources.get_mut(&handle))
+            && !r.attached.contains(&ctx)
+        {
+            r.attached.push(ctx);
         }
     }
 

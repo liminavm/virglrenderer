@@ -40,7 +40,8 @@ pub struct GlCtxParam {
 pub struct Callbacks {
     pub version: c_int,
     pub write_fence: Option<extern "C" fn(*mut c_void, u32)>,
-    pub create_gl_context: Option<extern "C" fn(*mut c_void, c_int, *mut GlCtxParam) -> *mut c_void>,
+    pub create_gl_context:
+        Option<extern "C" fn(*mut c_void, c_int, *mut GlCtxParam) -> *mut c_void>,
     pub destroy_gl_context: Option<extern "C" fn(*mut c_void, *mut c_void)>,
     pub make_current: Option<extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int>,
     pub get_drm_fd: Option<extern "C" fn(*mut c_void) -> c_int>,

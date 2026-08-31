@@ -12,8 +12,14 @@
 //! Every function here is a boundary against a guest, so every one of them validates rather than
 //! asserting: a bad handle, an unknown context or a null pointer is rejected with an error code.
 //! Asserts belong behind this line, on invariants we control.
+//!
+//! The exports are declared safe and dereference caller-supplied pointers, which is normally a
+//! lint. It is the correct shape here and the allow is module-wide rather than per-function: the
+//! contract is the C ABI's, identical for all 69, and stating it once is what keeps it readable.
+//! The caller is the VMM, which owns every pointer it passes for the duration of the call.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::{Mutex, OnceLock};
 
 use crate::abi::{
@@ -117,10 +123,7 @@ pub extern "C" fn virgl_renderer_get_dev_fd(_ctx_id: c_int) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_execute(
-    _execute_args: *mut c_void,
-    _execute_size: u32,
-) -> c_int {
+pub extern "C" fn virgl_renderer_execute(_execute_args: *mut c_void, _execute_size: u32) -> c_int {
     todo_phase!("P2: venus execute")
 }
 
