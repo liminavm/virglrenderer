@@ -22,11 +22,14 @@
 //
 //   --ctx N       which virgl context to replay (default: the one with the most records)
 //   --loops N     replay the captured stream N times (default 1)
-//   --nodraw      positive control: drop every DRAW_VBO. Readback must then report no ink, or
-//                 the oracle is not measuring what it claims.
-//   --readback R  resource to score (default: the colour attachment of the last glyph draw)
-//   --sweep       score every colour offscreen at its unref, not just one
+//   --nodraw      positive control: drop every DRAW_VBO. Score it and diff against the ordinary
+//                 score -- the resources that lose their ink are the ones drawing reaches, and an
+//                 empty diff means the oracle is measuring nothing.
+//   --readback R  score only this resource (default: every colour offscreen, at its unref)
+//   --sweep       score every colour offscreen at its unref -- the default
 //   --sweep-w W   restrict --sweep to targets of this width
+//   --score F     write the score to F
+//   --expect F    compare the score against F and exit non-zero on any difference
 //
 // Env: REPLAY_DUMP_DIR (raw BGRA + manifest.txt), REPLAY_DUMP_W, REPLAY_NO_UNREF.
 //
@@ -45,6 +48,7 @@
 #include "virgl_hw.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -158,47 +162,6 @@ static size_t res_bytes(const struct res_ev *r)
    return (size_t)(w * h * d * a * 16u + 65536u);
 }
 
-/* Walk the stream once to find the colour resource behind the LAST glyph-pipeline draw. Two
- * reasons this has to be a pre-pass rather than a running guess: the shell abandons a card's
- * resources, so by the end of the stream the interesting one has been unref'd and cannot be read
- * back unless the replay is told in advance to keep it alive; and "which draw was last" is not
- * knowable until the file is exhausted. */
-static uint32_t scan_last_glyph_colour(const uint8_t *blob, size_t flen, size_t off, int ctx)
-{
-   uint32_t surf_res[65536];
-   uint32_t fb_cbuf0 = 0, found = 0;
-   bool glyph_shaped = false;
-   memset(surf_res, 0, sizeof surf_res);
-
-   for (size_t p = off; p + sizeof(struct rec_hdr) <= flen; ) {
-      struct rec_hdr h;
-      memcpy(&h, blob + p, sizeof h);
-      if (h.total_len < sizeof h || p + h.total_len > flen) break;
-      if (h.ctx_id != (uint16_t)ctx) { p += h.total_len; continue; }
-      const uint8_t *pay = blob + p + sizeof h + (size_t)h.aux_count * 4;
-      const uint32_t *dw = (const uint32_t *)pay;
-      size_t ndw = h.payload_len / 4;
-
-      if (h.type == T_CMD && ndw >= 2) {
-         if (h.cmd == VIRGL_CCMD_CREATE_OBJECT && ndw >= 3 &&
-             ((dw[0] >> 8) & 0xff) == VIRGL_OBJECT_SURFACE && dw[1] < 65536)
-            surf_res[dw[1]] = dw[2];
-         else if (h.cmd == VIRGL_CCMD_SET_FRAMEBUFFER_STATE && ndw >= 4)
-            fb_cbuf0 = dw[3];
-         else if (h.cmd == VIRGL_CCMD_SET_VERTEX_BUFFERS) {
-            size_t n = (ndw - 1) / 3;
-            glyph_shaped = false;
-            if (n == 3)
-               for (size_t k = 0; k < n; k++)
-                  if (dw[1 + 3 * k] == 0) glyph_shaped = true;
-         } else if (h.cmd == VIRGL_CCMD_DRAW_VBO && glyph_shaped && fb_cbuf0 < 65536 &&
-                    surf_res[fb_cbuf0])
-            found = surf_res[fb_cbuf0];
-      }
-      p += h.total_len;
-   }
-   return found;
-}
 
 
 /* Score at the resource's UNREF, not after the whole stream.
@@ -212,6 +175,66 @@ static uint32_t scan_last_glyph_colour(const uint8_t *blob, size_t flen, size_t 
 static uint32_t readback_res;
 static int scored, scored_ink;
 static int want_ctx = -1;
+static const char *score_path, *expect_path;
+
+/* The score, accumulated in stream order. Two implementations that render the same pixels in a
+ * different order are not the same implementation, so the ORDER is part of what is pinned.
+ * Counters live in their own buffer only so the finished score can put them FIRST: a score that
+ * diverges should say whether the stream was applied the same way before it says the pixels are. */
+static char *score_buf;
+static size_t score_len, score_cap;
+static char *count_buf;
+static size_t count_len, count_cap;
+
+static void buf_addf(char **buf, size_t *len, size_t *cap, const char *fmt, va_list ap)
+{
+   char line[512];
+   int n = vsnprintf(line, sizeof line, fmt, ap);
+   if (n < 0 || (size_t)n >= sizeof line)
+      return;
+   if (*len + (size_t)n + 1 > *cap) {
+      *cap = *cap ? *cap * 2 : 4096;
+      while (*len + (size_t)n + 1 > *cap) *cap *= 2;
+      *buf = realloc(*buf, *cap);
+      if (!*buf) { perror("score"); exit(2); }
+   }
+   memcpy(*buf + *len, line, (size_t)n);
+   *len += (size_t)n;
+   (*buf)[*len] = 0;
+}
+
+static void score_addf(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   buf_addf(&score_buf, &score_len, &score_cap, fmt, ap);
+   va_end(ap);
+}
+
+static void count_addf(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   buf_addf(&count_buf, &count_len, &count_cap, fmt, ap);
+   va_end(ap);
+}
+
+/* Line by line, positional: the score is ordered, so a line that moved is as much a difference as
+ * a line that changed. */
+static void diff_lines(const char *a, const char *b)
+{
+   while (*a || *b) {
+      const char *ae = strchr(a, '\n'), *be = strchr(b, '\n');
+      size_t an = ae ? (size_t)(ae - a) : strlen(a);
+      size_t bn = be ? (size_t)(be - b) : strlen(b);
+      if (an != bn || memcmp(a, b, an)) {
+         if (an) fprintf(stderr, "  - %.*s\n", (int)an, a);
+         if (bn) fprintf(stderr, "  + %.*s\n", (int)bn, b);
+      }
+      a = ae ? ae + 1 : a + an;
+      b = be ? be + 1 : b + bn;
+   }
+}
 
 
 /* The payload records name the COPY_TRANSFER3D's DESTINATION, and the copy path never reads the
@@ -288,8 +311,8 @@ static void score_resource(const struct res_ev *ev)
    uint64_t hash = 1469598103934665603ull;
    for (size_t i = 0; i < need; i++) { hash ^= px[i]; hash *= 1099511628211ull; }
 
-   printf("PIXELS res=%u %ux%u hash=%016llx ink=%zu/%zu\n",
-          ev->handle, w, h, (unsigned long long)hash, ink, need / 4);
+   score_addf("res=%u %ux%u hash=%016llx ink=%zu/%zu\n",
+              ev->handle, w, h, (unsigned long long)hash, ink, need / 4);
 
    /* An ink COUNT cannot say which offscreen is the header and which is the body, and that
     * mapping is what any verdict about "the title is lost" rests on. Dump the pixels and look. */
@@ -338,6 +361,8 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--loops") && i + 1 < argc) loops = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
+      else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
       else if (argv[i][0] != '-') path = argv[i];
    }
    if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N] [--loops N] [--nodraw]\n"); return 2; }
@@ -397,14 +422,13 @@ int main(int argc, char **argv)
    ret = virgl_renderer_context_create((uint32_t)want_ctx, (uint32_t)strlen(name), name);
    if (ret) { fprintf(stderr, "context_create failed: %d\n", ret); return 2; }
 
-   if (!readback_res) {
-      readback_res = scan_last_glyph_colour(blob, (size_t)flen, off, want_ctx);
-      if (!readback_res) {
-         fprintf(stderr, "no glyph-pipeline draw found in ctx %d -- nothing to score\n", want_ctx);
-         return 2;
-      }
-      printf("replay: scoring resource %u (colour attachment of the last glyph draw)\n", readback_res);
-   }
+   /* Score every colour offscreen at its unref unless told to narrow. The old default picked ONE
+    * resource with a glyph-pipeline heuristic inherited from the debugging spike this grew out of,
+    * and bailed outright when it matched nothing -- which is what it does on a corpus that draws
+    * no glyphs. A heuristic scores a different set on every corpus, which is the exact drift the
+    * fixture exists to prevent. The set is defended by the pinned score now, not guessed. */
+   if (!readback_res)
+      sweep = true;
 
    for (int loop = 0; loop < loops; loop++) {
       uint32_t next_res = 0;
@@ -587,17 +611,72 @@ int main(int argc, char **argv)
       if (batch_dw && virgl_renderer_submit_cmd(batch, want_ctx, (int)batch_dw))
          dropped++;
       free(batch);
-      printf("loop %d: %u resources created (%u failed), %u unrefs, %u submits, %u commands, "
-             "%u transfers applied (%u redirected to a copy source, %u unmatched), "
-             "%u submit errors\n",
-             loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped);
+      count_addf("loop %d created %u failed %u unrefs %u submits %u cmds %u xfers %u "
+                 "copy-fed %u copy-unmatched %u submit-errors %u\n",
+                 loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped);
    }
 
    if (!scored)
-      fprintf(stderr, "scored resource %u was never unref'd in the trace; nothing read back\n",
-              readback_res);
-   if (nodraw && scored_ink)
-      printf("  !! POSITIVE CONTROL FAILED: draws were dropped and pixels still arrived; the "
-             "oracle is not measuring what it claims\n");
-   return scored_ink ? 0 : 1;
+      fprintf(stderr, "nothing was read back: no scored resource was unref'd in the trace\n");
+
+   /* The score: counters, then one readback line per scored resource in stream order -- the same
+    * shape the venus replayer emits, so both layers are compared with plain diff. */
+   size_t total = count_len + score_len;
+   char *text = malloc(total + 1);
+   if (!text) { perror("score"); return 2; }
+   memcpy(text, count_buf ? count_buf : "", count_len);
+   memcpy(text + count_len, score_buf ? score_buf : "", score_len);
+   text[total] = 0;
+   fputs(text, stdout);
+
+   /* Ink somewhere is the floor: a run that reads back nothing but zeros rendered nothing, and
+    * every hash it reports is the hash of an empty buffer. --nodraw is NOT the inverse of that.
+    * It used to fail on any ink at all, which was right when one render target was scored and is
+    * wrong now that the sweep scores every offscreen: a texture filled by a transfer has ink with
+    * no draw involved, and 5 of this corpus's 310 do. The control is the DIFF between the two
+    * pinned scores -- the resources that lose their ink when draws are dropped are exactly the
+    * ones drawing reaches, and an empty diff means the oracle is measuring nothing. */
+   int ok = scored_ink;
+
+   if (score_path) {
+      FILE *sf = fopen(score_path, "wb");
+      if (!sf || fwrite(text, 1, total, sf) != total) {
+         fprintf(stderr, "writing %s: %s\n", score_path, strerror(errno));
+         ok = 0;
+      } else {
+         fprintf(stderr, "score written to %s\n", score_path);
+      }
+      if (sf) fclose(sf);
+   }
+
+   if (expect_path) {
+      FILE *ef = fopen(expect_path, "rb");
+      if (!ef) {
+         fprintf(stderr, "reading %s: %s\n", expect_path, strerror(errno));
+         ok = 0;
+      } else {
+         fseek(ef, 0, SEEK_END);
+         long elen = ftell(ef);
+         fseek(ef, 0, SEEK_SET);
+         char *want = malloc((size_t)elen + 1);
+         if (!want || fread(want, 1, (size_t)elen, ef) != (size_t)elen) {
+            fprintf(stderr, "short read of %s\n", expect_path);
+            ok = 0;
+         } else {
+            want[elen] = 0;
+            if ((size_t)elen == total && !memcmp(want, text, total)) {
+               fprintf(stderr, "score matches %s\n", expect_path);
+            } else {
+               fprintf(stderr, "SCORE DIFFERS from %s:\n", expect_path);
+               diff_lines(want, text);
+               ok = 0;
+            }
+         }
+         free(want);
+         fclose(ef);
+      }
+   }
+
+   free(text);
+   return ok ? 0 : 1;
 }

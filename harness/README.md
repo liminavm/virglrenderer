@@ -32,8 +32,11 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 
 - `vrend-replay.c` — replays a classic-context stream: resource creates from the recorded
   arguments, transfer contents memcpy'd into synthesized backings, command batches submitted in
-  captured order. Reads back scored resources and prints a content hash per readback. Build with
-  `build.sh`, pointing `VIRGL_PREFIX` at whichever implementation is under test.
+  captured order. Scores every colour offscreen at its unref — a content hash and an ink count
+  per readback, in stream order — with the same `--score`/`--expect` contract as the venus side.
+  Run it with `vrend-replay.sh <corpus>`, which supplies the zink-on-KosmicKrisp environment the
+  renderer needs; `build.sh` alone builds it, pointing `VIRGL_PREFIX` at the implementation under
+  test.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
@@ -41,7 +44,10 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at the
   ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
   and exits non-zero, so `diff` is the whole comparison tool.
-- `fixtures/` — pinned scores, recorded from the C build. `synoik.score` is the content fixture:
+- `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
+  from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
+  the diff between the two — 19 resources that lose their ink — is the positive control: an empty
+  diff would mean the oracle measures nothing. `synoik.score` is the venus content fixture:
   its capture was taken mid-workload, so 22 device allocations are still live and half of them
   carry GPU-written bytes. `venus.score` is the lifecycle fixture: vkmark runs to completion, and
   every context censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there.
@@ -53,6 +59,10 @@ Corpora come from vrend's in-memory tracer (`LIMINA_VREND_TRACE=<MB>`) for class
 from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) for venus. Both
 dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
 path nothing until it happens.
+
+The corpora themselves are NOT in git — they run from kilobytes to tens of megabytes, and a
+permanent home for them is still to be decided. Recapture them with `vm/capture.sh` (see
+`vm/README.md`); the pinned scores here only regress against the corpus they were recorded from.
 
 ### What the venus score is, and is not
 
@@ -73,10 +83,10 @@ the renderer is perfectly deterministic.
 
 ### What P0 still has to build
 
-- **Fixture-named scoring** for the classic replayer. The default readback target is picked by a heuristic inherited from
-  the debugging spike this grew out of. A corpus wants its scored resources named by the fixture.
-- **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`, which is a
-  precondition for scoring more than one resource per run reliably.
+- **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`. The full
+  sweep, which is now the default, reads every resource before the damage matters and reports no
+  submit errors; a narrowed run (`--readback`, `--sweep-w`) still does. Fixing it is what would
+  make a narrowed score trustworthy.
 - **ABI fixtures.** The symbol list (`nm -gU` on the dylib ∩ what libkrun names — 62 today) and
   the layouts of `virgl_renderer_callbacks`, `virgl_renderer_resource_create_args` and the
   blob/import arg structs, pinned as files the Rust build is diffed against. A layout mismatch
