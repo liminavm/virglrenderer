@@ -7,6 +7,7 @@
  */
 
 #include "vkr_journal.h"
+#include "vkr_record.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -493,6 +494,10 @@ vkr_journal_create(uint32_t ctx_id)
    if (!j)
       return NULL;
 
+   /* The recorder's prologue is a journal export, so arming it here guarantees
+    * a journal exists before any command can be recorded against it. */
+   vkr_record_init();
+
    j->ctx_id = ctx_id;
    list_inithead(&j->entries);
    j->keys =
@@ -585,6 +590,8 @@ vkr_journal_destroy(struct vkr_journal *j)
 {
    if (!j)
       return;
+
+   vkr_record_context_gone(j->ctx_id);
 
    if (j->thread_live) {
       mtx_lock(&j->q_mutex);
@@ -1065,6 +1072,28 @@ vkr_journal_post_dispatch(struct vn_dispatch_context *dctx)
 
    struct vkr_cs_decoder *dec = (struct vkr_cs_decoder *)dctx->decoder;
    const uint8_t *end = dec->cur;
+
+   /* Full-stream recorder tee (harness capture; a no-op unless armed). It sits
+    * ahead of every early-out below because a test corpus needs the commands the
+    * journal deliberately drops — the transient ones ARE the frame traffic.
+    *
+    * vkExecuteCommandStreamsMESA is the one command excluded: the transport
+    * dispatches the commands it carries through this same tee, so recording the
+    * outer command as well would make a replay apply every one of them twice. */
+   if (vkr_record_enabled() &&
+       frame->cmd_type != VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT) {
+      /* Which decoder is dispatching, without the locked list walk the journal's
+       * own ring lookup does: the ring owns its dispatch context by value, so a
+       * dctx that is not the context's is one ring's, at a fixed offset. */
+      uint64_t ring_id = 0;
+      if (frame->ctx && dctx != &frame->ctx->dispatch)
+         ring_id = ((const struct vkr_ring *)((const char *)dctx -
+                                              offsetof(struct vkr_ring, dispatch)))
+                      ->id;
+      vkr_record_dispatch(frame->ctx, ring_id, frame->cmd_type, frame->start,
+                          end > frame->start ? (size_t)(end - frame->start) : 0,
+                          vkr_cs_decoder_get_fatal(dec));
+   }
 
    if (vkr_cs_decoder_get_fatal(dec) || end <= frame->start) {
       p_atomic_inc(&j->dropped_fatal_fast);
