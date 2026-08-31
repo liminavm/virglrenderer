@@ -517,9 +517,18 @@ pub extern "C" fn virgl_renderer_get_cap_set(set: u32, max_ver: *mut u32, max_si
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_fill_caps(_set: u32, _version: u32, _caps: *mut c_void) {
-    // Nothing is advertised, so nothing may be filled: writing into a buffer sized from a capset
-    // we reported as absent is how a "harmless" stub corrupts the caller's stack.
+pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_void) {
+    // A capset this build does not advertise fills nothing: the caller sized its buffer from
+    // `get_cap_set`, so writing into one we reported as absent corrupts the caller's stack.
+    if caps.is_null() {
+        return;
+    }
+    let Some(bytes) = with(None, |r| r.capset_bytes(set, version)) else {
+        return;
+    };
+    // SAFETY: `caps` is the caller's buffer, which it sized from `virgl_renderer_get_cap_set` for
+    // this same set -- and that reported exactly `bytes.len()`, the size of the capset struct.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), caps.cast::<u8>(), bytes.len()) };
 }
 
 // ---------------------------------------------------------------- fences
