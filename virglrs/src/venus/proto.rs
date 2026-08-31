@@ -33,10 +33,105 @@ pub mod types {
     clippy::needless_borrow,
     clippy::unnecessary_cast,
     clippy::comparison_to_empty,
+    clippy::if_same_then_else,
     clippy::len_zero,
     clippy::single_match
 )]
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
 pub mod serialize {
     include!(concat!(env!("OUT_DIR"), "/venus/serialize.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize::*;
+    use super::types::*;
+    use crate::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
+    use bumpalo::Bump;
+    use std::cell::Cell;
+
+    /// Decode a struct from wire bytes and encode it straight back. The gate P2 rests on, in
+    /// miniature: the guest's own encoder wrote these bytes, so reproducing them exactly is a
+    /// diff against the C implementation with nothing to compare by hand.
+    fn round_trip<T: Default>(
+        wire: &[u8],
+        decode: fn(&mut Decoder<'_>, &mut T),
+        sizeof: fn(&dyn crate::venus::cs::Protocol, &T) -> usize,
+        encode: fn(&mut Encoder<'_>, &T),
+    ) {
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
+        let mut val = T::default();
+        decode(&mut dec, &mut val);
+        assert!(!dec.fatal(), "decode poisoned the stream");
+        assert_eq!(dec.pos(), wire.len(), "decode did not consume the command");
+
+        let size = sizeof(&AllOfIt, &val);
+        let mut buf = vec![0u8; size];
+        let mut enc = Encoder::new(&mut buf, &AllOfIt);
+        encode(&mut enc, &val);
+        assert!(!enc.fatal(), "encode overran the buffer it sized itself");
+        assert_eq!(enc.written(), wire);
+    }
+
+    fn wire(words: &[&[u8]]) -> Vec<u8> {
+        words.concat()
+    }
+
+    #[test]
+    fn a_struct_with_strings_reproduces_the_wire() {
+        let w = wire(&[
+            &0u32.to_le_bytes(),           // sType = VK_STRUCTURE_TYPE_APPLICATION_INFO
+            &0u64.to_le_bytes(),           // pNext: absent
+            &6u64.to_le_bytes(),           // pApplicationName: six bytes, terminator included
+            b"limin\0\0\0",                // padded to eight
+            &0x0001_0002u32.to_le_bytes(), // applicationVersion
+            &0u64.to_le_bytes(),           // pEngineName: absent
+            &0u32.to_le_bytes(),           // engineVersion
+            &0x0040_3000u32.to_le_bytes(), // apiVersion
+        ]);
+        round_trip::<VkApplicationInfo>(
+            &w,
+            vn_decode_VkApplicationInfo_temp,
+            vn_sizeof_VkApplicationInfo,
+            vn_encode_VkApplicationInfo,
+        );
+    }
+
+    #[test]
+    fn a_union_reproduces_the_wire_through_the_tag_venus_pins() {
+        let w = wire(&[
+            &0u32.to_le_bytes(), // tag: VkClearValue.color
+            &2u32.to_le_bytes(), // tag: VkClearColorValue.uint32
+            &4u64.to_le_bytes(), // four elements
+            &1u32.to_le_bytes(),
+            &2u32.to_le_bytes(),
+            &3u32.to_le_bytes(),
+            &4u32.to_le_bytes(),
+        ]);
+        round_trip::<VkClearValue>(
+            &w,
+            vn_decode_VkClearValue_temp,
+            vn_sizeof_VkClearValue,
+            vn_encode_VkClearValue,
+        );
+    }
+
+    #[test]
+    fn a_blob_is_reproduced_with_its_padding() {
+        let w = wire(&[
+            &0u32.to_le_bytes(), // mapEntryCount
+            &0u64.to_le_bytes(), // pMapEntries: absent
+            &5u64.to_le_bytes(), // dataSize
+            &5u64.to_le_bytes(), // pData: five bytes
+            b"\x01\x02\x03\x04\x05\0\0\0",
+        ]);
+        round_trip::<VkSpecializationInfo>(
+            &w,
+            vn_decode_VkSpecializationInfo_temp,
+            vn_sizeof_VkSpecializationInfo,
+            vn_encode_VkSpecializationInfo,
+        );
+    }
 }

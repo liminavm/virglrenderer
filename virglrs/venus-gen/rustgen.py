@@ -205,11 +205,16 @@ class RustGen:
                 expr = expr.replace(key, str(val))
         return expr
 
-    def _len_expr(self, ty, var, level=0):
-        """The element count of a dynamic array, as a Rust `u64` expression."""
+    def _len_expr(self, ty, var, levels=1):
+        """The element count of a dynamic array, as a Rust `u64` expression.
+
+        `levels` is how many len expressions the shape accounts for -- two for an array of strings,
+        whose inner length is the terminator. A member with more than the shape expects is a gap,
+        never a silently ignored dimension.
+        """
         exprs = var.attrs.get('len_exprs')
         names = var.attrs.get('len_names')
-        if not exprs or len(exprs) != 1 or exprs[0] == 'null-terminated':
+        if not exprs or len(exprs) != levels or exprs[0] == 'null-terminated':
             raise self.Unsupported('%s.%s: len %r' % (ty.name, var.name, exprs))
         expr, name = exprs[0], names[0]
         expr = self._substitute_constants(expr)
@@ -226,18 +231,23 @@ class RustGen:
 
     def _shape(self, ty, var):
         """How a member is laid out: ('static', n) | ('dynamic', len) | ('pointer',) | ('plain',)."""
+        if 'stride' in var.attrs:
+            raise self.Unsupported('%s.%s: stride' % (ty.name, var.name))
         if var.is_blob():
-            raise self.Unsupported('%s.%s: blob' % (ty.name, var.name))
-        if 'stride' in var.attrs or 'selector' in var.attrs:
-            raise self.Unsupported('%s.%s: %s' % (ty.name, var.name, sorted(var.attrs)))
+            return ('blob', self._len_expr(ty, var))
         if var.ty.is_static_array():
-            dim = var.ty.static_array_size()
-            if '][' in dim:
-                raise self.Unsupported('%s.%s: 2-D array' % (ty.name, var.name))
-            return ('static', self.dimension(dim))
+            dims = [self.dimension(d) for d in var.ty.static_array_size().split('][')]
+            if len(dims) > 2:
+                raise self.Unsupported('%s.%s: array depth %d' % (ty.name, var.name, len(dims)))
+            total = ' * '.join(dims)
+            return ('static', total, len(dims) > 1)
+        if var.has_c_string():
+            if var.ty.is_c_string():
+                return ('string',)
+            if var.ty.indirection_depth() != 2:
+                raise self.Unsupported('%s.%s: string pointer depth' % (ty.name, var.name))
+            return ('string_array', self._len_expr(ty, var, levels=2))
         if var.is_dynamic_array():
-            if var.ty.is_c_string() or var.has_c_string():
-                raise self.Unsupported('%s.%s: c string' % (ty.name, var.name))
             if var.ty.indirection_depth() != 1:
                 raise self.Unsupported('%s.%s: pointer depth' % (ty.name, var.name))
             return ('dynamic', self._len_expr(ty, var))
@@ -247,12 +257,21 @@ class RustGen:
             return ('pointer',)
         return ('plain',)
 
+    def _tag_arg(self, ty, var):
+        """A tagged union's discriminant, which the owning struct carries in another member."""
+        sel = var.attrs.get('selector')
+        if not sel:
+            return ''
+        if '->' in sel or '[' in sel:
+            raise self.Unsupported('%s.%s: indirect selector %r' % (ty.name, var.name, sel))
+        return ', val.%s' % self.field_name(sel)
+
     def _elem_call(self, kind, ty, var, validity, alloc):
         """The per-element serializer to call, and whether it takes a scalar type parameter."""
         base = var.ty.base
         scalar = self.scalar_of(var.ty)
         if scalar:
-            return ('scalar', scalar)
+            return ('scalar', scalar, '')
         if base.category == VkType.FUNCPOINTER:
             raise self.Unsupported('%s.%s: function pointer' % (ty.name, var.name))
 
@@ -270,7 +289,9 @@ class RustGen:
                     name += '_temp'
         else:
             raise self.Unsupported('%s.%s: category %d' % (ty.name, var.name, base.category))
-        return ('call', name)
+        if base.category == VkType.UNION and base.is_valid_union() and kind != 'decode':
+            return ('call', name, self._tag_arg(ty, var))
+        return ('call', name, '')
 
     def decode_member(self, ty, var, partial, alloc):
         """Rust statements decoding one struct member or command argument."""
@@ -280,30 +301,60 @@ class RustGen:
 
         shape = self._shape(ty, var)
         m = self.member_expr(var)
-        elem_kind, elem = self._elem_call('decode', ty, var, validity, alloc)
+        elem_kind, elem, tag = self._elem_call('decode', ty, var, validity, alloc)
 
         if shape[0] == 'plain':
             if validity == Gen_INVALID:
                 return ['/* skip %s */' % m]
             if elem_kind == 'scalar':
                 return ['%s = dec.decode_scalar::<%s>();' % (m, elem)]
-            return ['%s(dec, &mut %s);' % (elem, m)]
+            return ['%s(dec, &mut %s%s);' % (elem, m, tag)]
 
         if shape[0] == 'static':
             n = shape[1]
+            # A 2-D array is one flat run of elements on the wire, in the order C would write it.
+            flat = '%s.as_flattened_mut()' % m if shape[2] else '%s' % m
             if validity == Gen_INVALID:
                 return ['/* skip %s */' % m]
             lines = ['let array_size = dec.decode_array_size(%s) as usize;' % n]
             if elem_kind == 'scalar':
-                lines.append('dec.decode_scalar_array(&mut %s[..array_size.min(%s)]);' % (m, n))
+                lines.append('dec.decode_scalar_array(&mut %s[..array_size.min(%s)]);' % (flat, n))
             else:
-                lines.append('for e in %s[..array_size.min(%s)].iter_mut() {' % (m, n))
-                lines.append('    %s(dec, e);' % elem)
+                lines.append('for e in %s[..array_size.min(%s)].iter_mut() {' % (flat, n))
+                lines.append('    %s(dec, e%s);' % (elem, tag))
                 lines.append('}')
             return ['{'] + ['    ' + l for l in lines] + ['}']
 
         ptr = '*const' if var.ty.is_const_pointer() else '*mut'
         null = 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
+
+        if shape[0] == 'blob':
+            # Borrowed from the stream, not copied: the arena is for what the guest does not
+            # already hold in a contiguous, correctly sized run of wire bytes.
+            hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
+                   'let Some(b) = dec.decode_blob(n) else { return };',
+                   '%s = b.as_ptr() as %s _;' % (m, ptr)]
+            return self._present(shape[1], var, m, null, hit)
+
+        if shape[0] == 'string':
+            hit = ['let n = dec.decode_array_size_unchecked() as usize;',
+                   'let Some(t) = dec.decode_c_string(n) else { return };',
+                   '%s = t.as_ptr() as %s _;' % (m, ptr)]
+            return self._present(None, var, m, null, hit)
+
+        if shape[0] == 'string_array':
+            if not alloc:
+                raise self.Unsupported('%s.%s: strings without temp storage' % (ty.name, var.name))
+            hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
+                   'let Some(a) = dec.alloc_temp_array::<%s>(n) else { return };'
+                   % self.base_name(var.ty),
+                   'for e in a.iter_mut() {',
+                   '    let n = dec.decode_array_size_unchecked() as usize;',
+                   '    let Some(t) = dec.decode_c_string(n) else { return };',
+                   '    *e = t.as_ptr() as _;',
+                   '}',
+                   '%s = a.as_ptr() as %s _;' % (m, ptr)]
+            return self._present(shape[1], var, m, null, hit)
 
         if shape[0] == 'pointer':
             miss = ['%s = %s;' % (m, null)]
@@ -313,7 +364,7 @@ class RustGen:
                 raise self.Unsupported('%s.%s: pointer without temp storage' % (ty.name, var.name))
             hit = ['let Some(p) = dec.alloc_temp::<%s>() else { return };' % self.base_name(var.ty)]
             if validity != Gen_INVALID:
-                hit.append('%s(dec, p);' % elem if elem_kind == 'call'
+                hit.append('%s(dec, p%s);' % (elem, tag) if elem_kind == 'call'
                            else '*p = dec.decode_scalar::<%s>();' % elem)
             hit.append('%s = p as %s _;' % (m, ptr))
             return (['if dec.decode_simple_pointer() {'] + ['    ' + l for l in hit]
@@ -331,16 +382,20 @@ class RustGen:
                 hit.append('dec.decode_scalar_array(a);')
             else:
                 hit.append('for e in a.iter_mut() {')
-                hit.append('    %s(dec, e);' % elem)
+                hit.append('    %s(dec, e%s);' % (elem, tag))
                 hit.append('}')
         hit.append('%s = a.as_%s;' % (m, 'ptr()' if var.ty.is_const_pointer() else 'mut_ptr()'))
 
-        if not var.is_optional() and var.can_validate():
+        return self._present(count, var, m, null, hit)
+
+    def _present(self, count, var, m, null, hit):
+        """The present/absent frame a wire array shares: peek the count, and on zero consume it
+        anyway -- the guest sent it either way -- and leave the member null."""
+        if count is not None and not var.is_optional() and var.can_validate():
             miss = ['dec.decode_array_size(%s);' % count]
         else:
             miss = ['dec.decode_array_size_unchecked();']
         miss.append('%s = %s;' % (m, null))
-
         return (['if dec.peek_array_size() != 0 {'] + ['    ' + l for l in hit]
                 + ['} else {'] + ['    ' + l for l in miss] + ['}'])
 
@@ -364,16 +419,16 @@ class RustGen:
 
         shape = self._shape(ty, var)
         m = self.member_expr(var)
-        elem_kind, elem = self._elem_call(kind, ty, var, validity, False)
+        elem_kind, elem, tag = self._elem_call(kind, ty, var, validity, False)
 
         def one(expr):
             if kind == 'encode':
                 if elem_kind == 'scalar':
                     return 'enc.encode_scalar::<%s>(%s);' % (elem, expr)
-                return '%s(enc, &%s);' % (elem, expr)
+                return '%s(enc, &%s%s);' % (elem, expr, tag)
             if elem_kind == 'scalar':
                 return 'size += cs::sizeof_scalar::<%s>();' % elem
-            return 'size += %s(proto, &%s);' % (elem, expr)
+            return 'size += %s(proto, &%s%s);' % (elem, expr, tag)
 
         def many(expr, count):
             """A whole array: scalars are packed and padded as one, others are per-element."""
@@ -381,7 +436,7 @@ class RustGen:
                 if kind == 'encode':
                     return ['enc.encode_scalar_array::<%s>(%s);' % (elem, expr)]
                 return ['size += cs::sizeof_scalar_array::<%s>(%s as usize);' % (elem, count)]
-            body = one('e') if kind == 'encode' else 'size += %s(proto, e);' % elem
+            body = one('e') if kind == 'encode' else 'size += %s(proto, e%s);' % (elem, tag)
             return ['for e in %s {' % expr, '    ' + body, '}']
 
         def array_size(count):
@@ -396,16 +451,82 @@ class RustGen:
 
         if shape[0] == 'static':
             n = shape[1]
+            flat = '%s.as_flattened()' % m if shape[2] else '&%s' % m
             lines = [array_size('%s as u64' % n)]
             if validity != Gen_INVALID:
-                lines += many('&%s' % m if elem_kind != 'scalar' else '&%s' % m, n)
+                lines += many(flat, n)
+            return lines
+
+        if shape[0] == 'blob':
+            n = shape[1]
+            if kind == 'encode':
+                return ['if !%s.is_null() {' % m,
+                        '    enc.encode_array_size(%s);' % n,
+                        '    // SAFETY: the member points at the run of wire bytes the decoder',
+                        '    // borrowed for it, which is exactly this long.',
+                        '    unsafe {',
+                        '        enc.encode_blob(core::slice::from_raw_parts(',
+                        '            %s as *const u8, (%s) as usize));' % (m, n),
+                        '    }',
+                        '} else {',
+                        '    enc.encode_array_size(0);',
+                        '}']
+            return ['size += cs::sizeof_scalar::<u64>();',
+                    'if !%s.is_null() {' % m,
+                    '    size += cs::sizeof_blob((%s) as usize);' % n,
+                    '}']
+
+        if shape[0] == 'string':
+            # A string carries no count of its own on the wire, so its length has to come back out
+            # of the bytes: the decoder guaranteed the terminator when it copied them in.
+            if kind == 'encode':
+                return ['if !%s.is_null() {' % m,
+                        '    // SAFETY: NUL-terminated by the decoder, and the arena outlives this.',
+                        '    unsafe {',
+                        '        let n = cs::c_string_len(%s);' % m,
+                        '        enc.encode_array_size(n as u64);',
+                        '        enc.encode_blob(core::slice::from_raw_parts(%s as *const u8, n));'
+                        % m,
+                        '    }',
+                        '} else {',
+                        '    enc.encode_array_size(0);',
+                        '}']
+            return ['size += cs::sizeof_scalar::<u64>();',
+                    'if !%s.is_null() {' % m,
+                    '    // SAFETY: as above.',
+                    '    size += cs::sizeof_blob(unsafe { cs::c_string_len(%s) });' % m,
+                    '}']
+
+        if shape[0] == 'string_array':
+            n = shape[1]
+            body = ['let n = cs::c_string_len(*e);']
+            if kind == 'encode':
+                body += ['enc.encode_array_size(n as u64);',
+                         'enc.encode_blob(core::slice::from_raw_parts(*e as *const u8, n));']
+            else:
+                body += ['size += cs::sizeof_scalar::<u64>() + cs::sizeof_blob(n);']
+            lines = ['if !%s.is_null() {' % m]
+            lines.append('    ' + ('enc.encode_array_size(%s);' % n if kind == 'encode'
+                                   else 'size += cs::sizeof_scalar::<u64>();'))
+            lines.append('    // SAFETY: the decoder allocated this many pointers and made each')
+            lines.append('    // one NUL-terminated in its arena.')
+            lines.append('    unsafe {')
+            lines.append('        for e in core::slice::from_raw_parts(%s, (%s) as usize) {'
+                         % (m, n))
+            lines += ['            ' + l for l in body]
+            lines.append('        }')
+            lines.append('    }')
+            lines.append('} else {')
+            lines.append('    ' + ('enc.encode_array_size(0);' if kind == 'encode'
+                                   else 'size += cs::sizeof_scalar::<u64>();'))
+            lines.append('}')
             return lines
 
         if shape[0] == 'pointer':
             if validity == Gen_INVALID:
                 if kind == 'encode':
                     return ['enc.encode_simple_pointer(!%s.is_null()); /* out */' % m]
-                return ['size += cs::sizeof_scalar::<u32>(); /* out */']
+                return ['size += cs::sizeof_scalar::<u64>(); /* out */']
             inner = one('*%s' % m)
             if kind == 'encode':
                 return ['if enc.encode_simple_pointer(!%s.is_null()) {' % m,
@@ -413,7 +534,7 @@ class RustGen:
                         '    // this member was decoded into.',
                         '    unsafe { %s }' % inner,
                         '}']
-            return ['size += cs::sizeof_scalar::<u32>();',
+            return ['size += cs::sizeof_scalar::<u64>();',
                     'if !%s.is_null() {' % m,
                     '    // SAFETY: as above.',
                     '    unsafe { %s }' % inner,
@@ -533,30 +654,80 @@ class RustGen:
             '',
         ]
 
-    def _union_fns(self, ty, gaps):
-        """Unions are selected by a tag the owning struct carries, which the member emitter does
-        not yet thread through; the bodies are gaps, but the names have to exist."""
-        n = ty.name
-        tag = ', tag: %s' % ty.sty.name if ty.is_valid_union() else ''
-        why = '%s: union' % n
+    # A union with no selector still carries a tag on the wire, and venus pins the one it writes
+    # so both sides agree without a discriminant Vulkan never gave them. Decode still accepts every
+    # case, as the C does.
+    UNION_DEFAULT_TAGS = {
+        'VkClearColorValue': 2,
+        'VkClearValue': 0,
+        'VkDeviceOrHostAddressKHR': 0,
+        'VkDeviceOrHostAddressConstKHR': 0,
+        'VkPipelineExecutableStatisticValueKHR': 2,
+    }
 
-        def gap(sig, kind):
-            gaps.append(why)
-            if kind == 'decode':
-                body = ['dec.set_fatal();']
-            elif kind == 'encode':
-                body = ['let _ = val;', 'enc.write(0, &[]);']
-            else:
-                body = ['let _ = (proto, val);', '0']
-            return (['/* gap: %s */' % why, 'pub fn %s {' % sig]
-                    + ['    ' + l for l in body] + ['}', ''])
+    def _union_fns(self, ty, gaps):
+        """A union is a tag followed by whichever member the tag names.
+
+        Reading a Rust union member is unsafe by definition -- nothing but the tag says which one
+        is live -- so every case body is wrapped. Where the tag comes from is the whole design:
+        a selected union takes it from the owning struct, and the rest write a pinned default. Only
+        decode can read it off the wire, which is why decode alone takes no tag argument.
+        """
+        n = ty.name
+        valid = ty.is_valid_union()
+        pinned = self.UNION_DEFAULT_TAGS.get(n)
+        tag = ', tag: %s' % ty.sty.name if valid else ''
+
+        def case(kind, var):
+            body = (self.decode_member(ty, var, False, True) if kind == 'decode'
+                    else self._out_member(kind, ty, var, False))
+            return (['// SAFETY: the tag names this member.', 'unsafe {']
+                    + ['    ' + l for l in body] + ['}'])
+
+        def body(kind):
+            def go():
+                if not valid and pinned is None:
+                    raise self.Unsupported('%s: union without a tag' % n)
+                out = ['let mut size = 0usize;'] if kind == 'sizeof' else []
+
+                # The pinned-tag encode has no branch at all: one member, always.
+                if not valid and kind != 'decode':
+                    var = dict(ty.get_union_cases())[pinned]
+                    out.append('enc.encode_scalar::<u32>(%du32);' % pinned if kind == 'encode'
+                               else 'size += cs::sizeof_scalar::<u32>();')
+                    out += case(kind, var)
+                    return out + (['size'] if kind == 'sizeof' else [])
+
+                if valid:
+                    if kind == 'decode':
+                        out.append('let tag = dec.decode_scalar::<%s>();' % ty.sty.name)
+                    elif kind == 'encode':
+                        out.append('enc.encode_scalar::<%s>(tag);' % ty.sty.name)
+                    else:
+                        out.append('size += cs::sizeof_scalar::<%s>();' % ty.sty.name)
+                    tests = [('tag == %s::%s' % (ty.sty.name, label), var)
+                             for label, var in ty.get_union_cases()]
+                else:
+                    out.append('let tag = dec.decode_scalar::<u32>();')
+                    tests = [('tag == %du32' % i, var) for i, var in ty.get_union_cases()]
+
+                for i, (test, var) in enumerate(tests):
+                    out.append('%sif %s {' % ('} else ' if i else '', test))
+                    out += ['    ' + l for l in case(kind, var)]
+                out += ['} else {',
+                        '    ' + ('dec.set_fatal();' if kind == 'decode'
+                                  else 'debug_assert!(false, "no case for this union tag");'),
+                        '}']
+                return out + (['size'] if kind == 'sizeof' else [])
+            return go
 
         out = []
-        out += gap('vn_sizeof_%s(proto: &dyn cs::Protocol, val: &%s%s) -> usize'
-                   % (n, n, tag), 'sizeof')
-        out += gap('vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s%s)' % (n, n, tag), 'encode')
-        out += gap('vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s%s)'
-                   % (n, n, tag), 'decode')
+        out += self._fn('vn_sizeof_%s(proto: &dyn cs::Protocol, val: &%s%s) -> usize'
+                        % (n, n, tag), body('sizeof'), gaps, n)
+        out += self._fn('vn_encode_%s(enc: &mut Encoder<\'_>, val: &%s%s)' % (n, n, tag),
+                        body('encode'), gaps, n)
+        out += self._fn('vn_decode_%s_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, n),
+                        body('decode'), gaps, n)
         return out
 
     def _plain_struct_fns(self, ty, gaps):
@@ -625,7 +796,7 @@ class RustGen:
                'pub unsafe fn vn_sizeof_%s_pnext(proto: &dyn cs::Protocol, val: *const c_void) -> usize {' % n]
         if not next_types:
             out += ['    let _ = (proto, val);',
-                    '    return cs::sizeof_scalar::<u32>(); /* no known struct */',
+                    '    return cs::sizeof_scalar::<u64>(); /* no known struct */',
                     '}', '']
             return out
         out += ['    let mut pnext = val as *const VkBaseInStructure;',
@@ -642,7 +813,7 @@ class RustGen:
                 out.append('                    continue;')
                 out.append('                }')
             out += [
-                '                size += cs::sizeof_scalar::<u32>();',
+                '                size += cs::sizeof_scalar::<u64>(); /* simple pointer */',
                 '                size += cs::sizeof_scalar::<VkStructureType>();',
                 '                let here = unsafe { &*(pnext as *const %s) };' % nt.name,
                 '                size += unsafe {',
@@ -656,7 +827,7 @@ class RustGen:
                 '        }',
                 '        pnext = node.pNext;',
                 '    }',
-                '    size + cs::sizeof_scalar::<u32>()',
+                '    size + cs::sizeof_scalar::<u64>()',
                 '}', '']
         return out
 

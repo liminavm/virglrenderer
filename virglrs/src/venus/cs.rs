@@ -361,10 +361,11 @@ impl<'a> Encoder<'a> {
     }
 }
 
-/// A pointer on the wire is one word: present or not. The pointee follows only if present.
+/// A pointer on the wire is an array size of one or zero: present or not. The pointee follows only
+/// if present, so it costs the same eight bytes an element count does.
 impl<'a> Decoder<'a> {
     pub fn decode_simple_pointer(&mut self) -> bool {
-        self.decode_scalar::<u32>() != 0
+        self.decode_array_size_unchecked() != 0
     }
 
     /// An array's element count, as the guest claims it. Nothing here validates it against what the
@@ -388,16 +389,60 @@ impl<'a> Decoder<'a> {
         }
         size
     }
+
+    /// `size` bytes of opaque payload, borrowed from the stream rather than copied. The renderer
+    /// only ever reads a blob, and the stream outlives the command that named it.
+    pub fn decode_blob(&mut self, size: usize) -> Option<&'a [u8]> {
+        self.read_bytes(align4(size), size)
+    }
+
+    /// `size` bytes of string, copied into the arena and forced NUL-terminated. The copy is what
+    /// buys the terminator: a guest that sends an unterminated string gets it truncated here
+    /// rather than run off the end of the stream in whatever host call receives it.
+    pub fn decode_c_string(&mut self, size: usize) -> Option<&'a mut [u8]> {
+        if size == 0 {
+            self.set_fatal();
+            return None;
+        }
+        let bytes = self.read_bytes(align4(size), size)?;
+        let out = self.alloc_temp_array::<u8>(size)?;
+        out.copy_from_slice(bytes);
+        out[size - 1] = 0;
+        Some(out)
+    }
+}
+
+/// The wire size of `size` bytes of opaque payload: padded to a word, with no count of its own.
+pub const fn sizeof_blob(size: usize) -> usize {
+    align4(size)
+}
+
+/// The length a NUL-terminated string occupies on the wire, terminator included.
+///
+/// # Safety
+/// `p` must point at a NUL-terminated string that outlives the call.
+pub unsafe fn c_string_len(p: *const core::ffi::c_char) -> usize {
+    let mut n = 0;
+    // SAFETY: the caller promises a terminator, so the walk stops inside the allocation.
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    n + 1
 }
 
 impl<'a> Encoder<'a> {
     pub fn encode_simple_pointer(&mut self, present: bool) -> bool {
-        self.encode_scalar::<u32>(present as u32);
+        self.encode_array_size(present as u64);
         present
     }
 
     pub fn encode_array_size(&mut self, count: u64) {
         self.encode_scalar::<u64>(count);
+    }
+
+    /// Opaque payload, padded to a word. The count, when the wire carries one, is the caller's.
+    pub fn encode_blob(&mut self, val: &[u8]) {
+        self.write(align4(val.len()), val);
     }
 }
 
