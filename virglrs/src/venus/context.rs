@@ -69,6 +69,19 @@ impl Context {
         self.replay = false;
     }
 
+    /// Poison the context, naming the command that did it -- once. A ring the guest can no longer
+    /// use looks the same from inside the guest whatever caused it, so the command type is the
+    /// only thing that tells a bug report from a hostile stream apart.
+    fn poison(&self, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
+        if !self.fatal.get() {
+            let name = vn_command_name(cmd)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("command type {}", cmd.0));
+            eprintln!("[virglrs] ctx {}: {name} {why}, {} bytes in", self.id.0, dec.pos());
+        }
+        dec.set_fatal();
+    }
+
     /// Drain one submission, dispatching every command in it.
     ///
     /// Returns false when the context was poisoned -- by this batch or by an earlier one. The C
@@ -93,6 +106,12 @@ impl Context {
             let flags = dec.decode_scalar::<VkFlags>();
             if dec.hard_fatal() {
                 // The header itself was short: there is no command here to lose.
+                eprintln!(
+                    "[virglrs] ctx {}: submission ends mid-header, {} bytes into {}",
+                    self.id.0,
+                    dec.pos(),
+                    buf.len()
+                );
                 break;
             }
 
@@ -103,28 +122,34 @@ impl Context {
             // the journal's entries have had their reply flag stripped already.
             if flags.0 & GENERATE_REPLY != 0 && !self.replay {
                 self.unhandled += 1;
-                dec.set_fatal();
+                self.poison(&dec, cmd, "wants a reply, and there is no ring to answer into");
                 break;
             }
 
             if vn_dispatch_command(&mut dec, None, cmd, &mut h).is_none() {
                 // A command type this protocol does not define. We cannot even skip it: its length
                 // is only knowable by decoding it.
-                dec.set_fatal();
+                self.poison(&dec, cmd, "is not a command type this protocol defines");
                 break;
             }
             self.dispatched += 1;
             // A guest that named id zero, or reused one that is still live, is naming objects
             // it cannot have. The handler had no decoder to say so; this is where it lands.
             if h.bad_id {
-                dec.set_fatal();
+                self.poison(&dec, cmd, "named an object it cannot have");
             }
 
             if self.fatal.get() {
-                return false;
+                // The decoder poisoned itself inside the command: a malformed argument, or a
+                // shape the generator has no decoder for. Either way the command is what a
+                // reader needs, because without it a gap reaches a user as a hung guest.
+                self.poison(&dec, cmd, "did not decode");
+                break;
             }
         }
-        true
+        // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
+        // success on the way out.
+        !self.fatal.get()
     }
 
     /// A ring-scoped submission. The ring the command belongs to is recorded but not yet acted on:
@@ -189,5 +214,59 @@ impl Unimplemented {
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(cmd: VkCommandTypeEXT, flags: u32) -> Vec<u8> {
+        let mut w = (cmd.0 as u32).to_le_bytes().to_vec();
+        w.extend_from_slice(&flags.to_le_bytes());
+        w
+    }
+
+    /// A shape the generator has no decoder for poisons the ring, and the log line that says so
+    /// has to be able to name the command. Without the name a gap reaches a user as a hung guest
+    /// with nothing to report; `vn_command_name` returning `None` here would be that silently.
+    #[test]
+    fn an_undecodable_command_poisons_the_context_by_name() {
+        let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT;
+        assert_eq!(vn_command_name(cmd), Some("vkGetPipelineCacheData"));
+
+        let mut ctx = Context::new(CtxId(1));
+        ctx.replay_begin();
+        let mut todo = Unimplemented::default();
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo), "a stubbed decoder must poison");
+        assert!(ctx.fatal());
+
+        // The poison outlives the batch: a stream we stopped trusting stays untrusted.
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo));
+    }
+
+    /// A command that wants an answer has nowhere to be answered into, so it poisons -- but only
+    /// outside replay, where the journal's replies have already been stripped.
+    #[test]
+    fn a_reply_request_poisons_only_outside_replay() {
+        let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT;
+        let mut todo = Unimplemented::default();
+
+        let mut ctx = Context::new(CtxId(1));
+        let w = header(cmd, GENERATE_REPLY);
+        let mut full = w.clone();
+        full.extend_from_slice(&1u64.to_le_bytes()); // instance id
+        full.extend_from_slice(&0u64.to_le_bytes()); // no allocator
+        assert!(!ctx.submit(&full, &mut todo));
+        assert_eq!(ctx.unhandled, 1);
+
+        // In replay the flag is stripped, so the command reaches the dispatcher instead of the
+        // poison. It still names an instance nothing created, which poisons for its own reason --
+        // what separates the two paths is whether the command was dispatched at all.
+        let mut ctx = Context::new(CtxId(1));
+        ctx.replay_begin();
+        assert!(!ctx.submit(&full, &mut todo));
+        assert_eq!(ctx.dispatched, 1);
+        assert_eq!(ctx.unhandled, 0);
     }
 }
