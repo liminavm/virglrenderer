@@ -27,6 +27,27 @@ source images are never touched — an ordinary copy of two ~15 GB images would 
 host. The two tiers are both here on purpose: the enhanced image boots the venus desktop, the
 stock image exercises classic vrend and the VA-API video path.
 
+## The three guests, and what each one needs
+
+All three images boot to **multi-user**, not to a seated desktop, so a capture that just boots
+records nothing. What starts the workload differs per image, and so does which renderer it drives:
+
+| `capture.sh` | guest | workload | drives |
+|---|---|---|---|
+| `synoik` | enhanced + synoik | starts on its own at boot | venus, end to end |
+| `venus` | enhanced GNOME | `sudo systemctl isolate graphical.target`, then a Vulkan client (`vkcube`, `vulkaninfo`) over SSH | venus from clients only |
+| `vrend` | stock | `sudo systemctl isolate graphical.target` | classic vrend, plus the video path |
+
+The surprise worth keeping: on the **enhanced** image gnome-shell renders through **classic virgl**
+(`GALLIUM_DRIVER=virgl` in its environ), not zink→venus. Its venus traffic comes from Vulkan
+clients, which makes it the mixed case rather than the venus one. Synoik is the desktop workload
+that is venus throughout.
+
+A Vulkan client over SSH needs only `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json`
+plus `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` for a windowed one. A **GL** client needs the session's
+zink environment too, which an SSH shell does not inherit — without it the stack silently falls back
+to llvmpipe and the capture records nothing while looking healthy.
+
 ## Capturing
 
 Both recorders are armed by capacity and write only when asked, through a FIFO — so arming one
