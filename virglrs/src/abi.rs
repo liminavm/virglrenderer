@@ -27,6 +27,8 @@ pub const USE_VIDEO: c_int = 1 << 11;
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;
 pub const CAPSET_VENUS: u32 = 4;
+/// A context's capset is the low byte of the flags it was created with.
+pub const CAPSET_MASK: u32 = 0xff;
 
 #[repr(C)]
 pub struct GlCtxParam {
