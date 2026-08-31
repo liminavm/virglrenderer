@@ -19,6 +19,7 @@ mod corpus;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use corpus::{Ctl, Record};
 
@@ -52,6 +53,10 @@ struct Args {
     renderer: String,
     flags: i32,
     verbose: bool,
+    /// Write the score here instead of only printing it.
+    score: Option<String>,
+    /// Compare the score against this file and fail on any difference.
+    expect: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +64,8 @@ fn parse_args() -> Result<Args, String> {
     let mut renderer = None;
     let mut flags = abi::DEFAULT_FLAGS;
     let mut verbose = false;
+    let mut score = None;
+    let mut expect = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -71,6 +78,8 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("--flags {v}: not a number"))?;
             }
             "--verbose" => verbose = true,
+            "--score" => score = Some(it.next().ok_or("--score wants a path")?),
+            "--expect" => expect = Some(it.next().ok_or("--expect wants a path")?),
             _ if corpus.is_none() => corpus = Some(a),
             _ => return Err(format!("unexpected argument {a}")),
         }
@@ -83,6 +92,8 @@ fn parse_args() -> Result<Args, String> {
             .ok_or("no --renderer and no VIRGL_RENDERER_LIB")?,
         flags,
         verbose,
+        score,
+        expect,
     })
 }
 
@@ -134,6 +145,12 @@ struct Replay<'a> {
     backings: BTreeMap<u32, Backing>,
     /// Classic contexts, and every resource event naming one, are skipped rather than failed.
     classic: BTreeSet<u32>,
+    /// Score lines, in the order the contexts produced them. A context is scored when it is
+    /// destroyed and once more at the end if it is still alive -- a workload that tears down
+    /// cleanly leaves nothing to census, so scoring only at the end would score nothing at all.
+    score: Vec<String>,
+    /// Contexts already scored at their destroy, so the final sweep does not score them twice.
+    scored: BTreeSet<u32>,
     /// DIAGNOSTIC, not the shipped semantics. A create_blob that exports a VkDeviceMemory
     /// (blob_id != 0) can be recorded ahead of the vkAllocateMemory that made it: the recorder
     /// orders events by when each thread reached its lock, and that is not the order they
@@ -227,12 +244,20 @@ impl<'a> Replay<'a> {
                 if rc == 0 {
                     self.begin(*ctx_id);
                 }
+                // The guest reuses context ids. This is a DIFFERENT context wearing the number of
+                // one already scored at its destroy, so it owes a score of its own.
+                self.scored.remove(ctx_id);
                 (rc, format!("context_create {ctx_id} flags={context_init:#x} {name:?}"))
             }
             Ctl::CtxDestroy { ctx_id } => {
                 // End the replay first: replay_end starts the deferred ring threads, and tearing
                 // the context down with them unstarted loses whatever they had parked.
                 self.end(*ctx_id);
+                // Score before destroying: this is the last moment the context's device memory
+                // exists, and for a workload that exits cleanly it is the ONLY moment.
+                let lines = score_context(&self.r, *ctx_id);
+                self.score.extend(lines);
+                self.scored.insert(*ctx_id);
                 self.r.context_destroy(*ctx_id);
                 (0, format!("context_destroy {ctx_id}"))
             }
@@ -362,7 +387,7 @@ impl<'a> Replay<'a> {
     }
 }
 
-fn run(args: &Args) -> Result<Tally, String> {
+fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
     let blob = std::fs::read(&args.corpus)
         .map_err(|e| format!("{}: {e}", args.corpus))?;
     let c = corpus::parse(&blob).map_err(|e| format!("{}: {e}", args.corpus))?;
@@ -384,6 +409,8 @@ fn run(args: &Args) -> Result<Tally, String> {
         open: BTreeSet::new(),
         backings: BTreeMap::new(),
         classic: BTreeSet::new(),
+        score: Vec::new(),
+        scored: BTreeSet::new(),
         deferred: Vec::new(),
     };
 
@@ -486,29 +513,117 @@ fn run(args: &Args) -> Result<Tally, String> {
         rp.end(ctx_id);
     }
 
-    // The oracle. Counts say the commands were accepted; the census says something was built.
+    // The oracle. Counts say the commands were accepted; the census says something was built, and
+    // the content hashes say it was built the same way.
     let mut ctxs: BTreeSet<u32> = c.prologues.iter().map(|p| p.ctx.id).collect();
     ctxs.extend(c.records.iter().map(|rec| rec.seq_ctx().id).filter(|id| *id != 0));
     for ctx_id in ctxs {
-        if rp.classic.contains(&ctx_id) {
+        if rp.classic.contains(&ctx_id) || rp.scored.contains(&ctx_id) {
             continue;
         }
-        match rp.r.memory_census(ctx_id) {
-            Ok(pairs) => {
-                let total: u64 = pairs.iter().map(|(_, sz)| sz).sum();
-                println!(
-                    "CENSUS ctx={ctx_id} allocations={} bytes={total}",
-                    pairs.len()
-                );
-            }
-            Err(rc) => println!("CENSUS ctx={ctx_id} unavailable ({rc})"),
-        }
+        rp.score.extend(score_context(&rp.r, ctx_id));
     }
+    let score = std::mem::take(&mut rp.score);
     rp.r.dump_state();
 
     let tally = std::mem::take(&mut rp.tally);
     r.cleanup();
-    Ok(tally)
+    Ok((tally, score))
+}
+
+/// FNV-1a, 64-bit. Inline because a content hash needs to be reproducible and comparable by hand,
+/// not fast or cryptographic -- and a score file is worth no new dependency.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// One pass over a context's capturable device memory: census, then read and hash each allocation.
+/// Returns the score lines, sorted, so two passes compare with a plain equality test.
+fn score_pass(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
+    let pairs = match r.memory_census(ctx_id) {
+        Ok(p) => p,
+        // A refused census is a fact about the run, not a reason to stop scoring the others.
+        Err(rc) => return vec![format!("census ctx={ctx_id} UNAVAILABLE rc={rc}")],
+    };
+    let mut lines: Vec<String> = Vec::with_capacity(pairs.len() + 1);
+    lines.push(format!("census ctx={ctx_id} allocations={}", pairs.len()));
+    for (mem_id, size) in pairs {
+        // Cap what a single allocation can cost us: a 64 MB scanout blob is real, and reading it
+        // whole on every settle pass is the difference between a score and a stall. The prefix is
+        // still content, and a divergence that misses the first megabyte is not one we can miss
+        // for long.
+        let want = size.min(1 << 20) as usize;
+        let mut buf = vec![0u8; want];
+        let rc = r.memory_read(ctx_id, mem_id, &mut buf);
+        if rc != 0 {
+            lines.push(format!("mem ctx={ctx_id} id={mem_id} size={size} UNREADABLE rc={rc}"));
+            continue;
+        }
+        lines.push(format!(
+            "mem ctx={ctx_id} id={mem_id} size={size} read={want} hash={:016x}",
+            fnv1a(&buf)
+        ));
+    }
+    lines.sort();
+    lines
+}
+
+/// Score a context, waiting for it to settle first. The replay skips every ring flow-control
+/// command, so nothing in the stream waits on the GPU: a hash taken the instant replay_end returns
+/// can race queue work that is still executing and read as nondeterministic when the renderer is
+/// perfectly deterministic. Two consecutive agreeing passes are the evidence that what we hashed
+/// is the finished state; a context that never settles says so in its own score, because that is
+/// itself a difference between two implementations.
+fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
+    const SETTLE_TRIES: u32 = 20;
+    const SETTLE_WAIT: Duration = Duration::from_millis(50);
+
+    let mut prev = score_pass(r, ctx_id);
+    for attempt in 1..=SETTLE_TRIES {
+        std::thread::sleep(SETTLE_WAIT);
+        let next = score_pass(r, ctx_id);
+        if next == prev {
+            if attempt > 1 {
+                eprintln!("settle: ctx {ctx_id} took {} passes", attempt + 1);
+            }
+            return next;
+        }
+        prev = next;
+    }
+    let mut out = prev;
+    out.insert(0, format!("census ctx={ctx_id} UNSETTLED after {SETTLE_TRIES} passes"));
+    out
+}
+
+/// The score: every fact a second implementation replaying the same corpus must reproduce, one
+/// per line, in a fixed order so `diff` is the whole comparison tool.
+///
+/// It scores RENDERER STATE, not pixels. A VM-free replay has no scanout and presents no frames,
+/// so what it can compare is what the commands built -- the accept/reject counts and the contents
+/// of the device memory left behind. That is the right target here: a port gets object lifetimes,
+/// descriptor writes and memory bindings wrong long before it gets a colour space wrong, and those
+/// are exactly what device memory shows.
+fn score_text(t: &Tally, census: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("prologue {} / {}\n", t.prologue_ok, t.prologue_ok + t.prologue_fail));
+    out.push_str(&format!("cmds {} / {}\n", t.cmd_ok, t.cmd_ok + t.cmd_fail));
+    out.push_str(&format!("ctl {} / {}\n", t.ctl_ok, t.ctl_ok + t.ctl_fail));
+    out.push_str(&format!("skipped flow-control {}\n", t.skipped_flow_control));
+    out.push_str(&format!("skipped classic {:?}\n", t.skipped_classic));
+    out.push_str(&format!("unreplayable imports {:?}\n", t.unreplayable_imports));
+    // Zero on a correct recorder: a parked create means the corpus needed reordering the execution
+    // clock should already have done, so it belongs in the score rather than only in the log.
+    out.push_str(&format!("parked {}\n", t.parked));
+    for line in census {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 fn main() -> ExitCode {
@@ -516,52 +631,64 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!("vkr-replay: {e}");
-            eprintln!("usage: vkr-replay <corpus.vkrc> --renderer <lib> [--flags N] [--verbose]");
+            eprintln!(
+                "usage: vkr-replay <corpus.vkrc> --renderer <lib> [--flags N] [--verbose]\n\
+                 \x20               [--score <file>] [--expect <file>]"
+            );
             return ExitCode::FAILURE;
         }
     };
 
-    match run(&args) {
-        Ok(t) => {
-            println!(
-                "REPLAY prologue={}/{} cmds={}/{} ctl={}/{}",
-                t.prologue_ok,
-                t.prologue_ok + t.prologue_fail,
-                t.cmd_ok,
-                t.cmd_ok + t.cmd_fail,
-                t.ctl_ok,
-                t.ctl_ok + t.ctl_fail
-            );
-            if t.parked != 0 {
-                println!(
-                    "REPLAY parked-and-retried blob creates: {} (deepest wait {} records)",
-                    t.parked, t.park_depth
-                );
-            }
-            if t.skipped_flow_control != 0 {
-                println!(
-                    "REPLAY skipped ring flow-control commands: {}",
-                    t.skipped_flow_control
-                );
-            }
-            if !t.skipped_classic.is_empty() {
-                println!("REPLAY skipped classic contexts: {:?}", t.skipped_classic);
-            }
-            if !t.unreplayable_imports.is_empty() {
-                println!(
-                    "REPLAY unreplayable imported blobs: {:?}",
-                    t.unreplayable_imports
-                );
-            }
-            if t.failed() == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+    let (t, census) = match run(&args) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("vkr-replay: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+
+    let score = score_text(&t, &census);
+    print!("{score}");
+
+    let mut ok = t.failed() == 0;
+
+    if let Some(path) = &args.score {
+        if let Err(e) = std::fs::write(path, &score) {
+            eprintln!("vkr-replay: writing {path}: {e}");
+            ok = false;
+        } else {
+            eprintln!("score written to {path}");
+        }
+    }
+
+    if let Some(path) = &args.expect {
+        match std::fs::read_to_string(path) {
+            Ok(want) if want == score => eprintln!("score matches {path}"),
+            Ok(want) => {
+                // Say WHICH lines moved. A golden that only reports "differs" makes the reader
+                // re-run by hand to find out what changed, every time.
+                eprintln!("SCORE DIFFERS from {path}:");
+                let (a, b): (Vec<&str>, Vec<&str>) =
+                    (want.lines().collect(), score.lines().collect());
+                for i in 0..a.len().max(b.len()) {
+                    let (x, y) = (a.get(i).copied(), b.get(i).copied());
+                    if x != y {
+                        eprintln!("  - {}", x.unwrap_or("<missing>"));
+                        eprintln!("  + {}", y.unwrap_or("<missing>"));
+                    }
+                }
+                ok = false;
+            }
+            Err(e) => {
+                eprintln!("vkr-replay: reading {path}: {e}");
+                ok = false;
+            }
+        }
+    }
+
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

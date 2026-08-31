@@ -37,9 +37,14 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
-  then the whole stream in execution order through the limina replay ABI, and reports a per-kind
-  tally. Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at
-  the ICD under test.
+  then the whole stream in execution order through the limina replay ABI, and scores the result.
+  Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at the
+  ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
+  and exits non-zero, so `diff` is the whole comparison tool.
+- `fixtures/` — pinned scores, recorded from the C build. `synoik.score` is the content fixture:
+  its capture was taken mid-workload, so 22 device allocations are still live and half of them
+  carry GPU-written bytes. `venus.score` is the lifecycle fixture: vkmark runs to completion, and
+  every context censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
@@ -49,14 +54,26 @@ from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) 
 dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
 path nothing until it happens.
 
+### What the venus score is, and is not
+
+It scores RENDERER STATE, not pixels. A VM-free replay has no scanout and presents no frames, so
+what it compares is the accept counts and the contents of the device memory the commands left
+behind. That is the right target for the rewrite: a port gets object lifetimes, descriptor writes
+and memory bindings wrong long before it gets a colour space wrong. The census deliberately
+excludes map_ptr-exported blobs — those are the VMM's mapped-blob capture and are already
+host-mapped — so what gets hashed is GPU-produced state plus allocations nothing has written.
+
+Each context is scored when it is destroyed, and once more at the end if it is still alive. A
+workload that exits cleanly frees everything, so scoring only at the end would score nothing.
+
+Each score is taken twice, 50 ms apart, and re-taken until two passes agree. The replay skips
+every ring flow-control command, so nothing in the stream waits on the GPU: a hash read the
+instant `replay_end` returns can race queue work still executing and look nondeterministic when
+the renderer is perfectly deterministic.
+
 ### What P0 still has to build
 
-- **Scoring for the venus replayer.** `replay/rs` replays a corpus end to end — a 580k-record
-  vkmark capture feeds 506657 commands and 606 control events with no failures — but what it
-  prints (an accepted/rejected tally, a per-context allocation count and byte total) is not
-  something two implementations can be diffed on, and none of it is pinned. It can fail a crash,
-  not a regression.
-- **Fixture-named scoring.** The default readback target is picked by a heuristic inherited from
+- **Fixture-named scoring** for the classic replayer. The default readback target is picked by a heuristic inherited from
   the debugging spike this grew out of. A corpus wants its scored resources named by the fixture.
 - **The `force_ctx_0` readback limitation** documented at the top of `vrend-replay.c`, which is a
   precondition for scoring more than one resource per run reliably.

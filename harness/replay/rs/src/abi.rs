@@ -104,6 +104,8 @@ syms! {
     dump_state: extern "C" fn() = "virgl_renderer_limina_dump_state",
     memory_census: extern "C" fn(u32, *mut *mut u64, *mut u32) -> c_int
         = "virgl_renderer_limina_memory_census",
+    memory_read: extern "C" fn(u32, u64, *mut c_void, u64) -> c_int
+        = "virgl_renderer_limina_memory_read",
 }
 
 /// The renderer under test. Owns the `dlopen` handle for the process lifetime: the library is
@@ -237,5 +239,11 @@ impl Renderer {
             v
         };
         Ok(out)
+    }
+
+    /// Copy a capturable memory's contents out of its host mapping. `size` should be the
+    /// allocation size the census reported; the renderer copies min(size, allocation).
+    pub fn memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> c_int {
+        (self.syms.memory_read)(ctx_id, mem_id, buf.as_mut_ptr().cast(), buf.len() as u64)
     }
 }
