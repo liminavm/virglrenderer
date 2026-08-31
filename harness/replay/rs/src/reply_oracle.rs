@@ -15,9 +15,15 @@
 //! decodes. Both sides encode the *same* `vn_command_*`: it is `#[repr(C)]`, so the C reads the
 //! memory the Rust decoder filled rather than a second construction of it.
 //!
-//! What this does not reach is the populated-out path. A recorded command carries the guest's
-//! request, so its output members are null or zero and the reply wrappers take their count-query
-//! branch. That is the half the corpus can witness; the filled branch needs synthesised arguments.
+//! A recorded command carries the guest's *request*, so its outputs arrive null or zeroed -- and
+//! zero is the value that hides a content mistake, because two encoders reading different members
+//! of the same zeroed struct write the same bytes. So the outputs are planted with distinct values
+//! before encoding (`proto::fill`), which is what makes a swapped or mis-strided output field show
+//! up as a byte difference rather than as agreement.
+//!
+//! Still out of reach: chained outputs. The fill leaves `pNext` null, because planting one link
+//! takes the reachable type set from 42 structs to 235. The null branch is the one a recorded
+//! command already exercises.
 
 // The reader is shared with the replayer, which uses more of it than this does.
 #[allow(dead_code)]
@@ -31,7 +37,8 @@ use std::process::ExitCode;
 
 use bumpalo::Bump;
 use virglrenderer::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
-use virglrenderer::venus::proto::serialize::{vn_command_name, vn_reply_oracle_args};
+use virglrenderer::venus::proto::fill::{vn_reply_oracle_args, Fill};
+use virglrenderer::venus::proto::serialize::vn_command_name;
 use virglrenderer::venus::proto::types::{VkCommandTypeEXT, VkFlags};
 
 extern "C" {
@@ -143,6 +150,9 @@ fn compare(wire: &[u8], tally: &mut Tally) {
 /// encoder zeroes its padding deliberately and the C leaves whatever the buffer held.
 fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
     let temp = Bump::new();
+    // Separate from the decoder's arena so a planted value can never be mistaken for one the
+    // guest sent, in a debugger or in a leak.
+    let fill_arena = Bump::new();
     let hard = Cell::new(false);
     let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
     let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
@@ -169,7 +179,8 @@ fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
                 args,
             ));
         };
-        let Some(size) = vn_reply_oracle_args(&mut dec, &mut enc, cmd, &mut also) else {
+        let Some(size) = vn_reply_oracle_args(&mut dec, &mut enc, &fill_arena, &mut Fill::new(), cmd, &mut also)
+        else {
             tally.note(key, Outcome::Unknown, || "this protocol has no such command".into());
             return true;
         };

@@ -1,0 +1,39 @@
+use super::serialize::*;
+use super::types::*;
+use crate::venus::cs::{Decoder, Encoder};
+use bumpalo::Bump;
+
+/// A source of distinct, non-zero field values.
+///
+/// The reply oracle compares two encoders reading one struct, so it only sees a mistake where the
+/// bytes differ. A command decoded from a recording has null or zeroed outputs, and zero is exactly
+/// the value that hides an encoder reading the wrong member: swap two same-typed output fields and
+/// the wire is unchanged. Every field gets its own value so that swap has somewhere to show up.
+pub struct Fill {
+    next: u64,
+}
+
+impl Default for Fill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fill {
+    /// Starts past the small integers so a planted value is never mistaken for a count or an
+    /// index while reading a failure.
+    pub fn new() -> Self {
+        Fill { next: 0x100 }
+    }
+
+    /// The stride is odd and coprime with the widths these values get truncated to, so a `u8`
+    /// field and a `u64` field next to each other still disagree.
+    pub fn take(&mut self) -> u64 {
+        self.next = self.next.wrapping_add(0x11);
+        self.next
+    }
+}
+
+/// How many elements a planted array gets. Small: the point is to have more than one, so an
+/// encoder that writes only the first, or walks with the wrong stride, is caught.
+const FILL_COUNT: u32 = 3;

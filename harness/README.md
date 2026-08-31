@@ -67,9 +67,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `vn_command_*`: it is `#[repr(C)]`, so the C reads the memory the Rust decoder filled rather than
   a second construction of it, and nothing has to agree about filling. It needs the C toolchain, so
   it is behind a feature — `cargo run --release --features reply-oracle --bin venus-reply-oracle --
-  <corpus>`. Both corpora match on every command. What it does not reach is the populated-out path:
-  a recorded command carries the guest's request, so its output members are null and the wrappers
-  take their count-query branch. The filled branch needs synthesised arguments.
+  <corpus>`. Both corpora match on every command. A recorded command carries the guest's
+  *request*, so its outputs arrive zeroed — and zero is the value that hides a content mistake,
+  since two encoders reading different members of the same zeroed struct write the same bytes. The
+  outputs are therefore planted with distinct values before encoding. Measured: a corruption that
+  only perturbs non-zero payload bytes is caught on 449 of synoik's 1397 replies with the fill and
+  331 without it. Still out of reach are chained outputs — the fill leaves `pNext` null, because
+  planting one link takes the reachable type set from 42 structs to 235.
 - The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh` with
   `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
   feed, the decode loop, the object table — and every command is accounted for rather than merely
