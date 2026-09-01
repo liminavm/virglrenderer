@@ -108,8 +108,8 @@ impl Default for ${ty.name} {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct vn_command_${ty.name}<'a> {
-%   for name, rs in RUST.command_params(ty):
-    pub ${name}: ${rs},
+%   for vis, name, rs in RUST.command_params(ty):
+    ${vis}${name}: ${rs},
 %   endfor
     pub _marker: PhantomData<&'a ()>,
 }
