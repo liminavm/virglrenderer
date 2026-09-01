@@ -2871,11 +2871,38 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
       int aux_plane = -1;
       if (res->aux_plane_egl_image[0]) {
          const bool indexed = view->u.tex.last_layer < view->u.tex.first_layer;
-         const uint32_t plane = indexed ? view->u.tex.first_layer : 0;
+         /* Only a two-plane surface can be named by its format: NV12's planes differ in
+          * component count (R8 luma, R8G8 chroma), while I420's three planes are all R8
+          * and say nothing. Deriving unguarded would send I420 chroma to the luma image
+          * on the GBM path, where three aux images are real. */
+         const bool two_plane = res->aux_plane_egl_image[1] &&
+                                (ARRAY_SIZE(res->aux_plane_egl_image) < 3 ||
+                                 !res->aux_plane_egl_image[2]);
+         uint32_t plane = 0;
+
+         if (indexed) {
+            plane = view->u.tex.first_layer;
+         } else if (two_plane && util_format_get_nr_components(view->format) == 2) {
+            /* A resource reached by dmabuf import carries no index: the winsys hands
+             * virgl_resource_from_handle plane 0 for every plane of the shared
+             * allocation, so the chroma view arrives looking exactly like a luma one and
+             * used to bind image 0. Sampling an R8 image through a two-component view
+             * reads U = luma and V = 0, which is the flat green a browser showed on
+             * every hardware-decoded frame. */
+            plane = 1;
+         }
+
          if ((indexed || view->format != res->base.format) &&
              plane < ARRAY_SIZE(res->aux_plane_egl_image) &&
-             res->aux_plane_egl_image[plane])
+             res->aux_plane_egl_image[plane]) {
             aux_plane = (int)plane;
+            if (!indexed && plane)
+               virgl_info("plane view: %ux%u %s sampled as %s -> plane %u derived from "
+                          "the view format (unindexed, would have bound plane 0)\n",
+                          res->base.width0, res->base.height0,
+                          util_format_name(res->base.format),
+                          util_format_name(view->format), plane);
+         }
       }
 
       if (view->u.tex.last_layer < view->u.tex.first_layer) {
