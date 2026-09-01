@@ -640,7 +640,11 @@ impl Driver {
         Ok(unsafe { f(device, a, ptr(info), out) })
     }
 
-    /// A physical-device enumeration, in whichever of Vulkan's two calls the guest asked for.
+    /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
+    ///
+    /// Generic over what is being enumerated *for* -- a physical device's queue families, an
+    /// instance's device groups -- because the two-call shape is the same and only the handle in
+    /// front of it differs.
     ///
     /// `out` is `None` for the count query -- the guest asking how many there are, with no array
     /// behind it -- and `Some` for the fill, where the slice's own length is what the driver is
@@ -649,14 +653,11 @@ impl Driver {
     ///
     /// `VK_INCOMPLETE` is the driver having more than the guest asked for. That is the guest's
     /// business rather than an error: it sized the array and it gets what fits.
-    pub fn pd_enumerate<T, R>(
+    pub fn enumerate_into<H, T, R>(
         &self,
-        pd: VkPhysicalDevice,
+        h: H,
         out: Option<&mut [T]>,
-        pick: impl FnOnce(
-            &InstanceFns,
-        )
-            -> Option<unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut T) -> R>,
+        pick: impl FnOnce(&InstanceFns) -> Option<unsafe extern "C" fn(H, *mut u32, *mut T) -> R>,
     ) -> Result<(u32, R), VkResult> {
         let f = self
             .instance
@@ -667,9 +668,9 @@ impl Driver {
             Some(s) => (s.len() as u32, s.as_mut_ptr()),
             None => (0, core::ptr::null_mut()),
         };
-        // SAFETY: `pd` is a handle this instance returned, and `n` is initialised to the length of
+        // SAFETY: `h` is a handle this instance returned, and `n` is initialised to the length of
         // the array `array` points at -- the pair the caller handed us as one slice.
-        let r = unsafe { f(pd, &mut n, array) };
+        let r = unsafe { f(h, &mut n, array) };
         Ok((n, r))
     }
 
