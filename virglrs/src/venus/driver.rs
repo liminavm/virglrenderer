@@ -15,19 +15,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::cs::{Handle, ObjectId};
+use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy,
-    VkBufferMemoryBarrier, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorSet, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkImage, VkImageLayout,
-    VkImageMemoryBarrier, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
-    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint,
-    VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueue, VkRect2D,
-    VkRenderPassBeginInfo, VkResult, VkSemaphore, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
-    VkWriteDescriptorSet,
+    VkBufferMemoryBarrier, VkBufferView, VkCommandBuffer, VkCommandBufferBeginInfo,
+    VkCommandBufferResetFlags, VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags,
+    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
+    VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkFramebuffer,
+    VkImage, VkImageLayout, VkImageMemoryBarrier, VkImageView, VkImportSemaphoreFdInfoKHR,
+    VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
+    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkObjectType, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkResult, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule, VkStructureType,
+    VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -249,7 +252,12 @@ impl Driver {
     /// mid-workload having sent no destroy at all -- which is the common case, because a guest
     /// that is still drawing when its VM stops never unwinds. Emptying the maps is what makes
     /// each destroy happen once.
-    pub fn teardown(&mut self) {
+    pub fn teardown(&mut self, doomed: &[Doomed]) {
+        // The same order a guest's own `vkDestroyDevice` gets: wait idle, then every object the
+        // device owns, then the device. `empty_device` picks out the ones that are its.
+        for handle in self.devices.keys().copied().collect::<Vec<_>>() {
+            self.empty_device(VkDevice(handle), doomed);
+        }
         for (handle, d) in core::mem::take(&mut self.devices) {
             // A device cannot be destroyed while its memory is live -- Vulkan calls that an
             // application error, and the guest is under no obligation to have avoided it.
@@ -499,11 +507,128 @@ impl Driver {
     /// it, and their objects with them, without a command naming any of them -- so the caller
     /// owes the object table their removal, or it goes on resolving ids to handles the driver has
     /// freed.
-    pub fn destroy_device(&mut self, device: VkDevice) -> Vec<ObjectId> {
+    /// Destroy one object the guest never named, on a device that is still alive.
+    ///
+    /// Vulkan does *not* free a device's objects when the device goes: it is undefined to destroy
+    /// a device that still owns any. The guest is under no obligation to have tidied up -- it may
+    /// send `vkDestroyDevice` with a hundred live fences behind it, and a VM that stops mid-frame
+    /// sends nothing at all -- so this is where the tidying happens, and it has to happen before
+    /// the device does.
+    ///
+    /// The match is total on purpose. Six kinds are skipped and each says why; a wildcard arm
+    /// would let the next object type Vulkan adds leak silently, which is exactly how the pool
+    /// children were lost the first time.
+    fn destroy_tracked(fns: &DeviceFns, device: VkDevice, o: &Doomed) {
+        use VkObjectType as T;
+        let h = o.handle;
+        let n = core::ptr::null();
+        // SAFETY (all arms): `h` is a handle this context created on `device`, taken out of the
+        // object table by this call so it is destroyed exactly once, and the entry point comes
+        // from that device's own proc table.
+        unsafe {
+            match o.ty {
+                T::VK_OBJECT_TYPE_SEMAPHORE => {
+                    (fns.vkDestroySemaphore())(device, VkSemaphore(h), n)
+                }
+                T::VK_OBJECT_TYPE_FENCE => (fns.vkDestroyFence())(device, VkFence(h), n),
+                T::VK_OBJECT_TYPE_BUFFER => (fns.vkDestroyBuffer())(device, VkBuffer(h), n),
+                T::VK_OBJECT_TYPE_IMAGE => (fns.vkDestroyImage())(device, VkImage(h), n),
+                T::VK_OBJECT_TYPE_EVENT => (fns.vkDestroyEvent())(device, VkEvent(h), n),
+                T::VK_OBJECT_TYPE_QUERY_POOL => {
+                    (fns.vkDestroyQueryPool())(device, VkQueryPool(h), n)
+                }
+                T::VK_OBJECT_TYPE_BUFFER_VIEW => {
+                    (fns.vkDestroyBufferView())(device, VkBufferView(h), n)
+                }
+                T::VK_OBJECT_TYPE_IMAGE_VIEW => {
+                    (fns.vkDestroyImageView())(device, VkImageView(h), n)
+                }
+                T::VK_OBJECT_TYPE_SHADER_MODULE => {
+                    (fns.vkDestroyShaderModule())(device, VkShaderModule(h), n)
+                }
+                T::VK_OBJECT_TYPE_PIPELINE_CACHE => {
+                    (fns.vkDestroyPipelineCache())(device, VkPipelineCache(h), n)
+                }
+                T::VK_OBJECT_TYPE_PIPELINE_LAYOUT => {
+                    (fns.vkDestroyPipelineLayout())(device, VkPipelineLayout(h), n)
+                }
+                T::VK_OBJECT_TYPE_RENDER_PASS => {
+                    (fns.vkDestroyRenderPass())(device, VkRenderPass(h), n)
+                }
+                T::VK_OBJECT_TYPE_PIPELINE => (fns.vkDestroyPipeline())(device, VkPipeline(h), n),
+                T::VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT => {
+                    (fns.vkDestroyDescriptorSetLayout())(device, VkDescriptorSetLayout(h), n)
+                }
+                T::VK_OBJECT_TYPE_SAMPLER => (fns.vkDestroySampler())(device, VkSampler(h), n),
+                T::VK_OBJECT_TYPE_FRAMEBUFFER => {
+                    (fns.vkDestroyFramebuffer())(device, VkFramebuffer(h), n)
+                }
+                T::VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION => {
+                    (fns.vkDestroySamplerYcbcrConversion())(device, VkSamplerYcbcrConversion(h), n)
+                }
+                T::VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE => (fns
+                    .vkDestroyDescriptorUpdateTemplate())(
+                    device,
+                    VkDescriptorUpdateTemplate(h),
+                    n,
+                ),
+                // Destroying a pool frees everything allocated from it, which is why the two kinds
+                // below it are skipped rather than walked.
+                T::VK_OBJECT_TYPE_COMMAND_POOL => {
+                    (fns.vkDestroyCommandPool())(device, VkCommandPool(h), n)
+                }
+                T::VK_OBJECT_TYPE_DESCRIPTOR_POOL => {
+                    (fns.vkDestroyDescriptorPool())(device, VkDescriptorPool(h), n)
+                }
+                // Freed with the pool they came from, one line above.
+                T::VK_OBJECT_TYPE_COMMAND_BUFFER | T::VK_OBJECT_TYPE_DESCRIPTOR_SET => {}
+                // Freed by `free_device_memory`, which the census keeps its own record for and
+                // which runs on this same teardown. Freeing it here as well would free it twice.
+                T::VK_OBJECT_TYPE_DEVICE_MEMORY => {}
+                // A queue is handed out by the device and dies with it; there is no destroy call.
+                T::VK_OBJECT_TYPE_QUEUE => {}
+                // Not device objects: the instance and its physical devices outlive this, and the
+                // device itself is destroyed by the caller once its contents are gone.
+                T::VK_OBJECT_TYPE_INSTANCE
+                | T::VK_OBJECT_TYPE_PHYSICAL_DEVICE
+                | T::VK_OBJECT_TYPE_DEVICE => {}
+                // Anything else is an object this renderer never created, so there is no handle
+                // here to leak -- but it is also a shape nobody has looked at, so it is logged
+                // rather than passed over in silence.
+                other => {
+                    eprintln!("[virglrs] no destroy for VkObjectType {}, leaking {h:#x}", other.0)
+                }
+            }
+        }
+    }
+
+    /// Everything a device owns, torn down in the order Vulkan requires, before the device itself.
+    fn empty_device(&mut self, device: VkDevice, doomed: &[Doomed]) {
+        let Some(d) = self.devices.get(&device.0) else {
+            return;
+        };
+        // Nothing may be destroyed while the device is still working on it, and the guest is not
+        // required to have waited. The C waits here too.
+        // SAFETY: a device this context created and has not yet destroyed.
+        let r = unsafe { (d.fns.vkDeviceWaitIdle())(device) };
+        if r != VkResult::VK_SUCCESS {
+            eprintln!("[virglrs] vkDeviceWaitIdle before teardown: VkResult {}", r.0);
+        }
+        // Filtered here rather than by the caller, so an object can only ever be destroyed on the
+        // device the table says it belongs to.
+        for o in doomed.iter().filter(|o| o.device == Some(device.0)) {
+            Self::destroy_tracked(&d.fns, device, o);
+        }
+    }
+
+    pub fn destroy_device(&mut self, device: VkDevice, doomed: &[Doomed]) -> Vec<ObjectId> {
         // Its pools go with it: Vulkan destroys them and says nothing, and a handle the driver may
         // now reuse must stop being vouched for at the same moment. Ahead of the lookup, not
         // behind it -- a device this table has already forgotten must still not leave records
         // behind that vouch for its objects.
+        // Ahead of everything else, and while the device is still in the map: its objects have to
+        // be destroyed before it is, and `empty_device` needs the entry points to do it.
+        self.empty_device(device, doomed);
         let orphans = self.pools.close_device(device.0);
         self.queues.retain(|_, owner| *owner != device.0);
         let Some(d) = self.devices.remove(&device.0) else {
@@ -1513,14 +1638,14 @@ mod tests {
         d.pools.open(4, 8);
         d.pools.adopt(8, [(21, ObjectId(210))]);
 
-        let mut orphans = d.destroy_device(VkDevice(3));
+        let mut orphans = d.destroy_device(VkDevice(3), &[]);
         orphans.sort_unstable_by_key(|i| i.0);
 
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "its pools' ids, and no others");
         assert!(!d.pools.is_open(7), "a pool outlived its device");
         assert!(d.pools.is_open(8), "another device's pool must be untouched");
         assert!(
-            d.destroy_device(VkDevice(4)) == [ObjectId(210)],
+            d.destroy_device(VkDevice(4), &[]) == [ObjectId(210)],
             "another device's pool must still hold its own"
         );
     }

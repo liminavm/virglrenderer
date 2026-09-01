@@ -485,7 +485,7 @@ impl Commands for Handlers<'_> {
             }
         }
         let handle = if host == 0 { id.0 } else { host };
-        if self.objects.borrow_mut().add(id, ty.0, handle, owner).is_err() {
+        if self.objects.borrow_mut().add(id, ty, handle, owner).is_err() {
             self.reject = Some("named an object it cannot have");
         }
     }
@@ -507,10 +507,14 @@ impl Commands for Handlers<'_> {
         self.plant("vkCreateInstance", args.pInstance, args.handle_pInstance, host.map(|h| h.0));
     }
 
-    fn vkDestroyInstance(&mut self, _args: &mut vn_command_vkDestroyInstance<'_>) {
-        // Every device under it dies first: Vulkan's teardown order is not advisory, and a guest
+    fn vkDestroyInstance(&mut self, args: &mut vn_command_vkDestroyInstance<'_>) {
+        // The whole tree comes out first, and while every device in it is still alive -- an object
+        // cannot be destroyed after the device that owns it, and the guest is under no obligation
+        // to have destroyed any of them itself.
+        let doomed = self.objects.borrow_mut().take_tree(args.id_instance);
+        // Every device under it dies next: Vulkan's teardown order is not advisory, and a guest
         // that skipped its own destroys does not get to leak them onto the host.
-        self.driver.teardown();
+        self.driver.teardown(&doomed);
     }
 
     fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices<'_>) {
@@ -559,7 +563,12 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
-        let orphans = self.driver.destroy_device(args.device);
+        // Taken out before the driver call, because destroying them afterwards would be destroying
+        // them on a device that no longer exists. Nothing else names these: the guest sent no
+        // command for any of them, which is why the table hands them back rather than dropping
+        // them, and why the result cannot be ignored.
+        let doomed = self.objects.borrow_mut().take_tree(args.id_device);
+        let orphans = self.driver.destroy_device(args.device, &doomed);
         self.forget(orphans);
     }
 
@@ -1185,7 +1194,7 @@ mod tests {
                 host: u64,
                 owner: Option<ObjectId>,
             ) {
-                self.objects.borrow_mut().add(id, ty.0, host, owner).expect("a fresh id");
+                self.objects.borrow_mut().add(id, ty, host, owner).expect("a fresh id");
             }
 
             fn object_destroyed(&mut self, _ty: VkObjectType, id: ObjectId) {
@@ -1207,7 +1216,7 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, 1, None)
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, 1, None)
             .unwrap();
         let mut h = Driver { objects: &objects };
 
@@ -1268,7 +1277,7 @@ mod tests {
             .borrow_mut()
             .add(
                 ObjectId(PHYSICAL_DEVICE),
-                VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0,
+                VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
                 PHYSICAL_DEVICE,
                 None,
             )
@@ -1337,7 +1346,7 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(INSTANCE), VkObjectType::VK_OBJECT_TYPE_INSTANCE.0, INSTANCE, None)
+            .add(ObjectId(INSTANCE), VkObjectType::VK_OBJECT_TYPE_INSTANCE, INSTANCE, None)
             .unwrap();
 
         let mut driver = Driver::new();
@@ -1394,7 +1403,7 @@ mod tests {
         let objects = Shared::new();
         objects
             .borrow_mut()
-            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, DEVICE, None)
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE, None)
             .unwrap();
 
         // The object table has the device; the driver does not. That is exactly the split the
@@ -1723,10 +1732,10 @@ mod tests {
         let objects = Shared::new();
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, 1, None).unwrap();
+            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, 1, None).unwrap();
             t.add(
                 ObjectId(POOL),
-                VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL.0,
+                VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL,
                 2,
                 Some(ObjectId(DEVICE)),
             )
@@ -1734,7 +1743,7 @@ mod tests {
             for (i, id) in BUFFERS.iter().enumerate() {
                 t.add(
                     ObjectId(*id),
-                    VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER.0,
+                    VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER,
                     100 + i as u64,
                     Some(ObjectId(DEVICE)),
                 )
@@ -1779,7 +1788,7 @@ mod tests {
         const POOL: u64 = 7;
         /// The guest ids of two command buffers, and the host handles they were allocated as.
         const BUFFERS: [(u64, u64); 2] = [(11, 110), (12, 120)];
-        const COMMAND_BUFFER: i32 = VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER.0;
+        const COMMAND_BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER;
 
         let objects = Shared::new();
         let mut driver = Driver::new();
@@ -1790,7 +1799,7 @@ mod tests {
             }
         }
         driver.plant_pool(DEVICE, POOL, &BUFFERS.map(|(host, id)| (host, ObjectId(id))));
-        assert_eq!(objects.lookup(ObjectId(BUFFERS[0].1), COMMAND_BUFFER), Lookup::Found(11));
+        assert_eq!(objects.lookup(ObjectId(BUFFERS[0].1), COMMAND_BUFFER.0), Lookup::Found(11));
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -1813,11 +1822,122 @@ mod tests {
 
         for (_, id) in BUFFERS {
             assert_eq!(
-                objects.lookup(ObjectId(id), COMMAND_BUFFER),
+                objects.lookup(ObjectId(id), COMMAND_BUFFER.0),
                 Lookup::Missing,
                 "id {id} was freed with its pool and must stop naming anything"
             );
         }
+    }
+
+    /// A device's objects are destroyed on the way out, before the device, in Vulkan's order.
+    ///
+    /// Forgetting a guest id and freeing a host handle are two different debts, and the table
+    /// fix only paid the first. Vulkan does not free a device's objects when the device goes --
+    /// it is undefined to destroy a device that still owns any -- so every fence, image and pool
+    /// the guest left behind has to be destroyed here, while the device is still alive to destroy
+    /// them on. The guest owes nothing: it may send `vkDestroyDevice` with everything still live,
+    /// and a VM that stops mid-frame sends no destroy at all.
+    ///
+    /// So this plants real entry points and asks what the driver called, in what order. It is the
+    /// only way to see it: no corpus contains a guest that leaves objects behind, and the object
+    /// table is already empty by the time anyone could look.
+    #[test]
+    fn a_destroyed_device_destroys_what_it_owned_first_and_waits_for_it_to_be_idle() {
+        use std::cell::RefCell;
+
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandPool, VkDevice, VkFence, VkImage,
+        };
+
+        const DEVICE: u64 = 3;
+        /// Guest id, host handle -- kept apart so a wrapper passing one for the other shows up.
+        const FENCE: (u64, u64) = (11, 0xf0);
+        const IMAGE: (u64, u64) = (12, 0xf1);
+        const POOL: (u64, u64) = (13, 0xf2);
+
+        #[derive(Default)]
+        struct Saw {
+            /// Every call, in order, so "waited then destroyed then dropped the device" is
+            /// checkable rather than assumed.
+            calls: Vec<(&'static str, u64)>,
+        }
+        thread_local! { static SAW: RefCell<Saw> = RefCell::new(Saw::default()); }
+        fn saw(what: &'static str, h: u64) {
+            SAW.with_borrow_mut(|s| s.calls.push((what, h)));
+        }
+
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            saw("wait", 0);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn fence(_d: VkDevice, h: VkFence, _a: *const VkAllocationCallbacks) {
+            saw("fence", h.0);
+        }
+        unsafe extern "C" fn image(_d: VkDevice, h: VkImage, _a: *const VkAllocationCallbacks) {
+            saw("image", h.0);
+        }
+        unsafe extern "C" fn pool(
+            _d: VkDevice,
+            h: VkCommandPool,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            saw("pool", h.0);
+        }
+        unsafe extern "C" fn device(h: VkDevice, _a: *const VkAllocationCallbacks) {
+            saw("device", h.0);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyFence(fence);
+        fns.plant_vkDestroyImage(image);
+        fns.plant_vkDestroyCommandPool(pool);
+        fns.plant_vkDestroyDevice(device);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        {
+            let mut t = objects.borrow_mut();
+            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE, None).unwrap();
+            let under = Some(ObjectId(DEVICE));
+            t.add(ObjectId(FENCE.0), VkObjectType::VK_OBJECT_TYPE_FENCE, FENCE.1, under).unwrap();
+            t.add(ObjectId(IMAGE.0), VkObjectType::VK_OBJECT_TYPE_IMAGE, IMAGE.1, under).unwrap();
+            t.add(ObjectId(POOL.0), VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL, POOL.1, under)
+                .unwrap();
+        }
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyDevice_EXT, 0);
+        w.extend_from_slice(&DEVICE.to_le_bytes());
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut dec = Decoder::new(&w, &temp, &objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+
+        SAW.with_borrow(|s| {
+            assert_eq!(s.calls.first(), Some(&("wait", 0)), "nothing may be destroyed while busy");
+            assert_eq!(s.calls.last(), Some(&("device", DEVICE)), "the device goes last of all");
+            let mut middle: Vec<_> = s.calls[1..s.calls.len() - 1].to_vec();
+            middle.sort_unstable();
+            assert_eq!(
+                middle,
+                [("fence", FENCE.1), ("image", IMAGE.1), ("pool", POOL.1)],
+                "each object destroyed once, by its own entry point, with its host handle"
+            );
+        });
     }
 
     /// And an instance takes the whole tree, which is the same rule one level up.
@@ -1834,24 +1954,24 @@ mod tests {
         const PHYSICAL_DEVICE: u64 = 2;
         const DEVICE: u64 = 3;
         const FENCE: u64 = 4;
-        const FENCE_TY: i32 = VkObjectType::VK_OBJECT_TYPE_FENCE.0;
+        const FENCE_TY: VkObjectType = VkObjectType::VK_OBJECT_TYPE_FENCE;
 
         let objects = Shared::new();
         let mut driver = Driver::new();
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(INSTANCE), VkObjectType::VK_OBJECT_TYPE_INSTANCE.0, INSTANCE, None)
+            t.add(ObjectId(INSTANCE), VkObjectType::VK_OBJECT_TYPE_INSTANCE, INSTANCE, None)
                 .unwrap();
             t.add(
                 ObjectId(PHYSICAL_DEVICE),
-                VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0,
+                VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE,
                 PHYSICAL_DEVICE,
                 Some(ObjectId(INSTANCE)),
             )
             .unwrap();
             t.add(
                 ObjectId(DEVICE),
-                VkObjectType::VK_OBJECT_TYPE_DEVICE.0,
+                VkObjectType::VK_OBJECT_TYPE_DEVICE,
                 DEVICE,
                 Some(ObjectId(PHYSICAL_DEVICE)),
             )
@@ -1881,7 +2001,7 @@ mod tests {
         assert!(!dec.fatal(), "the destroy must decode");
 
         assert_eq!(objects.borrow().len(), 0, "the instance was the root of everything");
-        assert_eq!(objects.lookup(ObjectId(FENCE), FENCE_TY), Lookup::Missing);
+        assert_eq!(objects.lookup(ObjectId(FENCE), FENCE_TY.0), Lookup::Missing);
         assert_eq!(
             objects.lookup(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0),
             Lookup::Missing
@@ -1911,17 +2031,16 @@ mod tests {
         /// A fence created on A, under a guest id, holding a host handle that is not that id.
         const FENCE_ID: u64 = 11;
         const FENCE_HOST: u64 = 0xfeed_face_0000_0011;
-        const FENCE: i32 = VkObjectType::VK_OBJECT_TYPE_FENCE.0;
+        const FENCE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_FENCE;
 
         let objects = Shared::new();
         let mut driver = Driver::new();
         {
             let mut t = objects.borrow_mut();
-            t.add(ObjectId(DEVICE_A), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, DEVICE_A, None)
-                .unwrap();
+            t.add(ObjectId(DEVICE_A), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE_A, None).unwrap();
             t.add(ObjectId(FENCE_ID), FENCE, FENCE_HOST, Some(ObjectId(DEVICE_A))).unwrap();
         }
-        assert_eq!(objects.lookup(ObjectId(FENCE_ID), FENCE), Lookup::Found(FENCE_HOST));
+        assert_eq!(objects.lookup(ObjectId(FENCE_ID), FENCE.0), Lookup::Found(FENCE_HOST));
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -1949,7 +2068,7 @@ mod tests {
         assert!(!dec.fatal(), "the destroy must decode");
 
         assert_eq!(
-            objects.lookup(ObjectId(FENCE_ID), FENCE),
+            objects.lookup(ObjectId(FENCE_ID), FENCE.0),
             Lookup::Missing,
             "the fence died with device A, so its id must stop naming anything -- \
              left behind, a command against the still-live device B would hand the driver \
