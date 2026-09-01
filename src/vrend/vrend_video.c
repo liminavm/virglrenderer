@@ -201,7 +201,7 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
                                      const struct virgl_video_dma_buf_plane *plane)
 {
     unsigned blocksize = util_format_get_blocksize(res->base.format);
-    size_t row, stride, offset, height, extent;
+    size_t row, stride, offset, height, extent, storage;
 
     if (!blocksize)
         return;
@@ -222,20 +222,19 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
         return;
     }
 
-    /* Check the whole extent before copying any of it. A half-written frame is worse
-     * than an unwritten one: it plays, and only a checksum would ever catch it. */
+    /* Measure the whole extent before copying any of it. A half-written frame is worse
+     * than an unwritten one: it plays, and only a checksum would ever catch it.
+     *
+     * Falling short is the normal case, not an error, and must stay silent. A classic
+     * per-plane resource has guest iovecs too -- the one-page shadow -- so every decoded
+     * frame reaches here with storage far too small until guest mesa starts allocating
+     * these in guest memory. Whether the storage is big enough IS the test for "the
+     * guest wants the frame here"; there is nothing else to ask. */
     extent = offset + (height ? (height - 1) * stride + row : 0);
-    if (res->guest_pixels_map) {
-        if (extent > res->guest_pixels_map_size) {
-            virgl_error("%s: layout needs %zu bytes, guest map holds %zu\n", __func__,
-                        extent, res->guest_pixels_map_size);
-            return;
-        }
-    } else if (extent > vrend_get_iovec_size(res->iov, res->num_iovs)) {
-        virgl_error("%s: layout needs %zu bytes, guest iovecs hold %zu\n", __func__,
-                    extent, vrend_get_iovec_size(res->iov, res->num_iovs));
+    storage = res->guest_pixels_map ? res->guest_pixels_map_size
+                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+    if (extent > storage)
         return;
-    }
 
     for (size_t y = 0; y < height; y++) {
         const char *src = (const char *)plane->map + y * plane->pitch;
