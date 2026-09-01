@@ -58,11 +58,17 @@ PRIMITIVE_ZERO = {
 class RustGen:
     """Renders vk.xml's types as Rust. Holds no state beyond the model and the API constants."""
 
-    def __init__(self, gen, constants):
+    def __init__(self, gen, constants, bitfields=None, member_order=None):
         self.gen = gen
         # vk.xml's "API Constants" block, which the C generator never needs (it includes
         # vulkan.h) and which this one does: they are the static array dimensions.
         self.constants = constants
+        # Structs vk.xml declares with C bit-fields. Only the layout oracle cares -- see
+        # `gen.bitfield_types` for what the two sides do and do not owe each other there.
+        self.bitfields = bitfields or {}
+        # Each struct's members as the registry declares them. The model holds the order the wire
+        # wants instead; `gen.member_order` is where the two part company.
+        self.member_order = member_order or {}
 
     # --- names ---
 
@@ -143,7 +149,23 @@ class RustGen:
         return 'r#' + name if name in KEYWORDS else name
 
     def struct_fields(self, ty):
-        return [(self.field_name(v.name), self.field_type(v)) for v in ty.variables]
+        """A struct's members as they are laid out, which is not the order they serialize in.
+
+        See `gen.member_order`. A type the registry does not declare -- venus\'s own, from the
+        private xmls -- keeps the model\'s order, which for those is the declared one.
+        """
+        return [(self.field_name(v.name), self.field_type(v)) for v in self.laid_out(ty)]
+
+    def laid_out(self, ty):
+        """`ty`\'s members in declaration order."""
+        order = self.member_order.get(ty.name)
+        if not order:
+            return ty.variables
+        rank = {name: i for i, name in enumerate(order)}
+        # A member the registry does not name cannot be ranked, and a partial sort would be worse
+        # than none: it would move some members and leave others, which is neither order.
+        assert all(v.name in rank for v in ty.variables), ty.name
+        return sorted(ty.variables, key=lambda v: rank[v.name])
 
     def command_params(self, ty):
         """A command's arguments as the fields of its `vn_command_*` struct, reply included.
@@ -1017,6 +1039,123 @@ class RustGen:
         out += ['        _ => None,', '    }', '}', '']
 
         return '\n'.join(out)
+
+    def unlaid_out(self):
+        """The types the layout oracle cannot ask a C compiler about, and everything holding one.
+
+        A bit-field has no `offsetof`, and a struct containing one of these types inherits its
+        size, so the exclusion has to travel up every containment edge to a fixpoint rather than
+        stopping at the seven structs vk.xml declares. `gen.bitfield_types` carries the reason
+        the divergence is allowed to stand at all.
+        """
+        out = set(self.bitfields)
+        composites = [ty for kind in (VkType.STRUCT, VkType.UNION)
+                      for ty in self.gen.supported_types[kind]]
+        grew = True
+        while grew:
+            grew = False
+            for ty in composites:
+                if ty.name in out:
+                    continue
+                if any(v.ty.base.name in out and not v.ty.is_pointer() for v in ty.variables):
+                    out.add(ty.name)
+                    grew = True
+        return out
+
+    def layout_rows(self):
+        """Every generated type a C compiler also defines, as `(rust, c, [(rust_f, c_f), ...])`.
+
+        A member is `(rust_field, c_field, rust_type)`. Shadow members are left out: they exist
+        on this side alone -- which is the whole reason `shadows` appends them after every wire
+        member rather than interleaving them -- so asking a C compiler for their offsets would
+        ask it about members it has never heard of. `unlaid_out` takes the rest away.
+        """
+        skip = self.unlaid_out()
+
+        def member(v):
+            return (self.field_name(v.name), v.name, self.field_type(v))
+
+        for kind in (VkType.STRUCT, VkType.UNION):
+            for ty in self.gen.supported_types[kind]:
+                if ty.name in skip:
+                    continue
+                yield ty.name, ty.name, [member(v) for v in self.laid_out(ty)]
+        for ty in self.gen.supported_types[VkType.COMMAND]:
+            if not self.gen.is_serializable(ty):
+                continue
+            # A command reaches an excluded struct only through a pointer, which is a word
+            # whatever it points at -- asserted rather than commented, because a command that
+            # took one by value would silently compare two different sizes.
+            assert not [v for v in ty.variables
+                        if v.ty.base.name in skip and not v.ty.is_pointer()], ty.name
+            members = [member(v) for v in ty.variables]
+            if ty.ret:
+                members.append(member(ty.ret))
+            yield ('vn_command_%s' % ty.name, 'struct vn_command_%s' % ty.name, members)
+
+    def render_layout_oracle(self):
+        """The C half of the layout parity check: what a C compiler makes of the same structs.
+
+        Two generated struct definitions being members-in-order is not the same claim as two
+        struct definitions having the same layout, and only the second one is what the reply
+        oracle relies on when it casts a pointer to our `vn_command_*` into venus-protocol's own
+        encoder, or what the driver relies on when it is handed a `Vk*` we filled. Padding,
+        alignment and the pointer-shape of a member are all places where the two can agree in
+        source and disagree in memory.
+
+        So both sides are asked the same question -- `offsetof` here, `offset_of!` there -- and
+        the answers are compared. The two tables are index-matched rather than name-matched:
+        one generator run emits both, so an index is exactly as trustworthy as a name and costs
+        no strings in the binary. The names live on the Rust side, where a mismatch is reported.
+        """
+        types, members = [], []
+        for rust, c, fields in self.layout_rows():
+            types.append('    { (uint32_t)sizeof(%s), (uint32_t)_Alignof(%s) }, /* %s */'
+                         % (c, c, rust))
+            for _, cf, _ in fields:
+                members.append('    { (uint32_t)offsetof(%s, %s), '
+                               '(uint32_t)sizeof(((%s *)0)->%s) },' % (c, cf, c, cf))
+        return '\n'.join([
+            '/* The layout oracle: offsets and sizes as a C compiler computes them, for the',
+            ' * generated Rust to be held to. Index-matched with the tables in `layout.rs`. */',
+            '',
+            '#include <stddef.h>',
+            '#include <stdint.h>',
+            '',
+            '#include "vn_protocol_renderer.h"',
+            '',
+            'struct vn_layout_type { uint32_t size; uint32_t align; };',
+            'struct vn_layout_member { uint32_t offset; uint32_t size; };',
+            '',
+            'const struct vn_layout_type vn_layout_types[] = {',
+        ] + types + [
+            '};',
+            '',
+            'const struct vn_layout_member vn_layout_members[] = {',
+        ] + members + [
+            '};',
+            '',
+            'const size_t vn_layout_type_count =',
+            '    sizeof(vn_layout_types) / sizeof(vn_layout_types[0]);',
+            'const size_t vn_layout_member_count =',
+            '    sizeof(vn_layout_members) / sizeof(vn_layout_members[0]);',
+            '',
+        ])
+
+    def render_layout_table(self):
+        """The Rust half of the layout parity check. See `render_layout_oracle`."""
+        types, members = [], []
+        for rust, c, fields in self.layout_rows():
+            types.append('    TypeLayout { name: "%s", size: size_of::<%s>(), '
+                         'align: align_of::<%s>(), shadowed: %s },'
+                         % (rust, rust, rust, 'true' if c.startswith('struct ') else 'false'))
+            for rf, _, rt in fields:
+                members.append('    MemberLayout { ty: "%s", name: "%s", '
+                               'offset: offset_of!(%s, %s), size: size_of::<%s>() },'
+                               % (rust, rf, rust, rf, rt))
+        return '\n'.join(['pub static TYPES: &[TypeLayout] = &['] + types
+                          + ['];', '', 'pub static MEMBERS: &[MemberLayout] = &['] + members
+                          + ['];', ''])
 
     def render_reply_oracle(self):
         """The C half of the reply differential, dispatched by command type.

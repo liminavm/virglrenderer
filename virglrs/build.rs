@@ -76,6 +76,10 @@ fn link_vulkan_loader() {
 ///
 /// The same generator, run the way the C tree runs it. Its output is the ground truth for reply
 /// encoding precisely because it is not ours: every venus guest in existence decodes it.
+///
+/// It brings the layout oracle with it. The reply differential is what *needs* the two sides'
+/// structs to have one layout -- it hands a Rust pointer to a C encoder -- so the check that they
+/// do belongs behind the same switch, where the headers to ask are already on the include path.
 #[cfg(feature = "reply-oracle")]
 fn reply_oracle(manifest: &std::path::Path, protocol: &std::path::Path, out: &std::path::Path) {
     let c_out = out.join("c");
@@ -103,6 +107,7 @@ fn reply_oracle(manifest: &std::path::Path, protocol: &std::path::Path, out: &st
 
     cc::Build::new()
         .file(out.join("reply_oracle.c"))
+        .file(out.join("layout_oracle.c"))
         .include(&c_out)
         .include(&oracle)
         .include(protocol.join("include"))

@@ -1,0 +1,29 @@
+// What this build's structs actually look like in memory, for the C oracle to be held to.
+//
+// `venus-gen`'s `render_layout_oracle` carries the argument for why this exists and why the two
+// tables are matched by index rather than by name.
+
+use core::mem::offset_of;
+
+use super::types::*;
+
+/// A whole type, as the compiler laid it out.
+pub struct TypeLayout {
+    pub name: &'static str,
+    pub size: usize,
+    pub align: usize,
+    /// Whether this side appended members C does not have, which is true of every `vn_command_*`
+    /// carrying a shadow. Then the two sizes are not meant to match and only the prefix is: C's
+    /// members keep their offsets, and ours is the larger. See `venus-gen`'s `shadows`.
+    pub shadowed: bool,
+}
+
+/// One member of one type. `size` is the member's own, which is where a pointer that grew a
+/// second word shows up even when nothing after it moved.
+pub struct MemberLayout {
+    pub ty: &'static str,
+    pub name: &'static str,
+    pub offset: usize,
+    pub size: usize,
+}
+
