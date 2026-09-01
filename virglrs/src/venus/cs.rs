@@ -177,7 +177,7 @@ impl<'a> Decoder<'a> {
     /// The next `n` bytes without consuming them, or `None` (having poisoned the stream) if the
     /// stream is shorter than that.
     pub fn peek_bytes(&self, n: usize) -> Option<&'a [u8]> {
-        match self.buf.get(self.pos..self.pos + n) {
+        match self.pos.checked_add(n).and_then(|end| self.buf.get(self.pos..end)) {
             Some(b) => Some(b),
             None => {
                 self.set_fatal();
@@ -186,12 +186,26 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Consume `advance` bytes of stream and hand back the first `n` of them. `advance` is the wire
-    /// size including padding; `n` is the payload. Poisons and yields `None` on a short stream.
-    pub fn read_bytes(&mut self, advance: usize, n: usize) -> Option<&'a [u8]> {
-        debug_assert!(n <= advance);
+    /// Consume `n` bytes of payload plus the padding that follows them, and hand back the payload.
+    ///
+    /// The stream advances further than the payload -- every field is padded to the wire's
+    /// four-byte granularity -- but both numbers are derived here from the one the caller gave,
+    /// rather than passed in as a pair. That is not tidiness: `n` is guest-controlled on the
+    /// string and blob paths, padding it up is an addition that can wrap, and a caller that did
+    /// the rounding itself would hand over a padded size *smaller* than its payload. Everything
+    /// after that trusts the pair, and the slice below is where a wrapped one panicked -- which
+    /// under `panic = "abort"` takes every guest's context with it, not just this command.
+    ///
+    /// So the rounding happens once, checked, and a length that cannot be padded is refused like
+    /// any other malformed input.
+    pub fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let Some(advance) = n.checked_next_multiple_of(4) else {
+            self.set_fatal();
+            return None;
+        };
         let b = self.peek_bytes(advance)?;
         self.pos += advance;
+        // `n <= advance` by construction, so this cannot be out of range.
         Some(&b[..n])
     }
 
@@ -453,7 +467,7 @@ pub fn sizeof_scalar_array<T: Scalar>(count: usize) -> usize {
 
 impl<'a> Decoder<'a> {
     pub fn decode_scalar<T: Scalar>(&mut self) -> T {
-        match self.read_bytes(sizeof_scalar::<T>(), size_of::<T>()) {
+        match self.read_bytes(size_of::<T>()) {
             Some(b) => T::from_le_bytes(b),
             None => T::default(),
         }
@@ -471,7 +485,7 @@ impl<'a> Decoder<'a> {
     #[allow(clippy::chunks_exact_to_as_chunks)] // the chunk size is generic, not const
     pub fn decode_scalar_array<T: Scalar>(&mut self, out: &mut [T]) {
         let packed = size_of_val(out);
-        let Some(b) = self.read_bytes(align4(packed), packed) else {
+        let Some(b) = self.read_bytes(packed) else {
             out.fill(T::default());
             return;
         };
@@ -536,7 +550,7 @@ impl<'a> Decoder<'a> {
     /// `size` bytes of opaque payload, borrowed from the stream rather than copied. The renderer
     /// only ever reads a blob, and the stream outlives the command that named it.
     pub fn decode_blob(&mut self, size: usize) -> Option<&'a [u8]> {
-        self.read_bytes(align4(size), size)
+        self.read_bytes(size)
     }
 
     /// `size` bytes of string, copied into the arena and forced NUL-terminated. The copy is what
@@ -547,7 +561,7 @@ impl<'a> Decoder<'a> {
             self.set_fatal();
             return None;
         }
-        let bytes = self.read_bytes(align4(size), size)?;
+        let bytes = self.read_bytes(size)?;
         let out = self.alloc_temp_array::<u8>(size)?;
         out.copy_from_slice(bytes);
         out[size - 1] = 0;
@@ -647,6 +661,36 @@ mod tests {
         let dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
         assert!(dec.alloc_temp_array::<u32>(usize::MAX / 2).is_none());
         assert!(dec.hard_fatal());
+    }
+
+    /// A string or blob length near `usize::MAX` poisons; it does not take the process down.
+    ///
+    /// The length is the guest's, decoded unchecked -- the generator emits
+    /// `decode_array_size_unchecked` for every string, because a string carries no separate count
+    /// to check against. Padding it up to the wire's four-byte granularity is therefore an
+    /// addition on a number the guest chose, and one that wraps leaves a padded size *smaller*
+    /// than the payload. Everything downstream then trusts the pair: the release build compiles
+    /// the debug assert out, the short read succeeds, and slicing the payload out of it panics.
+    ///
+    /// Under `panic = "abort"` that is not one lost command -- it is the worker gone, and with it
+    /// every other guest's context. A guest is never allowed to do that (CLAUDE.md), so the wire
+    /// arithmetic has to be total.
+    #[test]
+    fn a_string_length_that_cannot_be_padded_is_refused_rather_than_fatal_to_the_process() {
+        let temp = Bump::new();
+        let buf = [0u8; 16];
+
+        for size in [usize::MAX, usize::MAX - 1, usize::MAX - 2, usize::MAX - 3] {
+            let hard = Cell::new(false);
+            let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+            assert!(dec.decode_c_string(size).is_none(), "{size:#x} must not be read");
+            assert!(dec.hard_fatal(), "{size:#x} must poison the stream");
+
+            let hard = Cell::new(false);
+            let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+            assert!(dec.decode_blob(size).is_none(), "{size:#x} must not be read");
+            assert!(dec.hard_fatal(), "{size:#x} must poison the stream");
+        }
     }
 
     #[test]
