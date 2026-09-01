@@ -325,6 +325,40 @@ pub unsafe fn wire_array_mut<'a, T>(count: usize, ptr: *mut T) -> Option<&'a mut
     Some(unsafe { core::slice::from_raw_parts_mut(ptr, count) })
 }
 
+/// [`wire_array`] for a member that points at one value rather than an array.
+///
+/// The single-value half of the same wall. A command's `*const T` members are the ids the guest
+/// named -- the handle a create is to be filed under -- and reading one is the same question as
+/// reading an array of one: sound only because this module allocated it and knows how long it
+/// lives.
+///
+/// `None` is the guest having sent nothing, which Vulkan gives its own meaning to often enough
+/// that it cannot be folded into the value. What it means is the caller's to say.
+///
+/// # Safety
+///
+/// As [`wire_array`]: `'a` is unconstrained and the only callers are the generated accessors,
+/// where it is the command struct's own. `ptr` must be null, or one element that lives for `'a`.
+pub unsafe fn wire_ref<'a, T>(ptr: *const T) -> Option<&'a T> {
+    // SAFETY: the caller's, above.
+    unsafe { ptr.as_ref() }
+}
+
+/// [`wire_ref`] for the one value a command writes its answer back into.
+///
+/// This is what a handler is given instead of a raw out-parameter. A query that must answer the
+/// guest -- how many physical devices there are, what a format supports -- writes through this and
+/// through nothing else, which is what keeps `venus/context.rs` free of unsafe.
+///
+/// # Safety
+///
+/// As [`wire_ref`], and nothing else may hold the value while the returned reference lives. The
+/// generated accessor borrows the command struct mutably, which is what enforces it.
+pub unsafe fn wire_out<'a, T>(ptr: *mut T) -> Option<&'a mut T> {
+    // SAFETY: the caller's, above.
+    unsafe { ptr.as_mut() }
+}
+
 /// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
 /// cannot parse.
 ///

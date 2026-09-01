@@ -183,11 +183,57 @@ class RustGen:
         def vis(f):
             return 'pub(in crate::venus::proto) ' if f in shut else 'pub '
 
+        return [(vis(f), f, rs) for f, rs in self._members(ty)]
+
+    def _members(self, ty):
+        """A command's fields as `(name, rust type)`, in wire order, without visibility.
+
+        Split out from `command_params` because `restricted` needs the types to decide what to
+        shut in, and `command_params` asks `restricted` -- reading the types through it would be
+        a cycle.
+        """
         fields = [(self.field_name(v.name), self.param_type(ty, v)) for v in ty.variables]
         if ty.ret:
             fields.append((self.field_name(ty.ret.name), self.field_type(ty.ret)))
         fields += [(f, rs) for f, rs, _ in self.shadows(ty)]
-        return [(vis(f), f, rs) for f, rs in fields]
+        return fields
+
+    def scalar_rows(self, ty):
+        """The members that point at one value, as `(field, element type, mutable)`.
+
+        The single-value half of the array wall. A `*mut` member is where a query writes its
+        answer; a `*const` one is an id the guest named. Both are pointers into the batch arena,
+        and a handler that dereferences one is a handler doing the decoder's job with none of the
+        decoder's knowledge -- which is how `venus/context.rs`, a file that is supposed to hold no
+        unsafe at all, came to hold five blocks that were all the same mistake.
+
+        Three shapes are left out on purpose. Arrays already have their own door and their count to
+        be reconciled with. `c_char` is a string, and a reference to one byte is a worse answer
+        than the pointer -- it looks complete and is not; that wants a `CStr` accessor of its own.
+        `c_void` is untyped by construction, so there is no reference to hand out.
+        """
+        arrays = {f for f, _, _, _ in self._array_rows(ty)}
+        shadowed = {f for f, _, _ in self.shadows(ty)}
+        rows = []
+        for f, rs in self._members(ty):
+            if f in arrays:
+                continue
+            m = re.fullmatch(r'\*(mut|const) (.+)', rs)
+            if not m:
+                continue
+            elem = m.group(2)
+            if elem.startswith('*') or 'c_char' in elem or 'c_void' in elem:
+                continue
+            # A `*mut` member is not automatically one a handler writes. Where a shadow was
+            # emitted beside it, the wire member holds the *guest's* id -- venus carries ids
+            # directly, so the reply gives them back unchanged -- and the host handle goes in the
+            # shadow. Writing the wire member there would hand the guest a host pointer. So the
+            # shadow's existence is what says which of the pair is writable, exactly as it does
+            # for arrays in `_array_rows`.
+            field_mut = m.group(1) == 'mut'
+            mutable = field_mut and ('handle_%s' % f) not in shadowed
+            rows.append((f, elem, mutable, field_mut))
+        return rows
 
     def restricted(self, ty):
         """The members of `ty` no handler may reach, as field names.
@@ -201,8 +247,12 @@ class RustGen:
         Only the pointers, not the counts. A count on its own is an integer a handler is free to
         read and cannot make unsound; shutting them in as well would also shut in the several
         that are not array lengths at all.
+
+        The single-value members are shut in beside them, for the same reason and behind the same
+        kind of door -- see `scalar_rows`.
         """
-        return {f for f, _, _, _ in self._array_rows(ty)}
+        return ({f for f, _, _, _ in self._array_rows(ty)}
+                | {f for f, _, _, _ in self.scalar_rows(ty)})
 
     def destroy_target(self, ty):
         """The object a `vkDestroy*`/`vkFree*` names, as `(var, shape)`, or None.
@@ -1544,7 +1594,8 @@ class RustGen:
         What `None` means is deliberately not decided here. See `cs::wire_array`.
         """
         rows = self._array_rows(ty)
-        if not rows:
+        scalars = self.scalar_rows(ty)
+        if not rows and not scalars:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
         for f, elem, count, mutable in rows:
@@ -1576,7 +1627,52 @@ class RustGen:
                     '    }',
                     '']
             out += self._planter(ty, f, elem, count, mutable)
+        for f, elem, mutable, field_mut in scalars:
+            out += self._scalar_accessor(ty, f, elem, mutable, field_mut)
         return out[:-1] + ['}', '']
+
+    def _scalar_accessor(self, ty, f, elem, mutable, field_mut):
+        """The door onto a member that points at one value.
+
+        Readers hand back the arena's lifetime and writers borrow the struct, which is the array
+        wall's rule and not an accident of this one: a handler routinely reads the id the guest
+        named and writes the answer beside it in the same breath, and those two must be able to be
+        held at once. Two writers must not, and are not.
+        """
+        if mutable:
+            sig = 'pub fn %s_mut(&mut self) -> Option<&mut %s>' % (f, elem)
+            call, star = 'wire_out', 'mut'
+        else:
+            sig = "pub fn %s(&self) -> Option<&'a %s>" % (f, elem)
+            call, star = 'wire_ref', 'const'
+        # The door a test plants through follows the *field*, not the accessor. A wire out-handle
+        # is a `*mut` the handler may only read, so the two disagree there, and it is the field
+        # the assignment has to typecheck against.
+        plant_star = 'mut' if field_mut else 'const'
+        plant_life = "'a mut" if field_mut else "'a"
+        return [
+            '    /// Whether the guest sent `%s` at all.' % f,
+            '    ///',
+            '    /// Not a question a handler may skip: Vulkan gives a null out-parameter its own',
+            '    /// meaning, and the accessor answers `None` rather than deciding what it meant.',
+            '    pub fn has_%s(&self) -> bool {' % f,
+            '        !self.%s.is_null()' % f,
+            '    }',
+            '',
+            '    /// `%s`, as the one value it points at.' % f,
+            '    ' + sig + ' {',
+            '        // SAFETY: the decoder allocated this member from the batch arena as a',
+            "        // single element, and the arena outlives the struct's `'a`.",
+            '        unsafe { cs::%s(self.%s as *%s _) }' % (call, f, star),
+            '    }',
+            '',
+            '    /// Plant `%s` as the decoder would have.' % f,
+            '    #[cfg(test)]',
+            '    pub fn plant_%s(&mut self, v: &%s %s) {' % (f, plant_life, elem),
+            '        self.%s = v as *%s _;' % (f, plant_star),
+            '    }',
+            '',
+        ]
 
     def _member_is_mut(self, ty, f):
         """Whether the emitted member `f` of command `ty` is a `*mut` pointer."""
