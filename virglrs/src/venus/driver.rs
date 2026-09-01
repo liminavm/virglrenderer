@@ -62,13 +62,17 @@ const HOST_EXTENSIONS: [&str; 6] = [
 /// next command naming one would hand the driver a freed handle.
 ///
 /// Two maps that are exact inverses: a pool to its objects, and each object back to its pool. The
-/// reverse direction earns its keep because the question a recording command asks is "is this
-/// command buffer still alive", and answering that by searching every pool would be a scan on the
-/// hottest path there is.
+/// reverse direction earns its keep because closing a pool has to find each child again to forget
+/// it, and searching every pool for each would be a scan.
 ///
 /// They live behind a type because an inverse maintained at each mutation site is an invariant
-/// four call sites have to remember, and the one that forgets makes [`Pools::holds`] vouch for a
+/// four call sites have to remember, and the one that forgets leaves a record vouching for a
 /// handle the driver has already freed. See CLAUDE.md, "two values that must agree are one value".
+///
+/// Each child is carried as *both* of its names -- the host handle this table is keyed by, and
+/// the guest id the object table is keyed by. Destroying a pool destroys its objects without a
+/// command per object, and the guest ids have to come out of the object table at that moment;
+/// this is the only place that still knows what they were.
 #[derive(Default)]
 struct Pools {
     open: BTreeMap<u64, Pool>,
@@ -82,33 +86,27 @@ struct Pool {
     /// says nothing, and a host handle the driver is free to reuse must stop being vouched for the
     /// moment that happens.
     device: u64,
-    children: BTreeSet<u64>,
+    /// Host handle to the guest id it was allocated under.
+    children: BTreeMap<u64, ObjectId>,
 }
 
 impl Pools {
     fn open(&mut self, device: u64, pool: u64) {
-        self.open.insert(pool, Pool { device, children: BTreeSet::new() });
+        self.open.insert(pool, Pool { device, children: BTreeMap::new() });
     }
 
     fn is_open(&self, pool: u64) -> bool {
         self.open.contains_key(&pool)
     }
 
-    /// Whether a handle is an object of a live pool -- the check every command that *uses* a
-    /// command buffer owes before handing it to the driver. The object table resolves an id to a
-    /// handle; only this says the handle still names something.
-    fn holds(&self, handle: u64) -> bool {
-        self.owner.contains_key(&handle)
-    }
-
     /// Record objects freshly allocated from a pool. Both directions, or neither.
-    fn adopt(&mut self, pool: u64, children: impl IntoIterator<Item = u64>) {
+    fn adopt(&mut self, pool: u64, children: impl IntoIterator<Item = (u64, ObjectId)>) {
         let Some(p) = self.open.get_mut(&pool) else {
             return;
         };
-        for child in children {
-            p.children.insert(child);
-            self.owner.insert(child, pool);
+        for (handle, id) in children {
+            p.children.insert(handle, id);
+            self.owner.insert(handle, pool);
         }
     }
 
@@ -124,20 +122,21 @@ impl Pools {
         }
     }
 
-    /// Forget a pool and everything in it.
-    fn close(&mut self, pool: u64) {
-        for child in self.open.remove(&pool).map(|p| p.children).unwrap_or_default() {
-            self.owner.remove(&child);
+    /// Forget a pool and everything in it, handing back the guest ids that just stopped naming
+    /// anything -- the caller owes the object table their removal.
+    fn close(&mut self, pool: u64) -> Vec<ObjectId> {
+        let children = self.open.remove(&pool).map(|p| p.children).unwrap_or_default();
+        for handle in children.keys() {
+            self.owner.remove(handle);
         }
+        children.into_values().collect()
     }
 
     /// Forget every pool a device owned, because destroying the device destroyed them.
-    fn close_device(&mut self, device: u64) {
+    fn close_device(&mut self, device: u64) -> Vec<ObjectId> {
         let doomed: Vec<u64> =
             self.open.iter().filter(|(_, p)| p.device == device).map(|(h, _)| *h).collect();
-        for pool in doomed {
-            self.close(pool);
-        }
+        doomed.into_iter().flat_map(|pool| self.close(pool)).collect()
     }
 }
 
@@ -466,18 +465,24 @@ impl Driver {
     }
 
     /// Destroy a device and forget its entry points.
-    pub fn destroy_device(&mut self, device: VkDevice) {
+    ///
+    /// Returns the guest ids of everything its pools held. Vulkan destroys a device's pools with
+    /// it, and their objects with them, without a command naming any of them -- so the caller
+    /// owes the object table their removal, or it goes on resolving ids to handles the driver has
+    /// freed.
+    pub fn destroy_device(&mut self, device: VkDevice) -> Vec<ObjectId> {
         // Its pools go with it: Vulkan destroys them and says nothing, and a handle the driver may
         // now reuse must stop being vouched for at the same moment. Ahead of the lookup, not
         // behind it -- a device this table has already forgotten must still not leave records
         // behind that vouch for its objects.
-        self.pools.close_device(device.0);
+        let orphans = self.pools.close_device(device.0);
         let Some(d) = self.devices.remove(&device.0) else {
-            return;
+            return orphans;
         };
         self.free_device_memory(&d.fns, device.0);
         // SAFETY: a handle this context created, destroyed once -- `remove` is what makes it once.
         unsafe { (d.fns.vkDestroyDevice())(device, core::ptr::null()) };
+        orphans
     }
 
     // ------------------------------------------------------------------- simple objects
@@ -551,7 +556,9 @@ impl Driver {
     /// none -- so the caller's only two cases are the whole array and nothing.
     ///
     /// `out` is the shadow array the decoder allocated, so the driver writes host handles straight
-    /// into the place the generated lifecycle hook will read them from.
+    /// into the place the generated lifecycle hook will read them from. `ids` is the same run of
+    /// objects under the names the guest gave them, which the pool records alongside so that
+    /// destroying it can take them out of the object table.
     pub fn allocate_objects<T: Handle, I>(
         &mut self,
         device: VkDevice,
@@ -559,6 +566,7 @@ impl Driver {
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
         info: Option<&I>,
         out: &mut [T],
+        ids: &[ObjectId],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
@@ -578,7 +586,11 @@ impl Driver {
             return Err(r);
         }
         // Vulkan fills every element of a pool allocation or none, so the whole slice is real.
-        self.pools.adopt(pool, out.iter().map(|h| h.raw()).filter(|h| *h != 0));
+        // Both names of each object are recorded together; see `Pools`.
+        self.pools.adopt(
+            pool,
+            out.iter().map(|h| h.raw()).zip(ids.iter().copied()).filter(|(h, _)| *h != 0),
+        );
         Ok(())
     }
 
@@ -652,13 +664,6 @@ impl Driver {
 
     /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
     ///
-    /// The check every command that *uses* a command buffer owes before handing it to the driver:
-    /// the object table resolves an id to a handle, but only this says the handle still names
-    /// something.
-    pub fn pool_child(&self, handle: u64) -> bool {
-        self.pools.holds(handle)
-    }
-
     /// Free a run of objects back to the pool they came from.
     pub fn free_objects<T: Handle, P: Handle>(
         &mut self,
@@ -677,6 +682,17 @@ impl Driver {
         // length. The generated lifecycle hook removes the ids from the object table exactly once.
         unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
         self.pools.release(objects.iter().map(|h| h.raw()));
+    }
+
+    /// Stand a pool up with contents already in it, as a run of allocations would have left it.
+    ///
+    /// Test scaffolding. Reaching the real path needs a live device and a driver that answers,
+    /// which is the one thing a unit test has no way to arrange -- and what the tests want to ask
+    /// about is what happens to those contents afterwards.
+    #[cfg(test)]
+    pub(super) fn plant_pool(&mut self, device: u64, pool: u64, children: &[(u64, ObjectId)]) {
+        self.pools.open(device, pool);
+        self.pools.adopt(pool, children.iter().copied());
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
@@ -702,17 +718,19 @@ impl Driver {
     /// Destroy a pool, and with it everything allocated from it.
     ///
     /// Vulkan frees a pool's objects when the pool goes, without a command per object -- so this
-    /// is the only place their handles stop being live, and forgetting them here is what keeps a
-    /// later command from reaching the driver with one.
+    /// is the only place their handles stop being live. Their guest ids come back for the caller
+    /// to take out of the object table, which is what keeps a later command from resolving one
+    /// and reaching the driver with a freed handle.
     pub fn destroy_pool<T: Handle>(
         &mut self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
         pool: T,
         alloc: Option<&VkAllocationCallbacks>,
-    ) {
-        self.pools.close(pool.raw());
+    ) -> Vec<ObjectId> {
+        let orphans = self.pools.close(pool.raw());
         self.destroy_object(device, proc, pool, alloc);
+        orphans
     }
 
     // ------------------------------------------------------------ binding and updating
@@ -992,47 +1010,58 @@ mod tests {
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32);
 
     /// Destroying a pool destroys everything in it, and the guest sends no command per object --
-    /// so if the pool's contents stay tracked here, a later command naming one gets past the
-    /// re-check and reaches the driver with a handle Vulkan already freed.
+    /// so the guest ids of its contents have to come back here, for the caller to take out of
+    /// the object table. Left there, the table goes on resolving one to a handle Vulkan has
+    /// freed and the next command naming it hands that handle back to the driver.
     #[test]
-    fn a_pool_forgets_its_contents_when_it_is_destroyed() {
+    fn a_destroyed_pool_hands_back_the_ids_of_everything_in_it() {
         const DEVICE: u64 = 3;
 
         let mut d = Driver::default();
         d.pools.open(DEVICE, 7);
-        d.pools.adopt(7, [11, 12]);
-        assert!(d.pool_child(11) && d.pool_child(12));
+        d.pools.adopt(7, [(11, ObjectId(110)), (12, ObjectId(120))]);
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
-        d.destroy_pool(VkDevice(DEVICE), |f| f.vkDestroyCommandPool(), VkCommandPool(7), None);
-        assert!(!d.pool_child(11), "a buffer outlived the pool it came from");
-        assert!(!d.pool_child(12), "a buffer outlived the pool it came from");
+        let mut orphans =
+            d.destroy_pool(VkDevice(DEVICE), |f| f.vkDestroyCommandPool(), VkCommandPool(7), None);
+        orphans.sort_unstable_by_key(|i| i.0);
+        assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "every id in the pool, and no other");
         assert!(!d.pools.is_open(7));
+
+        // And a second destroy of the same pool has nothing left to hand back: the ids must not
+        // be removed from the object table twice, because the guest may have reused them.
+        assert!(
+            d.destroy_pool(VkDevice(DEVICE), |f| f.vkDestroyCommandPool(), VkCommandPool(7), None)
+                .is_empty()
+        );
     }
 
     /// A destroyed device takes its pools with it.
     ///
     /// Vulkan destroys a device's pools for it and says nothing, and the guest sends no command
-    /// per pool -- so a record that outlives the device keeps vouching for command buffers the
-    /// driver has freed and may already have handed back out under the same handle. `vkCmd*`
-    /// carries only a command buffer and has no device to re-check, so this record is the only
-    /// thing standing between a recycled handle and the driver.
+    /// per pool -- so the ids of every command buffer in them have to come back from here too.
+    /// `vkCmd*` carries only a command buffer and has no device to re-check: the object table
+    /// no longer knowing the id is the only thing standing between a recycled handle and the
+    /// driver.
     #[test]
-    fn a_device_takes_its_pools_with_it() {
+    fn a_device_takes_its_pools_and_their_ids_with_it() {
         let mut d = Driver::default();
         d.pools.open(3, 7);
-        d.pools.adopt(7, [11, 12]);
+        d.pools.adopt(7, [(11, ObjectId(110)), (12, ObjectId(120))]);
         d.pools.open(4, 8);
-        d.pools.adopt(8, [21]);
+        d.pools.adopt(8, [(21, ObjectId(210))]);
 
-        d.destroy_device(VkDevice(3));
+        let mut orphans = d.destroy_device(VkDevice(3));
+        orphans.sort_unstable_by_key(|i| i.0);
 
-        assert!(!d.pool_child(11), "a command buffer outlived its device");
-        assert!(!d.pool_child(12), "a command buffer outlived its device");
+        assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "its pools' ids, and no others");
         assert!(!d.pools.is_open(7), "a pool outlived its device");
-        assert!(d.pool_child(21), "another device's pool must be untouched");
         assert!(d.pools.is_open(8), "another device's pool must be untouched");
+        assert!(
+            d.destroy_device(VkDevice(4)) == [ObjectId(210)],
+            "another device's pool must still hold its own"
+        );
     }
 
     /// The census reports the padded size, so this rule is directly what a score compares.
