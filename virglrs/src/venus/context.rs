@@ -454,7 +454,7 @@ impl Commands for Handlers<'_> {
         }
         // A null array is the guest asking how many there are. Answering it needs no ids, so
         // there is nothing to register and nothing to plant.
-        if args.pPhysicalDevices.is_null() {
+        if !args.has_pPhysicalDevices() {
             if let Ok(n) = self.driver.physical_device_count(args.instance) {
                 // SAFETY: non-null, and the decoder allocated it in the arena.
                 unsafe { *args.pPhysicalDeviceCount = n };
@@ -1196,11 +1196,8 @@ mod tests {
             memoryOffset: VkDeviceSize(100 + i as u64),
             ..Default::default()
         });
-        let args = vn_command_vkBindBufferMemory2 {
-            bindInfoCount: 3,
-            pBindInfos: infos.as_ptr(),
-            ..Default::default()
-        };
+        let mut args = vn_command_vkBindBufferMemory2::default();
+        args.plant_pBindInfos(&infos);
         let got = args.pBindInfos().expect("three counted, three sent");
         assert_eq!(
             got.iter().map(|i| i.memoryOffset.0).collect::<Vec<_>>(),
@@ -1210,11 +1207,8 @@ mod tests {
 
         // A count of none is an empty slice, not an absent one: the guest asked for no binds,
         // which is a legal thing to ask for and a different answer from a broken pair.
-        let args = vn_command_vkBindBufferMemory2 {
-            bindInfoCount: 0,
-            pBindInfos: infos.as_ptr(),
-            ..Default::default()
-        };
+        let mut args = vn_command_vkBindBufferMemory2::default();
+        args.plant_pBindInfos(&infos[..0]);
         assert_eq!(args.pBindInfos().map(<[_]>::len), Some(0));
     }
 
@@ -1234,22 +1228,17 @@ mod tests {
             reject: None,
         };
 
-        let mut args = vn_command_vkBindBufferMemory2 {
-            bindInfoCount: 3,
-            pBindInfos: core::ptr::null(),
-            ..Default::default()
-        };
+        // Counted without planting: the pointer stays null, which is the one shape the
+        // planter cannot build and the only one this handler is here to refuse.
+        let mut args = vn_command_vkBindBufferMemory2::default();
+        args.bindInfoCount = 3;
         h.vkBindBufferMemory2(&mut args);
         assert!(h.reject.is_some(), "three binds with no array behind them must not pass");
 
         // No array and nothing counted is the ordinary optional array, and binding nothing is a
         // legal no-op -- a different answer from a protocol violation.
         h.reject = None;
-        let mut args = vn_command_vkBindBufferMemory2 {
-            bindInfoCount: 0,
-            pBindInfos: core::ptr::null(),
-            ..Default::default()
-        };
+        let mut args = vn_command_vkBindBufferMemory2::default();
         h.vkBindBufferMemory2(&mut args);
         assert!(h.reject.is_none(), "binding nothing is not a protocol violation");
 
@@ -1257,11 +1246,8 @@ mod tests {
         // which is again not a protocol violation.
         h.reject = None;
         let info = VkBindBufferMemoryInfo::default();
-        let mut args = vn_command_vkBindBufferMemory2 {
-            bindInfoCount: 1,
-            pBindInfos: &info,
-            ..Default::default()
-        };
+        let mut args = vn_command_vkBindBufferMemory2::default();
+        args.plant_pBindInfos(core::slice::from_ref(&info));
         h.vkBindBufferMemory2(&mut args);
         assert!(h.reject.is_none(), "an array the guest actually sent is not a violation");
     }
@@ -1295,15 +1281,12 @@ mod tests {
         // There is no device, so the driver refuses the whole run -- which is the only way to
         // reach the refusal path without a driver that fails on demand.
         let infos = [VkGraphicsPipelineCreateInfo::default(); IDS.len()];
-        let ids = IDS.map(VkPipeline);
+        let mut ids = IDS.map(VkPipeline);
         let mut shadow = [VkPipeline(0); IDS.len()];
-        let mut args = vn_command_vkCreateGraphicsPipelines {
-            createInfoCount: IDS.len() as u32,
-            pCreateInfos: infos.as_ptr(),
-            pPipelines: ids.as_ptr() as *mut VkPipeline,
-            handle_pPipelines: shadow.as_mut_ptr(),
-            ..Default::default()
-        };
+        let mut args = vn_command_vkCreateGraphicsPipelines::default();
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut ids);
+        args.plant_handle_pPipelines(&mut shadow);
         h.vkCreateGraphicsPipelines(&mut args);
 
         assert_ne!(args.ret, VkResult::VK_SUCCESS, "no device means no pipelines");
@@ -1347,12 +1330,12 @@ mod tests {
         // parallel run of zeroed shadows for the host handles that are never going to arrive.
         let mut asked = IDS.map(VkCommandBuffer);
         let mut shadow = [VkCommandBuffer(0); IDS.len()];
-        let mut args = vn_command_vkAllocateCommandBuffers {
-            pAllocateInfo: Some(&info),
-            pCommandBuffers: asked.as_mut_ptr(),
-            handle_pCommandBuffers: shadow.as_mut_ptr(),
-            ..Default::default()
-        };
+        // The count is `pAllocateInfo`'s, so the planters set only the pointers -- which is the
+        // shape the decoder leaves too.
+        let mut args = vn_command_vkAllocateCommandBuffers::default();
+        args.pAllocateInfo = Some(&info);
+        args.plant_pCommandBuffers(&mut asked);
+        args.plant_handle_pCommandBuffers(&mut shadow);
         h.vkAllocateCommandBuffers(&mut args);
 
         assert_ne!(args.ret, VkResult::VK_SUCCESS, "there is no device to allocate from");

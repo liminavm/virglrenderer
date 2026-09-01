@@ -11,6 +11,8 @@ Vulkan names are kept verbatim, `sType` and all. The generated Rust is meant to 
 the generated C when a wire question comes up, and a renaming layer would cost that for nothing.
 """
 
+import re
+
 from vkxml import VkType
 
 # Gen.VariableInfo's validity, restated so this module does not reach into a nested class: the
@@ -172,12 +174,35 @@ class RustGen:
 
         The wire's members first, then the host-side shadows -- see `shadows`, which is where the
         reason they are separate members and the reason they come last are both written down.
+
+        Each carries its own visibility, because an array's pointer is not the handlers\' to read.
+        See `restricted`.
         """
+        shut = self.restricted(ty)
+
+        def vis(f):
+            return 'pub(in crate::venus::proto) ' if f in shut else 'pub '
+
         fields = [(self.field_name(v.name), self.param_type(ty, v)) for v in ty.variables]
         if ty.ret:
             fields.append((self.field_name(ty.ret.name), self.field_type(ty.ret)))
         fields += [(f, rs) for f, rs, _ in self.shadows(ty)]
-        return fields
+        return [(vis(f), f, rs) for f, rs in fields]
+
+    def restricted(self, ty):
+        """The members of `ty` no handler may reach, as field names.
+
+        An array is a count and a pointer, and the pointer alone means nothing: read with the
+        wrong count it is an out-of-bounds slice, and the counts are not even all members --
+        eighteen of them come from an out-parameter, from inside another struct, or from
+        arithmetic. So the pointer is shut in here with the code that knows its count, and
+        `_command_accessors` emits the one door out.
+
+        Only the pointers, not the counts. A count on its own is an integer a handler is free to
+        read and cannot make unsound; shutting them in as well would also shut in the several
+        that are not array lengths at all.
+        """
+        return {f for f, _, _, _ in self._array_rows(ty)}
 
     def destroy_target(self, ty):
         """The object a `vkDestroy*`/`vkFree*` names, as `(var, shape)`, or None.
@@ -1437,6 +1462,27 @@ class RustGen:
         out += self._dispatch_fns(commands, gaps)
         return '\n'.join(out)
 
+    def _array_rows(self, ty):
+        """Every array `ty` carries, as `(field, element type, count expression, mutable)`.
+
+        The one place that decides what an array is, so the accessor that hands one out and the
+        visibility that shuts the pointer away cannot come to different answers.
+        """
+        rows = []
+        for var in ty.variables:
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported:
+                # The member has no emitted decode either, so there is no array to hand out.
+                continue
+            if shape[0] == 'dynamic':
+                rows.append((self.field_name(var.name), self.base_name(var.ty), shape[1], False))
+        for f, rs, shape in self.shadows(ty):
+            if shape[0] == 'dynamic':
+                mutable = rs.startswith('*mut ')
+                rows.append((f, rs.split(' ', 1)[1], shape[1], mutable))
+        return rows
+
     def _command_accessors(self, ty, gaps):
         """The arrays a command carries, as slices, on the struct that carries them.
 
@@ -1453,20 +1499,7 @@ class RustGen:
 
         What `None` means is deliberately not decided here. See `cs::wire_array`.
         """
-        rows = []
-        for var in ty.variables:
-            try:
-                shape = self._shape(ty, var)
-            except self.Unsupported:
-                # The member has no emitted decode either, so there is no array to hand out.
-                continue
-            if shape[0] == 'dynamic':
-                rows.append((self.field_name(var.name), self.base_name(var.ty), shape[1], False))
-        for f, rs, shape in self.shadows(ty):
-            if shape[0] == 'dynamic':
-                mutable = rs.startswith('*mut ')
-                rows.append((f, rs.split(' ', 1)[1], shape[1], mutable))
-
+        rows = self._array_rows(ty)
         if not rows:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
@@ -1476,10 +1509,17 @@ class RustGen:
             call = 'wire_array_mut' if mutable else 'wire_array'
             # The count expression is the decode's, which counts in `u64` because that is what the
             # wire holds. A slice is indexed in `usize`, and one cast says so once.
-            n = count[:-len(' as u64')] if count.endswith(' as u64') else count
-            if n.startswith('(') and n.endswith(')'):
-                n = n[1:-1]
-            out += ['    /// `%s`, reconciled with the count the guest sent beside it.' % f,
+            n = self._count_expr(count)
+            out += ['    /// Whether the guest sent `%s` at all.' % f,
+                    '    ///',
+                    '    /// Not the same question as whether it is empty: Vulkan gives a null',
+                    '    /// array its own meaning in the enumerations, where it is the guest',
+                    '    /// asking how many there are rather than asking for them.',
+                    '    pub fn has_%s(&self) -> bool {' % f,
+                    '        !self.%s.is_null()' % f,
+                    '    }',
+                    '',
+                    '    /// `%s`, reconciled with the count the guest sent beside it.' % f,
                     '    ' + sig + ' {',
                     "        // The count is the decode's own expression, so the slice can only be",
                     '        // as long as the array the decoder allocated. `val` is what that',
@@ -1491,7 +1531,54 @@ class RustGen:
                     % (call, n, f, 'mut' if mutable else 'const'),
                     '    }',
                     '']
+            out += self._planter(ty, f, elem, count, mutable)
         return out[:-1] + ['}', '']
+
+    def _member_is_mut(self, ty, f):
+        """Whether the emitted member `f` of command `ty` is a `*mut` pointer."""
+        for _vis, name, rs in self.command_params(ty):
+            if name == f:
+                return rs.startswith('*mut ')
+        return False
+
+    @staticmethod
+    def _count_expr(count):
+        """An array's count as the decode spells it, with the wire's `u64` cast taken back off.
+
+        The wire counts in `u64` because that is what it holds; a slice is indexed in `usize`,
+        and the accessor casts once rather than carrying two spellings around.
+        """
+        n = count[:-len(' as u64')] if count.endswith(' as u64') else count
+        return n[1:-1] if n.startswith('(') and n.endswith(')') else n
+
+    def _planter(self, ty, f, elem, count, mutable):
+        """The way a test builds a command that carries an array.
+
+        The decoder is the only thing that writes these members in a real run, and it writes the
+        count and the pointer together. A test that sets them as two fields can set them
+        inconsistently, which is the bug the accessor exists to make impossible -- so the test
+        door plants a slice and derives both from it.
+
+        Where the count is a member of this struct, it is set from the slice's own length. Where
+        it is not -- inside another struct, behind an out-pointer, or arithmetic -- only the
+        pointer is set, because the count is somewhere the test has already had to build.
+        """
+        # Whether the *member* is `*mut` is not whether the *accessor* hands out `&mut`: an
+        # enumeration's wire array is `*mut` because C writes host handles into it, while the
+        # accessor over it is read-only because what a handler reads there is the guest's ids.
+        wr = self._member_is_mut(ty, f)
+        life = "'a mut" if wr else "'a"
+        body = ['        self.%s = a.%s;' % (f, 'as_mut_ptr()' if wr else 'as_ptr()')]
+        m = re.fullmatch(r'val\.(\w+)', self._count_expr(count))
+        if m:
+            ct = next((self.field_type(v) for v in ty.variables if self.field_name(v.name) == m.group(1)), None)
+            if ct in ('u32', 'u64', 'usize', 'i32'):
+                body.append('        self.%s = a.len() as %s;' % (m.group(1), ct))
+        return ['    /// Plant `%s` as the decoder would have, count and pointer together.' % f,
+                '    #[cfg(test)]',
+                '    pub fn plant_%s(&mut self, a: &%s [%s]) {' % (f, life, elem)] + body + [
+                '    }',
+                '']
 
     def _handle_fns(self, ty):
         objtype = 'VkObjectType::%s' % ty.attrs['c_objtype']
