@@ -21,8 +21,9 @@ use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateMemory,
-    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateCommandBuffers,
+    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory, vn_command_vkCreateBuffer,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateImage, vn_command_vkCreateImageView,
     vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
@@ -34,7 +35,8 @@ use super::proto::types::{
     vn_command_vkDestroyInstance, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
-    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
+    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
+    vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
 };
 use crate::vulkan::Global;
 
@@ -295,6 +297,18 @@ impl Handlers<'_> {
             }
             Ok(_) => self.objects.borrow_mut().add_ghost(id),
         }
+    }
+
+    /// How many objects a pool allocation asks for, read out of its create-info.
+    ///
+    /// Read before the driver call, because a refusal has to ghost exactly the ids the generated
+    /// lifecycle hook is going to walk, and that count lives inside the guest's struct.
+    fn pool_count<I>(&self, info: *const I, count: impl FnOnce(&I) -> u32) -> usize {
+        if info.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null, and the decoder allocated it in the batch arena.
+        count(unsafe { &*info }) as usize
     }
 
     /// Refuse a run of ids in an out-array the guest sent.
@@ -591,6 +605,53 @@ impl Commands for Handlers<'_> {
     }
 
     simple_destroy!(vkDestroyShaderModule, vn_command_vkDestroyShaderModule, shaderModule);
+
+    // --------------------------------------------------------------- the pool objects
+    //
+    // Allocated in runs from a pool rather than one at a time, so the out-handles are an array and
+    // a refusal has to ghost every id in it. Vulkan fills the whole array or none of it, so unlike
+    // an enumeration there is no short answer between those two.
+
+    fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers) {
+        let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount);
+        let host = self.driver.allocate_objects(
+            args.device,
+            |d| d.vkAllocateCommandBuffers(),
+            args.pAllocateInfo,
+            args.handle_pCommandBuffers,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");
+            self.ghost_range(args.pCommandBuffers, 0..count);
+        }
+    }
+
+    fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers) {
+        self.driver.free_objects(
+            args.device,
+            |d| d.vkFreeCommandBuffers(),
+            args.commandPool,
+            args.commandBufferCount,
+            args.pCommandBuffers,
+        );
+    }
+
+    fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets) {
+        let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount);
+        let host = self.driver.allocate_objects(
+            args.device,
+            |d| d.vkAllocateDescriptorSets(),
+            args.pAllocateInfo,
+            args.handle_pDescriptorSets,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            // Running a descriptor pool dry is a normal thing for a guest to do -- it is how a
+            // guest discovers the pool is too small -- so this one is not logged as a surprise.
+            self.ghost_range(args.pDescriptorSets, 0..count);
+        }
+    }
 
     fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2) {
         // A queue is owned by its device and never created, so the guest's id is registered
@@ -993,5 +1054,55 @@ mod tests {
         h.reject = None;
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
+    }
+
+    /// A refused pool allocation ghosts every id in the run, not just the first.
+    ///
+    /// Vulkan fills the whole array or none of it, and the generated lifecycle hook walks all of
+    /// it either way -- so a refusal that decided about only one id leaves the guest holding
+    /// command buffers the driver never made.
+    #[test]
+    fn a_refused_pool_allocation_ghosts_the_whole_run() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{VkCommandBuffer, VkCommandBufferAllocateInfo};
+
+        const IDS: [u64; 3] = [31, 32, 33];
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        let info = VkCommandBufferAllocateInfo {
+            commandBufferCount: IDS.len() as u32,
+            ..Default::default()
+        };
+        // What the decoder hands a handler: the guest's chosen ids in the wire member, and a
+        // parallel run of zeroed shadows for the host handles that are never going to arrive.
+        let mut asked = IDS.map(VkCommandBuffer);
+        let mut shadow = [VkCommandBuffer(0); IDS.len()];
+        let mut args = vn_command_vkAllocateCommandBuffers {
+            pAllocateInfo: &info,
+            pCommandBuffers: asked.as_mut_ptr(),
+            handle_pCommandBuffers: shadow.as_mut_ptr(),
+            ..Default::default()
+        };
+        h.vkAllocateCommandBuffers(&mut args);
+
+        assert_ne!(args.ret, VkResult::VK_SUCCESS, "there is no device to allocate from");
+        for id in IDS {
+            assert_eq!(
+                objects.lookup(ObjectId(id), VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER.0),
+                Lookup::Ghost,
+                "id {id} was in a refused run and must not become an object"
+            );
+        }
     }
 }
