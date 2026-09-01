@@ -21,12 +21,28 @@ PIN=0
 [ "${1:-}" = "--pin" ] && PIN=1
 
 PREFIX="${VIRGL_PREFIX:-$ROOT/harness/vm/prefix}"
+
+# Own the freshness of the prefix we are about to score, the way vkr-replay.sh does. This gate
+# reads a built dylib and nothing else, so without this it happily pins or checks a dylib from
+# whatever the tree looked like when someone last installed -- and reports "symbols matches" about
+# a build that no longer exists. The replay ladder already learned this once; there is no reason
+# for the ABI gate to learn it again.
+if [ "$PREFIX" = "$ROOT/virglrs/prefix" ]; then
+  "$ROOT/virglrs/install.sh" >/dev/null
+fi
+
 LIB=""
 for cand in "$PREFIX/lib/libvirglrenderer.1.dylib" "$PREFIX/lib/libvirglrenderer.dylib" \
             "$PREFIX/src/libvirglrenderer.dylib"; do
   [ -f "$cand" ] && LIB="$cand" && break
 done
 [ -n "$LIB" ] || { echo "no libvirglrenderer under $PREFIX" >&2; exit 1; }
+
+# Any other prefix is built by someone else, so all we can do is say when it looks stale.
+if [ "$PREFIX" != "$ROOT/virglrs/prefix" ] \
+   && find "$ROOT/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+  echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
