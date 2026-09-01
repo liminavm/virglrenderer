@@ -305,22 +305,14 @@ impl Handlers<'_> {
     ///
     /// Read before the driver call, because a refusal has to ghost exactly the ids the generated
     /// lifecycle hook is going to walk, and that count lives inside the guest's struct.
-    fn pool_count<I>(&self, info: *const I, count: impl FnOnce(&I) -> u32) -> usize {
-        if info.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null, and the decoder allocated it in the batch arena.
-        count(unsafe { &*info }) as usize
+    fn pool_count<I>(&self, info: Option<&I>, count: impl FnOnce(&I) -> u32) -> usize {
+        info.map_or(0, |i| count(i) as usize)
     }
 
     /// The pool an allocation names, as a host handle -- zero when the info is missing, which no
     /// live pool can be, so the driver's re-check refuses it.
-    fn pool_of<I>(&self, info: *const I, pool: impl FnOnce(&I) -> u64) -> u64 {
-        if info.is_null() {
-            return 0;
-        }
-        // SAFETY: non-null, and the decoder allocated it in the batch arena.
-        pool(unsafe { &*info })
+    fn pool_of<I>(&self, info: Option<&I>, pool: impl FnOnce(&I) -> u64) -> u64 {
+        info.map_or(0, pool)
     }
 
     /// The array a command carries, as a slice -- or a refusal when the guest counted one it did
@@ -661,9 +653,7 @@ impl Commands for Handlers<'_> {
     /// allocation shorter than the number the driver is then handed, and the driver reads off the
     /// end of it. The guest chooses that number, which makes rejecting it the boundary's job.
     fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule<'_>) {
-        // SAFETY: non-null is checked first; the decoder allocated it in the batch arena.
-        let bad = args.pCreateInfo.is_null() || unsafe { (*args.pCreateInfo).codeSize } % 4 != 0;
-        if bad {
+        if args.pCreateInfo.is_none_or(|i| i.codeSize % 4 != 0) {
             self.reject = Some("gave a shader a code size that is not a whole number of words");
             return;
         }
@@ -1184,7 +1174,8 @@ mod tests {
         };
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
-        let mut args = vn_command_vkCreateShaderModule { pCreateInfo: &odd, ..Default::default() };
+        let mut args =
+            vn_command_vkCreateShaderModule { pCreateInfo: Some(&odd), ..Default::default() };
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_some(), "a code size of 7 must not reach the driver");
 
@@ -1192,7 +1183,7 @@ mod tests {
         // refuses it -- which is a different answer from a protocol violation.
         let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
         let mut args =
-            vn_command_vkCreateShaderModule { pCreateInfo: &whole, ..Default::default() };
+            vn_command_vkCreateShaderModule { pCreateInfo: Some(&whole), ..Default::default() };
         h.reject = None;
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
@@ -1339,7 +1330,7 @@ mod tests {
         let mut asked = IDS.map(VkCommandBuffer);
         let mut shadow = [VkCommandBuffer(0); IDS.len()];
         let mut args = vn_command_vkAllocateCommandBuffers {
-            pAllocateInfo: &info,
+            pAllocateInfo: Some(&info),
             pCommandBuffers: asked.as_mut_ptr(),
             handle_pCommandBuffers: shadow.as_mut_ptr(),
             ..Default::default()

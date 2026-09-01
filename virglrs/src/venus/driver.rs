@@ -194,6 +194,15 @@ pub struct Memory {
 // hundred handlers `context.rs` will grow, which is the opposite of keeping unsafe in a named
 // module. This is that module (CLAUDE.md); the handlers stay safe Rust.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// A borrowed argument as the pointer the entry point below it wants.
+///
+/// This is the whole of the conversion, and it lives here because here is where the C ABI starts.
+/// Above it a missing argument is `None`; below it, null -- and nothing in between has to know
+/// that Vulkan spells absence with a pointer value.
+fn ptr<T>(r: Option<&T>) -> *const T {
+    r.map_or(core::ptr::null(), |r| r as *const T)
+}
+
 impl Driver {
     pub fn new() -> Driver {
         Driver::default()
@@ -244,8 +253,8 @@ impl Driver {
     pub fn create_instance(
         &mut self,
         global: &Global,
-        info: *const VkInstanceCreateInfo,
-        alloc: *const VkAllocationCallbacks,
+        info: Option<&VkInstanceCreateInfo>,
+        alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkInstance, VkResult> {
         // One instance per context, as `objects` describes: a second would orphan the first's
         // devices and leak it, and no guest has a reason to ask.
@@ -255,7 +264,7 @@ impl Driver {
         let mut out = VkInstance(0);
         // SAFETY: `info` and `alloc` are the decoder's arena allocations, live for this call, and
         // `out` is a local. The guest cannot make them dangle: the arena outlives the batch.
-        let r = unsafe { (global.vkCreateInstance())(info, alloc, &mut out) };
+        let r = unsafe { (global.vkCreateInstance())(ptr(info), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -343,12 +352,12 @@ impl Driver {
     pub fn create_device(
         &mut self,
         pd: VkPhysicalDevice,
-        info: *const VkDeviceCreateInfo,
-        alloc: *const VkAllocationCallbacks,
+        info: Option<&VkDeviceCreateInfo>,
+        alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDevice, VkResult> {
-        if info.is_null() {
+        let Some(info) = info else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
-        }
+        };
         if self.instance.is_none() {
             // A device on an instance this context never created. The guest named an instance the
             // object table resolved, so this cannot happen without a host bug -- but it is the
@@ -356,8 +365,7 @@ impl Driver {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
 
-        // SAFETY: non-null, and the decoder allocated it in the arena for this batch.
-        let guest_info = unsafe { *info };
+        let guest_info = *info;
         // The extension list's size was checked against this count as it decoded, so the pair
         // cannot arrive split; a guest that asked for none simply gets an empty list.
         let guest = read_names(
@@ -384,7 +392,7 @@ impl Driver {
         let mut out = VkDevice(0);
         // SAFETY: `pd` is a handle this instance returned; `info` and everything it points at are
         // live for the call, including the extension array built just above.
-        let r = unsafe { (inst.vkCreateDevice())(pd, &info, alloc, &mut out) };
+        let r = unsafe { (inst.vkCreateDevice())(pd, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -442,13 +450,13 @@ impl Driver {
     pub fn device_queue(
         &self,
         device: VkDevice,
-        info: *const VkDeviceQueueInfo2,
+        info: Option<&VkDeviceQueueInfo2>,
     ) -> Option<VkQueue> {
         let d = self.devices.get(&device.0)?;
         let mut out = VkQueue(0);
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
-        unsafe { (d.fns.vkGetDeviceQueue2())(device, info, &mut out) };
+        unsafe { (d.fns.vkGetDeviceQueue2())(device, ptr(info), &mut out) };
         (out.0 != 0).then_some(out)
     }
 
@@ -491,8 +499,8 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: *const I,
-        alloc: *const VkAllocationCallbacks,
+        info: Option<&I>,
+        alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<u64, VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
@@ -500,7 +508,7 @@ impl Driver {
         let mut out = T::from_raw(0);
         // SAFETY: `device` is a handle in this table, `info` and `alloc` are the decoder's arena
         // allocations live for this call, and `out` is a local.
-        let r = unsafe { proc(&d.fns)(device, info, alloc, &mut out) };
+        let r = unsafe { proc(&d.fns)(device, ptr(info), ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -518,7 +526,7 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
         object: T,
-        alloc: *const VkAllocationCallbacks,
+        alloc: Option<&VkAllocationCallbacks>,
     ) {
         let Some(d) = self.devices.get(&device.0) else {
             return;
@@ -529,7 +537,7 @@ impl Driver {
         }
         // SAFETY: `device` and `object` are handles this context created, and the generated
         // lifecycle hook removes the id from the object table exactly once, so this runs once.
-        unsafe { proc(&d.fns)(device, object, alloc) };
+        unsafe { proc(&d.fns)(device, object, ptr(alloc)) };
     }
 
     /// Allocate a run of objects from a pool: `vkAllocateX(device, info, out)`.
@@ -544,13 +552,13 @@ impl Driver {
         device: VkDevice,
         pool: u64,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
-        info: *const I,
+        info: Option<&I>,
         out: &mut [T],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
-        if info.is_null() || out.is_empty() {
+        if info.is_none() || out.is_empty() {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         // The pool is re-checked here for the same reason the device is: the guest may have
@@ -560,7 +568,7 @@ impl Driver {
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
         // call, and `out` is the arena array the decoder sized from the count inside `info`.
-        let r = unsafe { proc(&d.fns)(device, info, out.as_mut_ptr()) };
+        let r = unsafe { proc(&d.fns)(device, ptr(info), out.as_mut_ptr()) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -595,7 +603,7 @@ impl Driver {
         ) -> VkResult,
         cache: VkPipelineCache,
         infos: &[I],
-        alloc: *const VkAllocationCallbacks,
+        alloc: Option<&VkAllocationCallbacks>,
         out: &mut [VkPipeline],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
@@ -610,7 +618,14 @@ impl Driver {
         // SAFETY: `device` is a handle in this table, `alloc` is an arena allocation live for the
         // call, and both counts Vulkan is given are the slices' own lengths.
         let r = unsafe {
-            proc(&d.fns)(device, cache, infos.len() as u32, infos.as_ptr(), alloc, out.as_mut_ptr())
+            proc(&d.fns)(
+                device,
+                cache,
+                infos.len() as u32,
+                infos.as_ptr(),
+                ptr(alloc),
+                out.as_mut_ptr(),
+            )
         };
         // A positive result is not a failure: `VK_PIPELINE_COMPILE_REQUIRED` says the driver
         // declined to compile early, and every handle is real.
@@ -623,7 +638,7 @@ impl Driver {
             }
             // SAFETY: a handle this call just produced, destroyed once -- the slice is walked once
             // and the guest never learns the handle, so nothing else can name it.
-            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, alloc) };
+            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };
             // The guest's reply must not carry a handle that is now gone.
             *survivor = VkPipeline(0);
         }
@@ -671,8 +686,8 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: *const I,
-        alloc: *const VkAllocationCallbacks,
+        info: Option<&I>,
+        alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<u64, VkResult> {
         let handle = self.create_object(device, proc, info, alloc)?;
         self.pools.open(device.0, handle);
@@ -689,7 +704,7 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
         pool: T,
-        alloc: *const VkAllocationCallbacks,
+        alloc: Option<&VkAllocationCallbacks>,
     ) {
         self.pools.close(pool.raw());
         self.destroy_object(device, proc, pool, alloc);
@@ -765,19 +780,18 @@ impl Driver {
         &mut self,
         device: VkDevice,
         id: u64,
-        info: *const VkMemoryAllocateInfo,
-        alloc: *const VkAllocationCallbacks,
+        info: Option<&VkMemoryAllocateInfo>,
+        alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDeviceMemory, VkResult> {
-        if info.is_null() {
+        let Some(info) = info else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
-        }
+        };
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         // A copy, not an edit in place: the decoder's struct is the guest's request, and the
         // round trip re-encodes it. The `pNext` chain is carried over untouched.
-        // SAFETY: non-null, and the decoder allocated it in the arena for this batch.
-        let mut info = unsafe { *info };
+        let mut info = *info;
         info.allocationSize = VkDeviceSize(pad_for_blob(
             info.allocationSize.0,
             d.memory_types.get(info.memoryTypeIndex as usize).copied(),
@@ -787,7 +801,7 @@ impl Driver {
         let mut out = VkDeviceMemory(0);
         // SAFETY: `info` is a local whose chain the decoder owns for the batch, `alloc` is another
         // of its arena allocations, and `out` is a local.
-        let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, alloc, &mut out) };
+        let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -986,12 +1000,7 @@ mod tests {
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
-        d.destroy_pool(
-            VkDevice(DEVICE),
-            |f| f.vkDestroyCommandPool(),
-            VkCommandPool(7),
-            core::ptr::null(),
-        );
+        d.destroy_pool(VkDevice(DEVICE), |f| f.vkDestroyCommandPool(), VkCommandPool(7), None);
         assert!(!d.pool_child(11), "a buffer outlived the pool it came from");
         assert!(!d.pool_child(12), "a buffer outlived the pool it came from");
         assert!(!d.pools.is_open(7));

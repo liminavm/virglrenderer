@@ -173,7 +173,7 @@ class RustGen:
         The wire's members first, then the host-side shadows -- see `shadows`, which is where the
         reason they are separate members and the reason they come last are both written down.
         """
-        fields = [(self.field_name(v.name), self.field_type(v)) for v in ty.variables]
+        fields = [(self.field_name(v.name), self.param_type(ty, v)) for v in ty.variables]
         if ty.ret:
             fields.append((self.field_name(ty.ret.name), self.field_type(ty.ret)))
         fields += [(f, rs) for f, rs, _ in self.shadows(ty)]
@@ -284,8 +284,46 @@ class RustGen:
         emits plausible-looking wrong code costs a day of round-trip bisection.
         """
 
+    @staticmethod
+    def null_of(var):
+        return 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
+
     def member_expr(self, var):
         return 'val.%s' % self.field_name(var.name)
+
+    def is_ref_member(self, ty, var):
+        """Whether this member is a reference rather than a pointer.
+
+        A command's arguments are what a handler is handed, and a handler is safe code (CLAUDE.md),
+        so a member that can be a reference is one. What cannot:
+
+        - An **array**. A slice is two words where C has one, and `vn_command_*` has to keep C's
+          layout -- `render_layout_oracle` is where that is written down and checked. The count and
+          the pointer stay, and are reconciled into a slice at the boundary that knows the truth.
+        - An **out member**. The driver writes through it, and the reply encoder reads it back;
+          a shared reference cannot express either.
+        - A **string** or a **blob**. Neither is one pointee, and neither is sized by anything in
+          the type.
+
+        Struct members are never references: a `Vk*` is handed to the Vulkan driver, which owns
+        the meaning of every pointer in it.
+        """
+        if ty.category != VkType.COMMAND:
+            return False
+        t = var.ty
+        return (t.is_pointer() and not t.is_static_array() and len(t.decor.ref_quals) == 1
+                and t.is_const_pointer() and 'len_names' not in var.attrs
+                and not (t.base.category == VkType.DEFAULT and t.base.name in ('void', 'char')))
+
+    def param_type(self, ty, var, life="'a"):
+        """The Rust type of a command argument. See `is_ref_member`.
+
+        `life` is the struct\'s lifetime everywhere but the layout table, which names types in a
+        static and so has no borrow to name.
+        """
+        if self.is_ref_member(ty, var):
+            return "Option<&%s %s>" % (life, self.base_name(var.ty))
+        return self.field_type(var)
 
     def scalar_of(self, ty):
         """The Rust type a scalar member decodes as, or None if it is not a scalar."""
@@ -331,6 +369,18 @@ class RustGen:
         access = 'val.%s' % self.field_name(parts[0])
         guard = access if len(parts) > 1 or holders[0].ty.is_pointer() else None
         newtype = holders[-1].ty.base.category in (VkType.BASETYPE, VkType.ENUM, VkType.BITMASK)
+
+        # When the holder is a reference member, the null check the C guards this read with is the
+        # match itself, and there is no pointer left to dereference. `h` rather than a name from
+        # vk.xml, so no member can shadow it.
+        if guard and self.is_ref_member(ty, holders[0]):
+            access = 'h.%s' % self.field_name(parts[1]) if len(parts) > 1 \
+                else ('(*h)' if newtype else '*h')
+            if newtype:
+                access = '%s.0' % access
+            inner = expr.replace(name, access)
+            return 'match %s { Some(h) => (%s) as u64, None => 0 }' % (guard, inner)
+
         if len(parts) > 1:
             access = '(*%s).%s' % (access, self.field_name(parts[1]))
         elif guard:
@@ -447,7 +497,8 @@ class RustGen:
             return ['{'] + ['    ' + l for l in lines] + ['}']
 
         ptr = '*const' if var.ty.is_const_pointer() else '*mut'
-        null = 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
+        ref = self.is_ref_member(ty, var)
+        null = 'None' if ref else self.null_of(var)
 
         if shape[0] == 'blob':
             if validity == Gen_INVALID:
@@ -490,7 +541,9 @@ class RustGen:
             if validity != Gen_INVALID:
                 hit.append('%s(dec, p%s);' % (elem, tag) if elem_kind == 'call'
                            else '*p = dec.decode_scalar::<%s>();' % elem)
-            hit.append('%s = p as %s _;' % (m, ptr))
+            # The arena hands back `&'a mut T` and the member wants `&'a T`, which is where the
+            # decoder's lifetime enters the struct: a reborrow, not a cast.
+            hit.append('%s = Some(&*p);' % m if ref else '%s = p as %s _;' % (m, ptr))
             return (['if dec.decode_simple_pointer() {'] + ['    ' + l for l in hit]
                     + ['} else {'] + ['    ' + l for l in miss] + ['}'])
 
@@ -530,7 +583,10 @@ class RustGen:
         m = self.member_expr(var)
         if not var.ty.is_pointer() or not var.maybe_null():
             raise self.Unsupported('%s.%s: not serializable' % (ty.name, var.name))
-        null = 'core::ptr::null()' if var.ty.is_const_pointer() else 'core::ptr::null_mut()'
+        ref = self.is_ref_member(ty, var)
+        null = 'None' if ref else self.null_of(var)
+        absent = '%s.is_none()' % m if ref else '%s.is_null()' % m
+        present = '%s.is_some()' % m if ref else '!%s.is_null()' % m
         if kind == 'decode':
             return ['if dec.decode_simple_pointer() {',
                     '    dec.set_fatal();',
@@ -538,11 +594,11 @@ class RustGen:
                     '    %s = %s;' % (m, null),
                     '}']
         if kind == 'encode':
-            return ['if enc.encode_simple_pointer(!%s.is_null()) {' % m,
+            return ['if enc.encode_simple_pointer(%s) {' % present,
                     '    debug_assert!(false, "%s is not serializable");' % var.name,
                     '}']
         return ['size += cs::sizeof_scalar::<u64>();',
-                'debug_assert!(%s.is_null(), "%s is not serializable");' % (m, var.name)]
+                'debug_assert!(%s, "%s is not serializable");' % (absent, var.name)]
 
     def _present(self, count, var, m, null, hit):
         """The present/absent frame a wire array shares: peek the count, and on zero consume it
@@ -686,6 +742,23 @@ class RustGen:
                 if kind == 'encode':
                     return ['enc.encode_simple_pointer(!%s.is_null()); /* out */' % m]
                 return ['size += cs::sizeof_scalar::<u64>(); /* out */']
+            if self.is_ref_member(ty, var):
+                # A reference member needs no null check and no unsafe: the absence the wire can
+                # express is the one the type can, and the borrow is the decoder's. The binding
+                # is what keeps it that way -- `is_some` and then `unwrap` would be two reads of
+                # one answer, which is the shape this whole change exists to stop emitting.
+                if elem_kind == 'scalar':
+                    body = 'enc.encode_scalar::<%s>(*p);' % elem if kind == 'encode' \
+                        else 'size += cs::sizeof_scalar::<%s>();' % elem
+                else:
+                    body = '%s(enc, p%s);' % (elem, tag) if kind == 'encode' \
+                        else 'size += %s(proto, p%s);' % (elem, tag)
+                head = 'enc.encode_simple_pointer(%s.is_some());' % m if kind == 'encode' \
+                    else 'size += cs::sizeof_scalar::<u64>();'
+                # A body that never names the pointee needs no binding for it.
+                guard = 'if let Some(p) = %s {' % m if 'p' in body.split('(', 1)[-1] \
+                    else 'if %s.is_some() {' % m
+                return [head, guard, '    ' + body, '}']
             inner = one('*%s' % m)
             if kind == 'encode':
                 return ['if enc.encode_simple_pointer(!%s.is_null()) {' % m,
@@ -1072,14 +1145,14 @@ class RustGen:
         """
         skip = self.unlaid_out()
 
-        def member(v):
-            return (self.field_name(v.name), v.name, self.field_type(v))
+        def member(owner, v):
+            return (self.field_name(v.name), v.name, self.param_type(owner, v, "'static"))
 
         for kind in (VkType.STRUCT, VkType.UNION):
             for ty in self.gen.supported_types[kind]:
                 if ty.name in skip:
                     continue
-                yield ty.name, ty.name, [member(v) for v in self.laid_out(ty)]
+                yield ty.name, ty.name, [member(ty, v) for v in self.laid_out(ty)]
         for ty in self.gen.supported_types[VkType.COMMAND]:
             if not self.gen.is_serializable(ty):
                 continue
@@ -1088,9 +1161,9 @@ class RustGen:
             # took one by value would silently compare two different sizes.
             assert not [v for v in ty.variables
                         if v.ty.base.name in skip and not v.ty.is_pointer()], ty.name
-            members = [member(v) for v in ty.variables]
+            members = [member(ty, v) for v in ty.variables]
             if ty.ret:
-                members.append(member(ty.ret))
+                members.append(member(ty, ty.ret))
             yield ('vn_command_%s' % ty.name, 'struct vn_command_%s' % ty.name, members)
 
     def render_layout_oracle(self):
