@@ -9,6 +9,8 @@
 //! the protocol has. Everything version-shaped in it therefore comes from the generated
 //! [`info`](crate::venus::proto::info) table rather than from a constant written here.
 
+use bytemuck::{Pod, Zeroable};
+
 use crate::config::Config;
 use crate::venus::proto::info;
 
@@ -18,8 +20,17 @@ const MASK_WORDS: usize = 32;
 
 /// `struct virgl_renderer_capset_venus`. The layout is the guest's, not ours: it is read straight
 /// out of a buffer the VMM sized from `get_cap_set`, so every field is where the C put it.
+///
+/// `repr(C)` here is a wire format and not a concession to the shim. The bytes go to the *guest*,
+/// whose mesa driver reads them back by offset, so they are owed to whoever hands them over --
+/// rutabaga through the Rust API just as much as `fill_caps` through the C one.
+///
+/// `Pod` is what turns those bytes into a safe operation, and it is a build-time claim rather than
+/// a comment: the derive refuses to compile a struct with any padding in it, which is the whole of
+/// what a cast to `&[u8]` needs to be sound. Every field is a `u32` or an array of them, so there
+/// is none -- and the day someone adds a `u16`, the build says so instead of the guest misparsing.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct Capset {
     pub wire_format_version: u32,
     pub vk_xml_version: u32,
@@ -66,16 +77,9 @@ impl Capset {
         c
     }
 
-    /// The bytes the VMM copies into the guest's capset buffer.
+    /// The bytes the guest reads this out of, for whoever is handing them over.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `Capset` is `repr(C)` and every field is a `u32` or an array of them, so it has
-        // no padding and no invalid bit pattern. The slice borrows `self` and cannot outlive it.
-        unsafe {
-            core::slice::from_raw_parts(
-                (self as *const Capset).cast::<u8>(),
-                core::mem::size_of::<Capset>(),
-            )
-        }
+        bytemuck::bytes_of(self)
     }
 }
 

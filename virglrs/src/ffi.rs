@@ -710,9 +710,15 @@ pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_
     if caps.is_null() {
         return;
     }
-    let Some(bytes) = with(None, |r| r.capset_bytes(capset_of(set), version)) else {
+    // The version is the C caller's request, and only this side has one: `get_cap_set` told it
+    // which version to ask for, and a different number names a layout we never described.
+    if version != crate::venus::capset::VERSION {
+        return;
+    }
+    let Some(capset) = with(None, |r| r.capset(capset_of(set))) else {
         return;
     };
+    let bytes = capset.as_bytes();
     // SAFETY: `caps` is the caller's buffer, which it sized from `virgl_renderer_get_cap_set` for
     // this same set -- and that reported exactly `bytes.len()`, the size of the capset struct.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), caps.cast::<u8>(), bytes.len()) };
