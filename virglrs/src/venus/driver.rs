@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::cs::Handle;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkDevice, VkDeviceCreateInfo, VkDeviceMemory,
     VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
@@ -364,6 +365,71 @@ impl Driver {
         self.free_device_memory(&d.fns, device.0);
         // SAFETY: a handle this context created, destroyed once -- `remove` is what makes it once.
         unsafe { (d.fns.vkDestroyDevice())(device, core::ptr::null()) };
+    }
+
+    // ------------------------------------------------------------------- simple objects
+
+    /// Create an object whose whole host action is one `vkCreateX(device, info, alloc, out)`.
+    ///
+    /// The entry point arrives as a closure over the device's proc table rather than as a name,
+    /// because that is the one part of the call that differs between the twenty objects shaped
+    /// like this -- and taking it this way is what keeps the `unsafe` here instead of at each of
+    /// the twenty call sites.
+    ///
+    /// The device is looked up in *this* table and never taken from the caller on trust. An id the
+    /// object table resolved is not evidence the driver still has the device: a guest that
+    /// destroys a device and then creates against it gets a rejection, not a call on a dead
+    /// handle.
+    pub fn create_object<T: Handle, I>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(
+            &DeviceFns,
+        ) -> unsafe extern "C" fn(
+            VkDevice,
+            *const I,
+            *const VkAllocationCallbacks,
+            *mut T,
+        ) -> VkResult,
+        info: *const I,
+        alloc: *const VkAllocationCallbacks,
+    ) -> Result<u64, VkResult> {
+        let Some(d) = self.devices.get(&device.0) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        let mut out = T::from_raw(0);
+        // SAFETY: `device` is a handle in this table, `info` and `alloc` are the decoder's arena
+        // allocations live for this call, and `out` is a local.
+        let r = unsafe { proc(&d.fns)(device, info, alloc, &mut out) };
+        if r != VkResult::VK_SUCCESS {
+            return Err(r);
+        }
+        let handle = out.raw();
+        assert!(handle != 0, "a create succeeded and returned a null handle");
+        Ok(handle)
+    }
+
+    /// Destroy an object created by [`Driver::create_object`].
+    ///
+    /// A destroy naming a device this table does not have is a no-op: the device is already gone,
+    /// and everything it owned went with it.
+    pub fn destroy_object<T: Handle>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
+        object: T,
+        alloc: *const VkAllocationCallbacks,
+    ) {
+        let Some(d) = self.devices.get(&device.0) else {
+            return;
+        };
+        if object.raw() == 0 {
+            // Vulkan makes destroying a null handle a legal no-op, and guests rely on it.
+            return;
+        }
+        // SAFETY: `device` and `object` are handles this context created, and the generated
+        // lifecycle hook removes the id from the object table exactly once, so this runs once.
+        unsafe { proc(&d.fns)(device, object, alloc) };
     }
 
     // ------------------------------------------------------------------- device memory
