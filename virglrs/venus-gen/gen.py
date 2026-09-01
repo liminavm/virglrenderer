@@ -39,6 +39,53 @@ def api_constants(vk_xml):
     return consts
 
 
+def member_order(xmls):
+    """Each struct's members in the order the registry declares them, by name.
+
+    The model does not keep this: `vkxml.py`'s `_sort_struct_members` moves a length member ahead
+    of the array it measures, so that the decoder meets the count before it needs it. That is the
+    order the *wire* wants, and it is what both generators serialize in.
+
+    It is not the order the struct is laid out in. C takes its layout from vulkan.h, where the
+    members stand as declared, and a driver handed one of ours reads it at those offsets. Emitting
+    the wire's order as the struct's would swap `VkHostAddressRangeEXT`'s address and size for
+    every driver that ever sees one.
+    """
+    order = {}
+    for xml in xmls:
+        for ty in ET.parse(xml).getroot().iter('type'):
+            if ty.get('category') not in ('struct', 'union') or ty.get('alias'):
+                continue
+            names = [m.find('name').text for m in ty.iter('member') if m.find('name') is not None]
+            if names:
+                order[ty.get('name')] = names
+    return order
+
+
+def bitfield_types(vk_xml):
+    """The structs vk.xml declares with C bit-fields, by name.
+
+    The model drops the widths -- `vkxml.py` reads the member name and not the `:24` after it --
+    so both generators serialize these as whole members, and the two agree on the wire. What they
+    cannot agree on is memory: our struct spends a word per member where C packs four into two.
+
+    That divergence is allowed to stand, and vk.xml says why in a comment of its own: the
+    bitfields "are non-normative since bitfield ordering is implementation-defined in C". Every
+    one of these is acceleration-structure payload the application writes into device memory, so
+    none is ever a Vulkan command's parameter and no driver reads our copy. They are excluded from
+    the layout oracle because there is no contract there to hold them to.
+    """
+    types = {}
+    for ty in ET.parse(vk_xml).getroot().iter('type'):
+        if ty.get('category') != 'struct':
+            continue
+        members = {m.find('name').text for m in ty.iter('member')
+                   if (m.find('name').tail or '').strip().startswith(':')}
+        if members:
+            types[ty.get('name')] = members
+    return types
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', required=True, help='Where to write the .rs files.')
@@ -59,7 +106,10 @@ def main():
 
     reg = VkRegistry.parse(vn_protocol.VN_PROTOCOL_VK_XML, vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)
     gen = vn_protocol.Gen(False, reg)
-    rust = RustGen(gen, api_constants(protocol / 'xmls' / 'vk.xml'))
+    vk_xml = protocol / 'xmls' / 'vk.xml'
+    rust = RustGen(gen, api_constants(vk_xml), bitfield_types(vk_xml),
+                   member_order([vn_protocol.VN_PROTOCOL_VK_XML]
+                                + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)))
 
     lookup = TemplateLookup(str(HERE / 'templates'))
     outdir = Path(args.outdir)
@@ -81,6 +131,12 @@ def main():
                 ' * overwrites it, and a fix made here is a fix no one will find. Edit the templates. */\n\n')
     (outdir / 'reply_oracle.c').write_bytes(
         c_banner.encode() + rust.render_reply_oracle().encode())
+    (outdir / 'layout_oracle.c').write_bytes(
+        c_banner.encode() + rust.render_layout_oracle().encode())
+
+    layout_head = (Path(HERE / 'templates' / 'layout.rs.head').read_text())
+    (outdir / 'layout.rs').write_bytes(
+        banner.encode() + layout_head.encode() + rust.render_layout_table().encode())
 
     proc_head = (Path(HERE / 'templates' / 'proc.rs.head').read_text())
     (outdir / 'proc.rs').write_bytes(

@@ -57,6 +57,94 @@ pub mod fill {
     include!(concat!(env!("OUT_DIR"), "/venus/fill.rs"));
 }
 
+/// What the compiler made of the generated structs, for the C oracle to be held to. Behind the
+/// same feature as the reply differential, which is the code that depends on the two agreeing.
+#[cfg(feature = "reply-oracle")]
+#[allow(non_camel_case_types, non_snake_case, dead_code)]
+pub mod layout {
+    include!(concat!(env!("OUT_DIR"), "/venus/layout.rs"));
+}
+
+/// Every generated struct laid out the same way a C compiler lays out venus-protocol's own.
+///
+/// The reply oracle casts a pointer to one of our `vn_command_*` straight into venus-protocol's
+/// encoder, and the driver is handed `Vk*` structs we filled. Both are memory contracts, and the
+/// generator can satisfy them in source -- same members, same order -- while a compiler quietly
+/// disagrees about padding, alignment, or how wide a pointer member is. That last one is the
+/// live risk: a member that becomes a slice reference grows a second word, and every member
+/// after it moves.
+#[cfg(all(test, feature = "reply-oracle"))]
+mod layout_parity {
+    use super::layout;
+
+    unsafe extern "C" {
+        static vn_layout_types: [CType; 0];
+        static vn_layout_members: [CMember; 0];
+        static vn_layout_type_count: usize;
+        static vn_layout_member_count: usize;
+    }
+
+    #[repr(C)]
+    struct CType {
+        size: u32,
+        align: u32,
+    }
+
+    #[repr(C)]
+    struct CMember {
+        offset: u32,
+        size: u32,
+    }
+
+    /// The tables are index-matched, so a length difference means the two halves came from
+    /// different generator runs and no row-by-row comparison below would mean anything.
+    #[test]
+    fn the_two_tables_describe_the_same_types_in_the_same_order() {
+        // SAFETY: both counts are `const size_t` the same generator run emitted beside the
+        // tables they measure.
+        let (types, members) = unsafe { (vn_layout_type_count, vn_layout_member_count) };
+        assert_eq!(types, layout::TYPES.len());
+        assert_eq!(members, layout::MEMBERS.len());
+    }
+
+    #[test]
+    fn every_generated_struct_has_the_layout_a_c_compiler_gives_it() {
+        // SAFETY: the arrays are declared `[T; 0]` because C sizes them and Rust cannot; every
+        // index below is bounded by the count the same generator run emitted for them, which
+        // `the_two_tables_describe_the_same_types_in_the_same_order` pins to the Rust length.
+        let (c_types, c_members) = unsafe {
+            (
+                core::slice::from_raw_parts(vn_layout_types.as_ptr(), vn_layout_type_count),
+                core::slice::from_raw_parts(vn_layout_members.as_ptr(), vn_layout_member_count),
+            )
+        };
+
+        let mut bad = Vec::new();
+        for (rs, c) in layout::TYPES.iter().zip(c_types) {
+            // A shadowed struct is allowed to be the larger of the two, and nothing else is:
+            // every member C knows about still has to be where C puts it, which the member rows
+            // below are what actually check.
+            let size_ok =
+                if rs.shadowed { rs.size >= c.size as usize } else { rs.size == c.size as usize };
+            if !size_ok || rs.align != c.align as usize {
+                bad.push(format!(
+                    "{}: C is {} bytes aligned {}, we are {} aligned {}",
+                    rs.name, c.size, c.align, rs.size, rs.align
+                ));
+            }
+        }
+        for (rs, c) in layout::MEMBERS.iter().zip(c_members) {
+            if rs.offset != c.offset as usize || rs.size != c.size as usize {
+                bad.push(format!(
+                    "{}.{}: C is {} bytes at offset {}, we are {} at {}",
+                    rs.ty, rs.name, c.size, c.offset, rs.size, rs.offset
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{} members disagree:\n{}", bad.len(), bad.join("\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::serialize::*;
