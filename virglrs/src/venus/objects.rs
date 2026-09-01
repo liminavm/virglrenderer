@@ -28,12 +28,14 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use super::cs::{Lookup, ObjectId, Objects};
+use super::proto::types::VkObjectType;
 
 /// One live object: the host handle, and the Vulkan type the guest must name it by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Object {
-    /// `VkObjectType`, as a bare i32 because that is what the generated decode passes.
-    pub ty: i32,
+    /// What kind of object it is. Named rather than a bare i32 because a destroy has to switch on
+    /// it to pick the right `vkDestroyX`, and a match on an integer is a match nobody can check.
+    pub ty: VkObjectType,
     /// The host handle, whatever Vulkan gave us for it.
     pub handle: u64,
     /// What this object was created under, or `None` for the instance, which is the root.
@@ -124,10 +126,21 @@ impl Arena {
     /// naming none of them. Walking the arena is what makes that a fact about the one place
     /// objects live, rather than a child list kept beside them that a destroy path has to
     /// remember to visit -- the list that goes stale is the bug this replaces.
-    fn remove_tree(&mut self, key: Key) -> Option<Object> {
-        let root = self.remove(key)?;
-        let mut doomed = vec![key];
-        while let Some(parent) = doomed.pop() {
+    fn take_tree(&mut self, key: Key) -> Vec<Doomed> {
+        let Some(root) = self.remove(key) else {
+            return Vec::new();
+        };
+        // The device an object has to be destroyed *on* is not its parent -- a fence's parent is
+        // the device, but a framebuffer three levels under an instance still needs the device
+        // handle from further up. So the walk carries it down: passing a device sets it for
+        // everything below, and everything else inherits what it was handed.
+        let under = |o: &Object, inherited| match o.ty {
+            VkObjectType::VK_OBJECT_TYPE_DEVICE => Some(o.handle),
+            _ => inherited,
+        };
+        let mut taken = vec![Doomed { ty: root.ty, handle: root.handle, device: None }];
+        let mut walk = vec![(key, under(&root, None))];
+        while let Some((parent, device)) = walk.pop() {
             let children: Vec<Key> = self
                 .entries
                 .iter()
@@ -136,11 +149,19 @@ impl Arena {
                 .map(|(i, e)| Key { index: i, generation: e.generation })
                 .collect();
             for child in children {
-                self.remove(child);
-                doomed.push(child);
+                if let Some(o) = self.remove(child) {
+                    walk.push((child, under(&o, device)));
+                    taken.push(Doomed { ty: o.ty, handle: o.handle, device });
+                }
             }
         }
-        Some(root)
+        taken
+    }
+
+    fn remove_tree(&mut self, key: Key) -> Option<Object> {
+        let object = self.get(key).copied()?;
+        let _ = self.take_tree(key);
+        Some(object)
     }
 
     fn len(&self) -> usize {
@@ -184,6 +205,20 @@ impl Slot {
     }
 }
 
+/// One object on its way out, and the device whose entry points can destroy it.
+///
+/// Not an [`Object`]: an object in the table knows its parent, which for anything below a device
+/// is not the device itself. What a destroy needs is the `VkDevice` to call *on*, and that is
+/// worked out once by the walk that takes the tree apart rather than by each caller guessing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Doomed {
+    pub ty: VkObjectType,
+    pub handle: u64,
+    /// `None` for the instance, its physical devices, and the devices themselves -- none of which
+    /// is destroyed by a device's entry points.
+    pub device: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct Table {
     /// What the guest calls each object. Entries here are allowed to go stale: a key whose object
@@ -208,7 +243,7 @@ impl Table {
     pub fn add(
         &mut self,
         id: ObjectId,
-        ty: i32,
+        ty: VkObjectType,
         handle: u64,
         owner: Option<ObjectId>,
     ) -> Result<(), AddError> {
@@ -249,6 +284,22 @@ impl Table {
     /// Only a live object is taken out. A ghost outlives the destroy that names it: the guest
     /// pipelined that destroy behind the create that failed, and every command in between is still
     /// in flight behind it.
+    /// Take an object and everything under it, root first, and hand back every one.
+    ///
+    /// [`Table::remove`] is the same cascade with the descendants dropped, which is right for a
+    /// leaf -- its handler destroyed the one host handle there was. A parent's children were never
+    /// named by any command, so nobody else has destroyed them and nobody else can: they arrive
+    /// here or they leak. That is why this returns them and why the result may not be discarded.
+    #[must_use = "these host handles are still alive, and this is the only place that names them"]
+    pub fn take_tree(&mut self, id: ObjectId) -> Vec<Doomed> {
+        let Some(key) = self.slots.get(&id).and_then(Slot::key) else {
+            return Vec::new();
+        };
+        let doomed = self.arena.take_tree(key);
+        self.slots.remove(&id);
+        doomed
+    }
+
     pub fn remove(&mut self, id: ObjectId) -> Option<Object> {
         let key = self.slots.get(&id)?.key()?;
         // Everything created under it goes at the same moment, because Vulkan has just destroyed
@@ -276,15 +327,35 @@ impl Table {
     /// Ordered teardown -- instance, then physical devices, then devices, then their objects, the
     /// way the C walks its intrusive lists -- arrives with the real handles that need destroying.
     /// There is nothing to order while a handle is a number.
-    pub fn drain(&mut self) -> impl Iterator<Item = (ObjectId, Object)> {
-        let slots = core::mem::take(&mut self.slots);
-        let mut arena = core::mem::take(&mut self.arena);
-        // Taken through `slots` rather than straight off the arena because the caller is owed the
-        // guest's name for each, and stale entries drop out on their own: an object the arena no
-        // longer holds was destroyed with its parent and has nothing left to destroy.
-        slots
-            .into_iter()
-            .filter_map(move |(id, slot)| slot.key().and_then(|k| arena.remove(k)).map(|o| (id, o)))
+    /// Empty the table, handing back every live object with the device it must be destroyed on.
+    ///
+    /// The teardown that actually runs. A context usually dies mid-workload with the guest still
+    /// holding everything it made -- it sent no destroy for any of it and never will -- so this is
+    /// not a tidy-up after the guest's own teardown but the only one there is.
+    ///
+    /// Taken root by root rather than slot by slot, because descending from a root is what works
+    /// out which device each object belongs to, and destroying one on the wrong device is worse
+    /// than leaking it.
+    #[must_use = "these host handles are still alive, and this is the only place that names them"]
+    pub fn take_all(&mut self) -> Vec<Doomed> {
+        let roots: Vec<ObjectId> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.key().and_then(|k| self.arena.get(k)).is_some_and(|o| o.parent.is_none())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut doomed: Vec<Doomed> = roots.into_iter().flat_map(|id| self.take_tree(id)).collect();
+        // An object whose owner was already gone when it was created has no root above it, so no
+        // descent reaches it. Swept here instead, with no device to destroy it on -- which is the
+        // truth about it, not an omission.
+        for (_, slot) in core::mem::take(&mut self.slots) {
+            if let Some(o) = slot.key().and_then(|k| self.arena.remove(k)) {
+                doomed.push(Doomed { ty: o.ty, handle: o.handle, device: None });
+            }
+        }
+        doomed
     }
 }
 
@@ -294,7 +365,10 @@ impl Objects for Table {
             // A key the arena no longer honours is an object that died with its parent. The id is
             // as good as one the guest invented, and is answered the same way.
             Some(Slot::Live(key)) => match self.arena.get(*key) {
-                Some(o) if o.ty == ty => Lookup::Found(o.handle),
+                // Compared as the integer the generated decode passes: the wire's number is the
+                // guest's to choose, so it is not turned into a `VkObjectType` before it has been
+                // matched against one that came from us.
+                Some(o) if o.ty.0 == ty => Lookup::Found(o.handle),
                 // A live id named by the wrong type is a guest reinterpreting one object as
                 // another. That is not a race it can lose; it is a protocol violation, and the
                 // ring stops.
@@ -311,22 +385,22 @@ impl Objects for Table {
 mod tests {
     use super::*;
 
-    const BUFFER: i32 = 9;
-    const IMAGE: i32 = 10;
+    const BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_BUFFER;
+    const IMAGE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_IMAGE;
 
     #[test]
     fn a_registered_object_resolves_only_under_its_own_type() {
         let mut t = Table::new();
         t.add(ObjectId(7), BUFFER, 0xdead_beef, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Found(0xdead_beef));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(0xdead_beef));
         // The whole point of the table: an id is not a capability for every object type.
-        assert_eq!(t.lookup(ObjectId(7), IMAGE), Lookup::Missing);
+        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Missing);
     }
 
     #[test]
     fn an_id_the_guest_invented_stops_the_ring() {
         let t = Table::new();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Missing);
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Missing);
     }
 
     /// A ghost is the one miss that is not the guest's fault: it pipelined commands behind a create
@@ -335,10 +409,10 @@ mod tests {
     fn a_refused_creation_becomes_a_ghost_and_then_stops_being_one() {
         let mut t = Table::new();
         t.add_ghost(ObjectId(7));
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Ghost);
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Ghost);
 
         t.add(ObjectId(7), BUFFER, 1, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Found(1));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
     }
 
     /// The state the two-container shape allowed and this one cannot represent.
@@ -355,13 +429,13 @@ mod tests {
         // changed, so the object still there is the truth.
         t.add_ghost(ObjectId(7));
         assert!(!t.is_ghost(ObjectId(7)));
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Found(1));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
 
         // And after the guest destroys it the id names nothing at all. A ghost surviving here is
         // the whole bug: every later command naming the id would be swallowed as one lost command
         // when the ring should have stopped.
         t.remove(ObjectId(7)).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Missing);
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Missing);
     }
 
     /// The other direction, which must keep working: a ghost is not something a destroy clears.
@@ -373,7 +447,7 @@ mod tests {
         // destroy names nothing, and the uses still in flight behind it are still the guest's to
         // unwind from.
         assert!(t.remove(ObjectId(7)).is_none());
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Ghost);
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Ghost);
     }
 
     #[test]
@@ -383,11 +457,11 @@ mod tests {
         t.add(ObjectId(7), BUFFER, 1, None).unwrap();
         assert_eq!(t.add(ObjectId(7), IMAGE, 2, None), Err(AddError::Duplicate));
         // Still the original: a refused insert must not have disturbed it.
-        assert_eq!(t.lookup(ObjectId(7), BUFFER), Lookup::Found(1));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
 
         t.remove(ObjectId(7)).unwrap();
         t.add(ObjectId(7), IMAGE, 2, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), IMAGE), Lookup::Found(2));
+        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Found(2));
     }
 
     /// What the generation is actually for.
@@ -407,10 +481,10 @@ mod tests {
 
         let newcomer = t.add(ObjectId(3), IMAGE, 30, None);
         assert_eq!(newcomer, Ok(()));
-        assert_eq!(t.lookup(ObjectId(3), IMAGE), Lookup::Found(30));
+        assert_eq!(t.lookup(ObjectId(3), IMAGE.0), Lookup::Found(30));
         // Same slot, same object type, different occupant. The generation is the only thing
         // separating them, and a guest naming id 2 must not be handed 30.
-        assert_eq!(t.lookup(ObjectId(2), IMAGE), Lookup::Missing);
+        assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
     }
 
     /// Destroying a parent destroys what hangs off it, however deep -- Vulkan does exactly this
@@ -430,8 +504,8 @@ mod tests {
         for id in [1, 2, 3] {
             assert!(t.get(ObjectId(id)).is_none(), "id {id} died with the root above it");
         }
-        assert_eq!(t.lookup(ObjectId(4), BUFFER), Lookup::Found(40));
-        assert_eq!(t.lookup(ObjectId(5), IMAGE), Lookup::Found(50));
+        assert_eq!(t.lookup(ObjectId(4), BUFFER.0), Lookup::Found(40));
+        assert_eq!(t.lookup(ObjectId(5), IMAGE.0), Lookup::Found(50));
         assert_eq!(t.len(), 2);
     }
 
@@ -445,13 +519,13 @@ mod tests {
         t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
         t.remove(ObjectId(1)).unwrap();
 
-        assert_eq!(t.lookup(ObjectId(2), IMAGE), Lookup::Missing);
+        assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
         // A destroy the guest pipelined behind the device's finds nothing left to destroy, and
         // must not report one -- the host handle is already gone.
         assert!(t.remove(ObjectId(2)).is_none());
         // And the id is not burned: the guest may name a new object by it.
         t.add(ObjectId(2), BUFFER, 21, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(2), BUFFER), Lookup::Found(21));
+        assert_eq!(t.lookup(ObjectId(2), BUFFER.0), Lookup::Found(21));
     }
 
     /// A slot cycled many times still does not hand a stale key back its object.
@@ -472,7 +546,7 @@ mod tests {
         for round in 0..500u64 {
             t.add(ObjectId(3), IMAGE, 1000 + round, None).unwrap();
             assert_eq!(
-                t.lookup(ObjectId(2), IMAGE),
+                t.lookup(ObjectId(2), IMAGE.0),
                 Lookup::Missing,
                 "the orphan resolved again on round {round}"
             );
@@ -486,7 +560,7 @@ mod tests {
     fn a_create_under_an_owner_that_is_already_gone_still_registers() {
         let mut t = Table::new();
         t.add(ObjectId(9), BUFFER, 90, Some(ObjectId(1))).unwrap();
-        assert_eq!(t.lookup(ObjectId(9), BUFFER), Lookup::Found(90));
+        assert_eq!(t.lookup(ObjectId(9), BUFFER.0), Lookup::Found(90));
     }
 
     #[test]
@@ -497,9 +571,11 @@ mod tests {
         // One of them hangs off the other, so a drain that walked the tree would hand back only
         // the root. Teardown wants every live handle: Vulkan is being told about each one.
         t.add(ObjectId(3), IMAGE, 30, Some(ObjectId(1))).unwrap();
-        let mut got: Vec<_> = t.drain().map(|(id, o)| (id.0, o.handle)).collect();
+        let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
         got.sort_unstable();
-        assert_eq!(got, [(1, 10), (2, 20), (3, 30)]);
+        // Every live handle, and each with the device it has to be destroyed on: 30 hangs off the
+        // buffer, which is not a device, so it inherits the nothing above it.
+        assert_eq!(got, [(10, None), (20, None), (30, None)]);
         assert!(t.is_empty());
     }
 }
