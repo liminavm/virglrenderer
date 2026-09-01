@@ -464,19 +464,19 @@ impl Commands for Handlers<'_> {
     // bottom of the frequency table -- and every one of the hot commands is unreachable until
     // they are served.
 
-    fn vkCreateInstance(&mut self, args: &mut vn_command_vkCreateInstance) {
+    fn vkCreateInstance(&mut self, args: &mut vn_command_vkCreateInstance<'_>) {
         let host = self.driver.create_instance(self.global, args.pCreateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateInstance", args.pInstance, args.handle_pInstance, host.map(|h| h.0));
     }
 
-    fn vkDestroyInstance(&mut self, _args: &mut vn_command_vkDestroyInstance) {
+    fn vkDestroyInstance(&mut self, _args: &mut vn_command_vkDestroyInstance<'_>) {
         // Every device under it dies first: Vulkan's teardown order is not advisory, and a guest
         // that skipped its own destroys does not get to leak them onto the host.
         self.driver.teardown();
     }
 
-    fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices) {
+    fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices<'_>) {
         if args.pPhysicalDeviceCount.is_null() {
             return;
         }
@@ -511,14 +511,14 @@ impl Commands for Handlers<'_> {
         self.ghost_ids(&ids[got as usize..]);
     }
 
-    fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice) {
+    fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice<'_>) {
         let host =
             self.driver.create_device(args.physicalDevice, args.pCreateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateDevice", args.pDevice, args.handle_pDevice, host.map(|h| h.0));
     }
 
-    fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice) {
+    fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
         self.driver.destroy_device(args.device);
     }
 
@@ -526,7 +526,7 @@ impl Commands for Handlers<'_> {
     //
     // What the memory census reads back, and the first thing the guest does with a device.
 
-    fn vkAllocateMemory(&mut self, args: &mut vn_command_vkAllocateMemory) {
+    fn vkAllocateMemory(&mut self, args: &mut vn_command_vkAllocateMemory<'_>) {
         // The id has to be read before the allocation, because it is the key the driver files it
         // under -- and it is the guest's, chosen in the request, not anything the host picks.
         let Some(id) = self.out_id(args.pMemory) else {
@@ -538,7 +538,7 @@ impl Commands for Handlers<'_> {
         self.plant("vkAllocateMemory", args.pMemory, args.handle_pMemory, host.map(|m| m.0));
     }
 
-    fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory) {
+    fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory<'_>) {
         // A null handle is a legal no-op in Vulkan, and the guest sends it: the id is then zero
         // and the driver's table has nothing under it, so this needs no guard of its own.
         self.driver.free_memory(args.id_memory.0);
@@ -660,7 +660,7 @@ impl Commands for Handlers<'_> {
     /// `codeSize / 4` words -- so a `codeSize` that is not a multiple of four decodes into an
     /// allocation shorter than the number the driver is then handed, and the driver reads off the
     /// end of it. The guest chooses that number, which makes rejecting it the boundary's job.
-    fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule) {
+    fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule<'_>) {
         // SAFETY: non-null is checked first; the decoder allocated it in the batch arena.
         let bad = args.pCreateInfo.is_null() || unsafe { (*args.pCreateInfo).codeSize } % 4 != 0;
         if bad {
@@ -685,7 +685,7 @@ impl Commands for Handlers<'_> {
     // a refusal has to ghost every id in it. Vulkan fills the whole array or none of it, so unlike
     // an enumeration there is no short answer between those two.
 
-    fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers) {
+    fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers<'_>) {
         // The count inside the create-info is what sized both arrays, and the wire's own size was
         // checked against it -- so it, and not either pointer, is the one length here.
         let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount) as u32;
@@ -705,7 +705,7 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers) {
+    fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers<'_>) {
         let buffers = self.array_or_empty(args.commandBufferCount, args.pCommandBuffers);
         self.driver.free_objects(
             args.device,
@@ -715,7 +715,7 @@ impl Commands for Handlers<'_> {
         );
     }
 
-    fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets) {
+    fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
         let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount) as u32;
         let Some(ids) = self.array(count, args.pDescriptorSets) else { return };
         let Some(out) = self.array_mut(count, args.handle_pDescriptorSets) else { return };
@@ -734,7 +734,7 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2) {
+    fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2<'_>) {
         // A queue is owned by its device and never created, so the guest's id is registered
         // against a handle the driver merely hands back.
         let host = self.driver.device_queue(args.device, args.pQueueInfo);
@@ -752,7 +752,7 @@ impl Commands for Handlers<'_> {
     // come back part real. What that costs is in [`Driver::create_pipelines`]; what is left here
     // is the all-or-nothing the guest sees.
 
-    fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines) {
+    fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
         let Some(infos) = self.array(args.createInfoCount, args.pCreateInfos) else { return };
         let Some(ids) = self.array(args.createInfoCount, args.pPipelines as *const _) else {
             return;
@@ -787,17 +787,17 @@ impl Commands for Handlers<'_> {
     // fully built: an image with no memory bound and a descriptor set that was never written are
     // undefined behaviour at draw time, not errors the driver reports.
 
-    fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2) {
+    fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2<'_>) {
         let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
         args.ret = self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
-    fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2) {
+    fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2<'_>) {
         let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
         args.ret = self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
-    fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets) {
+    fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets<'_>) {
         let Some(writes) = self.array(args.descriptorWriteCount, args.pDescriptorWrites) else {
             return;
         };
@@ -900,7 +900,7 @@ mod tests {
         impl Commands for Driver<'_> {
             fn unsupported(&mut self, _cmd: VkCommandTypeEXT) {}
 
-            fn vkCreateFence(&mut self, args: &mut vn_command_vkCreateFence) {
+            fn vkCreateFence(&mut self, args: &mut vn_command_vkCreateFence<'_>) {
                 assert!(!args.handle_pFence.is_null(), "the decoder owes a place to write");
                 // The guest id in `pFence` has to survive: the reply sends it back.
                 // SAFETY: the decoder allocated one element there.

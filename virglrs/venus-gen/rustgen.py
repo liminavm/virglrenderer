@@ -997,8 +997,8 @@ class RustGen:
             for var in self._out_vars(ty):
                 body += self._fill_member(ty, var, small, gaps)
             out += ['#[allow(unused_variables)]',
-                    'pub fn vn_fill_%s_outs(a: &Bump, f: &mut Fill, val: &mut vn_command_%s) {'
-                    % (ty.name, ty.name)]
+                    "pub fn vn_fill_%s_outs(a: &Bump, f: &mut Fill, "
+                    "val: &mut vn_command_%s<'_>) {" % (ty.name, ty.name)]
             out += ['    ' + l for l in body]
             out += ['}', '']
 
@@ -1146,13 +1146,17 @@ class RustGen:
         """The Rust half of the layout parity check. See `render_layout_oracle`."""
         types, members = [], []
         for rust, c, fields in self.layout_rows():
+            shadowed = c.startswith('struct ')
+            # A static holds no borrow, so the command structs are named at `'static` here. The
+            # lifetime is not part of a layout, and it cannot be elided in this position.
+            named = "%s<'static>" % rust if shadowed else rust
             types.append('    TypeLayout { name: "%s", size: size_of::<%s>(), '
                          'align: align_of::<%s>(), shadowed: %s },'
-                         % (rust, rust, rust, 'true' if c.startswith('struct ') else 'false'))
+                         % (rust, named, named, 'true' if shadowed else 'false'))
             for rf, _, rt in fields:
                 members.append('    MemberLayout { ty: "%s", name: "%s", '
                                'offset: offset_of!(%s, %s), size: size_of::<%s>() },'
-                               % (rust, rf, rust, rf, rt))
+                               % (rust, rf, named, rf, rt))
         return '\n'.join(['pub static TYPES: &[TypeLayout] = &['] + types
                           + ['];', '', 'pub static MEMBERS: &[MemberLayout] = &['] + members
                           + ['];', ''])
@@ -1503,7 +1507,7 @@ class RustGen:
         """
         n = ty.name
         cmd = 'VkCommandTypeEXT::%s' % ty.attrs['c_type']
-        args = 'vn_command_%s' % n
+        args = "vn_command_%s<'_>" % n
 
         target = self.destroy_target(ty)
         target_var = target[0] if target else None
@@ -1575,8 +1579,9 @@ class RustGen:
             return go
 
         out = []
-        out += self._fn('vn_decode_%s_args_temp(dec: &mut Decoder<\'_>, val: &mut %s)' % (n, args),
-                        request('decode'), gaps, n)
+        out += self._fn(
+            'vn_decode_%s_args_temp<\'a>(dec: &mut Decoder<\'a>, val: &mut vn_command_%s<\'a>)'
+            % (n, n), request('decode'), gaps, n)
         out += self._fn('vn_sizeof_%s_args(proto: &dyn cs::Protocol, val: &%s) -> usize'
                         % (n, args), request('sizeof'), gaps, n)
         out += self._fn('vn_encode_%s_args(enc: &mut Encoder<\'_>, cmd_flags: VkFlags, val: &%s)'
@@ -1736,7 +1741,7 @@ class RustGen:
                '']
         for ty in commands:
             n = ty.name
-            out += ['    fn %s(&mut self, args: &mut vn_command_%s) {' % (n, n),
+            out += ["    fn %s(&mut self, args: &mut vn_command_%s<'_>) {" % (n, n),
                     '        let _ = args;',
                     '        self.unsupported(VkCommandTypeEXT::%s);' % ty.attrs['c_type'],
                     '    }']
