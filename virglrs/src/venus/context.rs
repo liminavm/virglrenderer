@@ -49,7 +49,8 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
-    vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkImportSemaphoreResourceMESA,
+    vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
+    vn_command_vkGetPhysicalDeviceProperties2, vn_command_vkImportSemaphoreResourceMESA,
     vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer, vn_command_vkResetFences,
     vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
     vn_command_vkWaitSemaphoreResourceMESA,
@@ -521,6 +522,27 @@ macro_rules! simple_destroy {
     };
 }
 
+/// The API version the guest is allowed to be told, whatever the driver claims.
+///
+/// Not a workaround, and not a number to copy: it is the highest Vulkan version *this build can
+/// serialize*, which is a property of the pinned vk.xml the decoder was generated from and of
+/// nothing else. So it is read off `info::VK_XML_VERSION` rather than written down, and a bump of
+/// the pinned protocol moves it without anyone remembering to.
+///
+/// Telling the guest a higher version is telling it to use structs this renderer would then refuse
+/// -- the guest enables 1.5, sends a 1.5 `pNext`, and the decoder poisons its ring for asking. The
+/// patch level stays the driver's own: it identifies the implementation and carries no structs.
+fn cap_api_version(version: u32) -> u32 {
+    const MINOR: u32 = 12;
+    const PATCH: u32 = 0xfff;
+    let ceiling = crate::venus::proto::info::VK_XML_VERSION;
+    if (version >> MINOR) > (ceiling >> MINOR) {
+        (ceiling & !PATCH) | (version & PATCH)
+    } else {
+        version
+    }
+}
+
 impl Commands for Handlers<'_> {
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
         *self.todo.seen.entry(cmd.0).or_default() += 1;
@@ -892,6 +914,32 @@ impl Commands for Handlers<'_> {
             args.handle_pQueue_mut(),
             host.map(|q| q.0).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
         );
+    }
+
+    fn vkGetPhysicalDeviceProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pProperties_mut()) else { return };
+        let r = self.driver.pd_query(pd, &mut *out, |i| i.try_vkGetPhysicalDeviceProperties());
+        if r.is_ok() {
+            out.apiVersion = cap_api_version(out.apiVersion);
+        }
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceProperties2<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pProperties_mut()) else { return };
+        let r = self.driver.pd_query(pd, &mut *out, |i| i.try_vkGetPhysicalDeviceProperties2());
+        if r.is_ok() {
+            out.properties.apiVersion = cap_api_version(out.properties.apiVersion);
+        }
+        self.asked(r);
     }
 
     // ------------------------------------------------------------------------ queries
@@ -1457,6 +1505,85 @@ mod tests {
             "the struct the guest sent was filled"
         );
         assert_eq!(link.multiview, VkBool32(1), "and so was the one it chained behind it");
+
+        driver.abandon_planted();
+    }
+
+    /// The guest is told what this build can serialize, not what the driver can do.
+    ///
+    /// A driver newer than the pinned vk.xml is the normal case, not an exotic one, and passing
+    /// its version straight through is an invitation the renderer cannot honour: the guest enables
+    /// that version, sends a struct from it, and the decoder poisons the ring for asking. The
+    /// patch level is the driver's own and stays -- it names the implementation and carries no
+    /// structs with it.
+    #[test]
+    fn a_driver_newer_than_the_protocol_is_capped_to_the_protocol() {
+        use super::super::proto::info::VK_XML_VERSION;
+
+        const MINOR: u32 = 12;
+        let make = |major: u32, minor: u32, patch: u32| (major << 22) | (minor << MINOR) | patch;
+        let (major, minor) = (VK_XML_VERSION >> 22, (VK_XML_VERSION >> MINOR) & 0x3ff);
+
+        let newer = make(major, minor + 1, 77);
+        assert_eq!(
+            cap_api_version(newer),
+            make(major, minor, 77),
+            "a driver a minor version ahead is capped, and keeps its own patch level"
+        );
+
+        let older = make(major, minor - 1, 3);
+        assert_eq!(cap_api_version(older), older, "a driver behind us is reported as it is");
+        assert_eq!(cap_api_version(VK_XML_VERSION), VK_XML_VERSION, "our own version is untouched");
+    }
+
+    /// The cap is not a fact about the handler, it is a fact about the reply, so it is watched
+    /// where the guest would read it: in the struct the driver filled.
+    #[test]
+    fn the_properties_query_caps_the_version_the_driver_reported() {
+        use super::super::proto::info::VK_XML_VERSION;
+        use super::super::proto::types::{
+            VkPhysicalDevice, VkPhysicalDeviceProperties, vn_command_vkGetPhysicalDeviceProperties,
+        };
+
+        /// A driver from the future, which is what every driver eventually is.
+        unsafe extern "C" fn properties(
+            _pd: VkPhysicalDevice,
+            out: *mut VkPhysicalDeviceProperties,
+        ) {
+            // SAFETY: the handler passed an exclusive borrow of a live struct.
+            let out = unsafe { &mut *out };
+            out.apiVersion = ((VK_XML_VERSION >> 12) + 1) << 12 | 99;
+            out.driverVersion = 0xabcd;
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceProperties(properties);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+
+        let mut asked = VkPhysicalDeviceProperties::default();
+        let mut args = vn_command_vkGetPhysicalDeviceProperties::default();
+        args.plant_pProperties(&mut asked);
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceProperties(&mut args);
+        assert!(h.reject.is_none());
+
+        assert_eq!(
+            asked.apiVersion,
+            (VK_XML_VERSION & !0xfff) | 99,
+            "the guest reads this build's ceiling, with the driver's own patch level"
+        );
+        assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
 
         driver.abandon_planted();
     }
