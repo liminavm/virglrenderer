@@ -223,6 +223,34 @@ class RustGen:
         except self.Unsupported:
             return None
 
+    def create_owner(self, ty):
+        """The object a create hangs off, as `(var, shape)`, or None.
+
+        Vulkan spells creation `vkCreateX(parent, ..., out)`: the *first* handle argument is what
+        owns the result -- the device for most objects, the physical device for a device, and
+        nothing at all for an instance. Destroying that parent destroys everything under it and
+        names none of them, so the object table only knows to follow if the parentage was recorded
+        as the object was made.
+
+        Recorded as the guest's id, never the host handle. A handle the driver is free to reuse
+        would let a freshly created parent adopt a dead one's children -- which is the same
+        staleness the table exists to prevent, moved one level up.
+        """
+        if not self.out_handles(ty):
+            return None
+        for var in ty.variables:
+            if not self.gen.is_serializable(var) or var.ty.base.category != VkType.HANDLE:
+                continue
+            if self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs) != Gen_VALID:
+                continue
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported:
+                return None
+            # An owner named by an array is not a parent, and no Vulkan create is shaped that way.
+            return (var, shape) if shape[0] == 'plain' else None
+        return None
+
     def out_handles(self, ty):
         """The objects a command creates, as `(var, shape)`.
 
@@ -273,6 +301,10 @@ class RustGen:
         for var, shape in self.out_handles(ty):
             f = 'handle_%s' % self.field_name(var.name)
             out.append((f, '*mut %s' % self.base_name(var.ty), shape))
+        owner = self.create_owner(ty)
+        if owner:
+            var, shape = owner
+            out.append(('id_%s' % self.field_name(var.name), 'ObjectId', shape))
         return out
 
     def funcpointer(self, ty):
@@ -1740,6 +1772,8 @@ class RustGen:
 
         target = self.destroy_target(ty)
         target_var = target[0] if target else None
+        owner = self.create_owner(ty)
+        owner_var = owner[0] if owner else None
 
         def members(kind, reply):
             out = []
@@ -1752,7 +1786,7 @@ class RustGen:
                 else:
                     validity = self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs)
                 capture = None
-                if kind == 'decode' and var is target_var:
+                if kind == 'decode' and (var is target_var or var is owner_var):
                     capture = 'id_%s' % self.field_name(var.name)
                 out += self._member(kind, ty, var, validity, kind == 'decode', capture)
             return out
@@ -1879,6 +1913,10 @@ class RustGen:
         n = ty.name
         out = []
 
+        # `vkCreateInstance` has no parent handle: an instance is the root of the context's tree.
+        own = self.create_owner(ty)
+        owner = ('Some(val.id_%s)' % self.field_name(own[0].name)) if own else 'None'
+
         for var, shape in self.out_handles(ty):
             objtype = 'VkObjectType::%s' % var.ty.base.attrs['c_objtype']
             m = 'val.%s' % self.field_name(var.name)
@@ -1890,8 +1928,8 @@ class RustGen:
                     'if !%s.is_null() && !%s.is_null() {' % (m, s),
                     '    // SAFETY: both are non-null and the decoder allocated them in the arena,',
                     '    // one element each.',
-                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), (*%s).0) };'
-                    % (objtype, m, s),
+                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), (*%s).0, %s) };'
+                    % (objtype, m, s, owner),
                     '}']
             elif shape[0] == 'dynamic':
                 out += [
@@ -1899,8 +1937,8 @@ class RustGen:
                     '    for i in 0..(%s) as usize {' % shape[1],
                     '        // SAFETY: the decoder allocated both arrays with that many elements,',
                     '        // from the same count.',
-                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), (*%s.add(i)).0) };'
-                    % (objtype, m, s),
+                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), (*%s.add(i)).0, %s) };'
+                    % (objtype, m, s, owner),
                     '    }',
                     '}']
             else:
@@ -1956,8 +1994,19 @@ class RustGen:
                '    /// the shadow null and this uncalled. Registering the pairing is the',
                '    /// renderer\'s to do: the generator does not get to decide what a zero handle',
                '    /// means.',
-               '    fn object_created(&mut self, ty: VkObjectType, id: ObjectId, host: u64) {',
-               '        let _ = (ty, id, host);',
+               '    /// `owner` is the guest id of the object the create hung off -- the device',
+               '    /// for most things, the physical device for a device, `None` for an instance,',
+               '    /// which owns itself. Destroying it destroys everything under it without a',
+               '    /// command naming any of them, so this is the only moment the parentage is',
+               '    /// there to record.',
+               '    fn object_created(',
+               '        &mut self,',
+               '        ty: VkObjectType,',
+               '        id: ObjectId,',
+               '        host: u64,',
+               '        owner: Option<ObjectId>,',
+               '    ) {',
+               '        let _ = (ty, id, host, owner);',
                '    }',
                '',
                '    /// A command destroyed this object, named by the guest id the decoder kept',
