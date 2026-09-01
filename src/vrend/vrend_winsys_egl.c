@@ -843,19 +843,38 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
 
 #ifdef __APPLE__
 /* limina: EGLImage over an IOSurfaceRef, via the limina mesa EGL target
- * (egl_dri2.c EGL_IOSURFACE_LIMINA — the value must match). The surface
- * self-describes, so no attribs; the resulting image's storage IS the
- * IOSurface (zink -> KosmicKrisp MTLTEXTURE metal-handle adoption), which is
- * how vrend composites a venus client's window buffer with real pixels. */
-#define VIRGL_EGL_IOSURFACE_LIMINA 0x3B9A
+ * (egl_dri2.c EGL_IOSURFACE_LIMINA — the values must match). The resulting
+ * image's storage IS the IOSurface (zink -> KosmicKrisp MTLTEXTURE
+ * metal-handle adoption), which is how vrend composites a venus client's
+ * window buffer with real pixels.
+ *
+ * `fourcc` 0 imports the whole surface and lets it describe its own format.
+ * A planar surface cannot do that — a biplanar NV12 target reports '420v',
+ * which is the pair's name and neither plane's texture format — so naming a
+ * plane means naming its format too. */
+#define VIRGL_EGL_IOSURFACE_LIMINA        0x3B9A
+#define VIRGL_EGL_IOSURFACE_PLANE_LIMINA  0x3B9B
+#define VIRGL_EGL_IOSURFACE_FOURCC_LIMINA 0x3B9C
 
-void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface)
+void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface,
+                                     uint32_t plane, uint32_t fourcc)
 {
+   EGLint attrs[5];
+   EGLint *a = attrs;
+
+   if (fourcc) {
+      *a++ = VIRGL_EGL_IOSURFACE_PLANE_LIMINA;
+      *a++ = (EGLint)plane;
+      *a++ = VIRGL_EGL_IOSURFACE_FOURCC_LIMINA;
+      *a++ = (EGLint)fourcc;
+   }
+   *a = EGL_NONE;
+
    return (void *)eglCreateImageKHR(egl->egl_display,
                                     EGL_NO_CONTEXT,
                                     VIRGL_EGL_IOSURFACE_LIMINA,
                                     (EGLClientBuffer)iosurface,
-                                    NULL);
+                                    fourcc ? attrs : NULL);
 }
 #endif
 
