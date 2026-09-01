@@ -280,9 +280,14 @@ impl Driver {
 
         // SAFETY: non-null, and the decoder allocated it in the arena for this batch.
         let guest_info = unsafe { *info };
+        // The extension list's size was checked against this count as it decoded, so the pair
+        // cannot arrive split; a guest that asked for none simply gets an empty list.
         let guest = read_names(
-            guest_info.ppEnabledExtensionNames,
-            guest_info.enabledExtensionCount as usize,
+            super::cs::wire_array(
+                guest_info.enabledExtensionCount,
+                guest_info.ppEnabledExtensionNames,
+            )
+            .unwrap_or_default(),
         );
         let wanted = self.device_extensions(pd, &guest.iter().map(|s| &**s).collect::<Vec<_>>());
 
@@ -457,13 +462,12 @@ impl Driver {
         pool: u64,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
         info: *const I,
-        out: *mut T,
-        count: usize,
+        out: &mut [T],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
-        if info.is_null() || out.is_null() {
+        if info.is_null() || out.is_empty() {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         // The pool is re-checked here for the same reason the device is: the guest may have
@@ -473,18 +477,14 @@ impl Driver {
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
         // call, and `out` is the arena array the decoder sized from the count inside `info`.
-        let r = unsafe { proc(&d.fns)(device, info, out) };
+        let r = unsafe { proc(&d.fns)(device, info, out.as_mut_ptr()) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
-        for i in 0..count {
-            // SAFETY: `i` is inside the array the decoder sized to `count`, and the driver filled
-            // it -- Vulkan fills every element of a pool allocation or none.
-            let child = unsafe { *out.add(i) }.raw();
-            if child != 0 {
-                self.pools.entry(pool).or_default().insert(child);
-                self.pool_children.insert(child, pool);
-            }
+        // Vulkan fills every element of a pool allocation or none, so the whole slice is real.
+        for child in out.iter().map(|h| h.raw()).filter(|h| *h != 0) {
+            self.pools.entry(pool).or_default().insert(child);
+            self.pool_children.insert(child, pool);
         }
         Ok(())
     }
@@ -565,22 +565,19 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const T),
         pool: P,
-        count: u32,
-        objects: *const T,
+        objects: &[T],
     ) {
         let Some(d) = self.devices.get(&device.0) else {
             return;
         };
-        if count == 0 || objects.is_null() || !self.pools.contains_key(&pool.raw()) {
+        if objects.is_empty() || !self.pools.contains_key(&pool.raw()) {
             return;
         }
-        // SAFETY: handles this context allocated, in the arena array the decoder sized to `count`.
-        // The generated lifecycle hook removes the ids from the object table exactly once.
-        unsafe { proc(&d.fns)(device, pool, count, objects) };
+        // SAFETY: handles this context allocated, and the count Vulkan is given is the slice's own
+        // length. The generated lifecycle hook removes the ids from the object table exactly once.
+        unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
         let children = self.pools.entry(pool.raw()).or_default();
-        for i in 0..count as usize {
-            // SAFETY: as above.
-            let child = unsafe { *objects.add(i) }.raw();
+        for child in objects.iter().map(|h| h.raw()) {
             children.remove(&child);
             self.pool_children.remove(&child);
         }
@@ -881,17 +878,13 @@ fn imports_a_resource(mut node: *const core::ffi::c_void) -> bool {
 ///
 /// Owned rather than borrowed because the list is rebuilt before it is used, and a `&str` into the
 /// decoder's arena would tie the rebuilt list's lifetime to the guest's.
-fn read_names(names: *const *const std::ffi::c_char, count: usize) -> Vec<String> {
-    if names.is_null() {
-        return Vec::new();
-    }
-    (0..count)
-        .filter_map(|i| {
-            // SAFETY: the decoder allocated this array with `count` elements, each a pointer to a
-            // NUL-terminated string it decoded into the same arena.
-            let p = unsafe { *names.add(i) };
-            (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into())
-        })
+fn read_names(names: &[*const std::ffi::c_char]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|p| !p.is_null())
+        // SAFETY: each is a pointer to a NUL-terminated string the decoder wrote into the arena,
+        // which outlives this call.
+        .map(|p| unsafe { std::ffi::CStr::from_ptr(*p) }.to_string_lossy().into())
         .collect()
 }
 

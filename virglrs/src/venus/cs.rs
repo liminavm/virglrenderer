@@ -273,8 +273,11 @@ impl<'a> Decoder<'a> {
 /// Which of the two a given array is, is the generator's business and not a handler's. Past this
 /// point an array is a slice, and a length that disagrees with its contents cannot be written down.
 ///
-/// `None` is a count with no array behind it. It is a command that cannot be carried out, never an
-/// empty one: a caller that treated it as empty would report a bind or a write that never happened.
+/// `None` is a count with no array behind it. What that means is the caller's to say, and it is
+/// not the same answer everywhere: for a required array it is a command that cannot be carried out
+/// and must be refused, because calling it empty would report a bind or a write that never
+/// happened; for a `noautovalidity` array like `vkFreeCommandBuffers`' it names nothing to act on,
+/// which for a free is simply nothing to do. What this function will not do is decide for them.
 ///
 /// Lives here rather than beside the handlers because the invariant it rests on is the decoder's:
 /// this module allocated the array, and knows how long it lives.

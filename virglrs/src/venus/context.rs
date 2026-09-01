@@ -323,12 +323,6 @@ impl Handlers<'_> {
         pool(unsafe { &*info })
     }
 
-    /// Refuse a run of ids in an out-array the guest sent.
-    ///
-    /// The generated hook walks the whole array whatever the handler did with it, so every id it
-    /// will reach needs a decision recorded against it. The ones a short answer did not fill, and
-    /// all of them when the enumeration failed outright, are refusals: left alone they would be
-    /// registered as their own handles and the guest would hold objects that do not exist.
     /// The array a command carries, as a slice -- or a refusal when the guest counted one it did
     /// not send.
     ///
@@ -344,6 +338,18 @@ impl Handlers<'_> {
         a
     }
 
+    /// The array a command carries, where a count with none behind it names nothing to act on.
+    ///
+    /// The other honest reading of a split pair, and the right one for exactly the arrays vk.xml
+    /// marks `noautovalidity` -- `vkFreeCommandBuffers`, `vkFreeDescriptorSets` -- where the
+    /// decoder deliberately does not check the size and so the pair can genuinely arrive apart.
+    /// Freeing "three, list not supplied" identifies nothing to free, which is not the same as
+    /// claiming work was done: there is no work to claim. Poisoning a ring over it would cost the
+    /// guest everything to punish a request that asked for nothing.
+    fn array_or_empty<'w, T>(&mut self, count: u32, ptr: *const T) -> &'w [T] {
+        wire_array(count, ptr).unwrap_or_default()
+    }
+
     /// [`Handlers::array`] for the shadow array a command writes host handles back into.
     fn array_mut<'w, T>(&mut self, count: u32, ptr: *mut T) -> Option<&'w mut [T]> {
         let a = wire_array_mut(count, ptr);
@@ -353,12 +359,16 @@ impl Handlers<'_> {
         a
     }
 
-    fn ghost_range<T: Handle>(&mut self, out: *const T, range: core::ops::Range<usize>) {
-        for i in range {
-            // SAFETY: `i` is inside the array, which the decoder allocated with `asked` elements.
-            if let Some(id) = self.out_id(unsafe { out.add(i) }) {
-                self.objects.borrow_mut().add_ghost(id);
-            }
+    /// Refuse every id in a run the guest sent.
+    ///
+    /// The generated lifecycle hook walks the whole array whatever the handler did with it, so
+    /// every id it will reach needs a decision recorded against it. The ones a short answer did
+    /// not fill, and all of them when the call failed outright, are refusals: left alone they
+    /// would be registered as their own handles and the guest would hold objects that do not
+    /// exist. A zero id is not one the guest can name, and [`Table::add_ghost`] drops it.
+    fn ghost_ids<T: Handle>(&mut self, ids: &[T]) {
+        for id in ids {
+            self.objects.borrow_mut().add_ghost(ObjectId(id.raw()));
         }
     }
 }
@@ -480,12 +490,15 @@ impl Commands for Handlers<'_> {
             return;
         }
 
-        // SAFETY: both are non-null and the decoder allocated the arrays with this many elements.
-        let asked = unsafe { *args.pPhysicalDeviceCount } as usize;
-        let out = unsafe { core::slice::from_raw_parts_mut(args.handle_pPhysicalDevices, asked) };
+        // SAFETY: non-null, and the decoder allocated it in the arena.
+        let asked = unsafe { *args.pPhysicalDeviceCount };
+        // Both arrays were sized from this same count, and the wire's own size was checked
+        // against it as it decoded -- so one length governs the pair.
+        let Some(ids) = self.array(asked, args.pPhysicalDevices as *const _) else { return };
+        let Some(out) = self.array_mut(asked, args.handle_pPhysicalDevices) else { return };
         let Ok(got) = self.driver.physical_devices(args.instance, out) else {
             args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
-            self.ghost_range(args.pPhysicalDevices, 0..asked);
+            self.ghost_ids(ids);
             return;
         };
         // SAFETY: as above.
@@ -495,7 +508,7 @@ impl Commands for Handlers<'_> {
         for pd in out.iter().take(got as usize) {
             self.driver.learn_extensions(*pd);
         }
-        self.ghost_range(args.pPhysicalDevices, got as usize..asked);
+        self.ghost_ids(&ids[got as usize..]);
     }
 
     fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice) {
@@ -673,47 +686,51 @@ impl Commands for Handlers<'_> {
     // an enumeration there is no short answer between those two.
 
     fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers) {
-        let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount);
+        // The count inside the create-info is what sized both arrays, and the wire's own size was
+        // checked against it -- so it, and not either pointer, is the one length here.
+        let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount) as u32;
+        let Some(ids) = self.array(count, args.pCommandBuffers) else { return };
+        let Some(out) = self.array_mut(count, args.handle_pCommandBuffers) else { return };
         let host = self.driver.allocate_objects(
             args.device,
             self.pool_of(args.pAllocateInfo, |i| i.commandPool.raw()),
             |d| d.vkAllocateCommandBuffers(),
             args.pAllocateInfo,
-            args.handle_pCommandBuffers,
-            count,
+            out,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");
-            self.ghost_range(args.pCommandBuffers, 0..count);
+            self.ghost_ids(ids);
         }
     }
 
     fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers) {
+        let buffers = self.array_or_empty(args.commandBufferCount, args.pCommandBuffers);
         self.driver.free_objects(
             args.device,
             |d| d.vkFreeCommandBuffers(),
             args.commandPool,
-            args.commandBufferCount,
-            args.pCommandBuffers,
+            buffers,
         );
     }
 
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets) {
-        let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount);
+        let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount) as u32;
+        let Some(ids) = self.array(count, args.pDescriptorSets) else { return };
+        let Some(out) = self.array_mut(count, args.handle_pDescriptorSets) else { return };
         let host = self.driver.allocate_objects(
             args.device,
             self.pool_of(args.pAllocateInfo, |i| i.descriptorPool.raw()),
             |d| d.vkAllocateDescriptorSets(),
             args.pAllocateInfo,
-            args.handle_pDescriptorSets,
-            count,
+            out,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             // Running a descriptor pool dry is a normal thing for a guest to do -- it is how a
             // guest discovers the pool is too small -- so this one is not logged as a surprise.
-            self.ghost_range(args.pDescriptorSets, 0..count);
+            self.ghost_ids(ids);
         }
     }
 
@@ -737,10 +754,12 @@ impl Commands for Handlers<'_> {
 
     fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines) {
         let Some(infos) = self.array(args.createInfoCount, args.pCreateInfos) else { return };
+        let Some(ids) = self.array(args.createInfoCount, args.pPipelines as *const _) else {
+            return;
+        };
         let Some(out) = self.array_mut(args.createInfoCount, args.handle_pPipelines) else {
             return;
         };
-        let count = infos.len();
         let host = self.driver.create_pipelines(
             args.device,
             |d| d.vkCreateGraphicsPipelines(),
@@ -755,7 +774,7 @@ impl Commands for Handlers<'_> {
             // saying out loud -- unlike a descriptor pool running dry, it is not something a
             // working guest does on purpose.
             eprintln!("[virglrs] vkCreateGraphicsPipelines refused by the driver");
-            self.ghost_range(args.pPipelines, 0..count);
+            self.ghost_ids(ids);
         }
     }
 
