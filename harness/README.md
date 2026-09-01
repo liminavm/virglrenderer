@@ -82,6 +82,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   no device memory to census and nothing to hash. What it catches is the layer between the bytes
   and Vulkan, and it caught two things already — a `VK_NULL_HANDLE` treated as a missing object,
   and every command after the first that named one.
+- The layout oracle is the third leg of the same feature, and it runs as a plain unit test:
+  `cargo test --features reply-oracle` in `virglrs/`. `venus-roundtrip` proves the wire and
+  `venus-reply-oracle` proves the replies, but both compare *bytes*, and the reply oracle only
+  reaches them by handing a Rust pointer to a C encoder. What no byte comparison can see is the
+  memory contract underneath that — nor the one the driver relies on when it is given a `Vk*` we
+  filled. So every generated type is asked for its offsets twice, `offsetof` against `offset_of!`,
+  and the answers are diffed. It caught a real one on its first run: the model reorders a struct's
+  members to put a length before its array, which is what the wire wants and not what the layout
+  is, and `VkHostAddressRangeEXT` reached the driver with its address and size swapped.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
   from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
   the diff between the two is the positive control: 19 offscreens lose their ink, and all three
