@@ -1676,8 +1676,9 @@ class RustGen:
         return [
             '    /// Whether the guest sent `%s` at all.' % f,
             '    ///',
-            '    /// A meaning of its own, not an empty string: an absent `pLayerName` asks for',
-            "    /// the implementation's own extensions rather than for a layer's.",
+            '    /// A meaning of its own, not an empty string: an absent name is the guest',
+            '    /// declining to narrow the request, which is not the same as naming nothing --',
+            "    /// an absent `pLayerName` asks for the implementation's own extensions.",
             '    pub fn has_%s(&self) -> bool {' % f,
             '        !self.%s.is_null()' % f,
             '    }',
