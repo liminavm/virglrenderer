@@ -19,8 +19,8 @@ use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkCopyDescriptorSet, VkDevice, VkDeviceCreateInfo,
     VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
     VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkQueue, VkResult, VkStructureType,
-    VkWriteDescriptorSet,
+    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineCache, VkQueue,
+    VkResult, VkStructureType, VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -487,6 +487,67 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Create a run of pipelines: `vkCreateXPipelines(device, cache, count, infos, alloc, out)`.
+    ///
+    /// The one create in the protocol that can half-succeed. On a failure Vulkan still writes a
+    /// handle for every pipeline it did build, `VK_NULL_HANDLE` for each it did not, and returns
+    /// the first error -- so the array can come back part real. The guest is never told which
+    /// half: the whole run is refused and every id it named is ghosted, because a partial answer
+    /// is one the venus reply has no way to express.
+    ///
+    /// Which leaves the survivors owned by nobody, so they are destroyed here. The C zeroes the
+    /// array and walks away, leaking them until the device goes; there is nothing to be faithful
+    /// to in that.
+    pub fn create_pipelines<I>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(
+            &DeviceFns,
+        ) -> unsafe extern "C" fn(
+            VkDevice,
+            VkPipelineCache,
+            u32,
+            *const I,
+            *const VkAllocationCallbacks,
+            *mut VkPipeline,
+        ) -> VkResult,
+        cache: VkPipelineCache,
+        infos: &[I],
+        alloc: *const VkAllocationCallbacks,
+        out: &mut [VkPipeline],
+    ) -> Result<(), VkResult> {
+        let Some(d) = self.devices.get(&device.0) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        // One handle comes back per create-info, so the decoder sized both from the same count.
+        // A mismatch is this renderer having got it wrong, not the guest -- so it asserts.
+        assert_eq!(infos.len(), out.len(), "a pipeline run needs one handle slot per create-info");
+        if infos.is_empty() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        // SAFETY: `device` is a handle in this table, `alloc` is an arena allocation live for the
+        // call, and both counts Vulkan is given are the slices' own lengths.
+        let r = unsafe {
+            proc(&d.fns)(device, cache, infos.len() as u32, infos.as_ptr(), alloc, out.as_mut_ptr())
+        };
+        // A positive result is not a failure: `VK_PIPELINE_COMPILE_REQUIRED` says the driver
+        // declined to compile early, and every handle is real.
+        if r.0 >= VkResult::VK_SUCCESS.0 {
+            return Ok(());
+        }
+        for survivor in out.iter_mut() {
+            if survivor.raw() == 0 {
+                continue;
+            }
+            // SAFETY: a handle this call just produced, destroyed once -- the slice is walked once
+            // and the guest never learns the handle, so nothing else can name it.
+            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, alloc) };
+            // The guest's reply must not carry a handle that is now gone.
+            *survivor = VkPipeline(0);
+        }
+        Err(r)
     }
 
     /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
