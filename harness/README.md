@@ -83,11 +83,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   named one.
 
   **It measures that a command was accounted for, not that it was carried out correctly.** Measured
-  by sabotage: every array accessor cut to hand its handler one element fewer than the guest sent
-  replays both corpora at `cmds 506657/506657` and `1348/1348` with the census unchanged. Anything
-  about the *contents* a handler passes to the driver needs its own witness — a unit test beside the
-  handler — until the census covers enough served state to be pinned. `venus-roundtrip` does not
-  help there either: it never calls a handler.
+  by sabotage against a build that serves the whole frame: every array accessor cut to hand its
+  handler one element fewer than the guest sent replays both corpora at `cmds 506657/506657` and
+  `1348/1348`, census unchanged — and KosmicKrisp's own workload counters (barriers, render pass
+  starts, clears) come back byte-identical too, so the one host-side signal in the output cannot
+  see it either. Anything about the *contents* a handler passes to the driver needs its own witness
+  — a unit test beside the handler — until the census covers enough served state to be pinned.
+  `venus-roundtrip` does not help there either: it never calls a handler.
 
   The seam for those witnesses is generated: `Device::plant_<cmd>` puts a stub entry point in a proc
   table, `Driver::plant_device`/`plant_pool` give it something to be reached through, and

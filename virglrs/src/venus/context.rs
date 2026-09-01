@@ -17,7 +17,7 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
-use super::driver::Driver;
+use super::driver::{Driver, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
@@ -43,7 +43,9 @@ use super::proto::types::{
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
     vn_command_vkEndCommandBuffer, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
-    vn_command_vkResetCommandBuffer, vn_command_vkUpdateDescriptorSets,
+    vn_command_vkImportSemaphoreResourceMESA, vn_command_vkQueueSubmit,
+    vn_command_vkResetCommandBuffer, vn_command_vkResetFences, vn_command_vkUpdateDescriptorSets,
+    vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
 };
 use crate::vulkan::Global;
 
@@ -372,6 +374,25 @@ impl Handlers<'_> {
 
     fn no_recorder(&mut self) {
         self.reject = Some("recorded into a command buffer with no device behind it");
+    }
+
+    /// The verdict on a sync-fd command. Neither carries a result the guest can read, so the ring
+    /// is the only place a failure can be reported -- which is what the C does with them too.
+    fn synced(&mut self, cmd: &str, done: Result<VkResult, NoSyncFd>) {
+        match done {
+            Ok(VkResult::VK_SUCCESS) => {}
+            Ok(r) => {
+                eprintln!("[virglrs] {cmd} refused by the driver: {r:?}");
+                self.reject = Some("asked for a semaphore payload the driver would not move");
+            }
+            Err(NoSyncFd::NoDevice) => {
+                self.reject = Some("moved a semaphore payload on a device it does not have");
+            }
+            Err(NoSyncFd::Unsupported) => {
+                eprintln!("[virglrs] {cmd}: this driver exports no external semaphore fd");
+                self.reject = Some("asked for venus sync on a driver that cannot do it");
+            }
+        }
     }
 
     fn ghost_ids<T: Handle>(&mut self, ids: &[T]) {
@@ -993,6 +1014,62 @@ impl Commands for Handlers<'_> {
             regions,
         );
         self.recorded(done);
+    }
+
+    // --------------------------------------------------------------------------- sync
+    //
+    // Where a frame is handed to the GPU and waited for. Everything the recording section built
+    // is inert until a submit names it, and everything after a submit is the guest asking whether
+    // the work is done yet.
+
+    fn vkQueueSubmit(&mut self, args: &mut vn_command_vkQueueSubmit<'_>) {
+        // Submitting nothing is legal -- it is how a guest signals a fence with no work -- so the
+        // empty slice goes through rather than being turned away.
+        let submits = self.array_or_empty(args.pSubmits());
+        let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {
+            self.reject = Some("submitted to a queue with no device behind it");
+            return;
+        };
+        args.ret = ret;
+    }
+
+    fn vkResetFences(&mut self, args: &mut vn_command_vkResetFences<'_>) {
+        let Some(fences) = self.array(args.pFences()) else { return };
+        args.ret = self.driver.reset_fences(args.device, fences);
+    }
+
+    /// Blocks the caller for as long as the guest asked, up to forever. That is the guest's own
+    /// thread being spent on the guest's own wait; answering early would be answering wrongly.
+    fn vkWaitForFences(&mut self, args: &mut vn_command_vkWaitForFences<'_>) {
+        let Some(fences) = self.array(args.pFences()) else { return };
+        args.ret = self.driver.wait_for_fences(args.device, fences, args.waitAll, args.timeout);
+    }
+
+    fn vkWaitSemaphoreResourceMESA(
+        &mut self,
+        args: &mut vn_command_vkWaitSemaphoreResourceMESA<'_>,
+    ) {
+        let done = self.driver.export_semaphore_sync_fd(args.device, args.semaphore);
+        self.synced("vkWaitSemaphoreResourceMESA", done);
+    }
+
+    fn vkImportSemaphoreResourceMESA(
+        &mut self,
+        args: &mut vn_command_vkImportSemaphoreResourceMESA<'_>,
+    ) {
+        let Some(info) = args.pImportSemaphoreResourceInfo else {
+            self.reject = Some("imported a semaphore payload from no descriptor at all");
+            return;
+        };
+        // The C asserts on this. Here it is the guest's own number, arriving over the wire, so an
+        // assert would let a guest abort the process: only id 0 -- an already-signaled payload
+        // with no resource behind it -- is a thing this serves, and anything else is rejected.
+        if info.resourceId != 0 {
+            self.reject = Some("imported a semaphore payload from a resource id");
+            return;
+        }
+        let done = self.driver.import_signaled_semaphore(args.device, info.semaphore);
+        self.synced("vkImportSemaphoreResourceMESA", done);
     }
 }
 
@@ -1889,5 +1966,218 @@ mod tests {
         args.plant_pViewports(&vps);
         h.vkCmdSetViewport(&mut args);
         assert!(h.reject.is_some(), "there is no device to record into");
+    }
+
+    /// What a sync handler hands the driver, and what it does when there is nothing behind the
+    /// handle the guest named.
+    ///
+    /// `vkQueueSubmit` is the one command in the corpus that carries a whole tree of the guest's
+    /// work -- the submit infos, and inside each the semaphores and command buffers the decoder
+    /// already resolved. The replay gate sees it as one command accounted for either way, so the
+    /// count and the fence arriving intact is measured here or nowhere.
+    #[test]
+    fn a_sync_handler_hands_the_driver_what_the_guest_sent() {
+        use super::super::proto::types::{
+            VkBool32, VkDevice, VkFence, VkImportSemaphoreFdInfoKHR,
+            VkImportSemaphoreResourceInfoMESA, VkQueue, VkSemaphore, VkSemaphoreGetFdInfoKHR,
+            VkSubmitInfo, vn_command_vkImportSemaphoreResourceMESA, vn_command_vkQueueSubmit,
+            vn_command_vkResetFences, vn_command_vkWaitForFences,
+            vn_command_vkWaitSemaphoreResourceMESA,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const QUEUE: u64 = 21;
+
+        #[derive(Default)]
+        struct Saw {
+            submits: Vec<(u64, u32, u64)>,
+            reset: Vec<u32>,
+            waited: Vec<(u32, u32, u64)>,
+            imported: u32,
+            /// The descriptor the export handed over, so the test can ask whether it was closed.
+            exported: Vec<core::ffi::c_int>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn submit(
+            queue: VkQueue,
+            count: u32,
+            _p: *const VkSubmitInfo,
+            fence: VkFence,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.submits.push((queue.0, count, fence.0)));
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn reset(_d: VkDevice, count: u32, _p: *const VkFence) -> VkResult {
+            SAW.with_borrow_mut(|s| s.reset.push(count));
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn wait(
+            _d: VkDevice,
+            count: u32,
+            _p: *const VkFence,
+            all: VkBool32,
+            timeout: u64,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.waited.push((count, all.0, timeout)));
+            VkResult::VK_TIMEOUT
+        }
+
+        unsafe extern "C" fn import(
+            _d: VkDevice,
+            _info: *const VkImportSemaphoreFdInfoKHR,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.imported += 1);
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn export(
+            _d: VkDevice,
+            _info: *const VkSemaphoreGetFdInfoKHR,
+            out: *mut core::ffi::c_int,
+        ) -> VkResult {
+            // A real descriptor, so the close the handler owes it is a thing the test can see.
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0, "the test needs a descriptor to watch");
+            // SAFETY: the caller is `export_semaphore_sync_fd`, which passes a live `c_int`.
+            unsafe { *out = fd };
+            SAW.with_borrow_mut(|s| s.exported.push(fd));
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkQueueSubmit(submit);
+        fns.plant_vkGetSemaphoreFdKHR(export);
+        fns.plant_vkResetFences(reset);
+        fns.plant_vkWaitForFences(wait);
+        fns.plant_vkImportSemaphoreFdKHR(import);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        driver.plant_queue(DEVICE, QUEUE);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        // A submit is two submit infos and a fence. The fence has to arrive as itself: it is the
+        // handle every later wait in the frame is keyed by, and passing the wrong one -- or none
+        // -- would leave the guest waiting on something nothing signals.
+        let submits = [VkSubmitInfo::default(); 2];
+        let mut args = vn_command_vkQueueSubmit::default();
+        args.queue = VkQueue(QUEUE);
+        args.fence = VkFence(99);
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer is the guest's");
+        SAW.with_borrow(|s| assert_eq!(s.submits, [(QUEUE, 2, 99)]));
+
+        // Three fences to reset, then a wait on two of them. `waitAll` and the timeout are the
+        // guest's own: a wait that returned early would be a lie it cannot tell from the truth.
+        let fences = [VkFence(1), VkFence(2), VkFence(3)];
+        let mut args = vn_command_vkResetFences::default();
+        args.device = VkDevice(DEVICE);
+        args.plant_pFences(&fences);
+        h.vkResetFences(&mut args);
+        SAW.with_borrow(|s| assert_eq!(s.reset, [3]));
+
+        let mut args = vn_command_vkWaitForFences::default();
+        args.device = VkDevice(DEVICE);
+        args.plant_pFences(&fences[..2]);
+        args.waitAll = VkBool32(1);
+        args.timeout = u64::MAX;
+        h.vkWaitForFences(&mut args);
+        assert_eq!(args.ret, VkResult::VK_TIMEOUT, "a timeout is an answer, not a failure");
+        SAW.with_borrow(|s| assert_eq!(s.waited, [(2, 1, u64::MAX)]));
+
+        // The import that stands in for a signal the host never saw.
+        let info =
+            VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
+        let mut args = vn_command_vkImportSemaphoreResourceMESA {
+            device: VkDevice(DEVICE),
+            pImportSemaphoreResourceInfo: Some(&info),
+            ..Default::default()
+        };
+        h.vkImportSemaphoreResourceMESA(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| assert_eq!(s.imported, 1));
+
+        // The export half. Its whole effect is outside Vulkan, so what there is to check is that
+        // the descriptor it produced was closed -- an fd leaked once per frame is a renderer that
+        // runs out of them.
+        let mut args = vn_command_vkWaitSemaphoreResourceMESA {
+            device: VkDevice(DEVICE),
+            semaphore: VkSemaphore(5),
+            ..Default::default()
+        };
+        h.vkWaitSemaphoreResourceMESA(&mut args);
+        assert!(h.reject.is_none());
+        let fd = SAW.with_borrow(|s| {
+            assert_eq!(s.exported.len(), 1);
+            s.exported[0]
+        });
+        // SAFETY: a plain query on a descriptor number; it is closed, which is what is asserted.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "the exported descriptor must not outlive the command that made it"
+        );
+
+        // A resource id the C asserts on. The number is the guest's, so it is a rejection here --
+        // an assert would hand a guest the power to abort the process.
+        let info = VkImportSemaphoreResourceInfoMESA {
+            semaphore: VkSemaphore(5),
+            resourceId: 1,
+            ..Default::default()
+        };
+        let mut args = vn_command_vkImportSemaphoreResourceMESA {
+            device: VkDevice(DEVICE),
+            pImportSemaphoreResourceInfo: Some(&info),
+            ..Default::default()
+        };
+        h.vkImportSemaphoreResourceMESA(&mut args);
+        assert!(h.reject.is_some(), "a resource-backed import is not something this serves");
+        SAW.with_borrow(|s| assert_eq!(s.imported, 1, "and it must not have reached the driver"));
+
+        // A driver with no `vkImportSemaphoreFdKHR` at all. The proc table's own answer to a
+        // missing entry point is `.expect()`, and this build aborts on panic -- so for the two
+        // commands a guest reaches an extension through, the predicate is what stands between a
+        // driver we cannot serve on and a guest that can kill the process by asking.
+        const BARE: u64 = 8;
+        h.driver.plant_device(BARE, crate::vulkan::Device::default());
+        let info =
+            VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
+        let mut args = vn_command_vkImportSemaphoreResourceMESA {
+            device: VkDevice(BARE),
+            pImportSemaphoreResourceInfo: Some(&info),
+            ..Default::default()
+        };
+        h.reject = None;
+        h.vkImportSemaphoreResourceMESA(&mut args);
+        assert!(h.reject.is_some(), "a driver without the extension is a rejection, not an abort");
+        SAW.with_borrow(|s| assert_eq!(s.imported, 1));
+
+        // A queue the context never retrieved stops the ring rather than reaching Vulkan with a
+        // handle nothing vouches for.
+        h.reject = None;
+        let mut args = vn_command_vkQueueSubmit::default();
+        args.queue = VkQueue(4242);
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit(&mut args);
+        assert!(h.reject.is_some(), "a queue with no device behind it must poison the ring");
+        SAW.with_borrow(|s| assert_eq!(s.submits.len(), 1, "and must not reach the driver"));
     }
 }
