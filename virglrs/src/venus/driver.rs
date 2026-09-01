@@ -432,6 +432,55 @@ impl Driver {
         unsafe { proc(&d.fns)(device, object, alloc) };
     }
 
+    /// Allocate a run of objects from a pool: `vkAllocateX(device, info, out)`.
+    ///
+    /// Unlike an enumeration there is no short answer to handle -- Vulkan fills every element or
+    /// none -- so the caller's only two cases are the whole array and nothing.
+    ///
+    /// `out` is the shadow array the decoder allocated, so the driver writes host handles straight
+    /// into the place the generated lifecycle hook will read them from.
+    pub fn allocate_objects<T: Handle, I>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
+        info: *const I,
+        out: *mut T,
+    ) -> Result<(), VkResult> {
+        let Some(d) = self.devices.get(&device.0) else {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        };
+        if info.is_null() || out.is_null() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
+        // call, and `out` is the arena array the decoder sized from the count inside `info`.
+        let r = unsafe { proc(&d.fns)(device, info, out) };
+        if r != VkResult::VK_SUCCESS {
+            return Err(r);
+        }
+        Ok(())
+    }
+
+    /// Free a run of objects back to the pool they came from.
+    pub fn free_objects<T: Handle, P: Copy>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const T),
+        pool: P,
+        count: u32,
+        objects: *const T,
+    ) {
+        let Some(d) = self.devices.get(&device.0) else {
+            return;
+        };
+        if count == 0 || objects.is_null() {
+            return;
+        }
+        // SAFETY: handles this context allocated, in the arena array the decoder sized to `count`.
+        // The generated lifecycle hook removes the ids from the object table exactly once.
+        unsafe { proc(&d.fns)(device, pool, count, objects) };
+    }
+
     // ------------------------------------------------------------------- device memory
 
     /// Allocate device memory and remember it, so the census can find it by the guest's id.
