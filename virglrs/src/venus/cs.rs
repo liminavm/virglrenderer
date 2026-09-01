@@ -344,6 +344,33 @@ pub unsafe fn wire_ref<'a, T>(ptr: *const T) -> Option<&'a T> {
     unsafe { ptr.as_ref() }
 }
 
+/// [`wire_ref`] for a member that points at a NUL-terminated string.
+///
+/// The one member on the wire that is *not* a split pair, and the reason it gets its own door
+/// rather than a `&[u8]` one. A counted array arrives as a length and a pointer that two layers
+/// could disagree about; a C string carries its length inside itself, and [`Decoder::decode_c_string`]
+/// makes that true rather than hoping: it copies the guest's bytes into the arena and writes the
+/// terminator itself, over whatever the guest put in the last byte. So there is nothing here to
+/// reconcile -- storing the wire's length beside the pointer would be a second copy of a fact the
+/// bytes already carry, which is the pair this codebase spends its time removing.
+///
+/// `None` is the guest having sent no string at all, which `vkEnumerateDeviceExtensionProperties`
+/// gives a meaning to: no layer named, so the implementation's own extensions.
+///
+/// # Safety
+///
+/// As [`wire_array`]: `'a` is unconstrained and the only callers are the generated accessors,
+/// where it is the command struct's own. `ptr` must be null, or a NUL-terminated allocation that
+/// lives for `'a` -- which for every caller means one `decode_c_string` produced.
+pub unsafe fn wire_c_string<'a>(ptr: *const core::ffi::c_char) -> Option<&'a core::ffi::CStr> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's, above: the decoder allocated this from the arena and forced its last
+    // byte to NUL, so the scan terminates inside the allocation.
+    Some(unsafe { core::ffi::CStr::from_ptr(ptr) })
+}
+
 /// [`wire_ref`] for the one value a command writes its answer back into.
 ///
 /// This is what a handler is given instead of a raw out-parameter. A query that must answer the
@@ -680,6 +707,23 @@ mod tests {
         assert!(!dec.fatal());
         assert_eq!(dec.decode_scalar::<u32>(), 0);
         assert!(dec.hard_fatal());
+    }
+
+    /// The invariant `wire_c_string`'s whole soundness rests on, tested without going near a
+    /// `CStr` -- because the obvious way to falsify that accessor is to remove this forcing, and
+    /// then the scan runs off the allocation instead of failing.
+    ///
+    /// A guest that sends an unterminated string is not a guest we may believe: the decoder
+    /// overwrites the last byte rather than searching for a NUL it has no guarantee of finding.
+    #[test]
+    fn a_string_the_guest_left_unterminated_is_terminated_anyway() {
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let buf = *b"VK_KHR_a";
+        let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
+        let out = dec.decode_c_string(8).expect("eight bytes are there to read");
+        assert_eq!(out, b"VK_KHR_\0", "the last byte is the terminator, whatever the guest sent");
+        assert!(!dec.fatal());
     }
 
     #[test]

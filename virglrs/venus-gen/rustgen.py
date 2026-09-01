@@ -235,6 +235,25 @@ class RustGen:
             rows.append((f, elem, mutable, field_mut))
         return rows
 
+    def string_rows(self, ty):
+        """The members that point at a NUL-terminated string, as field names.
+
+        The third door, and the one that needs no count. A counted array is a pair the wall exists
+        to reconcile; a C string is not a pair at all -- `Decoder::decode_c_string` copies the
+        guest's bytes into the arena and writes the terminator itself, so the length is inside the
+        bytes and a second copy of it beside the pointer would be exactly the redundancy the rest
+        of this file removes. What the pointer needed was not reconciling but typing.
+        """
+        return [self.field_name(var.name) for var in ty.variables
+                if self._shape_or_none(ty, var) == ('string',)]
+
+    def _shape_or_none(self, ty, var):
+        """`_shape`, with an unsupported member reading as no shape rather than an exception."""
+        try:
+            return self._shape(ty, var)
+        except self.Unsupported:
+            return None
+
     def restricted(self, ty):
         """The members of `ty` no handler may reach, as field names.
 
@@ -252,7 +271,8 @@ class RustGen:
         kind of door -- see `scalar_rows`.
         """
         return ({f for f, _, _, _ in self._array_rows(ty)}
-                | {f for f, _, _, _ in self.scalar_rows(ty)})
+                | {f for f, _, _, _ in self.scalar_rows(ty)}
+                | set(self.string_rows(ty)))
 
     def destroy_target(self, ty):
         """The object a `vkDestroy*`/`vkFree*` names, as `(var, shape)`, or None.
@@ -1606,7 +1626,8 @@ class RustGen:
         """
         rows = self._array_rows(ty)
         scalars = self.scalar_rows(ty)
-        if not rows and not scalars:
+        strings = self.string_rows(ty)
+        if not rows and not scalars and not strings:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
         for f, elem, count, mutable in rows:
@@ -1640,7 +1661,44 @@ class RustGen:
             out += self._planter(ty, f, elem, count, mutable)
         for f, elem, mutable, field_mut in scalars:
             out += self._scalar_accessor(ty, f, elem, mutable, field_mut)
+        for f in strings:
+            out += self._string_accessor(f)
         return out[:-1] + ['}', '']
+
+    @staticmethod
+    def _string_accessor(f):
+        """The door onto a member that points at a NUL-terminated string.
+
+        Read-only, and there is no writable counterpart to be had: every string on the wire is
+        something the guest named, and a reply that had to hand one back would need storage the
+        command struct does not carry.
+        """
+        return [
+            '    /// Whether the guest sent `%s` at all.' % f,
+            '    ///',
+            '    /// A meaning of its own, not an empty string: an absent `pLayerName` asks for',
+            "    /// the implementation's own extensions rather than for a layer's.",
+            '    pub fn has_%s(&self) -> bool {' % f,
+            '        !self.%s.is_null()' % f,
+            '    }',
+            '',
+            '    /// `%s`, as the string it points at.' % f,
+            '    ///',
+            '    /// No length beside it, because there is none to keep in step: the terminator is',
+            '    /// the length. See `cs::wire_c_string`.',
+            "    pub fn %s(&self) -> Option<&'a core::ffi::CStr> {" % f,
+            '        // SAFETY: the decoder copied this string into the batch arena and forced its',
+            "        // last byte to NUL, and the arena outlives the struct's `'a`.",
+            '        unsafe { cs::wire_c_string(self.%s) }' % f,
+            '    }',
+            '',
+            '    /// Plant `%s` as the decoder would have, terminator and all.' % f,
+            '    #[cfg(test)]',
+            "    pub fn plant_%s(&mut self, v: &'a core::ffi::CStr) {" % f,
+            '        self.%s = v.as_ptr();' % f,
+            '    }',
+            '',
+        ]
 
     def _scalar_accessor(self, ty, f, elem, mutable, field_mut):
         """The door onto a member that points at one value.
