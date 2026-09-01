@@ -28,12 +28,12 @@ use super::proto::types::{
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
+    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
+    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
     vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
     vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
@@ -1233,8 +1233,29 @@ mod tests {
         assert_eq!(n, 0, "venus/context.rs is not on the list of modules allowed unsafe");
     }
 
+    /// The third door, and the only one with no count to reconcile: a NUL-terminated string
+    /// carries its length in its own bytes, and the decoder writes the terminator rather than
+    /// trusting the guest to have. `has_` and `None` are the same question here as everywhere --
+    /// `vkEnumerateDeviceExtensionProperties` reads an absent `pLayerName` as "no layer", which
+    /// is not the same request as an empty one.
+    #[test]
+    fn a_string_arrives_as_a_string_and_absent_is_not_empty() {
+        use super::super::proto::types::vn_command_vkEnumerateDeviceExtensionProperties;
+
+        let mut args = vn_command_vkEnumerateDeviceExtensionProperties::default();
+        assert!(!args.has_pLayerName(), "no layer named");
+        assert!(args.pLayerName().is_none(), "and absent is not the empty layer name");
+
+        let name = c"VK_LAYER_KHRONOS_validation";
+        args.plant_pLayerName(name);
+        assert!(args.has_pLayerName());
+        assert_eq!(args.pLayerName(), Some(name), "the string, terminator and all");
+    }
+
     #[test]
     fn a_blob_is_as_long_as_the_count_beside_it() {
+        use super::super::proto::types::vn_command_vkCmdPushConstants;
+
         // A blob is the array wall's case with the element type left unsaid: vk.xml calls it
         // `void`, the wire counts it in bytes. So the door has to hand back exactly the bytes
         // the count claims -- planting more than the count says must not widen the slice.
