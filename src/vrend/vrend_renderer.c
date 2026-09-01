@@ -9490,6 +9490,10 @@ static bool vrend_iosurface_enabled(void)
  * as separate component-format resources asks for plane N by index, and until now there was
  * no image to answer with, so the index was cleared and its chroma view sampled luma.
  * Replacing the base texture's storage would fix the second by breaking the first. */
+/* Defined next to vrend_guest_plane_layout, whose canonical layout it mirrors. */
+static void vrend_resource_init_planar_guest_layout(struct vrend_resource *gr,
+                                                    enum virgl_formats format);
+
 static void vrend_resource_iosurface_init_planes(struct vrend_resource *gr,
                                                  enum virgl_formats format)
 {
@@ -9760,6 +9764,8 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
 
    if (format_can_texture_storage)
       gr->storage_bits |= VREND_STORAGE_GL_IMMUTABLE;
+
+   vrend_resource_init_planar_guest_layout(gr, format);
 
    if (!image_oes) {
       vrend_resource_d3d_init(gr, format);
@@ -14956,14 +14962,8 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
  * fit the blob, in which case the texture is left untouched — uploading half a
  * frame is worse than not uploading one.
  */
-/* limina: how the guest laid out one plane inside the blob. Chroma planes are
- * subsampled, so a plane's own width/height are not the resource's. */
-struct guest_plane {
-   uint32_t width, height, bpp;
-};
-
-static void
-guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
+void
+vrend_guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
                    struct guest_plane planes[VIRGL_GBM_MAX_PLANES],
                    uint32_t *plane_count)
 {
@@ -14987,6 +14987,40 @@ guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
       };
       *plane_count = 1;
       return;
+   }
+}
+
+/* limina: describe where each plane sits in the guest's own storage.
+ *
+ * A composite planar target arrives through resource_create, so the untyped-blob
+ * SET_TYPE path that normally transmits plane_strides/plane_offsets never runs and
+ * both consumers of ->guest_pixels_stride/offset would fall back to "stride = pitch,
+ * offset = 0" -- which for plane 1 means writing chroma over luma.
+ *
+ * Nothing on the wire carries the layout, so mirror the guest's own math instead:
+ * guest mesa lays a planar resource out by accumulating util_format_get_stride() over
+ * the plane templates, tight and in plane order, which is exactly vrend_guest_plane_layout
+ * accumulated the same way. Both sides then describe the same bytes with no new field.
+ *
+ * A divergence cannot corrupt silently. Too large and the writeback's extent check
+ * skips the frame; too small and it is visible in the picture. This runs at create,
+ * so a layout that IS transmitted still wins: SET_TYPE overwrites these later.
+ */
+static void vrend_resource_init_planar_guest_layout(struct vrend_resource *gr,
+                                                    enum virgl_formats format)
+{
+   struct guest_plane planes[VIRGL_GBM_MAX_PLANES];
+   uint32_t plane_count = 0;
+   uint32_t offset = 0;
+
+   vrend_guest_plane_layout(format, gr->base.width0, gr->base.height0, planes, &plane_count);
+   if (plane_count < 2)
+      return;
+
+   for (uint32_t p = 0; p < plane_count; p++) {
+      gr->guest_pixels_stride[p] = planes[p].width * planes[p].bpp;
+      gr->guest_pixels_offset[p] = offset;
+      offset += gr->guest_pixels_stride[p] * planes[p].height;
    }
 }
 
@@ -15129,7 +15163,7 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
    struct guest_plane planes[VIRGL_GBM_MAX_PLANES];
    uint32_t plane_count = 0;
 
-   guest_plane_layout(gr->base.format, width, height, planes, &plane_count);
+   vrend_guest_plane_layout(gr->base.format, width, height, planes, &plane_count);
 
    /* Planar frames are converted, so the staging buffer -- and what GL is
     * handed -- is always RGBA at luma resolution. */

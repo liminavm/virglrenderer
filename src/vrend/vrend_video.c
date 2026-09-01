@@ -77,6 +77,16 @@
 #include "vrend_iov.h"
 #include "vrend_video.h"
 
+#ifdef __APPLE__
+/* From vkr_metal_helpers (same library), forward-declared rather than included: the
+ * header needs Vulkan types, which vrend deliberately keeps out. Same reason and same
+ * shape as the declarations in vrend_renderer.c. */
+struct vkr_mtl_iosurface;
+int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane,
+                                  const void *src, uint32_t src_stride, uint32_t rows,
+                                  uint32_t row_bytes);
+#endif
+
 struct vrend_context;
 
 struct vrend_video_context {
@@ -154,9 +164,30 @@ static struct vrend_video_buffer *get_video_buffer(
  * The dmabuf path below hands the picture over as an EGLImage and blits; a backend
  * with no dmabuf to export — VideoToolbox, whose output is a CVPixelBuffer — maps
  * the plane instead and we copy. */
-static void upload_mapped_plane(struct vrend_resource *res,
+static void upload_mapped_plane(struct vrend_resource *res, unsigned plane_idx,
                                 const struct virgl_video_dma_buf_plane *plane)
 {
+#ifdef __APPLE__
+    /* limina: a composite target has one resource for the whole picture, so there is no
+     * per-plane GL texture to upload into -- res->base.format is the planar format and
+     * res->gl_id is the RGBA texture composite consumers sample. The plane's pixels
+     * belong in the IOSurface plane the guest's own plane view is bound to, which is
+     * where a plane sampler reads them and needs no upload at all. */
+    if (plane_idx < res->iosurf_planes) {
+        struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+        uint32_t plane_count = 0;
+
+        vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
+                                 geom, &plane_count);
+        if (plane_idx < plane_count) {
+            vkr_mtl_iosurface_plane_write(res->iosurface, plane_idx, plane->map,
+                                          plane->pitch, geom[plane_idx].height,
+                                          geom[plane_idx].width * geom[plane_idx].bpp);
+            return;
+        }
+    }
+#endif
+
     /* Ask vrend how this resource was actually created rather than deriving a GL
      * format from the plane's size: an R8 luma plane and an RG8 chroma plane both
      * arrive here, and a mismatched format silently uploads the wrong bytes. */
@@ -194,13 +225,30 @@ static void upload_mapped_plane(struct vrend_resource *res,
  * texture upload stays: sampling must not start depending on the guest's copy being
  * read back, and the readback only happens once per batch.
  *
- * Layout is the guest's, taken from SET_TYPE (vrend_resource::guest_pixels_*); each
- * plane is its own resource, so only index 0 of that array applies here.
+ * Layout is the guest's, in vrend_resource::guest_pixels_*. Which entry applies depends
+ * on the shape the guest asked for: with one resource per plane every target is plane 0
+ * of its own resource, while a composite target is one resource holding all the planes,
+ * so the index has to come from the caller either way.
  */
-static void writeback_plane_to_guest(struct vrend_resource *res,
+static void writeback_plane_to_guest(struct vrend_resource *res, unsigned plane_idx,
                                      const struct virgl_video_dma_buf_plane *plane)
 {
-    unsigned blocksize = util_format_get_blocksize(res->base.format);
+    struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+    uint32_t plane_count = 0;
+    unsigned blocksize, width, height_in;
+
+    vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
+                             geom, &plane_count);
+    /* A per-plane resource describes one plane and nothing else, so its own plane 0 is
+     * the answer however many planes the video buffer has. */
+    if (plane_count < 2)
+        plane_idx = 0;
+    else if (plane_idx >= plane_count)
+        return;
+
+    blocksize = geom[plane_idx].bpp;
+    width = geom[plane_idx].width;
+    height_in = geom[plane_idx].height;
     size_t row, stride, offset, height, extent, storage;
     /* Every reason to skip is a legitimate steady state, so none of them can log per
      * frame. But when the guest ends up reading an unwritten target the skip IS the
@@ -212,7 +260,8 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
 
     if (!blocksize) {
         if (trace)
-            virgl_warn("writeback: res fmt %d has no blocksize\n", res->base.format);
+            virgl_warn("writeback: res fmt %d plane %u has no blocksize\n",
+                       res->base.format, plane_idx);
         return;
     }
 
@@ -224,14 +273,14 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
         return;
     }
 
-    row = (size_t)res->base.width0 * blocksize;
-    height = res->base.height0;
-    stride = res->guest_pixels_stride[0] ? res->guest_pixels_stride[0] : row;
-    offset = res->guest_pixels_offset[0];
+    row = (size_t)width * blocksize;
+    height = height_in;
+    stride = res->guest_pixels_stride[plane_idx] ? res->guest_pixels_stride[plane_idx] : row;
+    offset = res->guest_pixels_offset[plane_idx];
 
     if (stride < row) {
-        virgl_error("%s: guest stride %zu < row %zu for %ux%u %s\n", __func__,
-                    stride, row, res->base.width0, res->base.height0,
+        virgl_error("%s: guest stride %zu < row %zu for plane %u of %ux%u %s\n", __func__,
+                    stride, row, plane_idx, res->base.width0, res->base.height0,
                     util_format_name(res->base.format));
         return;
     }
@@ -248,9 +297,9 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
     storage = res->guest_pixels_map ? res->guest_pixels_map_size
                                     : vrend_get_iovec_size(res->iov, res->num_iovs);
     if (trace)
-        virgl_warn("writeback: %ux%u %s row %zu stride %zu off %zu extent %zu storage %zu "
-                   "src pitch %u -> %s\n",
-                   res->base.width0, res->base.height0,
+        virgl_warn("writeback: plane %u %ux%u of %ux%u %s row %zu stride %zu off %zu "
+                   "extent %zu storage %zu src pitch %u -> %s\n",
+                   plane_idx, width, height_in, res->base.width0, res->base.height0,
                    util_format_name(res->base.format), row, stride, offset, extent,
                    storage, plane->pitch, extent > storage ? "SKIP" : "write");
     if (extent > storage)
@@ -286,8 +335,8 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         }
 
         if (dmabuf->planes[i].fd < 0 && dmabuf->planes[i].map) {
-            upload_mapped_plane(res, &dmabuf->planes[i]);
-            writeback_plane_to_guest(res, &dmabuf->planes[i]);
+            upload_mapped_plane(res, i, &dmabuf->planes[i]);
+            writeback_plane_to_guest(res, i, &dmabuf->planes[i]);
             continue;
         }
 

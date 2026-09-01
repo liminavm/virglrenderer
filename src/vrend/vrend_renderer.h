@@ -562,6 +562,17 @@ struct vrend_resource *vrend_renderer_ctx_res_lookup(struct vrend_context *ctx,
 
 void vrend_renderer_resource_destroy(struct vrend_resource *res);
 
+/* limina: how the guest laid out one plane of a planar format. Chroma planes are
+ * subsampled, so a plane's own width/height are not the resource's. Shared with
+ * vrend_video, which has to answer the same question per decoded plane. */
+struct guest_plane {
+   uint32_t width, height, bpp;
+};
+
+void vrend_guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
+                              struct guest_plane planes[VIRGL_GBM_MAX_PLANES],
+                              uint32_t *plane_count);
+
 static inline void
 vrend_resource_reference(struct vrend_resource **ptr, struct vrend_resource *tex)
 {
