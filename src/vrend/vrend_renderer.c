@@ -2860,6 +2860,24 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
        * just below; the texture-view path then refuses the view for having no layers, and
        * a refused CREATE_OBJECT puts the whole context in error -- every later submission
        * on it fails. One chroma plane is enough to take a browser down for its lifetime. */
+      /* Which plane of a planar surface this view samples, or -1 for an ordinary view.
+       * Two signals are needed because the guest cannot send the first one for plane 0:
+       * virgl_encode_sampler_view writes metadata.plane only when it is nonzero. The
+       * second is the view's own format — a component format on a planar resource is a
+       * plane request and can be nothing else, and for a two-plane surface it names the
+       * plane by itself. Both are gated on an aux image actually being there, so a
+       * resource that was never given planes cannot reach this path however it is
+       * sampled. */
+      int aux_plane = -1;
+      if (res->aux_plane_egl_image[0]) {
+         const bool indexed = view->u.tex.last_layer < view->u.tex.first_layer;
+         const uint32_t plane = indexed ? view->u.tex.first_layer : 0;
+         if ((indexed || view->format != res->base.format) &&
+             plane < ARRAY_SIZE(res->aux_plane_egl_image) &&
+             res->aux_plane_egl_image[plane])
+            aux_plane = (int)plane;
+      }
+
       if (view->u.tex.last_layer < view->u.tex.first_layer) {
          const uint32_t plane = view->u.tex.first_layer;
 
@@ -2871,7 +2889,27 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
       if (view->u.tex.first_layer > 0 || view->u.tex.first_level > 0)
          needs_view = true;
 
-      if (needs_view &&
+      /* Ahead of the texture-view branch, not below it: the index that selects a plane is
+       * exactly what sets needs_view, and glTextureView would then be asked for a
+       * zero-layer view and refuse — which puts the whole context in error for its
+       * lifetime. The GBM path below reaches its aux bind only because its EGLImage
+       * fallback strips GL_IMMUTABLE; ours keeps it. */
+      if (aux_plane >= 0) {
+         glGenTextures(1, &view->gl_id);
+         glBindTexture(view->target, view->gl_id);
+         glEGLImageTargetTexture2DOES(view->target,
+                                      (GLeglImageOES)res->aux_plane_egl_image[aux_plane]);
+         /* The plane is a one- or two-component texture and the guest's view says which
+          * of its channels land where — dropping the swizzle here would silently zero
+          * whatever the shader reads past the components the plane has. */
+         if (vrend_state.use_gles) {
+            for (unsigned int i = 0; i < 4; ++i)
+               glTexParameteri(view->target, GL_TEXTURE_SWIZZLE_R + i, view->gl_swizzle[i]);
+         } else {
+            glTexParameteriv(view->target, GL_TEXTURE_SWIZZLE_RGBA, view->gl_swizzle);
+         }
+         glBindTexture(view->target, 0);
+      } else if (needs_view &&
           has_bit(view->texture->storage_bits, VREND_STORAGE_GL_IMMUTABLE) &&
           has_feature(feat_texture_view)) {
         GLenum internalformat = tex_conv_table[format].internalformat;
@@ -9355,6 +9393,15 @@ struct vkr_mtl_iosurface;
 struct vkr_mtl_iosurface *
 vkr_mtl_iosurface_alloc_plain(uint32_t width, uint32_t height,
                               uint32_t iosurface_pixel_format, uint32_t bytes_per_element);
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_planar(uint32_t width, uint32_t height,
+                               uint32_t iosurface_pixel_format, uint32_t plane_count,
+                               const uint32_t *plane_width, const uint32_t *plane_height,
+                               const uint32_t *plane_bpe, uint32_t *out_stride,
+                               uint32_t *out_offset);
+int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane,
+                                  const void *src, uint32_t src_stride, uint32_t rows,
+                                  uint32_t row_bytes);
 void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 /* From vkr_budget: charge what follows to the shared classic-resource bucket rather than
  * to whichever venus context this thread served last. */
@@ -9425,11 +9472,96 @@ static bool vrend_iosurface_enabled(void)
    return cached != 0;
 }
 
+/* The fourccs the per-plane EGL import names a plane's texture format with. These are DRM
+ * fourccs (first character in the LOW byte) and must match egl_dri2.c's
+ * LIMINA_DRM_FORMAT_*; they are deliberately not IOSurface pixel formats, which pack the
+ * other way round. */
+#define LIMINA_FOURCC(a, b, c, d)                                                        \
+   ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#define LIMINA_DRM_FORMAT_R8 LIMINA_FOURCC('R', '8', ' ', ' ')
+#define LIMINA_DRM_FORMAT_GR88 LIMINA_FOURCC('G', 'R', '8', '8')
+
+/* Back a planar video surface's planes with one IOSurface, additively: each plane gets its
+ * own EGLImage in aux_plane_egl_image, and the resource's own texture is left alone.
+ *
+ * Additive because both consumers are live and want different things. A guest sampling the
+ * composite format reads the RGBA the host converts into the base texture
+ * (yuv_planar_formats + guest_pixels_convert_yuv); a guest that imported the target's planes
+ * as separate component-format resources asks for plane N by index, and until now there was
+ * no image to answer with, so the index was cleared and its chroma view sampled luma.
+ * Replacing the base texture's storage would fix the second by breaking the first. */
+static void vrend_resource_iosurface_init_planes(struct vrend_resource *gr,
+                                                 enum virgl_formats format)
+{
+   /* NV12 and NV21 only. The three-plane formats would work the same way, but P010 would
+    * not: its planes are 16-bit, so a plane imported as R8/GR88 would address half a row.
+    * Refuse what is not modelled rather than mis-address it. */
+   if (format != VIRGL_FORMAT_NV12 && format != VIRGL_FORMAT_NV21)
+      return;
+   if (gr->base.target != PIPE_TEXTURE_2D || gr->base.last_level != 0 ||
+       gr->base.nr_samples > 1 || gr->base.depth0 != 1)
+      return;
+   if (!egl)
+      return;
+
+   const uint32_t w = gr->base.width0, h = gr->base.height0;
+   const uint32_t plane_width[2] = { w, (w + 1) / 2 };
+   const uint32_t plane_height[2] = { h, (h + 1) / 2 };
+   const uint32_t plane_bpe[2] = { 1, 2 };
+   const uint32_t plane_fourcc[2] = { LIMINA_DRM_FORMAT_R8, LIMINA_DRM_FORMAT_GR88 };
+
+   /* Same context-less path as the plain allocation below: bill the surface to the shared
+    * classic bucket, not to whichever venus context this thread served last. */
+   vkr_budget_set_vrend();
+
+   uint32_t stride[VIRGL_GBM_MAX_PLANES] = { 0 };
+   uint32_t offset[VIRGL_GBM_MAX_PLANES] = { 0 };
+   struct vkr_mtl_iosurface *surf = vkr_mtl_iosurface_alloc_planar(
+      w, h, '420f', 2, plane_width, plane_height, plane_bpe, stride, offset);
+   if (!surf)
+      return;
+
+   void *images[2] = { NULL, NULL };
+   for (uint32_t i = 0; i < 2; i++) {
+      images[i] = virgl_egl_image_from_iosurface(egl, vkr_mtl_iosurface_get_ref(surf), i,
+                                                 plane_fourcc[i]);
+      if (!images[i]) {
+         virgl_warn("iosurface planes: %ux%u %s plane %u refused (egl err 0x%x), "
+                    "keeping the converting path\n",
+                    w, h, util_format_name(format), i, virgl_egl_error_code(egl));
+         for (uint32_t j = 0; j < i; j++)
+            virgl_egl_image_destroy(egl, images[j]);
+         vkr_mtl_iosurface_free(surf);
+         return;
+      }
+   }
+
+   for (uint32_t i = 0; i < 2; i++) {
+      gr->aux_plane_egl_image[i] = images[i];
+      gr->iosurf_plane_stride[i] = stride[i];
+   }
+   gr->iosurf_planes = 2;
+   gr->iosurface = surf;
+   gr->iosurf_pbo = 0;
+   virgl_info("iosurface planes: %ux%u %s two-plane EGL-backed (IOSurface id %u), "
+              "plane views sample the surface directly\n",
+              w, h, util_format_name(format), vkr_mtl_iosurface_get_id(surf));
+}
+
 static void vrend_resource_iosurface_init(struct vrend_resource *gr,
                                           enum virgl_formats format)
 {
    if (!vrend_iosurface_enabled())
       return;
+
+   /* A decode target is neither a scanout nor shared, so it never reaches the bind gate
+    * below; its planar format is what identifies it, and nothing else carries one. */
+   if (format == VIRGL_FORMAT_NV12 || format == VIRGL_FORMAT_NV21 ||
+       format == VIRGL_FORMAT_IYUV || format == VIRGL_FORMAT_YV12 ||
+       format == VIRGL_FORMAT_P010) {
+      vrend_resource_iosurface_init_planes(gr, format);
+      return;
+   }
 
    /* SCANOUT is the compositor's own KMS framebuffer. SHARED is every buffer gbm hands
     * out — gbm_bo_create sets __DRI_IMAGE_USE_SHARE unconditionally ("Gallium drivers
@@ -14936,6 +15068,54 @@ guest_pixels_convert_yuv(struct vrend_resource *gr,
    return ok;
 }
 
+/* Copy the guest's planes into the IOSurface backing this resource's plane views, so a
+ * guest sampling the planes sees the same frame the converted base texture shows. The copy
+ * is what phase 3 removes, by decoding into the surface instead; until then it is what
+ * makes the two consumers agree. Best-effort: a plane that will not copy leaves the
+ * surface holding the previous frame, which is a stale picture and not a broken one. */
+static void
+vrend_resource_write_iosurface_planes(struct vrend_resource *gr,
+                                      const struct guest_plane *planes,
+                                      uint32_t plane_count)
+{
+#ifdef __APPLE__
+   if (!gr->iosurf_planes || !gr->iosurface)
+      return;
+   if (plane_count > gr->iosurf_planes)
+      plane_count = gr->iosurf_planes;
+
+   for (uint32_t p = 0; p < plane_count; p++) {
+      const size_t row = (size_t)planes[p].width * planes[p].bpp;
+      const size_t stride = gr->guest_pixels_stride[p] ? gr->guest_pixels_stride[p] : row;
+      uint8_t *buf = malloc(row * planes[p].height);
+      if (!buf)
+         return;
+
+      bool ok = true;
+      for (uint32_t y = 0; y < planes[p].height && ok; y++) {
+         const size_t off = gr->guest_pixels_offset[p] + (size_t)y * stride;
+         ok = vrend_read_from_iovec(gr->iov, gr->num_iovs, off,
+                                    (char *)buf + (size_t)y * row, row) == row;
+      }
+      if (ok)
+         ok = vkr_mtl_iosurface_plane_write(gr->iosurface, p, buf, (uint32_t)row,
+                                            planes[p].height, (uint32_t)row) != 0;
+      free(buf);
+      if (!ok) {
+         virgl_warn("iosurface planes: plane %u of a %ux%u %s target did not copy; "
+                    "its plane views hold the previous frame\n",
+                    p, gr->base.width0, gr->base.height0,
+                    util_format_name(gr->base.format));
+         return;
+      }
+   }
+#else
+   (void)gr;
+   (void)planes;
+   (void)plane_count;
+#endif
+}
+
 static bool
 vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
 {
@@ -15003,6 +15183,9 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
       free(staging);
       return false;
    }
+
+   if (yuv)
+      vrend_resource_write_iosurface_planes(gr, planes, plane_count);
 
    /* This can run in the middle of binding a draw's samplers, so leave the
     * texture unit exactly as it was — unbinding to 0 would silently drop a

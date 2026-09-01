@@ -105,6 +105,34 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
                               uint32_t iosurface_pixel_format,
                               uint32_t bytes_per_element);
 
+#define VKR_MTL_MAX_PLANES 3
+
+/* Write `rows` rows of `row_bytes` from `src` (of stride `src_stride`) into one plane of a
+ * planar IOSurface. Returns 0 if the plane does not exist or the row does not fit. */
+int
+vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf,
+                              uint32_t plane,
+                              const void *src,
+                              uint32_t src_stride,
+                              uint32_t rows,
+                              uint32_t row_bytes);
+
+/* Allocate a multi-planar IOSurface (no Metal texture), dictating each plane's pitch and
+ * offset rather than letting IOSurface choose: the guest is handed this layout and
+ * addresses the planes by it. Writes the accepted per-plane stride and offset into
+ * out_stride/out_offset (both at least VKR_MTL_MAX_PLANES long) and returns NULL if
+ * IOSurface would not honour the layout. Free with vkr_mtl_iosurface_free. */
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_planar(uint32_t width,
+                               uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint32_t plane_count,
+                               const uint32_t *plane_width,
+                               const uint32_t *plane_height,
+                               const uint32_t *plane_bpe,
+                               uint32_t *out_stride,
+                               uint32_t *out_offset);
+
 /* Field accessors for TUs that must not include this (Vulkan-typed) header — vrend
  * forward-declares these instead. */
 uint32_t

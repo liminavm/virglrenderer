@@ -114,6 +114,11 @@ struct vrend_resource {
    void *iosurface;      /* struct vkr_mtl_iosurface *, owned */
    GLuint iosurf_pbo;    /* pinned-memory PBO aliasing the IOSurface bytes */
    GLenum iosurf_read_format; /* glReadPixels format producing display byte order */
+   /* limina: a planar video surface's planes, each with its own EGLImage in
+    * ->aux_plane_egl_image. Nonzero ->iosurf_planes is what marks ->iosurface as
+    * planar; the strides are the surface's own, which the plane writes address by. */
+   uint32_t iosurf_planes;
+   uint32_t iosurf_plane_stride[VIRGL_GBM_MAX_PLANES];
 #endif
 
    uint64_t size;
