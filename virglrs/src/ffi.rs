@@ -101,7 +101,7 @@ fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
         ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned
-        | NoAllocation | NotMappable | ZeroSize => EINVAL,
+        | NoAllocation | NotMappable | ZeroSize | Unmappable => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
     }
 }
