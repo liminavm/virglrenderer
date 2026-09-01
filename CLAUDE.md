@@ -71,6 +71,20 @@ from there on. Where the wire genuinely lets the two disagree, that same boundar
 guest's version is rejected — never averaged, never clamped. The pair may reappear only as the
 arguments of the foreign call that needs it, rebuilt from the single value.
 
+The rule is about state as much as about wire pairs, and that is where it has been learned the
+hard way. Two containers holding one fact, two maps each holding a copy of a handle, two writers
+deciding one thing — each has cost us a bug. The same reconciliation applies: one owner, and
+everything else holds a key to it rather than a copy of it.
+
+**A lifetime mismatch is a design bug, and wants a structural fix.** When something outlives what
+it describes — an id still naming a freed handle, a record surviving the thing it recorded, a
+cached answer outliving what it was true of — the fix is never another purge to remember at
+another destroy site. Adding one leaves the next destroy path to be found by whoever hits it in
+production. Restructure so the stale thing cannot be reached: make one place the owner, have
+everything else name it indirectly, and let a reference to something gone fail on its own. The
+test of a proposed fix is whether a future call site can still get it wrong. If it can, it is a
+patch, not a fix.
+
 **Generated code is generated.** The venus decoder is emitted from templates. Fixing a bug by
 editing generated output puts it somewhere no one will find it and the next regeneration eats
 it. Fix the template.
