@@ -32,6 +32,14 @@ pub const CAPSET_VENUS: u32 = 4;
 /// A context's capset is the low byte of the flags it was created with.
 pub const CAPSET_MASK: u32 = 0xff;
 
+/// `blob_mem` and `fd_type` values, from `virglrenderer.h`. Only the ones the import path accepts
+/// are named; the rest are refused by not being here.
+pub const BLOB_MEM_HOST3D: u32 = 0x0002;
+pub const BLOB_MEM_GUEST_VRAM: u32 = 0x0004;
+pub const BLOB_FD_TYPE_DMABUF: u32 = 0x0001;
+pub const BLOB_FD_TYPE_OPAQUE: u32 = 0x0002;
+pub const BLOB_FD_TYPE_SHM: u32 = 0x0003;
+
 #[repr(C)]
 pub struct GlCtxParam {
     pub major_ver: c_int,
