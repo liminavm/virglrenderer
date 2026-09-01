@@ -57,16 +57,10 @@ impl Vkr {
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
     /// not a guest that gets to keep host memory after it is gone.
     pub fn context_destroy(&mut self, id: CtxId) {
-        let Some(mut ctx) = self.contexts.remove(&id) else {
-            return;
-        };
-        // A context usually dies mid-workload, with the guest still holding everything it made,
-        // so this is the destroy that actually runs -- not a tidy-up after the guest's own.
-        // The table is emptied first, and it is what says which device each object hangs off: the
-        // driver is about to destroy the devices, and afterwards there is nothing left to destroy
-        // anything on.
-        let doomed = ctx.objects().borrow_mut().take_all();
-        ctx.driver_mut().teardown(&doomed);
+        // Dropping it is the teardown -- see `impl Drop for Context`. A context usually dies
+        // mid-workload with the guest still holding everything it made, so this is the destroy
+        // that actually runs, not a tidy-up after the guest's own.
+        self.contexts.remove(&id);
     }
 
     pub fn context(&self, id: CtxId) -> Option<&Context> {

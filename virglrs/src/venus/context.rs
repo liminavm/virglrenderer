@@ -17,15 +17,16 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
-use super::driver::{Driver, NoSyncFd};
+use super::driver::{Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateCommandBuffers,
-    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
-    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory2,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
+    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags, VkObjectType, VkResult,
+    vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
+    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory2,
+    vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
+    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
     vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
@@ -209,6 +210,39 @@ impl Context {
     /// The driver state, for the census that has to read what it holds.
     pub fn driver(&self) -> &Driver {
         &self.driver
+    }
+
+    /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
+    ///
+    /// Here rather than on [`Driver`] because it takes both halves and only this owns both: the
+    /// table says what handle the id names and which device it lives on, and the driver knows how
+    /// big the guest asked for it to be. Neither keeps a copy of the other's answer.
+    pub fn memory_read(&self, id: ObjectId, buf: &mut [u8]) -> Result<usize, MemoryError> {
+        let objects = self.objects.borrow();
+        let handle = objects
+            .get(id)
+            .filter(|o| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY)
+            .map(|o| VkDeviceMemory(o.handle))
+            .ok_or(MemoryError::NoSuchAllocation)?;
+        let device = objects.device_of(id).ok_or(MemoryError::NoSuchAllocation)?;
+        self.driver.memory_read(VkDevice(device), handle, id, buf)
+    }
+}
+
+/// Everything this context stood up on the host goes when the context does.
+///
+/// A teardown a caller had to remember to call was a teardown three of its four paths skipped: the
+/// guest's own context destroy called it, and a duplicate context id replacing a live context, a
+/// renderer dropped with contexts still in it, and a panic on the way up did not -- each leaking
+/// an instance, its devices and every handle under them. None of those paths is going to grow a
+/// call; the drop is the one thing all four already do.
+///
+/// The table is emptied first, and it is what says which device each object hangs off. The driver
+/// is about to destroy the devices, and afterwards there is nothing left to destroy anything on.
+impl Drop for Context {
+    fn drop(&mut self) {
+        let doomed = self.objects.borrow_mut().take_all();
+        self.driver.teardown(&doomed);
     }
 }
 
@@ -583,15 +617,16 @@ impl Commands for Handlers<'_> {
             return;
         };
         let host =
-            self.driver.allocate_memory(args.device, id.0, args.pAllocateInfo, args.pAllocator);
+            self.driver.allocate_memory(args.device, id, args.pAllocateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkAllocateMemory", args.pMemory, args.handle_pMemory, host.map(|m| m.0));
     }
 
     fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory<'_>) {
-        // A null handle is a legal no-op in Vulkan, and the guest sends it: the id is then zero
-        // and the driver's table has nothing under it, so this needs no guard of its own.
-        self.driver.free_memory(args.id_memory.0);
+        // A null handle is a legal no-op in Vulkan, and the guest sends it: the lookup resolved
+        // it to a null handle and the census has nothing under the id, so this needs no guard of
+        // its own.
+        self.driver.free_memory(args.device, args.memory, args.id_memory);
     }
 
     // --------------------------------------------------------------- the simple objects
@@ -1940,6 +1975,69 @@ mod tests {
         });
     }
 
+    /// A context that nobody tore down still gives its host handles back.
+    ///
+    /// Three of the four ways a context ends never called a teardown: a duplicate context id
+    /// replacing a live one, the renderer being dropped with contexts still in it, and a panic on
+    /// the way up. Only the guest's own context destroy did -- so the common ending, a VM stopped
+    /// mid-workload, leaked an instance and every device under it unless the VMM happened to send
+    /// the destroy first. The teardown is the drop now, and this is what says so: nothing here
+    /// calls it, and the destroys still happen.
+    #[test]
+    fn a_context_nobody_tore_down_still_destroys_what_it_stood_up() {
+        use std::cell::RefCell;
+
+        use super::super::proto::types::{VkAllocationCallbacks, VkFence};
+
+        const DEVICE: u64 = 3;
+        const FENCE: (u64, u64) = (11, 0xf0);
+
+        thread_local! { static SAW: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) }; }
+        fn saw(what: &'static str, h: u64) {
+            SAW.with_borrow_mut(|s| s.push((what, h)));
+        }
+
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            saw("wait", 0);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn fence(_d: VkDevice, h: VkFence, _a: *const VkAllocationCallbacks) {
+            saw("fence", h.0);
+        }
+        unsafe extern "C" fn device(h: VkDevice, _a: *const VkAllocationCallbacks) {
+            saw("device", h.0);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyFence(fence);
+        fns.plant_vkDestroyDevice(device);
+
+        let mut ctx = Context::new(CtxId::new(7).expect("7 is not zero"));
+        ctx.driver_mut().plant_device(DEVICE, fns);
+        {
+            let mut t = ctx.objects().borrow_mut();
+            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE, None).unwrap();
+            t.add(
+                ObjectId(FENCE.0),
+                VkObjectType::VK_OBJECT_TYPE_FENCE,
+                FENCE.1,
+                Some(ObjectId(DEVICE)),
+            )
+            .unwrap();
+        }
+
+        drop(ctx);
+
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.as_slice(),
+                [("wait", 0), ("fence", FENCE.1), ("device", DEVICE)],
+                "the drop is the teardown, in the order a teardown owes Vulkan"
+            );
+        });
+    }
+
     /// And an instance takes the whole tree, which is the same rule one level up.
     ///
     /// `vkDestroyInstance` tears the driver down without a command naming a single device,
@@ -2253,6 +2351,9 @@ mod tests {
         args.plant_pViewports(&vps);
         h.vkCmdSetViewport(&mut args);
         assert!(h.reject.is_some(), "there is no device to record into");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
     }
 
     /// What a sync handler hands the driver, and what it does when there is nothing behind the
@@ -2466,5 +2567,8 @@ mod tests {
         h.vkQueueSubmit(&mut args);
         assert!(h.reject.is_some(), "a queue with no device behind it must poison the ring");
         SAW.with_borrow(|s| assert_eq!(s.submits.len(), 1, "and must not reach the driver"));
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
     }
 }
