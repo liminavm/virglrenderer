@@ -14438,8 +14438,13 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
     * guest that allocated real guest memory for one against a host that never writes
     * it back would export an honest-looking fd naming a black frame -- strictly worse
     * than today's refuse-and-fall-back. */
-   if (caps->v2.num_video_caps)
+   if (caps->v2.num_video_caps) {
       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VIDEO_GUEST_PLANES;
+      /* Same gate and nothing more: the storage a composite target needs is
+       * yuv_planar_formats, which vrend_build_format_list_common registers
+       * unconditionally, so a host with a decoder can always take the shape. */
+      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VIDEO_PLANAR_TARGET;
+   }
 #else
    caps->v2.num_video_caps = 0;
 #endif
