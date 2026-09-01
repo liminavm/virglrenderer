@@ -64,6 +64,15 @@ case " $* " in
       [ -f "$cand" ] && LIB="$cand" && break
     done
     [ -n "$LIB" ] || { echo "no libvirglrenderer under $VIRGL_PREFIX" >&2; exit 1; }
+    # This script builds the replayer, never the renderer -- so a prefix laid down by an earlier
+    # install.sh scores whatever was in the tree then, silently. That has already put a claim in
+    # harness/README.md that was measured against a build three commits old. For the Rust prefix
+    # the fix is to build it; for any other, say so and let the caller decide.
+    if [ "$VIRGL_PREFIX" = "$ROOT/virglrs/prefix" ]; then
+      "$ROOT/virglrs/install.sh" >/dev/null
+    elif find "$ROOT/src" -name '*.c' -newer "$LIB" 2>/dev/null | read -r _; then
+      echo "warning: $LIB is older than the C sources it was built from -- stale build" >&2
+    fi
     RENDERER=(--renderer "$LIB")
     ;;
 esac
