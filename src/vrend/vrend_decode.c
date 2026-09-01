@@ -2147,8 +2147,22 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
 #define TRANSFER_HEADER_SIZE 4096
 
    bret = vrend_hw_switch_context(gdctx->grctx, true);
-   if (bret == false)
-      return EINVAL;
+   if (bret == false) {
+      /* TEST LEVER (LIMINA_UNLATCH_CTX=1): sizing whether the sticky in_error is the
+       * last fault in the way of a hardware-decoded picture, or merely the first. */
+      static int unlatch = -1;
+      if (unlatch < 0)
+         unlatch = getenv("LIMINA_UNLATCH_CTX") ? 1 : 0;
+      if (unlatch) {
+         vrend_context_clear_error(gdctx->grctx);
+         bret = vrend_hw_switch_context(gdctx->grctx, true);
+      }
+      if (bret == false) {
+         virgl_warn("submit: ctx %d refused by switch_context (in_error)\n",
+                    gdctx->base.ctx_id);
+         return EINVAL;
+      }
+   }
 
    vrend_renderer_begin_cmd_batch();
 
@@ -2175,8 +2189,11 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
       uint32_t len = *buf >> 16;
       uint32_t cmd = *buf & 0xff;
 
-      if (cmd >= VIRGL_MAX_COMMANDS)
+      if (cmd >= VIRGL_MAX_COMMANDS) {
+         virgl_warn("submit: ctx %d unknown command %u at dword %u\n",
+                    gdctx->base.ctx_id, cmd, cur_offset);
          return EINVAL;
+      }
 
       buf_offset += len + 1;
 

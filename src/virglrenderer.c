@@ -2107,14 +2107,18 @@ int virgl_renderer_submit_cmd2(void *buffer,
 {
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
-   if (!ctx)
+   if (!ctx) {
+      virgl_warn("submit2: ctx %d not found\n", ctx_id);
       return EINVAL;
+   }
 
    if (((uintptr_t)buffer & 3) != 0)
       return EFAULT;
 
-   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t))
+   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t)) {
+      virgl_warn("submit2: ctx %d bad ndw %d\n", ctx_id, ndw);
       return EINVAL;
+   }
 
    if (num_in_fences) {
       int err = virgl_renderer_context_attach_in_fences(ctx, in_fence_ids, num_in_fences);
