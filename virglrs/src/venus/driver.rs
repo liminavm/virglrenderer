@@ -16,10 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::cs::{Handle, ObjectId};
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkDevice, VkDeviceCreateInfo, VkDeviceMemory,
-    VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
+    VkAllocationCallbacks, VkBaseInStructure, VkCopyDescriptorSet, VkDevice, VkDeviceCreateInfo,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
     VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
     VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkQueue, VkResult, VkStructureType,
+    VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -560,6 +561,64 @@ impl Driver {
             self.pool_children.remove(&child);
         }
         self.destroy_object(device, proc, pool, alloc);
+    }
+
+    // ------------------------------------------------------------ binding and updating
+    //
+    // Commands that change an existing object rather than create one. They register nothing and
+    // return no handle, so nothing here touches the object table -- but a submit that draws from
+    // a buffer with no memory bound, or through a descriptor set that was never written, is
+    // undefined behaviour just as surely as one naming a handle that does not exist. Serving
+    // these is what makes a later `vkQueueSubmit` safe to pass through.
+
+    /// Bind memory to a run of buffers or images: `vkBindXMemory2(device, count, infos)`.
+    ///
+    /// Both `vkBindBufferMemory2` and `vkBindImageMemory2` have exactly this shape, which is why
+    /// the entry point arrives as a closure -- the info type is the only thing that differs, and
+    /// it is a type parameter.
+    pub fn bind_memory<I>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, u32, *const I) -> VkResult,
+        count: u32,
+        infos: *const I,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // Binding nothing is legal and the guest sends it. The count is the caller's, already
+        // reconciled against the array it came with, so a zero here means an absent array and
+        // never a pointer this must not read.
+        if count == 0 {
+            return VkResult::VK_SUCCESS;
+        }
+        // SAFETY: `device` is a handle in this table, and `infos` is the decoder's arena array,
+        // sized to `count` and live for this call.
+        unsafe { proc(&d.fns)(device, count, infos) }
+    }
+
+    /// Write and copy descriptors: `vkUpdateDescriptorSets`.
+    ///
+    /// Alone among the commands here it returns nothing -- Vulkan gives it no failure to report,
+    /// because everything it could refuse is a validation error the guest was required not to
+    /// commit. So a device this table does not have is a silent no-op, the same as a destroy.
+    pub fn update_descriptor_sets(
+        &self,
+        device: VkDevice,
+        writes: (u32, *const VkWriteDescriptorSet),
+        copies: (u32, *const VkCopyDescriptorSet),
+    ) {
+        let Some(d) = self.devices.get(&device.0) else {
+            return;
+        };
+        // Both counts are the caller's, each already reconciled against the array it came with.
+        let ((nw, pw), (nc, pc)) = (writes, copies);
+        if nw == 0 && nc == 0 {
+            return;
+        }
+        // SAFETY: `device` is a handle in this table, and both arrays are the decoder's arena
+        // allocations, sized to their counts and live for this call.
+        unsafe { (d.fns.vkUpdateDescriptorSets())(device, nw, pw, nc, pc) };
     }
 
     // ------------------------------------------------------------------- device memory
