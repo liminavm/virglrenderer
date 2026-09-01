@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::fence::{FenceSink, Retirement};
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
+use crate::venus::driver::{Allocation, MemoryError};
 use std::collections::BTreeMap;
 
 /// Why a call failed.
@@ -36,6 +37,10 @@ pub enum Error {
     RendererUnimplemented,
     /// The stream violated the protocol; its context is poisoned and accepts nothing further.
     Poisoned,
+    /// Nothing is allocated under that id in that context.
+    NoAllocation,
+    /// The allocation exists but the driver would not map it; see [`MemoryError::NotMappable`].
+    NotMappable,
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +53,8 @@ impl std::fmt::Display for Error {
             Error::RendererAbsent => "this build was not initialized to serve that capset",
             Error::RendererUnimplemented => "no renderer serves that capset yet",
             Error::Poisoned => "the context is poisoned",
+            Error::NoAllocation => "no such allocation in that context",
+            Error::NotMappable => "that allocation cannot be mapped for reading",
         };
         f.write_str(s)
     }
@@ -348,21 +355,32 @@ impl Renderer {
         self.venus.as_ref().map(|v| v.todo.by_frequency()).unwrap_or_default()
     }
 
-    /// One venus context's live device memory, as (guest id, size).
+    /// One venus context's live device memory.
     ///
-    /// `None` when there is no such venus context, which the ABI reports as a failure -- a census
-    /// of nothing and a census that could not be taken are different answers, and the VMM decides
-    /// whether to snapshot on the difference.
-    pub fn venus_memory_census(&self, ctx_id: CtxId) -> Option<Vec<(u64, u64)>> {
-        Some(self.venus.as_ref()?.context(ctx_id)?.driver().memory_census())
+    /// An empty census and a census that could not be taken are different answers, and the VMM
+    /// decides whether to snapshot on the difference -- so the failure says which it was.
+    pub fn venus_memory_census(&self, ctx_id: CtxId) -> Result<Vec<Allocation>, Error> {
+        Ok(self.venus_context(ctx_id)?.driver().memory_census())
     }
 
-    /// Copy one allocation's contents out. False when the context, the id, or the mapping fails.
-    pub fn venus_memory_read(&self, ctx_id: CtxId, mem_id: u64, buf: &mut [u8]) -> bool {
-        let Some(ctx) = self.venus.as_ref().and_then(|v| v.context(ctx_id)) else {
-            return false;
-        };
-        ctx.driver().memory_read(mem_id, buf)
+    /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
+    pub fn venus_memory_read(
+        &self,
+        ctx_id: CtxId,
+        mem_id: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.venus_context(ctx_id)?.driver().memory_read(mem_id, buf).map_err(|e| match e {
+            MemoryError::NoSuchAllocation => Error::NoAllocation,
+            MemoryError::NotMappable => Error::NotMappable,
+        })
+    }
+
+    /// The venus context under an id, distinguishing "no venus in this build" from "no such
+    /// context" -- which a caller asking for a snapshot needs to tell apart.
+    fn venus_context(&self, ctx_id: CtxId) -> Result<&venus::context::Context, Error> {
+        let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
+        v.context(ctx_id).ok_or(Error::NoContext)
     }
 }
 
