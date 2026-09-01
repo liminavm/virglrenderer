@@ -25,6 +25,7 @@ reply-oracle = ["dep:cc"]
 
 [dependencies]
 bumpalo = "3.20"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 libc = "0.2"
 
 [build-dependencies]

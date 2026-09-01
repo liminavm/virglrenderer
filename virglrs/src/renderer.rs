@@ -146,30 +146,31 @@ impl Renderer {
         }
     }
 
-    /// Which capsets this build advertises, given the flags it was initialized with.
+    /// What this build advertises for a capset, or `None` for one it does not serve.
     ///
     /// Honest by construction: a capset appears only when the renderer that serves it is present.
     /// A skeleton that claimed VIRGL2 would have the guest bind a classic context and submit
     /// commands into a renderer that cannot answer them.
-    pub fn capset_max(&self, set: CapsetId) -> Option<(u32, u32)> {
+    ///
+    /// The struct, not its bytes. A caller that wants to read a field reads a field, and one about
+    /// to hand the image to a guest asks for the bytes at that moment -- which is the only point
+    /// at which the layout matters, and is never here. The version a C caller names is checked at
+    /// the shim, where a requested version is a thing that exists.
+    pub fn capset(&self, set: CapsetId) -> Option<venus::capset::Capset> {
         match set {
-            CapsetId::Venus if self.venus.is_some() => {
-                Some((venus::capset::VERSION, venus::capset::size()))
-            }
+            CapsetId::Venus => self.venus.as_ref().map(|_| venus::capset::Capset::new(self.config)),
             _ => None,
         }
     }
 
-    /// The capset's bytes, for a set this build advertises. `None` for anything else -- the caller
-    /// sized its buffer from `capset_max`, so writing into a buffer for a capset we reported as
-    /// absent would run off the end of it.
-    pub fn capset_bytes(&self, set: CapsetId, version: u32) -> Option<Vec<u8>> {
-        match set {
-            CapsetId::Venus if self.config.venus && version == venus::capset::VERSION => {
-                Some(venus::capset::Capset::new(self.config).as_bytes().to_vec())
-            }
-            _ => None,
-        }
+    /// The version and size a caller sizes its buffer from, for a capset this build serves.
+    ///
+    /// Asks [`Renderer::capset`] rather than testing a flag of its own. Advertising a capset and
+    /// filling one were two answers to "does this build serve venus" -- one read the config, the
+    /// other read whether the renderer existed -- and a VMM that sized a buffer from the first and
+    /// got nothing from the second would hand its guest an uninitialised capset.
+    pub fn capset_max(&self, set: CapsetId) -> Option<(u32, u32)> {
+        self.capset(set).map(|_| (venus::capset::VERSION, venus::capset::size()))
     }
 
     // ---- resources ----
@@ -403,5 +404,61 @@ pub fn unsupported_renderers(config: Config) -> &'static str {
         (true, false) => "venus serves only part of the protocol",
         (false, true) => "no vrend",
         (false, false) => "no renderer asked for",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sink that goes nowhere. Nothing here retires a fence; the renderer needs one to exist.
+    struct NoSink;
+    impl FenceSink for NoSink {
+        fn context_fence(&mut self, _ctx: CtxId, _ring: RingIdx, _fence: FenceId) {}
+        fn global_fence(&mut self, _fence: ClientFenceId) {}
+    }
+
+    fn renderer(config: Config) -> Renderer {
+        Renderer::new(Box::new(NoSink), config)
+    }
+
+    /// A capset is advertised and filled by the same predicate.
+    ///
+    /// They were two: the size a VMM sizes its buffer from asked whether the venus renderer
+    /// existed, and the fill asked whether the config had venus set. They agree today only
+    /// because one is built from the other at construction -- and the day they stopped agreeing,
+    /// a VMM would size a buffer from the first and get nothing back from the second, handing its
+    /// guest whatever was already in that memory as a capset.
+    #[test]
+    fn a_capset_is_advertised_by_whatever_would_fill_it() {
+        let venus = Config { venus: true, ..Config::default() };
+        let r = renderer(venus);
+        assert!(r.capset(CapsetId::Venus).is_some(), "this build serves venus");
+        assert_eq!(
+            r.capset_max(CapsetId::Venus),
+            Some((venus::capset::VERSION, venus::capset::size())),
+            "and says so at exactly the size the fill will write"
+        );
+
+        // Nothing else is served, by either answer.
+        for set in [CapsetId::Virgl, CapsetId::Virgl2, CapsetId::Unknown(9)] {
+            assert!(r.capset(set).is_none(), "{set:?} has no renderer behind it");
+            assert!(r.capset_max(set).is_none(), "{set:?} must not be advertised either");
+        }
+
+        // And a build without venus advertises nothing at all, rather than a size it cannot fill.
+        let bare = renderer(Config::default());
+        assert!(bare.capset(CapsetId::Venus).is_none());
+        assert!(bare.capset_max(CapsetId::Venus).is_none());
+    }
+
+    /// What the guest reads is the configuration it was given, through the struct the Rust API
+    /// hands over -- no serialization in between, which is the point of handing over the struct.
+    #[test]
+    fn the_capset_a_caller_receives_carries_the_configuration() {
+        let on = Config { venus: true, guest_vram: true, ..Config::default() };
+        let c = renderer(on).capset(CapsetId::Venus).expect("venus is served");
+        assert_eq!(c.use_guest_vram, 1, "a field, read as a field");
+        assert_eq!(c.as_bytes().len(), venus::capset::size() as usize);
     }
 }
