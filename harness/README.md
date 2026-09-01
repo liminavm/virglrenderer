@@ -83,11 +83,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   named one.
 
   **It measures that a command was accounted for, not that it was carried out correctly.** Measured
-  by sabotage: an array accessor handing a handler one element more than the guest sent replays both
-  corpora with every command accepted and the census unchanged, and so does one handing back an
-  empty array for every count. Anything about the *contents* a handler passes to the driver needs
-  its own witness — a unit test beside the handler — until the census covers enough served state to
-  be pinned. `venus-roundtrip` does not help there either: it never calls a handler.
+  by sabotage: every array accessor cut to hand its handler one element fewer than the guest sent
+  replays both corpora at `cmds 506657/506657` and `1348/1348` with the census unchanged. Anything
+  about the *contents* a handler passes to the driver needs its own witness — a unit test beside the
+  handler — until the census covers enough served state to be pinned. `venus-roundtrip` does not
+  help there either: it never calls a handler.
+
+  The seam for those witnesses is generated: `Device::plant_<cmd>` puts a stub entry point in a proc
+  table, `Driver::plant_device`/`plant_pool` give it something to be reached through, and
+  `vn_command_X::plant_<array>` fills an argument struct whose pointers the handlers cannot see.
+  `a_recording_handler_hands_the_driver_what_the_guest_sent` reads back what crossed over.
 
   The witness has a seam to hang off: `Device::plant_*` puts a plain function of the entry point's
   own shape into a proc table, and `Driver::plant_device`/`plant_pool` stand that table up as a
