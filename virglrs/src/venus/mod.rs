@@ -14,4 +14,5 @@ pub mod cs;
 pub mod driver;
 pub mod objects;
 pub mod proto;
+pub mod ring;
 pub mod vkr;
