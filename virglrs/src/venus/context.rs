@@ -17,6 +17,7 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
+use super::cs::wire_array;
 use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -328,23 +329,19 @@ impl Handlers<'_> {
     /// will reach needs a decision recorded against it. The ones a short answer did not fill, and
     /// all of them when the enumeration failed outright, are refusals: left alone they would be
     /// registered as their own handles and the guest would hold objects that do not exist.
-    /// An array argument the guest sent, checked against the count it claimed.
+    /// The array a command carries, as a slice -- or a refusal when the guest counted one it did
+    /// not send.
     ///
-    /// The decoder nulls the pointer when the guest encoded the array as absent, and leaves the
-    /// claimed count where it was -- so the pair can disagree, and a driver handed the pair walks
-    /// off the end of nothing. Absent-and-zero is the ordinary optional array and passes through
-    /// as an empty one. Absent-but-counted is a command that cannot be carried out, and refusing
-    /// it is the honest answer: doing nothing and reporting success would leave the guest drawing
-    /// from buffers it believes are bound.
-    fn counted<T>(&mut self, count: u32, ptr: *const T) -> Option<u32> {
-        if !ptr.is_null() {
-            return Some(count);
-        }
-        if count != 0 {
+    /// The reconciliation itself is [`wire_array`]; what this adds is the verdict. A count with no
+    /// array behind it is a command that cannot be carried out, and refusing it is the only honest
+    /// answer: doing nothing and reporting success would leave the guest drawing through binds and
+    /// writes that never happened.
+    fn array<'w, T>(&mut self, count: u32, ptr: *const T) -> Option<&'w [T]> {
+        let a = wire_array(count, ptr);
+        if a.is_none() {
             self.reject = Some("counted an array it did not send");
-            return None;
         }
-        Some(0)
+        a
     }
 
     fn ghost_range<T: Handle>(&mut self, out: *const T, range: core::ops::Range<usize>) {
@@ -731,29 +728,23 @@ impl Commands for Handlers<'_> {
     // undefined behaviour at draw time, not errors the driver reports.
 
     fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2) {
-        let Some(n) = self.counted(args.bindInfoCount, args.pBindInfos) else { return };
-        args.ret =
-            self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), n, args.pBindInfos);
+        let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
+        args.ret = self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
     fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2) {
-        let Some(n) = self.counted(args.bindInfoCount, args.pBindInfos) else { return };
-        args.ret =
-            self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), n, args.pBindInfos);
+        let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
+        args.ret = self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
     fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets) {
-        let Some(nw) = self.counted(args.descriptorWriteCount, args.pDescriptorWrites) else {
+        let Some(writes) = self.array(args.descriptorWriteCount, args.pDescriptorWrites) else {
             return;
         };
-        let Some(nc) = self.counted(args.descriptorCopyCount, args.pDescriptorCopies) else {
+        let Some(copies) = self.array(args.descriptorCopyCount, args.pDescriptorCopies) else {
             return;
         };
-        self.driver.update_descriptor_sets(
-            args.device,
-            (nw, args.pDescriptorWrites),
-            (nc, args.pDescriptorCopies),
-        );
+        self.driver.update_descriptor_sets(args.device, writes, copies);
     }
 }
 

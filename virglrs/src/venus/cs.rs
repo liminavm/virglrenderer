@@ -256,6 +256,34 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// The array a decoded command carries, reconciled into a slice.
+///
+/// A decoded command holds an array the way the wire spells it: the guest's count, and separately
+/// a pointer that is null when the guest encoded the array as absent. The two are independent on
+/// the wire -- "no array, count 7" is a thing a guest can send, and a slice cannot express it --
+/// so the generated structs have to keep them apart. Nothing above the decoder should: past here
+/// an array is a slice, and a length that disagrees with its contents is unrepresentable.
+///
+/// `None` is exactly that disagreement -- an array the guest counted and did not send. It is a
+/// command that cannot be carried out, never an empty one: a caller that treated it as empty
+/// would report a bind or a write that never happened.
+///
+/// Lives here rather than beside the handlers because the invariant it rests on is the decoder's:
+/// this module allocated the array, and knows how long it lives.
+// Safe rather than `unsafe fn` for the reason `driver.rs` gives at its own module head: the
+// invariant is the decoder's and holds for every caller by construction, and marking it unsafe
+// would push an `unsafe` block into every one of the handlers that carries an array.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn wire_array<'a, T>(count: u32, ptr: *const T) -> Option<&'a [T]> {
+    if ptr.is_null() {
+        return (count == 0).then_some(&[]);
+    }
+    // SAFETY: every array pointer in a decoded command is one `alloc_temp_array` returned, sized
+    // to the count decoded beside it, in the batch arena -- which outlives the submission and so
+    // outlives any `'a` a handler can hold the slice for.
+    Some(unsafe { core::slice::from_raw_parts(ptr, count as usize) })
+}
+
 /// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
 /// cannot parse.
 ///

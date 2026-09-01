@@ -571,7 +571,7 @@ impl Driver {
     // undefined behaviour just as surely as one naming a handle that does not exist. Serving
     // these is what makes a later `vkQueueSubmit` safe to pass through.
 
-    /// Bind memory to a run of buffers or images: `vkBindXMemory2(device, count, infos)`.
+    /// Bind memory to a run of buffers or images: `vkBindXMemory2`.
     ///
     /// Both `vkBindBufferMemory2` and `vkBindImageMemory2` have exactly this shape, which is why
     /// the entry point arrives as a closure -- the info type is the only thing that differs, and
@@ -580,21 +580,18 @@ impl Driver {
         &self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, u32, *const I) -> VkResult,
-        count: u32,
-        infos: *const I,
+        infos: &[I],
     ) -> VkResult {
         let Some(d) = self.devices.get(&device.0) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
-        // Binding nothing is legal and the guest sends it. The count is the caller's, already
-        // reconciled against the array it came with, so a zero here means an absent array and
-        // never a pointer this must not read.
-        if count == 0 {
+        // Binding nothing is legal and the guest sends it.
+        if infos.is_empty() {
             return VkResult::VK_SUCCESS;
         }
-        // SAFETY: `device` is a handle in this table, and `infos` is the decoder's arena array,
-        // sized to `count` and live for this call.
-        unsafe { proc(&d.fns)(device, count, infos) }
+        // SAFETY: `device` is a handle in this table, and the count and array Vulkan wants are
+        // the slice's own -- which is the whole reason the pair is not carried this far.
+        unsafe { proc(&d.fns)(device, infos.len() as u32, infos.as_ptr()) }
     }
 
     /// Write and copy descriptors: `vkUpdateDescriptorSets`.
@@ -605,20 +602,25 @@ impl Driver {
     pub fn update_descriptor_sets(
         &self,
         device: VkDevice,
-        writes: (u32, *const VkWriteDescriptorSet),
-        copies: (u32, *const VkCopyDescriptorSet),
+        writes: &[VkWriteDescriptorSet],
+        copies: &[VkCopyDescriptorSet],
     ) {
         let Some(d) = self.devices.get(&device.0) else {
             return;
         };
-        // Both counts are the caller's, each already reconciled against the array it came with.
-        let ((nw, pw), (nc, pc)) = (writes, copies);
-        if nw == 0 && nc == 0 {
+        if writes.is_empty() && copies.is_empty() {
             return;
         }
-        // SAFETY: `device` is a handle in this table, and both arrays are the decoder's arena
-        // allocations, sized to their counts and live for this call.
-        unsafe { (d.fns.vkUpdateDescriptorSets())(device, nw, pw, nc, pc) };
+        // SAFETY: `device` is a handle in this table, and each count is its own slice's length.
+        unsafe {
+            (d.fns.vkUpdateDescriptorSets())(
+                device,
+                writes.len() as u32,
+                writes.as_ptr(),
+                copies.len() as u32,
+                copies.as_ptr(),
+            )
+        };
     }
 
     // ------------------------------------------------------------------- device memory
