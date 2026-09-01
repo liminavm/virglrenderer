@@ -626,30 +626,23 @@ pub extern "C" fn virgl_renderer_submit_cmd(
     ctx_id: c_int,
     ndw: c_int,
 ) -> c_int {
-    let Some(buf) = cmd_slice(buffer, ndw) else {
-        return EINVAL;
-    };
     // vrend's global context arrives in P3; until then this ABI has no global to submit to.
     let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.submit_cmd(id, buf) {
-        Ok(()) => 0,
-        Err(e) => errno(e),
+    with_cmd_bytes(buffer, ndw, |buf| {
+        with(EINVAL, |r| match r.submit_cmd(id, buf) {
+            Ok(()) => 0,
+            Err(e) => errno(e),
+        })
     })
+    .unwrap_or(EINVAL)
 }
 
 /// A submission as the ABI describes it: a pointer and a length in *dwords*, not bytes.
-///
-/// Returning `None` rather than an empty slice for a null pointer is deliberate -- a null buffer
-/// with a non-zero length is a caller bug, and treating it as "nothing to do" would hide it.
-fn cmd_slice<'a>(buffer: *mut c_void, ndw: c_int) -> Option<&'a [u8]> {
-    if buffer.is_null() || ndw < 0 {
-        return None;
-    }
-    // SAFETY: the caller owns this buffer and promised it holds `ndw` dwords. It is only read, and
-    // the borrow does not outlive the call the slice is passed into.
-    Some(unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), ndw as usize * 4) })
+fn with_cmd_bytes<R>(buffer: *mut c_void, ndw: c_int, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let dwords = usize::try_from(ndw).ok()?;
+    with_bytes(buffer, dwords * 4, f)
 }
 
 #[unsafe(no_mangle)]
@@ -856,16 +849,16 @@ pub extern "C" fn virgl_renderer_limina_replay_submit(
     cmd: *mut c_void,
     size: u32,
 ) -> c_int {
-    let Some(buf) = byte_slice(cmd, size) else {
-        return EINVAL;
-    };
     let Some(ctx) = CtxId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(ctx, buf)) {
-        Some(Ok(())) => 0,
-        _ => EINVAL,
+    with_bytes(cmd, size as usize, |buf| {
+        with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(ctx, buf)) {
+            Some(Ok(())) => 0,
+            _ => EINVAL,
+        })
     })
+    .unwrap_or(EINVAL)
 }
 
 #[unsafe(no_mangle)]
@@ -875,19 +868,19 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
     cmd: *mut c_void,
     size: u32,
 ) -> c_int {
-    let Some(buf) = byte_slice(cmd, size) else {
-        return EINVAL;
-    };
     // The ring id is the guest's 64-bit ring object; the index is what fences are keyed by. Until
     // a ring loop exists there is nothing to key, so the command is dispatched directly.
     let ring = RingIdx(ring_id as u32);
     let Some(ctx) = CtxId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(ctx, ring, buf)) {
-        Some(Ok(())) => 0,
-        _ => EINVAL,
+    with_bytes(cmd, size as usize, |buf| {
+        with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(ctx, ring, buf)) {
+            Some(Ok(())) => 0,
+            _ => EINVAL,
+        })
     })
+    .unwrap_or(EINVAL)
 }
 
 #[unsafe(no_mangle)]
@@ -901,14 +894,24 @@ pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
     })
 }
 
-/// A buffer the caller owns, as bytes. See [`cmd_slice`] for why null is `None`.
-fn byte_slice<'a>(p: *mut c_void, size: u32) -> Option<&'a [u8]> {
+/// Runs `f` on a buffer the caller owns, as bytes.
+///
+/// The slice goes to a closure rather than being returned because a returned `&'a [u8]` has no
+/// borrow to anchor `'a` to: the lifetime is chosen by the caller, so nothing stops it being
+/// inferred as `'static` and the slice outliving the call the VMM guaranteed it for. The bound
+/// here is higher-ranked over the slice's lifetime, so `R` cannot name it -- an attempt to let the
+/// slice escape is a compile error rather than a convention to remember.
+///
+/// Returning `None` rather than running `f` on an empty slice for a null pointer is deliberate --
+/// a null buffer with a non-zero length is a caller bug, and treating it as "nothing to do" would
+/// hide it.
+fn with_bytes<R>(p: *mut c_void, len: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     if p.is_null() {
         return None;
     }
-    // SAFETY: the caller owns this buffer and promised it holds `size` bytes. It is only read, and
-    // the borrow does not outlive the call the slice is passed into.
-    Some(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), size as usize) })
+    // SAFETY: the caller owns this buffer and promised it holds `len` bytes. It is only read, and
+    // the slice cannot escape `f`.
+    Some(f(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) }))
 }
 
 #[unsafe(no_mangle)]
