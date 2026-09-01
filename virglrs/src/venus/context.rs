@@ -276,7 +276,7 @@ impl Handlers<'_> {
     ///
     /// A guest pipelines: it sends a create and the commands using it without waiting for an
     /// answer, so those are already in flight when the create fails. A ghost turns each of them
-    /// into one lost command instead of a poisoned ring -- see `objects::Table::ghosts`. Leaving
+    /// into one lost command instead of a poisoned ring -- see `objects::Slot::Ghost`. Leaving
     /// the shadow zero would instead register the id as its own handle, which is the unserved
     /// command's fiction and a lie for a served one.
     fn plant<T: Handle>(
