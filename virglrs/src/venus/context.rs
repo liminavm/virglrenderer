@@ -338,6 +338,20 @@ impl Handlers<'_> {
     /// not fill, and all of them when the call failed outright, are refusals: left alone they
     /// would be registered as their own handles and the guest would hold objects that do not
     /// exist. A zero id is not one the guest can name, and [`Table::add_ghost`] drops it.
+    /// Take a run of ids out of the object table because the thing that owned them is gone.
+    ///
+    /// Destroying a pool destroys its objects, and destroying a device destroys its pools -- both
+    /// without a command naming any of the objects. Their entries have to go at that moment, or
+    /// the table keeps resolving an id to a handle the driver has freed and the next command
+    /// naming one hands it back to Vulkan. Afterwards the id resolves to nothing, and a guest
+    /// that names it stops its own ring, which is what the C does too.
+    fn forget(&mut self, orphans: Vec<ObjectId>) {
+        let mut table = self.objects.borrow_mut();
+        for id in orphans {
+            table.remove(id);
+        }
+    }
+
     fn ghost_ids<T: Handle>(&mut self, ids: &[T]) {
         for id in ids {
             self.objects.borrow_mut().add_ghost(ObjectId(id.raw()));
@@ -386,7 +400,9 @@ macro_rules! pool_create {
 macro_rules! pool_destroy {
     ($cmd:ident, $args:ty, $target:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
-            self.driver.destroy_pool(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
+            let orphans =
+                self.driver.destroy_pool(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
+            self.forget(orphans);
         }
     };
 }
@@ -494,7 +510,8 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
-        self.driver.destroy_device(args.device);
+        let orphans = self.driver.destroy_device(args.device);
+        self.forget(orphans);
     }
 
     // ------------------------------------------------------------------- device memory
@@ -665,9 +682,18 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, info) = (args.device, args.pAllocateInfo);
         let pool = self.pool_of(info, |i| i.commandPool.raw());
+        // The pool records both names of every object it holds, so that destroying it can take
+        // the guest's out of the object table. Built before the shadow is borrowed.
+        let named: Vec<ObjectId> = ids.iter().map(|h| ObjectId(h.raw())).collect();
         let Some(out) = self.array(args.handle_pCommandBuffers_mut()) else { return };
-        let host =
-            self.driver.allocate_objects(device, pool, |d| d.vkAllocateCommandBuffers(), info, out);
+        let host = self.driver.allocate_objects(
+            device,
+            pool,
+            |d| d.vkAllocateCommandBuffers(),
+            info,
+            out,
+            &named,
+        );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");
@@ -690,9 +716,18 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, info) = (args.device, args.pAllocateInfo);
         let pool = self.pool_of(info, |i| i.descriptorPool.raw());
+        // The pool records both names of every object it holds, so that destroying it can take
+        // the guest's out of the object table. Built before the shadow is borrowed.
+        let named: Vec<ObjectId> = ids.iter().map(|h| ObjectId(h.raw())).collect();
         let Some(out) = self.array(args.handle_pDescriptorSets_mut()) else { return };
-        let host =
-            self.driver.allocate_objects(device, pool, |d| d.vkAllocateDescriptorSets(), info, out);
+        let host = self.driver.allocate_objects(
+            device,
+            pool,
+            |d| d.vkAllocateDescriptorSets(),
+            info,
+            out,
+            &named,
+        );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             // Running a descriptor pool dry is a normal thing for a guest to do -- it is how a
@@ -1431,5 +1466,65 @@ mod tests {
         let (saw, fatal) = run(&wire(1, &BUFFERS), &objects);
         assert!(fatal, "a count with a longer array behind it must poison the ring too");
         assert_eq!(saw, None);
+    }
+
+    /// A destroyed pool takes its objects out of the object table, not just out of the driver's.
+    ///
+    /// Vulkan frees a command pool's buffers with the pool, and the guest sends no command per
+    /// buffer -- so nothing else in the stream says those ids stopped naming anything. Left in
+    /// the table they go on resolving to host handles the driver has freed and may already have
+    /// handed back out for something else, and the next `vkCmd*` naming one would carry that
+    /// handle to Vulkan. This is why the recording commands need no liveness check of their own:
+    /// the lookup is the gate, which is also what the C does (`vkr_command_pool_release`).
+    #[test]
+    fn a_destroyed_pool_takes_its_command_buffers_out_of_the_object_table() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{
+            VkCommandPool, VkDevice, vn_command_vkDestroyCommandPool,
+        };
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        /// The guest ids of two command buffers, and the host handles they were allocated as.
+        const BUFFERS: [(u64, u64); 2] = [(11, 110), (12, 120)];
+        const COMMAND_BUFFER: i32 = VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER.0;
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        {
+            let mut t = objects.borrow_mut();
+            for (host, id) in BUFFERS {
+                t.add(ObjectId(id), COMMAND_BUFFER, host).unwrap();
+            }
+        }
+        driver.plant_pool(DEVICE, POOL, &BUFFERS.map(|(host, id)| (host, ObjectId(id))));
+        assert_eq!(objects.lookup(ObjectId(BUFFERS[0].1), COMMAND_BUFFER), Lookup::Found(11));
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        // The pool arrives as the host handle the lookup resolved, which is what the driver is
+        // keyed by. There is no device registered, so the driver call is skipped -- the object
+        // table is what is under test.
+        let mut args = vn_command_vkDestroyCommandPool {
+            device: VkDevice(DEVICE),
+            commandPool: VkCommandPool(POOL),
+            ..Default::default()
+        };
+        h.vkDestroyCommandPool(&mut args);
+
+        for (_, id) in BUFFERS {
+            assert_eq!(
+                objects.lookup(ObjectId(id), COMMAND_BUFFER),
+                Lookup::Missing,
+                "id {id} was freed with its pool and must stop naming anything"
+            );
+        }
     }
 }
