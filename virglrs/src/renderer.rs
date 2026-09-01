@@ -192,8 +192,9 @@ impl Renderer {
     // ---- contexts ----
 
     pub fn context_create(&mut self, id: CtxId, flags: u32, name: String) -> Result<(), c_int> {
-        // Context 0 is the ABI's implicit global, never a context the guest may create.
-        if !id.is_real() || self.contexts.contains_key(&id) {
+        // A guest reusing a live id is the guest's error, not ours: rejected rather than
+        // replacing an entry it still holds. Zero needs no check -- `CtxId` cannot be zero.
+        if self.contexts.contains_key(&id) {
             return Err(-libc::EINVAL);
         }
         self.contexts.insert(id, Context { id, flags, name, last_fence: BTreeMap::new() });

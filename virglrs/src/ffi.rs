@@ -130,6 +130,32 @@ pub extern "C" fn virgl_renderer_execute(_execute_args: *mut c_void, _execute_si
 
 // ---------------------------------------------------------------- contexts
 
+/// The upstream ABI's `ctx_id` argument.
+///
+/// Zero is not a small context id: it is that ABI's implicit global, the `force_ctx_0` world this
+/// tree exists to remove. The two are different kinds of thing, so an entry point below has to say
+/// which one it is answering -- and nothing inside the renderer has to know the global was ever a
+/// possibility, because no [`CtxId`] can carry it.
+///
+/// This is deliberately private and deliberately only on the upstream entry points. limina's own
+/// `virgl_renderer_limina_*` calls have no global: we designed them, and there a zero is simply an
+/// id that names nothing.
+enum AbiCtx {
+    /// The implicit global. Nothing here implements it; vrend is where it will mean something.
+    Global,
+    /// A context the guest created.
+    Ctx(CtxId),
+}
+
+impl AbiCtx {
+    fn new(raw: u32) -> AbiCtx {
+        match CtxId::new(raw) {
+            Some(id) => AbiCtx::Ctx(id),
+            None => AbiCtx::Global,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_context_create(
     handle: u32,
@@ -146,8 +172,12 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
     nlen: u32,
     name: *const c_char,
 ) -> c_int {
+    // The global is not a context the guest may create; it is the one that always existed.
+    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id) else {
+        return EINVAL;
+    };
     let name = read_name(name, nlen);
-    with(EINVAL, |r| match r.context_create(CtxId(ctx_id), ctx_flags, name) {
+    with(EINVAL, |r| match r.context_create(id, ctx_flags, name) {
         Ok(()) => 0,
         Err(e) => e,
     })
@@ -155,17 +185,25 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_context_destroy(handle: u32) {
-    with((), |r| r.context_destroy(CtxId(handle)));
+    // The global is never destroyed, so this is a no-op for it, as it has always been.
+    if let AbiCtx::Ctx(id) = AbiCtx::new(handle) {
+        with((), |r| r.context_destroy(id));
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_attach_resource(ctx_id: c_int, res_handle: c_int) {
-    with((), |r| r.ctx_attach_resource(CtxId(ctx_id as u32), ResourceHandle(res_handle as u32)));
+    // Nothing is attached to the global: it holds no resource table of its own.
+    if let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) {
+        with((), |r| r.ctx_attach_resource(id, ResourceHandle(res_handle as u32)));
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: c_int) {
-    with((), |r| r.ctx_detach_resource(CtxId(ctx_id as u32), ResourceHandle(res_handle as u32)));
+    if let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) {
+        with((), |r| r.ctx_detach_resource(id, ResourceHandle(res_handle as u32)));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -454,7 +492,11 @@ pub extern "C" fn virgl_renderer_submit_cmd(
     let Some(buf) = cmd_slice(buffer, ndw) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.submit_cmd(CtxId(ctx_id as u32), buf) {
+    // vrend's global context arrives in P3; until then this ABI has no global to submit to.
+    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.submit_cmd(id, buf) {
         Ok(()) => 0,
         Err(e) => e,
     })
@@ -569,11 +611,13 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     ring_idx: u32,
     fence_id: u64,
 ) -> c_int {
-    with(EINVAL, |r| {
-        match r.context_create_fence(CtxId(ctx_id), RingIdx(ring_idx), FenceId(fence_id)) {
-            Ok(()) => 0,
-            Err(e) => e,
-        }
+    // The global has no per-context ring to fence; `virgl_renderer_create_fence` is its path.
+    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.context_create_fence(id, RingIdx(ring_idx), FenceId(fence_id)) {
+        Ok(()) => 0,
+        Err(e) => e,
     })
 }
 
@@ -654,7 +698,10 @@ pub extern "C" fn virgl_renderer_limina_journal_unpin(_ctx_id: u32, _key: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_begin(CtxId(ctx_id))) {
+    let Some(ctx) = CtxId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_begin(ctx)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
@@ -669,7 +716,10 @@ pub extern "C" fn virgl_renderer_limina_replay_submit(
     let Some(buf) = byte_slice(cmd, size) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(CtxId(ctx_id), buf)) {
+    let Some(ctx) = CtxId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(ctx, buf)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
@@ -688,7 +738,10 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
     // The ring id is the guest's 64-bit ring object; the index is what fences are keyed by. Until
     // a ring loop exists there is nothing to key, so the command is dispatched directly.
     let ring = RingIdx(ring_id as u32);
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(CtxId(ctx_id), ring, buf)) {
+    let Some(ctx) = CtxId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(ctx, ring, buf)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
@@ -696,7 +749,10 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_end(CtxId(ctx_id))) {
+    let Some(ctx) = CtxId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_end(ctx)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
@@ -740,7 +796,7 @@ pub extern "C" fn virgl_renderer_limina_memory_census(
         return EINVAL;
     }
     with(EINVAL, |r| {
-        let Some(pairs) = r.venus_memory_census(CtxId(ctx_id)) else {
+        let Some(pairs) = CtxId::new(ctx_id).and_then(|c| r.venus_memory_census(c)) else {
             return EINVAL;
         };
         // The array is the caller's to `free`, which is the ABI's contract and the reason this
@@ -784,7 +840,10 @@ pub extern "C" fn virgl_renderer_limina_memory_read(
     with(EINVAL, |r| {
         // SAFETY: the VMM's contract is `size` writable bytes at `buf` for the length of the call.
         let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize) };
-        if r.venus_memory_read(CtxId(ctx_id), mem_id, out) { 0 } else { EINVAL }
+        let Some(ctx) = CtxId::new(ctx_id) else {
+            return EINVAL;
+        };
+        if r.venus_memory_read(ctx, mem_id, out) { 0 } else { EINVAL }
     })
 }
 

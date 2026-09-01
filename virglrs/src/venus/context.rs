@@ -132,7 +132,7 @@ impl Context {
                 // The header itself was short: there is no command here to lose.
                 eprintln!(
                     "[virglrs] ctx {}: submission ends mid-header, {} bytes into {}",
-                    id.0,
+                    id.get(),
                     dec.pos(),
                     buf.len()
                 );
@@ -215,7 +215,7 @@ fn poison(fatal: &Cell<bool>, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEX
         let name = vn_command_name(cmd)
             .map(str::to_string)
             .unwrap_or_else(|| format!("command type {}", cmd.0));
-        eprintln!("[virglrs] ctx {}: {name} {why}, {} bytes in", id.0, dec.pos());
+        eprintln!("[virglrs] ctx {id}: {name} {why}, {} bytes in", dec.pos());
     }
     dec.set_fatal();
 }
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(vn_command_name(cmd), Some("vkGetPipelineCacheData"));
 
         let g = crate::vulkan::global();
-        let mut ctx = Context::new(CtxId(1));
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
         assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g), "a stubbed decoder must poison");
@@ -754,7 +754,7 @@ mod tests {
         let mut todo = Unimplemented::default();
         let g = crate::vulkan::global();
 
-        let mut ctx = Context::new(CtxId(1));
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
         let w = header(cmd, GENERATE_REPLY);
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
@@ -765,7 +765,7 @@ mod tests {
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
         // poison. It still names an instance nothing created, which poisons for its own reason --
         // what separates the two paths is whether the command was dispatched at all.
-        let mut ctx = Context::new(CtxId(1));
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
         ctx.replay_begin();
         assert!(!ctx.submit(&full, &mut todo, &g));
         assert_eq!(ctx.dispatched, 1);
