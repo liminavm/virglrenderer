@@ -343,6 +343,30 @@ impl Table {
         }
     }
 
+    /// The id the guest gave a host handle, which is the reply direction of every lookup here.
+    ///
+    /// A handful of queries hand back handles *inside* a struct the driver filled --
+    /// `vkEnumeratePhysicalDeviceGroups` is the one that reaches a guest -- and those are host
+    /// handles that must never leave this process. There is no shadow to put them in, because the
+    /// generator can only shadow a member and these are buried in an out-struct's fixed array,
+    /// so the swap is the handler's and this is what it swaps through.
+    ///
+    /// A scan rather than a second map, deliberately. A reverse index would be a second container
+    /// holding a fact this one already holds, and every destroy path would owe it an entry it
+    /// could be forgotten at -- which is the shape of bug this table was rebuilt to remove. What
+    /// it costs is a walk over live objects for a query a guest asks once or twice at startup.
+    ///
+    /// `ty` is part of the question, not a check on the answer: handles are only unique within a
+    /// type, and Vulkan is free to give a physical device and a buffer the same number.
+    pub fn id_of_handle(&self, ty: VkObjectType, handle: u64) -> Option<ObjectId> {
+        self.arena
+            .entries
+            .iter()
+            .filter_map(|e| e.object.as_ref())
+            .find(|o| o.ty == ty && o.handle == handle)
+            .map(|o| o.id)
+    }
+
     pub fn get(&self, id: ObjectId) -> Option<&Object> {
         self.arena.get(self.slots.get(&id)?.key()?)
     }

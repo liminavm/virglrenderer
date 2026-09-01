@@ -21,7 +21,7 @@ use super::driver::{Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags, VkObjectType, VkResult,
+    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags, VkObjectType, VkPhysicalDevice, VkResult,
     vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
     vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
@@ -43,11 +43,12 @@ use super::proto::types::{
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
     vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
-    vn_command_vkEnumerateInstanceVersion, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
-    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
-    vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements2,
-    vn_command_vkGetImageSubresourceLayout, vn_command_vkGetPhysicalDeviceExternalFenceProperties,
+    vn_command_vkEnumerateInstanceVersion, vn_command_vkEnumeratePhysicalDeviceGroups,
+    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
+    vn_command_vkFreeMemory, vn_command_vkGetBufferMemoryRequirements2,
+    vn_command_vkGetDeviceQueue2, vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
+    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
+    vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
@@ -919,6 +920,82 @@ impl Commands for Handlers<'_> {
         );
     }
 
+    fn vkEnumeratePhysicalDeviceGroups(
+        &mut self,
+        args: &mut vn_command_vkEnumeratePhysicalDeviceGroups<'_>,
+    ) {
+        // The one query that hands back handles *inside* the struct the driver filled. Every
+        // other command names its objects in members the generator can shadow; these sit in a
+        // fixed array inside an out-struct, where there is nowhere to put a shadow -- so the swap
+        // back to the guest's own ids is this handler's, and it has to happen before the reply
+        // encodes. Left alone, the guest is handed live host pointers.
+        if !args.has_pPhysicalDeviceGroupCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let instance = args.instance;
+        if !args.has_pPhysicalDeviceGroupProperties() {
+            let asked = self
+                .driver
+                .enumerate_into(instance, None, |i| i.try_vkEnumeratePhysicalDeviceGroups());
+            match asked {
+                Ok((n, ret)) => {
+                    args.ret = ret;
+                    if ret == VkResult::VK_SUCCESS
+                        && let Some(count) = args.pPhysicalDeviceGroupCount_mut()
+                    {
+                        *count = n;
+                    }
+                }
+                Err(e) => args.ret = e,
+            }
+            return;
+        }
+
+        let Some(out) = self.array(args.pPhysicalDeviceGroupProperties_mut()) else { return };
+        let asked = self
+            .driver
+            .enumerate_into(instance, Some(out), |i| i.try_vkEnumeratePhysicalDeviceGroups());
+        let (n, ret) = match asked {
+            Ok(pair) => pair,
+            Err(e) => {
+                args.ret = e;
+                return;
+            }
+        };
+        if ret != VkResult::VK_SUCCESS && ret != VkResult::VK_INCOMPLETE {
+            args.ret = ret;
+            return;
+        }
+
+        // Swap every host handle for the id the guest gave it. A handle with no id behind it is
+        // a guest that never enumerated its physical devices -- it cannot be told about a device
+        // it has no name for, and inventing one would name something it never asked to exist.
+        let table = self.objects.borrow();
+        let mut unknown = false;
+        for group in out.iter_mut().take(n as usize) {
+            let live = (group.physicalDeviceCount as usize).min(group.physicalDevices.len());
+            for pd in &mut group.physicalDevices[..live] {
+                match table.id_of_handle(VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE, pd.0) {
+                    Some(id) => *pd = VkPhysicalDevice(id.0),
+                    None => unknown = true,
+                }
+            }
+        }
+        drop(table);
+        if unknown {
+            // Refusing outright rather than half-swapping: a group carrying one real id and one
+            // host pointer is worse than no answer, because the guest cannot tell them apart.
+            args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+            return;
+        }
+
+        args.ret = ret;
+        if let Some(count) = args.pPhysicalDeviceGroupCount_mut() {
+            *count = n;
+        }
+    }
+
     fn vkEnumerateDeviceExtensionProperties(
         &mut self,
         args: &mut vn_command_vkEnumerateDeviceExtensionProperties<'_>,
@@ -968,7 +1045,7 @@ impl Commands for Handlers<'_> {
         if !args.has_pQueueFamilyProperties() {
             let asked = self
                 .driver
-                .pd_enumerate(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
+                .enumerate_into(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
             if let Some((n, ())) = self.asked(asked)
                 && let Some(count) = args.pQueueFamilyPropertyCount_mut()
             {
@@ -979,7 +1056,7 @@ impl Commands for Handlers<'_> {
         let Some(out) = self.array(args.pQueueFamilyProperties_mut()) else { return };
         let asked = self
             .driver
-            .pd_enumerate(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
+            .enumerate_into(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
         // The count goes back last, and has to: it lives in the struct the array was borrowed
         // from, so the two cannot be held at once -- and how many there are is not known until
         // the array has been filled. See `vkEnumeratePhysicalDevices`.
@@ -1701,6 +1778,108 @@ mod tests {
             "the guest reads this build's ceiling, with the driver's own patch level"
         );
         assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
+
+        driver.abandon_planted();
+    }
+
+    /// A host handle must never reach a guest, and this is the one query that hands them back
+    /// somewhere no shadow can be put: inside a fixed array, inside an out-struct the driver
+    /// filled. Every other command names its objects in a member the generator can shadow.
+    ///
+    /// The test plants a driver whose handles are deliberately nothing like the ids -- equal
+    /// numbers would let a handler that never swaps pass.
+    #[test]
+    fn a_device_group_reaches_the_guest_as_ids_and_never_as_host_handles() {
+        use super::super::proto::types::{
+            VkInstance, VkPhysicalDeviceGroupProperties,
+            vn_command_vkEnumeratePhysicalDeviceGroups as Cmd,
+        };
+
+        const INSTANCE: VkInstance = VkInstance(0x5000);
+        const HOSTS: [u64; 2] = [0xfeed_0001, 0xfeed_0002];
+        const IDS: [u64; 2] = [11, 12];
+
+        unsafe extern "C" fn groups(
+            _i: VkInstance,
+            count: *mut u32,
+            out: *mut VkPhysicalDeviceGroupProperties,
+        ) -> VkResult {
+            // SAFETY: the driver passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = 1;
+                return VkResult::VK_SUCCESS;
+            }
+            // SAFETY: `count` is the length the caller sized the array to.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, *count as usize) };
+            out[0].physicalDeviceCount = 2;
+            out[0].physicalDevices[0] = VkPhysicalDevice(HOSTS[0]);
+            out[0].physicalDevices[1] = VkPhysicalDevice(HOSTS[1]);
+            *count = 1;
+            VkResult::VK_SUCCESS
+        }
+
+        let objects = Shared::new();
+        for (id, host) in IDS.iter().zip(HOSTS) {
+            objects
+                .borrow_mut()
+                .add(ObjectId(*id), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE, host, None)
+                .unwrap();
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkEnumeratePhysicalDeviceGroups(groups);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        let mut props = [VkPhysicalDeviceGroupProperties::default(); 1];
+        let mut n = 1u32;
+        let mut args = Cmd::default();
+        args.instance = INSTANCE;
+        args.plant_pPhysicalDeviceGroupCount(&mut n);
+        args.plant_pPhysicalDeviceGroupProperties(&mut props);
+
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkEnumeratePhysicalDeviceGroups(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        assert_eq!(
+            [props[0].physicalDevices[0].0, props[0].physicalDevices[1].0],
+            IDS,
+            "the guest reads back the ids it chose, not the handles the driver returned"
+        );
+
+        // A handle the guest has no name for: it never enumerated, so there is nothing honest to
+        // hand it. Half a swapped group would be worse than none -- the guest cannot tell which
+        // half is which.
+        objects.borrow_mut().remove(ObjectId(IDS[1]));
+        let mut props = [VkPhysicalDeviceGroupProperties::default(); 1];
+        let mut n = 1u32;
+        let mut args = Cmd::default();
+        args.instance = INSTANCE;
+        args.plant_pPhysicalDeviceGroupCount(&mut n);
+        args.plant_pPhysicalDeviceGroupProperties(&mut props);
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkEnumeratePhysicalDeviceGroups(&mut args);
+        assert_eq!(
+            args.ret,
+            VkResult::VK_ERROR_INITIALIZATION_FAILED,
+            "a group this guest has no names for is refused, not half-translated"
+        );
 
         driver.abandon_planted();
     }
