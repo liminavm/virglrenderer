@@ -1571,6 +1571,17 @@ class RustGen:
                 continue
             if shape[0] == 'dynamic':
                 rows.append((self.field_name(var.name), self.base_name(var.ty), shape[1], False))
+            elif shape[0] == 'blob':
+                # A blob is an array whose element type vk.xml declines to name: `void`, with a
+                # length counted in bytes. So the slice is of `u8` -- `base_name` would say
+                # `c_void`, which nothing can be a slice of, and that is the only reason these
+                # were not already behind this door.
+                #
+                # Mutability follows the member, with no shadow to consult: a blob carries no
+                # guest ids, so there is nothing to keep out of the reply, and an out-blob is
+                # written where it lies.
+                rows.append((self.field_name(var.name), 'u8', shape[1],
+                             not var.ty.is_const_pointer()))
         for f, rs, shape in self.shadows(ty):
             if shape[0] == 'dynamic':
                 mutable = rs.startswith('*mut ')
@@ -1708,7 +1719,10 @@ class RustGen:
         # accessor over it is read-only because what a handler reads there is the guest's ids.
         wr = self._member_is_mut(ty, f)
         life = "'a mut" if wr else "'a"
-        body = ['        self.%s = a.%s;' % (f, 'as_mut_ptr()' if wr else 'as_ptr()')]
+        # A blob's slice is of `u8` while its member is `c_void`, so the planter has to
+        # say so; for every other array the cast is the identity.
+        body = ['        self.%s = a.%s as %s _;'
+                % (f, 'as_mut_ptr()' if wr else 'as_ptr()', '*mut' if wr else '*const')]
         m = re.fullmatch(r'val\.(\w+)', self._count_expr(count))
         if m:
             ct = next((self.field_type(v) for v in ty.variables if self.field_name(v.name) == m.group(1)), None)
