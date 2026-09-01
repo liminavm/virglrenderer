@@ -1732,11 +1732,16 @@ mod tests {
 
     /// The cap is not a fact about the handler, it is a fact about the reply, so it is watched
     /// where the guest would read it: in the struct the driver filled.
+    ///
+    /// Both spellings of the query are driven, because both carry the cap and a guest picks
+    /// whichever its instance version allows. They are the same three lines today, which is
+    /// exactly why one of them can lose the cap in a refactor and stay green on its own.
     #[test]
     fn the_properties_query_caps_the_version_the_driver_reported() {
         use super::super::proto::info::VK_XML_VERSION;
         use super::super::proto::types::{
-            VkPhysicalDevice, VkPhysicalDeviceProperties, vn_command_vkGetPhysicalDeviceProperties,
+            VkPhysicalDevice, VkPhysicalDeviceProperties, VkPhysicalDeviceProperties2,
+            vn_command_vkGetPhysicalDeviceProperties, vn_command_vkGetPhysicalDeviceProperties2,
         };
 
         /// A driver from the future, which is what every driver eventually is.
@@ -1779,7 +1784,98 @@ mod tests {
         );
         assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
 
+        /// The same driver, reached through the `2` spelling: the version sits one struct deeper.
+        unsafe extern "C" fn properties2(
+            _pd: VkPhysicalDevice,
+            out: *mut VkPhysicalDeviceProperties2,
+        ) {
+            // SAFETY: the handler passed an exclusive borrow of a live struct.
+            let out = unsafe { &mut *out };
+            out.properties.apiVersion = ((VK_XML_VERSION >> 12) + 1) << 12 | 99;
+            out.properties.driverVersion = 0xabcd;
+        }
+
+        let mut fns2 = crate::vulkan::Instance::default();
+        fns2.plant_vkGetPhysicalDeviceProperties2(properties2);
         driver.abandon_planted();
+        driver.plant_instance(fns2);
+
+        let mut asked2 = VkPhysicalDeviceProperties2::default();
+        let mut args2 = vn_command_vkGetPhysicalDeviceProperties2::default();
+        args2.plant_pProperties(&mut asked2);
+
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceProperties2(&mut args2);
+        assert!(h.reject.is_none());
+
+        assert_eq!(
+            asked2.properties.apiVersion,
+            (VK_XML_VERSION & !0xfff) | 99,
+            "the `2` spelling caps it in the nested struct, where the guest reads it"
+        );
+        assert_eq!(
+            asked2.properties.driverVersion, 0xabcd,
+            "and it too leaves the rest of the driver's answer alone"
+        );
+
+        driver.abandon_planted();
+    }
+
+    /// The one query answered off the global table, before any instance exists. It reaches the
+    /// real loader, so there is no driver to plant and the cap cannot be forced: measured
+    /// 2026-09-01, the loader here reports 4211029 against this build's 4211045, which leaves the
+    /// ceiling check true for a reason that has nothing to do with the handler. It is kept as the
+    /// invariant it states, not as a witness; what this test actually holds down is the second
+    /// half, that the handler asks the driver *before* checking the guest left it somewhere to
+    /// answer -- an ordering a refactor reverses without noticing.
+    #[test]
+    fn the_instance_version_query_is_capped_and_needs_somewhere_to_answer() {
+        use super::super::proto::info::VK_XML_VERSION;
+        use super::super::proto::types::vn_command_vkEnumerateInstanceVersion as Cmd;
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new();
+
+        let mut args = Cmd::default();
+        let mut out = 0u32;
+        args.plant_pApiVersion(&mut out);
+
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkEnumerateInstanceVersion(&mut args);
+        assert!(h.reject.is_none(), "a real loader answering is never a reason to poison a ring");
+        let ret = args.ret;
+        if ret == VkResult::VK_SUCCESS {
+            assert!(
+                out <= VK_XML_VERSION,
+                "whatever the loader reports, the guest never hears a version past this build's"
+            );
+        }
+
+        // No `pApiVersion` at all: nothing to fill, and that is the guest's fault, not the host's.
+        let mut empty = Cmd::default();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkEnumerateInstanceVersion(&mut empty);
+        assert!(h.reject.is_some(), "a query with nowhere to answer is refused, not answered");
     }
 
     /// A host handle must never reach a guest, and this is the one query that hands them back
