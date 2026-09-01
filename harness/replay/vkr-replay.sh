@@ -68,4 +68,4 @@ case " $* " in
     ;;
 esac
 
-exec env VK_ICD_FILENAMES="$ICD" "$BIN" "$CORPUS" "${RENDERER[@]}" "$@"
+exec env VK_ICD_FILENAMES="$ICD" "$BIN" "$CORPUS" "${RENDERER[@]+"${RENDERER[@]}"}" "$@"
