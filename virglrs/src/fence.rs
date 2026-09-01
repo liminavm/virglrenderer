@@ -118,7 +118,7 @@ fn run(sink: Sink, q: Arc<(Mutex<Queue>, Condvar)>) {
         match job {
             Job::Context(ctx, ring, fence) => {
                 if let Some(f) = sink.write_context_fence {
-                    f(sink.cookie, ctx.0, ring.0, fence.0);
+                    f(sink.cookie, ctx.get(), ring.0, fence.0);
                 }
             }
             Job::Global(id) => {
