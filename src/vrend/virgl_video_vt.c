@@ -1269,6 +1269,23 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
     VT_TRACE("decode_bitstream: %u buffers, %zu bytes total, frame %ux%u prof %u depth %u\n",
              num_buffers, codec->bitstream_len, codec->frame_width, codec->frame_height,
              codec->frame_profile, codec->frame_bit_depth);
+    /* The size comes from the descriptor; the BYTES come from guest memory, and the two
+     * fail independently. A VP9 uncompressed header starts 0x82/0x83 for profile 0, so a
+     * run of zeros here means the host copied a buffer the guest never filled. */
+    if (codec->bitstream_len >= 8) {
+        const uint8_t *b = codec->bitstream;
+        size_t nz = 0;
+        for (size_t i = 0; i < codec->bitstream_len && i < 4096; i++)
+            nz += b[i] != 0;
+        uint64_t sum = 1469598103934665603ull;
+        for (size_t i = 0; i < codec->bitstream_len; i++)
+            sum = (sum ^ b[i]) * 1099511628211ull;
+        VT_TRACE("decode_bitstream: head %02x %02x %02x %02x %02x %02x %02x %02x, "
+                 "nonzero %zu of first %zu, fnv %016llx of %zu\n", b[0], b[1], b[2], b[3],
+                 b[4], b[5], b[6], b[7], nz,
+                 codec->bitstream_len < 4096 ? codec->bitstream_len : 4096,
+                 (unsigned long long)sum, codec->bitstream_len);
+    }
 
     return 0;
 }
