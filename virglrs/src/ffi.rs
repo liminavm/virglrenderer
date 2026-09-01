@@ -84,9 +84,8 @@ impl fence::FenceSink for VmmFences {
 fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
-        ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned => {
-            EINVAL
-        }
+        ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned
+        | NoAllocation | NotMappable => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
     }
 }
@@ -906,12 +905,16 @@ pub extern "C" fn virgl_renderer_limina_memory_census(
         return EINVAL;
     }
     with(EINVAL, |r| {
-        let Some(pairs) = CtxId::new(ctx_id).and_then(|c| r.venus_memory_census(c)) else {
+        let Some(ctx) = CtxId::new(ctx_id) else {
             return EINVAL;
+        };
+        let census = match r.venus_memory_census(ctx) {
+            Ok(c) => c,
+            Err(e) => return errno(e),
         };
         // The array is the caller's to `free`, which is the ABI's contract and the reason this
         // does not hand out a `Vec`: the VMM is C and frees it with `free`.
-        let n = pairs.len();
+        let n = census.len();
         let buf = if n == 0 {
             core::ptr::null_mut()
         } else {
@@ -919,11 +922,13 @@ pub extern "C" fn virgl_renderer_limina_memory_census(
             if p.is_null() {
                 return ENOMEM;
             }
-            for (i, (id, size)) in pairs.iter().enumerate() {
+            // The ABI's shape: id and size alternating in one array. Flattening a named pair
+            // into two anonymous words is the shim's job, not the renderer's.
+            for (i, a) in census.iter().enumerate() {
                 // SAFETY: `p` holds 2*n u64s and `i` is below `n`.
                 unsafe {
-                    p.add(2 * i).write(*id);
-                    p.add(2 * i + 1).write(*size);
+                    p.add(2 * i).write(a.id.0);
+                    p.add(2 * i + 1).write(a.size);
                 }
             }
             p
@@ -953,7 +958,12 @@ pub extern "C" fn virgl_renderer_limina_memory_read(
         let Some(ctx) = CtxId::new(ctx_id) else {
             return EINVAL;
         };
-        if r.venus_memory_read(ctx, mem_id, out) { 0 } else { EINVAL }
+        // The ABI answers success or a code, never a count -- a caller that wants fewer bytes
+        // than the census reported passes a shorter buffer and knows what it asked for.
+        match r.venus_memory_read(ctx, mem_id, out) {
+            Ok(_) => 0,
+            Err(e) => errno(e),
+        }
     })
 }
 
@@ -1112,7 +1122,16 @@ mod tests {
     #[test]
     fn every_cause_keeps_the_errno_the_abi_answered_with() {
         use renderer::Error::*;
-        for e in [ZeroHandle, ResourceExists, ContextExists, NoContext, RendererAbsent, Poisoned] {
+        for e in [
+            ZeroHandle,
+            ResourceExists,
+            ContextExists,
+            NoContext,
+            RendererAbsent,
+            Poisoned,
+            NoAllocation,
+            NotMappable,
+        ] {
             assert_eq!(errno(e), -libc::EINVAL, "{e:?} must still be EINVAL");
         }
         assert_eq!(errno(RendererUnimplemented), -libc::ENOTSUP);

@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::cs::Handle;
+use super::cs::{Handle, ObjectId};
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkDevice, VkDeviceCreateInfo, VkDeviceMemory,
     VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
@@ -635,31 +635,28 @@ impl Driver {
         }
     }
 
-    /// Every live allocation as (guest id, size), for the memory census.
+    /// Every live allocation, for the memory census.
     ///
     /// The C also skips memory it has exported as a blob and memory imported from another
     /// context's storage -- in both cases the bytes are captured where they actually live, not
     /// here. Neither flag can be set yet: both are decided by the blob path, which does not exist,
     /// so nothing is skipped and the count reads high against the C by exactly the blobs a corpus
     /// exported.
-    pub fn memory_census(&self) -> Vec<(u64, u64)> {
-        self.memory.iter().map(|(id, m)| (*id, m.size)).collect()
+    pub fn memory_census(&self) -> Vec<Allocation> {
+        self.memory.iter().map(|(id, m)| Allocation { id: ObjectId(*id), size: m.size }).collect()
     }
 
-    /// Copy an allocation's contents out through a host mapping, returning whether it worked.
+    /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
     ///
     /// Short buffers are the caller's business, not an error: the census reports whole sizes and
-    /// the VMM caps what it reads, so a prefix is the normal request.
-    ///
-    /// A map can be refused -- device-local memory is not the driver's to hand out, and a scanout
-    /// backed by an IOSurface lives in the surface rather than the allocation. Those bytes are
-    /// reachable by another path, and reaching them is the blob path's job; here it is a false.
-    pub fn memory_read(&self, id: u64, buf: &mut [u8]) -> bool {
+    /// the VMM caps what it reads, so a prefix is the normal request -- which is why the count
+    /// comes back rather than being inferred from the buffer's length.
+    pub fn memory_read(&self, id: u64, buf: &mut [u8]) -> Result<usize, MemoryError> {
         let Some(mem) = self.memory.get(&id) else {
-            return false;
+            return Err(MemoryError::NoSuchAllocation);
         };
         let Some(d) = self.devices.get(&mem.device) else {
-            return false;
+            return Err(MemoryError::NoSuchAllocation);
         };
         let device = VkDevice(mem.device);
         let handle = VkDeviceMemory(mem.handle);
@@ -676,7 +673,7 @@ impl Driver {
             )
         };
         if r != VkResult::VK_SUCCESS || ptr.is_null() {
-            return false;
+            return Err(MemoryError::NotMappable);
         }
         let n = buf.len().min(mem.size as usize);
         // SAFETY: the driver mapped at least `mem.size` bytes at `ptr`, which is what `n` is
@@ -685,8 +682,31 @@ impl Driver {
         unsafe { core::ptr::copy_nonoverlapping(ptr.cast::<u8>(), buf.as_mut_ptr(), n) };
         // SAFETY: the mapping this call just made, unmapped once.
         unsafe { (d.fns.vkUnmapMemory())(device, handle) };
-        true
+        Ok(n)
     }
+}
+
+/// One live allocation, as the census reports it.
+///
+/// Two bare `u64`s side by side is how the ABI carries this, and exactly the confusion the
+/// newtypes exist to prevent -- so they are named here and paired only at the shim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Allocation {
+    /// The id the guest gave the `VkDeviceMemory`, which is the name the VMM reads it back by.
+    pub id: ObjectId,
+    /// Its size in bytes, padded to the blob the guest may map it as -- see [`pad_for_blob`].
+    pub size: u64,
+}
+
+/// Why an allocation could not be read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoryError {
+    /// Nothing is allocated under that id in this context.
+    NoSuchAllocation,
+    /// The allocation exists, but the driver would not map it. Device-local memory is not the
+    /// driver's to hand out, and a scanout backed by an IOSurface lives in the surface rather
+    /// than in the allocation -- in both cases the bytes are reachable, but by the blob path.
+    NotMappable,
 }
 
 /// Round a host-visible allocation up to the size of the blob the guest may create from it.
