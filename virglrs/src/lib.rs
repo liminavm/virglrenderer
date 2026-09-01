@@ -15,6 +15,7 @@ pub mod abi;
 pub mod config;
 pub mod fence;
 pub mod ffi;
+pub mod guest_mem;
 pub mod ids;
 pub mod renderer;
 pub mod venus;
