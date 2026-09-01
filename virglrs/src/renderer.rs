@@ -15,6 +15,46 @@ use crate::fence::Retirement;
 use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
 
+/// Why a call failed.
+///
+/// Named causes, not error codes: the C ABI answers in `errno`, and translating to it is the
+/// shim's job -- see `ffi::errno`. A Rust caller gets to tell "that id is already live" from
+/// "there is no renderer for that capset" without consulting a table of negative integers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    /// A handle of zero, which names nothing.
+    ZeroHandle,
+    /// The guest reused a resource handle that is still live.
+    ResourceExists,
+    /// The guest reused a context id that is still live.
+    ContextExists,
+    /// No context under that id.
+    NoContext,
+    /// The context bound a capset this build was not initialized to serve.
+    RendererAbsent,
+    /// The context bound a capset no build serves yet.
+    RendererUnimplemented,
+    /// The stream violated the protocol; its context is poisoned and accepts nothing further.
+    Poisoned,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Error::ZeroHandle => "handle zero names nothing",
+            Error::ResourceExists => "that resource handle is already live",
+            Error::ContextExists => "that context id is already live",
+            Error::NoContext => "no such context",
+            Error::RendererAbsent => "this build was not initialized to serve that capset",
+            Error::RendererUnimplemented => "no renderer serves that capset yet",
+            Error::Poisoned => "the context is poisoned",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::error::Error for Error {}
+
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
 pub enum Backing {
@@ -103,13 +143,11 @@ impl Renderer {
         &mut self,
         args: &ResourceCreateArgs,
         iov: Vec<GuestIov>,
-    ) -> Result<(), c_int> {
+    ) -> Result<(), Error> {
         let handle = ResourceHandle(args.handle);
         // A guest-chosen handle that is already live is the guest's error, not ours: reject it
         // rather than replacing an entry something else still holds.
-        if handle.0 == 0 || self.resources.contains_key(&handle) {
-            return Err(-libc::EINVAL);
-        }
+        self.free_handle(handle)?;
         self.resources.insert(
             handle,
             Resource {
@@ -123,11 +161,9 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn resource_create_blob(&mut self, args: &CreateBlobArgs) -> Result<(), c_int> {
+    pub fn resource_create_blob(&mut self, args: &CreateBlobArgs) -> Result<(), Error> {
         let handle = ResourceHandle(args.res_handle);
-        if handle.0 == 0 || self.resources.contains_key(&handle) {
-            return Err(-libc::EINVAL);
-        }
+        self.free_handle(handle)?;
         // SAFETY: the VMM's contract for create_blob is that `iovecs` points to `num_iovs` valid
         // entries for the duration of the call.
         let iov = unsafe { GuestIov::from_raw(args.iovecs, args.num_iovs) };
@@ -155,10 +191,8 @@ impl Renderer {
         blob_mem: u32,
         fd_type: u32,
         size: u64,
-    ) -> Result<(), c_int> {
-        if handle.0 == 0 || self.resources.contains_key(&handle) {
-            return Err(-libc::EINVAL);
-        }
+    ) -> Result<(), Error> {
+        self.free_handle(handle)?;
         self.resources.insert(
             handle,
             Resource {
@@ -169,6 +203,17 @@ impl Renderer {
                 attached: Vec::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Check a guest-chosen resource handle before anything is inserted under it.
+    fn free_handle(&self, handle: ResourceHandle) -> Result<(), Error> {
+        if handle.0 == 0 {
+            return Err(Error::ZeroHandle);
+        }
+        if self.resources.contains_key(&handle) {
+            return Err(Error::ResourceExists);
+        }
         Ok(())
     }
 
@@ -191,11 +236,11 @@ impl Renderer {
 
     // ---- contexts ----
 
-    pub fn context_create(&mut self, id: CtxId, flags: u32, name: String) -> Result<(), c_int> {
+    pub fn context_create(&mut self, id: CtxId, flags: u32, name: String) -> Result<(), Error> {
         // A guest reusing a live id is the guest's error, not ours: rejected rather than
         // replacing an entry it still holds. Zero needs no check -- `CtxId` cannot be zero.
         if self.contexts.contains_key(&id) {
-            return Err(-libc::EINVAL);
+            return Err(Error::ContextExists);
         }
         self.contexts.insert(id, Context { id, flags, name, last_fence: BTreeMap::new() });
         // A venus context gets venus state. The capset the guest bound is the low byte of the
@@ -248,9 +293,9 @@ impl Renderer {
         ctx: CtxId,
         ring: RingIdx,
         fence: FenceId,
-    ) -> Result<(), c_int> {
+    ) -> Result<(), Error> {
         let Some(c) = self.contexts.get_mut(&ctx) else {
-            return Err(-libc::EINVAL);
+            return Err(Error::NoContext);
         };
         c.last_fence.insert(ring, fence);
         // Nothing here submits GPU work yet, so every fence is already satisfied. It still goes
@@ -267,17 +312,20 @@ impl Renderer {
 
     /// Route a submission to the renderer the context bound. `Err` is a context that named no
     /// renderer we have, or a stream that poisoned the one it named.
-    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), c_int> {
+    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
         let Some(c) = self.contexts.get(&ctx) else {
-            return Err(-libc::EINVAL);
+            return Err(Error::NoContext);
         };
         match c.flags & abi::CAPSET_MASK {
             abi::CAPSET_VENUS => {
-                let v = self.venus.as_mut().ok_or(-libc::EINVAL)?;
-                v.submit(ctx, buf).map_err(|_| -libc::EINVAL)
+                let v = self.venus.as_mut().ok_or(Error::RendererAbsent)?;
+                v.submit(ctx, buf).map_err(|e| match e {
+                    venus::vkr::Error::NoContext => Error::NoContext,
+                    venus::vkr::Error::Poisoned => Error::Poisoned,
+                })
             }
             // vrend arrives in P3.
-            _ => Err(-libc::ENOTSUP),
+            _ => Err(Error::RendererUnimplemented),
         }
     }
 
