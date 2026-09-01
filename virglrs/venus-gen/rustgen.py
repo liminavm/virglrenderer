@@ -1535,6 +1535,19 @@ class RustGen:
                     '        self.fp_%s.is_some()' % ty.name,
                     '    }',
                     '',
+                    '    /// `%s` if the driver exports it, and no opinion about it if not.'
+                    % ty.name,
+                    '    ///',
+                    '    /// The accessor above panics because absence there is a host bug: this',
+                    '    /// build asked for a command it advertises. That reasoning does not',
+                    '    /// reach a path the guest can steer, where absence means the guest',
+                    '    /// named something this driver does not have -- an answer to give back,',
+                    '    /// not a reason to take the process down with it.',
+                    '    #[inline]',
+                    '    pub fn try_%s(&self) -> Option<%s> {' % (ty.name, self.proc_signature(ty)),
+                    '        self.fp_%s' % ty.name,
+                    '    }',
+                    '',
                 ]
             out += ['}', '']
 

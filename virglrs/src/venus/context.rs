@@ -43,10 +43,16 @@ use super::proto::types::{
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
     vn_command_vkEndCommandBuffer, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
-    vn_command_vkImportSemaphoreResourceMESA, vn_command_vkQueueSubmit,
-    vn_command_vkResetCommandBuffer, vn_command_vkResetFences, vn_command_vkUpdateDescriptorSets,
-    vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
+    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
+    vn_command_vkGetPhysicalDeviceExternalFenceProperties,
+    vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
+    vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
+    vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkImportSemaphoreResourceMESA,
+    vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer, vn_command_vkResetFences,
+    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
+    vn_command_vkWaitSemaphoreResourceMESA,
 };
 use crate::vulkan::Global;
 
@@ -355,6 +361,32 @@ impl Handlers<'_> {
             self.reject = Some("counted an array it did not send");
         }
         a
+    }
+
+    /// The verdict on a query whose answer has nowhere to go.
+    ///
+    /// A `vkGet*` is the guest handing over a struct and asking for it back filled. If it sent no
+    /// struct there is no answer to give, and the only dishonest option is the quiet one: return,
+    /// encode a reply built from a null, and let the guest read whatever it had there before as
+    /// though the host had written it.
+    fn fills<T>(&mut self, out: Option<T>) -> Option<T> {
+        if out.is_none() {
+            self.reject = Some("asked a query with no struct to answer into");
+        }
+        out
+    }
+
+    /// The verdict on a query this renderer could not put to the driver at all.
+    ///
+    /// Not the same as a query the driver answered badly, which is the driver's answer and goes
+    /// back as it came. This is no instance, no such device, or an entry point this driver does
+    /// not export -- and the struct is then still whatever the guest sent, so reporting anything
+    /// other than a refusal would be reporting success for a call that never happened.
+    fn asked<R>(&mut self, r: Result<R, VkResult>) -> Option<R> {
+        if r.is_err() {
+            self.reject = Some("asked a query this driver cannot answer");
+        }
+        r.ok()
     }
 
     /// The other honest reading of a split pair, for the arrays where it is the right one.
@@ -862,6 +894,106 @@ impl Commands for Handlers<'_> {
         );
     }
 
+    // ------------------------------------------------------------------------ queries
+    //
+    // The guest hands over a struct and asks for it back filled. Every one of these is three
+    // lines because the work is not here: the decoder allocated the struct from the arena at the
+    // layout a C compiler agrees with, so the driver writes into the very memory the reply
+    // encoder reads back -- chained `pNext` structs included -- and this file only has to decide
+    // what an absent struct and an unanswerable query mean.
+
+    fn vkGetPhysicalDeviceFeatures2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceFeatures2<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pFeatures_mut()) else { return };
+        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceFeatures2());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceMemoryProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceMemoryProperties2<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pMemoryProperties_mut()) else { return };
+        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceMemoryProperties2());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceFormatProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceFormatProperties2<'_>,
+    ) {
+        let (pd, format) = (args.physicalDevice, args.format);
+        let Some(out) = self.fills(args.pFormatProperties_mut()) else { return };
+        let r = self
+            .driver
+            .pd_query_arg(pd, format, out, |i| i.try_vkGetPhysicalDeviceFormatProperties2());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceExternalFenceProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceExternalFenceProperties<'_>,
+    ) {
+        let (pd, info) = (args.physicalDevice, args.pExternalFenceInfo);
+        let Some(out) = self.fills(args.pExternalFenceProperties_mut()) else { return };
+        let r = self
+            .driver
+            .pd_query_info(pd, info, out, |i| i.try_vkGetPhysicalDeviceExternalFenceProperties());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceExternalSemaphoreProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties<'_>,
+    ) {
+        let (pd, info) = (args.physicalDevice, args.pExternalSemaphoreInfo);
+        let Some(out) = self.fills(args.pExternalSemaphoreProperties_mut()) else { return };
+        let r = self.driver.pd_query_info(pd, info, out, |i| {
+            i.try_vkGetPhysicalDeviceExternalSemaphoreProperties()
+        });
+        self.asked(r);
+    }
+
+    fn vkGetImageMemoryRequirements2(
+        &mut self,
+        args: &mut vn_command_vkGetImageMemoryRequirements2<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetImageMemoryRequirements2());
+        self.asked(r);
+    }
+
+    fn vkGetBufferMemoryRequirements2(
+        &mut self,
+        args: &mut vn_command_vkGetBufferMemoryRequirements2<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetBufferMemoryRequirements2());
+        self.asked(r);
+    }
+
+    fn vkGetImageSubresourceLayout(
+        &mut self,
+        args: &mut vn_command_vkGetImageSubresourceLayout<'_>,
+    ) {
+        let (device, image, sub) = (args.device, args.image, args.pSubresource);
+        let Some(out) = self.fills(args.pLayout_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_arg_info(device, image, sub, out, |d| d.try_vkGetImageSubresourceLayout());
+        self.asked(r);
+    }
+
     // ------------------------------------------------------------------------ pipelines
     //
     // Not a `simple_create`: one command makes a run of them, and it is the only create that can
@@ -1250,6 +1382,129 @@ mod tests {
         args.plant_pLayerName(name);
         assert!(args.has_pLayerName());
         assert_eq!(args.pLayerName(), Some(name), "the string, terminator and all");
+    }
+
+    /// The mechanism the sixteen queries all rest on, tested once on the one that shows it best.
+    ///
+    /// A query is three lines in this file because the interesting work is a memory contract, not
+    /// code: the decoder allocates the guest's struct from the arena at the layout a C compiler
+    /// agrees with, so the driver fills the very bytes the reply encoder will read back. The
+    /// chained `pNext` structs come along for free -- nobody copies them, nobody re-links them.
+    /// That is the claim, and a chain is the only way to see it, because an unchained struct would
+    /// pass just as well if the handler had quietly filled a copy.
+    #[test]
+    fn a_query_fills_the_guest_s_chain_where_it_lies() {
+        use super::super::proto::types::{
+            VkBool32, VkPhysicalDevice, VkPhysicalDeviceFeatures2,
+            VkPhysicalDeviceVulkan11Features, VkStructureType,
+            vn_command_vkGetPhysicalDeviceFeatures2,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(0x9001);
+
+        /// A driver that answers through the chain, which is what a real one does.
+        unsafe extern "C" fn features(pd: VkPhysicalDevice, out: *mut VkPhysicalDeviceFeatures2) {
+            assert_eq!(pd, PD, "the handle the guest named reaches the driver");
+            // SAFETY: the handler passed an exclusive borrow of a live struct.
+            let out = unsafe { &mut *out };
+            out.features.geometryShader = VkBool32(1);
+            assert_eq!(out.sType, VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+            // SAFETY: the guest chained one struct, and it is live for this call.
+            let link = unsafe { &mut *(out.pNext as *mut VkPhysicalDeviceVulkan11Features) };
+            assert_eq!(
+                link.sType,
+                VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                "the chain arrives with the guest's own sType, not a rebuilt one"
+            );
+            link.multiview = VkBool32(1);
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceFeatures2(features);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+
+        let mut link = VkPhysicalDeviceVulkan11Features {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+            ..Default::default()
+        };
+        let mut asked = VkPhysicalDeviceFeatures2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            pNext: &raw mut link as *mut _,
+            ..Default::default()
+        };
+
+        let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
+        args.physicalDevice = PD;
+        args.plant_pFeatures(&mut asked);
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceFeatures2(&mut args);
+        assert!(h.reject.is_none(), "a query this driver can answer is not refused");
+
+        assert_eq!(
+            asked.features.geometryShader,
+            VkBool32(1),
+            "the struct the guest sent was filled"
+        );
+        assert_eq!(link.multiview, VkBool32(1), "and so was the one it chained behind it");
+
+        driver.abandon_planted();
+    }
+
+    /// The two ways a query cannot be carried out, and neither may pass for success. A reply built
+    /// from an unfilled struct is the guest reading its own zeroes back as the host's answer.
+    #[test]
+    fn a_query_that_cannot_be_answered_is_refused() {
+        use super::super::proto::types::{
+            VkPhysicalDeviceFeatures2, VkStructureType, vn_command_vkGetPhysicalDeviceFeatures2,
+        };
+
+        // No struct to answer into.
+        let mut driver = Driver::new();
+        driver.plant_instance(crate::vulkan::Instance::default());
+        let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceFeatures2(&mut args);
+        assert!(h.reject.is_some(), "a query with nowhere to put the answer");
+
+        // A struct, but a driver with no such entry point. The guest can steer this one, so it is
+        // a refusal and not the panic the advertised-command accessor would raise.
+        let mut asked = VkPhysicalDeviceFeatures2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            ..Default::default()
+        };
+        let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
+        args.plant_pFeatures(&mut asked);
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceFeatures2(&mut args);
+        assert!(h.reject.is_some(), "a query this driver does not export");
+
+        driver.abandon_planted();
     }
 
     #[test]

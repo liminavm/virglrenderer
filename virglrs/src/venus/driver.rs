@@ -479,6 +479,130 @@ impl Driver {
         Ok(out)
     }
 
+    // ------------------------------------------------------------------- queries
+    //
+    // Vulkan's `vkGet*` queries are one shape wearing several arities: find a table, call one
+    // entry point, let it fill a struct the guest supplied. The struct is the guest's because the
+    // decoder allocated it from the arena at the layout a C compiler agrees with -- so the driver
+    // writes into the very memory the reply encoder will read back, chained `pNext` structs and
+    // all, and nothing has to be copied between two spellings of the same fact.
+    //
+    // What varies is only the signature, so these are generic over it: the caller names the entry
+    // point and the types follow. `R` is the entry point's own return, which is `()` for the
+    // queries that cannot fail and `VkResult` for the ones that can -- one set of primitives for
+    // both. `Err` is this renderer unable to *ask* (no instance, no such entry point); `Ok(r)` is
+    // the driver's own answer, whatever it was.
+    //
+    // A missing entry point is deliberately not a panic here. The accessors that panic are for
+    // commands this build advertises, where absence is our bug; a query is a path the guest
+    // steers, and one guest asking for an extension this driver lacks must not take the worker
+    // down with it.
+
+    /// A physical-device query with nothing between the handle and the answer.
+    pub fn pd_query<T, R>(
+        &self,
+        pd: VkPhysicalDevice,
+        out: &mut T,
+        pick: impl FnOnce(&InstanceFns) -> Option<unsafe extern "C" fn(VkPhysicalDevice, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: `pd` is a handle this instance returned, and `out` is a live exclusive
+        // borrow for the length of the call.
+        Ok(unsafe { f(pd, out) })
+    }
+
+    /// A physical-device query that names what it is asking about by value.
+    pub fn pd_query_arg<A, T, R>(
+        &self,
+        pd: VkPhysicalDevice,
+        a: A,
+        out: &mut T,
+        pick: impl FnOnce(
+            &InstanceFns,
+        ) -> Option<unsafe extern "C" fn(VkPhysicalDevice, A, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `pd_query`; `a` is a plain value the guest sent.
+        Ok(unsafe { f(pd, a, out) })
+    }
+
+    /// A physical-device query that names what it is asking about with a struct.
+    ///
+    /// `info` stays an `Option<&I>` right up to the call, which is what keeps the null the guest
+    /// is allowed to send from being a raw pointer anywhere a handler can see it.
+    pub fn pd_query_info<I, T, R>(
+        &self,
+        pd: VkPhysicalDevice,
+        info: Option<&I>,
+        out: &mut T,
+        pick: impl FnOnce(
+            &InstanceFns,
+        )
+            -> Option<unsafe extern "C" fn(VkPhysicalDevice, *const I, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `pd_query`; `info` is an arena allocation live for the call, or null.
+        Ok(unsafe { f(pd, ptr(info), out) })
+    }
+
+    /// A device query that names what it is asking about with a struct.
+    pub fn dev_query_info<I, T, R>(
+        &self,
+        device: VkDevice,
+        info: Option<&I>,
+        out: &mut T,
+        pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: `device` is a handle this table was loaded from, `info` is an arena allocation
+        // live for the call or null, and `out` is a live exclusive borrow.
+        Ok(unsafe { f(device, ptr(info), out) })
+    }
+
+    /// A device query about one of the device's own objects.
+    pub fn dev_query_arg<A, T, R>(
+        &self,
+        device: VkDevice,
+        a: A,
+        out: &mut T,
+        pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, A, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `dev_query_info`; `a` is a handle the guest named, already resolved.
+        Ok(unsafe { f(device, a, out) })
+    }
+
+    /// A device query about one of its objects, narrowed by a struct.
+    pub fn dev_query_arg_info<A, I, T, R>(
+        &self,
+        device: VkDevice,
+        a: A,
+        info: Option<&I>,
+        out: &mut T,
+        pick: impl FnOnce(
+            &DeviceFns,
+        ) -> Option<unsafe extern "C" fn(VkDevice, A, *const I, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `dev_query_info`.
+        Ok(unsafe { f(device, a, ptr(info), out) })
+    }
+
     /// The instance's physical devices, into a caller-owned slice.
     ///
     /// Vulkan's two-call idiom collapses here: the guest already asked the count, so the slice is
@@ -899,6 +1023,13 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_device(&mut self, handle: u64, fns: DeviceFns) {
         self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+    }
+
+    /// Stand an instance table up with no loader behind it, so an instance-level query has
+    /// somewhere to be watched. The device half of this is `plant_device`.
+    #[cfg(test)]
+    pub(super) fn plant_instance(&mut self, fns: InstanceFns) {
+        self.instance = Some(fns);
     }
 
     #[cfg(test)]
