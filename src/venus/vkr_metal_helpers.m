@@ -514,22 +514,10 @@ vkr_mtl_iosurface_alloc(void *mtl_device,
  * Deliberately querying Metal rather than hardcoding 16: the 256-vs-16 gap is settled at
  * the source, so the number can never drift out of step with KK's own computation. */
 static uint32_t
-limina_metal_linear_pitch(uint32_t iosurface_pixel_format,
-                          uint32_t width,
-                          uint32_t bytes_per_element)
+limina_metal_pitch_for(MTLPixelFormat mtl_format,
+                       uint32_t width,
+                       uint32_t bytes_per_element)
 {
-   MTLPixelFormat mtl_format;
-   switch (iosurface_pixel_format) {
-   case 'BGRA':
-      mtl_format = MTLPixelFormatBGRA8Unorm;
-      break;
-   case 'RGBA':
-      mtl_format = MTLPixelFormatRGBA8Unorm;
-      break;
-   default:
-      return 0;
-   }
-
    /* Cached: this is on the resource-create path. */
    static id<MTLDevice> device;
    static dispatch_once_t once;
@@ -545,6 +533,184 @@ limina_metal_linear_pitch(uint32_t iosurface_pixel_format,
 
    uint64_t row = (uint64_t)width * bytes_per_element;
    return (uint32_t)(((row + align - 1) / align) * align);
+}
+
+static uint32_t
+limina_metal_linear_pitch(uint32_t iosurface_pixel_format,
+                          uint32_t width,
+                          uint32_t bytes_per_element)
+{
+   MTLPixelFormat mtl_format;
+   switch (iosurface_pixel_format) {
+   case 'BGRA':
+      mtl_format = MTLPixelFormatBGRA8Unorm;
+      break;
+   case 'RGBA':
+      mtl_format = MTLPixelFormatRGBA8Unorm;
+      break;
+   default:
+      return 0;
+   }
+   return limina_metal_pitch_for(mtl_format, width, bytes_per_element);
+}
+
+/* A plane is imported as its own single-component texture, so its pitch must satisfy the
+ * alignment of the format that plane is sampled as, not of the composite surface — which
+ * has no MTLPixelFormat at all. One and two bytes per element are the only widths the
+ * 4:2:0 layouts here produce (luma R8, interleaved chroma RG88, or 16-bit variants). */
+static uint32_t
+limina_metal_plane_pitch(uint32_t width, uint32_t bytes_per_element)
+{
+   MTLPixelFormat mtl_format;
+   switch (bytes_per_element) {
+   case 1:
+      mtl_format = MTLPixelFormatR8Unorm;
+      break;
+   case 2:
+      mtl_format = MTLPixelFormatRG8Unorm;
+      break;
+   default:
+      return 0;
+   }
+   return limina_metal_pitch_for(mtl_format, width, bytes_per_element);
+}
+
+static CFMutableDictionaryRef
+limina_plane_dict(uint32_t width, uint32_t height, uint32_t bpe, uint32_t bpr,
+                  uint32_t offset)
+{
+   CFMutableDictionaryRef d = CFDictionaryCreateMutable(
+      NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+   const struct {
+      CFStringRef key;
+      uint32_t val;
+   } entries[] = {
+      { kIOSurfacePlaneWidth, width },
+      { kIOSurfacePlaneHeight, height },
+      { kIOSurfacePlaneBytesPerElement, bpe },
+      { kIOSurfacePlaneBytesPerRow, bpr },
+      { kIOSurfacePlaneOffset, offset },
+   };
+   for (size_t i = 0; i < ARRAY_SIZE(entries); i++) {
+      int32_t v = (int32_t)entries[i].val;
+      CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
+      CFDictionarySetValue(d, entries[i].key, n);
+      CFRelease(n);
+   }
+   return d;
+}
+
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_planar(uint32_t width,
+                               uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint32_t plane_count,
+                               const uint32_t *plane_width,
+                               const uint32_t *plane_height,
+                               const uint32_t *plane_bpe,
+                               uint32_t *out_stride,
+                               uint32_t *out_offset)
+{
+   if (!width || !height || !plane_count || plane_count > VKR_MTL_MAX_PLANES)
+      return NULL;
+
+   /* Offsets and pitches are dictated, never discovered: the guest is told this layout
+    * and addresses the planes by it, so IOSurface picking its own would shear every
+    * plane after the first. */
+   uint32_t offset = 0;
+   for (uint32_t i = 0; i < plane_count; i++) {
+      if (!plane_width[i] || !plane_height[i])
+         return NULL;
+      uint32_t pitch = limina_metal_plane_pitch(plane_width[i], plane_bpe[i]);
+      if (!pitch)
+         return NULL;
+      out_stride[i] = pitch;
+      out_offset[i] = offset;
+      offset += pitch * plane_height[i];
+   }
+   const uint32_t total = offset;
+
+   bool scope = limina_scope_surfaces();
+   bool mark_global = limina_mark_global();
+
+   IOSurfaceRef io = NULL;
+   @autoreleasepool {
+      CFMutableDictionaryRef planes[VKR_MTL_MAX_PLANES];
+      const void *plane_refs[VKR_MTL_MAX_PLANES];
+      for (uint32_t i = 0; i < plane_count; i++) {
+         planes[i] = limina_plane_dict(plane_width[i], plane_height[i], plane_bpe[i],
+                                       out_stride[i], out_offset[i]);
+         plane_refs[i] = planes[i];
+      }
+      CFArrayRef arr =
+         CFArrayCreate(NULL, plane_refs, plane_count, &kCFTypeArrayCallBacks);
+
+      NSMutableDictionary *props = [@{
+         (id)kIOSurfaceWidth : @(width),
+         (id)kIOSurfaceHeight : @(height),
+         (id)kIOSurfacePixelFormat : @(iosurface_pixel_format),
+         (id)kIOSurfaceAllocSize : @(total),
+         (id)kIOSurfaceIsGlobal : @(mark_global),
+      } mutableCopy];
+      props[(id)kIOSurfacePlaneInfo] = (__bridge id)arr;
+      io = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+
+      CFRelease(arr);
+      for (uint32_t i = 0; i < plane_count; i++)
+         CFRelease(planes[i]);
+   }
+   if (!io)
+      return NULL;
+
+   if (IOSurfaceGetPlaneCount(io) != plane_count) {
+      fprintf(stderr,
+              "[KK-STRIDE] IOSurface gave %zu planes, asked %u — refusing\n",
+              IOSurfaceGetPlaneCount(io), plane_count);
+      CFRelease(io);
+      return NULL;
+   }
+   for (uint32_t i = 0; i < plane_count; i++) {
+      uint32_t got = (uint32_t)IOSurfaceGetBytesPerRowOfPlane(io, i);
+      if (got != out_stride[i]) {
+         /* Unlike the single-plane path this one refuses: the guest has not been told a
+          * layout yet, so failing here costs a fallback to the copy path, while keeping
+          * it would hand the guest offsets that do not describe the surface. */
+         fprintf(stderr,
+                 "[KK-STRIDE] IOSurface overrode plane %u pitch (asked %u, got %u) — "
+                 "refusing the planar surface\n",
+                 i, out_stride[i], got);
+         CFRelease(io);
+         return NULL;
+      }
+      /* IOSurface has no plane-offset getter; the plane's base against the surface's is
+       * the same number, and it is the one the guest is handed. */
+      out_offset[i] = (uint32_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(io, i) -
+                                 (uint8_t *)IOSurfaceGetBaseAddress(io));
+   }
+
+   struct vkr_mtl_iosurface *surf = calloc(1, sizeof(*surf));
+   if (!surf) {
+      CFRelease(io);
+      return NULL;
+   }
+   surf->io_surface = (void *)io; /* +1 from IOSurfaceCreate */
+   surf->mtl_texture = NULL;
+   surf->id = IOSurfaceGetID(io);
+   surf->width = width;
+   surf->height = height;
+   surf->bytes_per_row = (uint32_t)IOSurfaceGetBytesPerRow(io);
+   surf->base_addr = IOSurfaceGetBaseAddress(io);
+   surf->alloc_size = IOSurfaceGetAllocSize(io);
+   surf->limina_budget_ctx = vkr_budget_charge(surf->alloc_size, "IOSurface");
+   atomic_fetch_add(&g_limina_n_ios_alloc, 1);
+   limina_sentinel_once();
+   limina_sentinel_attach((id)io, LIMINA_SENTINEL_IOSURFACE);
+
+   if (scope) {
+      limina_registry_insert(surf->id, io);
+      limina_publish_surface(surf->id, io);
+   }
+   return surf;
 }
 
 struct vkr_mtl_iosurface *
@@ -805,6 +971,39 @@ vkr_mtl_iosurface_read(uint32_t id, void *dst, uint32_t dst_stride, uint32_t hei
    IOSurfaceUnlock(io, kIOSurfaceLockReadOnly, NULL);
    vkr_mtl_iosurface_release_ref((void *)io); /* -1 */
    return 1;
+}
+
+/* limina: write `rows` rows of `row_bytes` into one plane of a planar IOSurface, from a
+ * source of its own stride. Rows rather than a flat copy because the guest's pitch and the
+ * surface's are independently chosen, and only the guest's is under its control. The lock is
+ * per call: a decode target is written once per frame, on the vrend thread, and holding it
+ * across the sample would serialise the GPU against the next decode. */
+int
+vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf,
+                              uint32_t plane,
+                              const void *src,
+                              uint32_t src_stride,
+                              uint32_t rows,
+                              uint32_t row_bytes)
+{
+   if (!surf || !surf->io_surface || !src || !rows || !row_bytes)
+      return 0;
+   IOSurfaceRef io = (IOSurfaceRef)surf->io_surface;
+   if (plane >= IOSurfaceGetPlaneCount(io))
+      return 0;
+
+   IOSurfaceLock(io, 0, NULL);
+   uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddressOfPlane(io, plane);
+   const size_t dst_stride = (size_t)IOSurfaceGetBytesPerRowOfPlane(io, plane);
+   int ok = 0;
+   if (base && (size_t)row_bytes <= dst_stride) {
+      for (uint32_t row = 0; row < rows; row++)
+         memcpy(base + (size_t)row * dst_stride,
+                (const uint8_t *)src + (size_t)row * src_stride, row_bytes);
+      ok = 1;
+   }
+   IOSurfaceUnlock(io, 0, NULL);
+   return ok;
 }
 
 /* limina snapshot-replay P2: raw byte copy in/out of a scanout IOSurface — see the header. The
