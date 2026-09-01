@@ -52,7 +52,8 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
-    vn_command_vkGetPhysicalDeviceProperties2, vn_command_vkImportSemaphoreResourceMESA,
+    vn_command_vkGetPhysicalDeviceProperties2,
+    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkImportSemaphoreResourceMESA,
     vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer, vn_command_vkResetFences,
     vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
     vn_command_vkWaitSemaphoreResourceMESA,
@@ -918,6 +919,41 @@ impl Commands for Handlers<'_> {
         );
     }
 
+    fn vkGetPhysicalDeviceQueueFamilyProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceQueueFamilyProperties2<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !args.has_pQueueFamilyPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        // A null array is the guest asking how many there are, which is the spec's own first call.
+        if !args.has_pQueueFamilyProperties() {
+            let asked = self
+                .driver
+                .pd_enumerate(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
+            if let Some((n, ())) = self.asked(asked)
+                && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+            {
+                *count = n;
+            }
+            return;
+        }
+        let Some(out) = self.array(args.pQueueFamilyProperties_mut()) else { return };
+        let asked = self
+            .driver
+            .pd_enumerate(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties2());
+        // The count goes back last, and has to: it lives in the struct the array was borrowed
+        // from, so the two cannot be held at once -- and how many there are is not known until
+        // the array has been filled. See `vkEnumeratePhysicalDevices`.
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+        {
+            *count = n;
+        }
+    }
+
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
     // the honest channel and refusal is not: a driver without `VK_EXT_image_drm_format_modifier`
     // is an answer the guest asked for and can act on, not a reason to take its ring down. The
@@ -1629,6 +1665,93 @@ mod tests {
             "the guest reads this build's ceiling, with the driver's own patch level"
         );
         assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
+
+        driver.abandon_planted();
+    }
+
+    /// Vulkan's two-call enumeration, both halves, and the ordering the second half forces.
+    ///
+    /// The count is written *after* the array is filled, and not by preference: it lives in the
+    /// same struct the array was borrowed from, so the borrow checker will not hold both -- which
+    /// is the right answer, because how many there are is not known until the driver has said.
+    #[test]
+    fn an_enumeration_answers_the_count_call_and_the_fill_call() {
+        use super::super::proto::types::{
+            VkPhysicalDevice, VkQueueFamilyProperties2,
+            vn_command_vkGetPhysicalDeviceQueueFamilyProperties2 as Cmd,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(0x33);
+        const FAMILIES: u32 = 3;
+
+        unsafe extern "C" fn families(
+            _pd: VkPhysicalDevice,
+            count: *mut u32,
+            out: *mut VkQueueFamilyProperties2,
+        ) {
+            // SAFETY: the driver passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = FAMILIES;
+                return;
+            }
+            // SAFETY: `count` is the length the caller sized the array to.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, *count as usize) };
+            for (i, f) in out.iter_mut().enumerate() {
+                f.queueFamilyProperties.queueCount = i as u32 + 10;
+            }
+            *count = FAMILIES.min(*count);
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceQueueFamilyProperties2(families);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        // The count call: a count member, no array behind it.
+        let mut n = 0u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pQueueFamilyPropertyCount(&mut n);
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(n, FAMILIES, "a null array is the guest asking how many there are");
+
+        // The fill call, with room to spare on purpose. The count the guest reads back has to be
+        // the driver's answer and not the size it asked with, so the two are kept different --
+        // equal, and a handler that never writes the count back would pass this.
+        let mut props = [VkQueueFamilyProperties2::default(); 4];
+        let mut n = 4u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pQueueFamilyPropertyCount(&mut n);
+        args.plant_pQueueFamilyProperties(&mut props);
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(n, FAMILIES, "the driver's count reaches the guest, not the size it asked with");
+        assert_eq!(
+            props.map(|p| p.queueFamilyProperties.queueCount),
+            [10, 11, 12, 13],
+            "and the guest's own array is where the driver wrote"
+        );
 
         driver.abandon_planted();
     }
