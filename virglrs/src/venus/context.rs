@@ -297,12 +297,8 @@ pub struct Handlers<'a> {
 
 impl Handlers<'_> {
     /// The guest id a single out-handle carries, or None when the guest asked for no object.
-    fn out_id<T: Handle>(&self, out: *const T) -> Option<ObjectId> {
-        if out.is_null() {
-            return None;
-        }
-        // SAFETY: non-null, and the decoder allocated one element in the arena.
-        Some(ObjectId(unsafe { *out }.raw()))
+    fn out_id<T: Handle>(&self, out: Option<&T>) -> Option<ObjectId> {
+        Some(ObjectId(out?.raw()))
     }
 
     /// Write what the driver produced into the shadow the generated hook will read, or ghost the
@@ -316,8 +312,8 @@ impl Handlers<'_> {
     fn plant<T: Handle>(
         &mut self,
         what: &str,
-        out: *const T,
-        shadow: *mut T,
+        out: Option<&T>,
+        shadow: Option<&mut T>,
         host: Result<u64, VkResult>,
     ) {
         let Some(id) = self.out_id(out) else {
@@ -325,9 +321,8 @@ impl Handlers<'_> {
         };
         match host {
             Ok(h) if h != 0 => {
-                if !shadow.is_null() {
-                    // SAFETY: non-null, and the decoder allocated one element in the arena.
-                    unsafe { *shadow = T::from_raw(h) };
+                if let Some(shadow) = shadow {
+                    *shadow = T::from_raw(h);
                 }
             }
             Err(r) => {
@@ -453,7 +448,7 @@ macro_rules! simple_create {
             let host =
                 self.driver.create_object(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-            self.plant(stringify!($cmd), args.$out, args.$shadow, host);
+            self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
     };
 }
@@ -468,7 +463,7 @@ macro_rules! pool_create {
             let host =
                 self.driver.create_pool(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-            self.plant(stringify!($cmd), args.$out, args.$shadow, host);
+            self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
     };
 }
@@ -538,7 +533,12 @@ impl Commands for Handlers<'_> {
     fn vkCreateInstance(&mut self, args: &mut vn_command_vkCreateInstance<'_>) {
         let host = self.driver.create_instance(self.global, args.pCreateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant("vkCreateInstance", args.pInstance, args.handle_pInstance, host.map(|h| h.0));
+        self.plant(
+            "vkCreateInstance",
+            args.pInstance(),
+            args.handle_pInstance_mut(),
+            host.map(|h| h.0),
+        );
     }
 
     fn vkDestroyInstance(&mut self, args: &mut vn_command_vkDestroyInstance<'_>) {
@@ -552,15 +552,16 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkEnumeratePhysicalDevices(&mut self, args: &mut vn_command_vkEnumeratePhysicalDevices<'_>) {
-        if args.pPhysicalDeviceCount.is_null() {
+        if !args.has_pPhysicalDeviceCount() {
             return;
         }
         // A null array is the guest asking how many there are. Answering it needs no ids, so
         // there is nothing to register and nothing to plant.
         if !args.has_pPhysicalDevices() {
-            if let Ok(n) = self.driver.physical_device_count(args.instance) {
-                // SAFETY: non-null, and the decoder allocated it in the arena.
-                unsafe { *args.pPhysicalDeviceCount = n };
+            if let Ok(n) = self.driver.physical_device_count(args.instance)
+                && let Some(count) = args.pPhysicalDeviceCount_mut()
+            {
+                *count = n;
             }
             return;
         }
@@ -572,19 +573,23 @@ impl Commands for Handlers<'_> {
         // The shadow is borrowed from `args`, so everything else this needs off it is read first.
         // That is the borrow doing its job: while the driver is writing host handles into the
         // array, nothing else may be reading the struct that owns it.
-        let (instance, count_out) = (args.instance, args.pPhysicalDeviceCount);
+        let instance = args.instance;
         let Some(out) = self.array(args.handle_pPhysicalDevices_mut()) else { return };
         let Ok(got) = self.driver.physical_devices(instance, out) else {
             args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
             self.ghost_ids(ids);
             return;
         };
-        // SAFETY: as above.
-        unsafe { *count_out = got };
         // What each one supports is asked once, here, because device creation is filtered against
         // it and there is no later point where the guest is guaranteed to have named them all.
         for pd in out.iter().take(got as usize) {
             self.driver.learn_extensions(*pd);
+        }
+        // The count goes back last, and has to: it lives in the same struct the shadow array was
+        // borrowed from, so the two cannot be held at once. That is not the borrow checker being
+        // awkward -- how many there are is not known until the array has been filled.
+        if let Some(count) = args.pPhysicalDeviceCount_mut() {
+            *count = got;
         }
         self.ghost_ids(&ids[got as usize..]);
     }
@@ -593,7 +598,7 @@ impl Commands for Handlers<'_> {
         let host =
             self.driver.create_device(args.physicalDevice, args.pCreateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant("vkCreateDevice", args.pDevice, args.handle_pDevice, host.map(|h| h.0));
+        self.plant("vkCreateDevice", args.pDevice(), args.handle_pDevice_mut(), host.map(|h| h.0));
     }
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
@@ -613,13 +618,18 @@ impl Commands for Handlers<'_> {
     fn vkAllocateMemory(&mut self, args: &mut vn_command_vkAllocateMemory<'_>) {
         // The id has to be read before the allocation, because it is the key the driver files it
         // under -- and it is the guest's, chosen in the request, not anything the host picks.
-        let Some(id) = self.out_id(args.pMemory) else {
+        let Some(id) = self.out_id(args.pMemory()) else {
             return;
         };
         let host =
             self.driver.allocate_memory(args.device, id, args.pAllocateInfo, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant("vkAllocateMemory", args.pMemory, args.handle_pMemory, host.map(|m| m.0));
+        self.plant(
+            "vkAllocateMemory",
+            args.pMemory(),
+            args.handle_pMemory_mut(),
+            host.map(|m| m.0),
+        );
     }
 
     fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory<'_>) {
@@ -636,7 +646,7 @@ impl Commands for Handlers<'_> {
     // visible line in a diff, and so that an object needing more than the pair cannot be added by
     // accident -- `vkCreateShaderModule` below is what that looks like.
 
-    simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence);
+    simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence_mut);
     simple_destroy!(vkDestroyFence, vn_command_vkDestroyFence, fence);
 
     simple_create!(
@@ -644,7 +654,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateSemaphore,
         pCreateInfo,
         pSemaphore,
-        handle_pSemaphore
+        handle_pSemaphore_mut
     );
     simple_destroy!(vkDestroySemaphore, vn_command_vkDestroySemaphore, semaphore);
 
@@ -653,14 +663,20 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateCommandPool,
         pCreateInfo,
         pCommandPool,
-        handle_pCommandPool
+        handle_pCommandPool_mut
     );
     pool_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
 
-    simple_create!(vkCreateBuffer, vn_command_vkCreateBuffer, pCreateInfo, pBuffer, handle_pBuffer);
+    simple_create!(
+        vkCreateBuffer,
+        vn_command_vkCreateBuffer,
+        pCreateInfo,
+        pBuffer,
+        handle_pBuffer_mut
+    );
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
 
-    simple_create!(vkCreateImage, vn_command_vkCreateImage, pCreateInfo, pImage, handle_pImage);
+    simple_create!(vkCreateImage, vn_command_vkCreateImage, pCreateInfo, pImage, handle_pImage_mut);
     simple_destroy!(vkDestroyImage, vn_command_vkDestroyImage, image);
 
     simple_create!(
@@ -668,7 +684,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateImageView,
         pCreateInfo,
         pView,
-        handle_pView
+        handle_pView_mut
     );
     simple_destroy!(vkDestroyImageView, vn_command_vkDestroyImageView, imageView);
 
@@ -677,7 +693,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateSampler,
         pCreateInfo,
         pSampler,
-        handle_pSampler
+        handle_pSampler_mut
     );
     simple_destroy!(vkDestroySampler, vn_command_vkDestroySampler, sampler);
 
@@ -686,7 +702,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateRenderPass,
         pCreateInfo,
         pRenderPass,
-        handle_pRenderPass
+        handle_pRenderPass_mut
     );
     simple_destroy!(vkDestroyRenderPass, vn_command_vkDestroyRenderPass, renderPass);
 
@@ -695,7 +711,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateFramebuffer,
         pCreateInfo,
         pFramebuffer,
-        handle_pFramebuffer
+        handle_pFramebuffer_mut
     );
     simple_destroy!(vkDestroyFramebuffer, vn_command_vkDestroyFramebuffer, framebuffer);
 
@@ -704,7 +720,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateDescriptorSetLayout,
         pCreateInfo,
         pSetLayout,
-        handle_pSetLayout
+        handle_pSetLayout_mut
     );
     simple_destroy!(
         vkDestroyDescriptorSetLayout,
@@ -717,7 +733,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreateDescriptorPool,
         pCreateInfo,
         pDescriptorPool,
-        handle_pDescriptorPool
+        handle_pDescriptorPool_mut
     );
     pool_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
 
@@ -726,7 +742,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreatePipelineLayout,
         pCreateInfo,
         pPipelineLayout,
-        handle_pPipelineLayout
+        handle_pPipelineLayout_mut
     );
     simple_destroy!(vkDestroyPipelineLayout, vn_command_vkDestroyPipelineLayout, pipelineLayout);
 
@@ -735,7 +751,7 @@ impl Commands for Handlers<'_> {
         vn_command_vkCreatePipelineCache,
         pCreateInfo,
         pPipelineCache,
-        handle_pPipelineCache
+        handle_pPipelineCache_mut
     );
     simple_destroy!(vkDestroyPipelineCache, vn_command_vkDestroyPipelineCache, pipelineCache);
 
@@ -757,7 +773,12 @@ impl Commands for Handlers<'_> {
             args.pAllocator,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant("vkCreateShaderModule", args.pShaderModule, args.handle_pShaderModule, host);
+        self.plant(
+            "vkCreateShaderModule",
+            args.pShaderModule(),
+            args.handle_pShaderModule_mut(),
+            host,
+        );
     }
 
     simple_destroy!(vkDestroyShaderModule, vn_command_vkDestroyShaderModule, shaderModule);
@@ -835,8 +856,8 @@ impl Commands for Handlers<'_> {
         let host = self.driver.device_queue(args.device, args.pQueueInfo);
         self.plant(
             "vkGetDeviceQueue2",
-            args.pQueue,
-            args.handle_pQueue,
+            args.pQueue(),
+            args.handle_pQueue_mut(),
             host.map(|q| q.0).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
         );
     }
@@ -1191,6 +1212,27 @@ mod tests {
         assert_eq!(ctx.unhandled, 0);
     }
 
+    /// Nothing in this file's handlers reaches for `unsafe`, and this is what keeps it that way.
+    ///
+    /// Handlers adjudicate the guest's decisions; a raw pointer in one is the generator having
+    /// handed it the wrong thing, so the fix belongs in the template and never in a block here.
+    /// That was a rule written down and then broken five times, always the same way -- an
+    /// out-parameter dereferenced because there was no other way to answer the guest. There is
+    /// one now: the command structs' single-value members are shut away behind generated
+    /// accessors, the way their arrays already were.
+    ///
+    /// Counting the source is a blunt instrument and deliberately so. The alternative is trusting
+    /// the next person to remember, which is what produced the five.
+    #[test]
+    fn no_handler_here_reaches_for_unsafe() {
+        let src = include_str!("context.rs");
+        let (handlers, _tests) = src
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("this file ends in its own test module");
+        let n = handlers.matches("unsafe").count();
+        assert_eq!(n, 0, "venus/context.rs is not on the list of modules allowed unsafe");
+    }
+
     /// The pairing the whole shadow mechanism exists for: the guest names an object by an id it
     /// chose, and the host knows it by a handle the driver chose. Until a handler runs the two are
     /// the same number, which is exactly why a test that leaves them equal proves nothing -- this
@@ -1216,10 +1258,8 @@ mod tests {
             fn unsupported(&mut self, _cmd: VkCommandTypeEXT) {}
 
             fn vkCreateFence(&mut self, args: &mut vn_command_vkCreateFence<'_>) {
-                assert!(!args.handle_pFence.is_null(), "the decoder owes a place to write");
-                // The guest id in `pFence` has to survive: the reply sends it back.
-                // SAFETY: the decoder allocated one element there.
-                unsafe { *args.handle_pFence = VkFence(HOST) };
+                let out = args.handle_pFence_mut().expect("the decoder owes a place to write");
+                *out = VkFence(HOST);
             }
 
             fn object_created(
@@ -1506,16 +1546,16 @@ mod tests {
         };
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
-        let mut args =
-            vn_command_vkCreateShaderModule { pCreateInfo: Some(&odd), ..Default::default() };
+        let mut args = vn_command_vkCreateShaderModule::default();
+        args.pCreateInfo = Some(&odd);
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_some(), "a code size of 7 must not reach the driver");
 
         // Four is a whole word, so the guard lets it through; there is no device, so the driver
         // refuses it -- which is a different answer from a protocol violation.
         let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
-        let mut args =
-            vn_command_vkCreateShaderModule { pCreateInfo: Some(&whole), ..Default::default() };
+        let mut args = vn_command_vkCreateShaderModule::default();
+        args.pCreateInfo = Some(&whole);
         h.reject = None;
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
