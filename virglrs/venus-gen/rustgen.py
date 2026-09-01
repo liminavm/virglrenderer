@@ -1596,6 +1596,7 @@ class RustGen:
         visibility that shuts the pointer away cannot come to different answers.
         """
         rows = []
+        shadowed = {f for f, _, _ in self.shadows(ty)}
         for var in ty.variables:
             try:
                 shape = self._shape(ty, var)
@@ -1603,7 +1604,16 @@ class RustGen:
                 # The member has no emitted decode either, so there is no array to hand out.
                 continue
             if shape[0] == 'dynamic':
-                rows.append((self.field_name(var.name), self.base_name(var.ty), shape[1], False))
+                # Same rule as `scalar_rows`, and for the same reason: a `*mut` member is not
+                # automatically one a handler writes. Where a shadow was emitted beside it the
+                # wire array holds the *guest's* ids and the host handles go in the shadow, so
+                # the wire member is read-only. Where no shadow exists there are no ids to keep
+                # apart, and a `*mut` out-array is exactly what it looks like -- an array the
+                # driver fills in place.
+                f = self.field_name(var.name)
+                mutable = (not var.ty.is_const_pointer()
+                           and ('handle_%s' % f) not in shadowed)
+                rows.append((f, self.base_name(var.ty), shape[1], mutable))
             elif shape[0] == 'blob':
                 # A blob is an array whose element type vk.xml declines to name: `void`, with a
                 # length counted in bytes. So the slice is of `u8` -- `base_name` would say
