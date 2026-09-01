@@ -304,24 +304,32 @@ impl<'a> Replay<'a> {
                 self.r.context_destroy(*ctx_id);
                 (0, format!("context_destroy {ctx_id}"))
             }
-            Ctl::CreateBlob { res_handle, ctx_id, blob_mem, blob_flags, blob_id, size, num_iovs } => {
+            Ctl::CreateBlob {
+                res_handle,
+                ctx_id,
+                blob_mem,
+                blob_flags,
+                blob_id,
+                size,
+                num_iovs,
+            } => {
                 // Guest-storage blobs were backed by guest RAM. Only the count and total size were
                 // recorded -- the addresses named a machine that no longer exists -- so supply one
                 // contiguous backing of the right size instead. It is the shape the renderer
                 // validates (total iov size >= blob size), not the layout.
-                let (iovecs, iov_count) = if matches!(*blob_mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D_GUEST)
-                    || *num_iovs > 0
-                {
-                    let mut bytes = vec![0u8; *size as usize];
-                    let iov = libc::iovec {
-                        iov_base: bytes.as_mut_ptr().cast(),
-                        iov_len: bytes.len(),
+                let (iovecs, iov_count) =
+                    if matches!(*blob_mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D_GUEST) || *num_iovs > 0
+                    {
+                        let mut bytes = vec![0u8; *size as usize];
+                        let iov = libc::iovec {
+                            iov_base: bytes.as_mut_ptr().cast(),
+                            iov_len: bytes.len(),
+                        };
+                        self.backings.insert(*res_handle, Backing { _bytes: bytes });
+                        (Box::leak(Box::new(iov)) as *const libc::iovec, 1u32)
+                    } else {
+                        (std::ptr::null(), 0u32)
                     };
-                    self.backings.insert(*res_handle, Backing { _bytes: bytes });
-                    (Box::leak(Box::new(iov)) as *const libc::iovec, 1u32)
-                } else {
-                    (std::ptr::null(), 0u32)
-                };
 
                 let args = abi::CreateBlobArgs {
                     res_handle: *res_handle,
@@ -397,13 +405,7 @@ impl<'a> Replay<'a> {
         for (event, age) in pending {
             let retry_ok = match &event {
                 Ctl::CreateBlob {
-                    res_handle,
-                    ctx_id,
-                    blob_mem,
-                    blob_flags,
-                    blob_id,
-                    size,
-                    ..
+                    res_handle, ctx_id, blob_mem, blob_flags, blob_id, size, ..
                 } => {
                     let args = abi::CreateBlobArgs {
                         res_handle: *res_handle,
@@ -434,8 +436,7 @@ impl<'a> Replay<'a> {
 }
 
 fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
-    let blob = std::fs::read(&args.corpus)
-        .map_err(|e| format!("{}: {e}", args.corpus))?;
+    let blob = std::fs::read(&args.corpus).map_err(|e| format!("{}: {e}", args.corpus))?;
     let c = corpus::parse(&blob).map_err(|e| format!("{}: {e}", args.corpus))?;
 
     if c.flags & corpus::FLAG_TRUNC_FULL != 0 {

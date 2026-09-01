@@ -189,5 +189,9 @@ fn main() -> ExitCode {
     for (outcome, n) in totals.iter().filter(|(o, _)| **o != Outcome::Ok) {
         println!("  {n} {outcome:?}");
     }
-    if ok == commands { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if ok == commands {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
