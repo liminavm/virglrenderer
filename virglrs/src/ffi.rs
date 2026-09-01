@@ -27,7 +27,22 @@ use crate::abi::{
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
 use crate::ids::{CtxId, FenceId, ResourceHandle, RingIdx};
-use crate::renderer::Renderer;
+use crate::renderer::{self, Renderer};
+
+/// Translate a renderer failure into the errno the C ABI answers with.
+///
+/// The whole reason [`renderer::Error`] exists: the negative integers stop here, so nothing on the
+/// Rust side has to describe a failure in a vocabulary borrowed from a C header. Several causes
+/// share a code because the ABI has no finer answer, not because they are the same thing.
+fn errno(e: renderer::Error) -> c_int {
+    use renderer::Error::*;
+    match e {
+        ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned => {
+            EINVAL
+        }
+        RendererUnimplemented => -libc::ENOTSUP,
+    }
+}
 
 /// THE global. See the module docs -- one static, one owned root, nothing else.
 fn root() -> &'static Mutex<Option<Renderer>> {
@@ -179,7 +194,7 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
     let name = read_name(name, nlen);
     with(EINVAL, |r| match r.context_create(id, ctx_flags, name) {
         Ok(()) => 0,
-        Err(e) => e,
+        Err(e) => errno(e),
     })
 }
 
@@ -230,7 +245,7 @@ pub extern "C" fn virgl_renderer_resource_create(
     let iov = read_iov(iov, num_iovs);
     with(EINVAL, |r| match r.resource_create(a, iov) {
         Ok(()) => 0,
-        Err(e) => e,
+        Err(e) => errno(e),
     })
 }
 
@@ -243,7 +258,7 @@ pub extern "C" fn virgl_renderer_resource_create_blob(args: *const CreateBlobArg
     let a = unsafe { &*args };
     with(EINVAL, |r| match r.resource_create_blob(a) {
         Ok(()) => 0,
-        Err(e) => e,
+        Err(e) => errno(e),
     })
 }
 
@@ -257,7 +272,7 @@ pub extern "C" fn virgl_renderer_resource_import_blob(args: *const ImportBlobArg
     with(EINVAL, |r| {
         match r.resource_import(ResourceHandle(a.res_handle), a.blob_mem, a.fd_type, a.size) {
             Ok(()) => 0,
-            Err(e) => e,
+            Err(e) => errno(e),
         }
     })
 }
@@ -498,7 +513,7 @@ pub extern "C" fn virgl_renderer_submit_cmd(
     };
     with(EINVAL, |r| match r.submit_cmd(id, buf) {
         Ok(()) => 0,
-        Err(e) => e,
+        Err(e) => errno(e),
     })
 }
 
@@ -617,7 +632,7 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     };
     with(EINVAL, |r| match r.context_create_fence(id, RingIdx(ring_idx), FenceId(fence_id)) {
         Ok(()) => 0,
-        Err(e) => e,
+        Err(e) => errno(e),
     })
 }
 
@@ -908,3 +923,22 @@ fn _type_anchors(p: &GlCtxParam, s: &CStr) -> (c_int, usize) {
 
 #[allow(dead_code)]
 const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one thing lost when the Rust API stopped speaking errno: nothing else checks that a
+    /// cause still reaches the guest as the code it used to. `ENOTSUP` is the code that matters --
+    /// it is the ABI's "this build has no renderer for that", and collapsing it into `EINVAL`
+    /// would tell a VMM the guest sent something malformed instead.
+    #[test]
+    fn every_cause_keeps_the_errno_the_abi_answered_with() {
+        use renderer::Error::*;
+        for e in [ZeroHandle, ResourceExists, ContextExists, NoContext, RendererAbsent, Poisoned] {
+            assert_eq!(errno(e), -libc::EINVAL, "{e:?} must still be EINVAL");
+        }
+        assert_eq!(errno(RendererUnimplemented), -libc::ENOTSUP);
+        assert_ne!(errno(RendererUnimplemented), errno(RendererAbsent));
+    }
+}
