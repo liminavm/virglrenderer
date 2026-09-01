@@ -1721,13 +1721,16 @@ mod tests {
     /// and the census unchanged. So the driver is stood up out of planted entry points and asked
     /// what it was called with.
     ///
-    /// Three shapes, which is what the fifteen recording commands are made of: one counted array,
-    /// two arrays under one count, and a command with a result to carry back.
+    /// Four shapes, which is what the fifteen recording commands are made of: one counted array,
+    /// two arrays under one count, three arrays with three counts, and a command with a result to
+    /// carry back.
     #[test]
     fn a_recording_handler_hands_the_driver_what_the_guest_sent() {
         use super::super::proto::types::{
-            VkBuffer, VkCommandBuffer, VkCommandBufferBeginInfo, VkDeviceSize, VkViewport,
-            vn_command_vkBeginCommandBuffer, vn_command_vkCmdBindVertexBuffers,
+            VkBuffer, VkBufferMemoryBarrier, VkCommandBuffer, VkCommandBufferBeginInfo,
+            VkDependencyFlags, VkDeviceSize, VkImageMemoryBarrier, VkMemoryBarrier,
+            VkPipelineStageFlags, VkViewport, vn_command_vkBeginCommandBuffer,
+            vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdPipelineBarrier,
             vn_command_vkCmdSetViewport,
         };
         use std::cell::RefCell;
@@ -1741,6 +1744,7 @@ mod tests {
         struct Saw {
             viewports: Vec<(u32, Vec<f32>)>,
             vertex_buffers: Vec<(u32, Vec<u64>, Vec<u64>)>,
+            barriers: Vec<(u32, u32, u32)>,
             began: u32,
         }
         thread_local! {
@@ -1781,6 +1785,22 @@ mod tests {
             });
         }
 
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn pipeline_barrier(
+            _cb: VkCommandBuffer,
+            _src: VkPipelineStageFlags,
+            _dst: VkPipelineStageFlags,
+            _dependency: VkDependencyFlags,
+            memory: u32,
+            _pm: *const VkMemoryBarrier,
+            buffers: u32,
+            _pb: *const VkBufferMemoryBarrier,
+            images: u32,
+            _pi: *const VkImageMemoryBarrier,
+        ) {
+            SAW.with_borrow_mut(|s| s.barriers.push((memory, buffers, images)));
+        }
+
         unsafe extern "C" fn begin(
             _cb: VkCommandBuffer,
             _info: *const VkCommandBufferBeginInfo,
@@ -1792,6 +1812,7 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCmdSetViewport(set_viewport);
         fns.plant_vkCmdBindVertexBuffers(bind_vertex_buffers);
+        fns.plant_vkCmdPipelineBarrier(pipeline_barrier);
         fns.plant_vkBeginCommandBuffer(begin);
 
         let objects = Shared::new();
@@ -1837,6 +1858,21 @@ mod tests {
         SAW.with_borrow(|s| {
             assert_eq!(s.vertex_buffers, [(1, vec![0x100, 0x200], vec![64, 128])]);
         });
+
+        // Three arrays with three counts of their own. Deliberately unequal lengths: every count
+        // is a `u32` and only the pointer types differ, so passing one array's length where
+        // another's belongs compiles, and nothing outside this can see it.
+        let memory = [VkMemoryBarrier::default(); 1];
+        let buffers = [VkBufferMemoryBarrier::default(); 2];
+        let images = [VkImageMemoryBarrier::default(); 3];
+        let mut args = vn_command_vkCmdPipelineBarrier::default();
+        args.commandBuffer = cb;
+        args.plant_pMemoryBarriers(&memory);
+        args.plant_pBufferMemoryBarriers(&buffers);
+        args.plant_pImageMemoryBarriers(&images);
+        h.vkCmdPipelineBarrier(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| assert_eq!(s.barriers, [(1, 2, 3)], "each count with its own array"));
 
         // A result the guest is owed: the driver's answer has to reach the reply, not be
         // replaced by a success the renderer invented.
