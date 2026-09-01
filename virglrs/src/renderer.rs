@@ -7,9 +7,8 @@
 //! `static`. There are no file-scope mutables and no implicit current context -- `force_ctx_0`,
 //! the C's implicit global, is a no-op here because nothing reads such a thing.
 
-use crate::abi;
 use crate::abi::{GuestIov, VmmPtr};
-use crate::config::Config;
+use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
@@ -117,7 +116,9 @@ pub struct Resource {
 
 pub struct Context {
     pub id: CtxId,
-    pub flags: u32,
+    /// The renderer this context bound. It is the only thing that says which one a submission
+    /// belongs to, and it cannot change once the context exists.
+    pub capset: CapsetId,
     pub name: String,
     /// The last fence id created on each ring. A ring's fences retire in creation order, so this
     /// is what a later phase checks a retirement against.
@@ -149,9 +150,9 @@ impl Renderer {
     /// Honest by construction: a capset appears only when the renderer that serves it is present.
     /// A skeleton that claimed VIRGL2 would have the guest bind a classic context and submit
     /// commands into a renderer that cannot answer them.
-    pub fn capset_max(&self, set: u32) -> Option<(u32, u32)> {
+    pub fn capset_max(&self, set: CapsetId) -> Option<(u32, u32)> {
         match set {
-            abi::CAPSET_VENUS if self.venus.is_some() => {
+            CapsetId::Venus if self.venus.is_some() => {
                 Some((venus::capset::VERSION, venus::capset::size()))
             }
             _ => None,
@@ -161,9 +162,9 @@ impl Renderer {
     /// The capset's bytes, for a set this build advertises. `None` for anything else -- the caller
     /// sized its buffer from `capset_max`, so writing into a buffer for a capset we reported as
     /// absent would run off the end of it.
-    pub fn capset_bytes(&self, set: u32, version: u32) -> Option<Vec<u8>> {
+    pub fn capset_bytes(&self, set: CapsetId, version: u32) -> Option<Vec<u8>> {
         match set {
-            abi::CAPSET_VENUS if self.config.venus && version == venus::capset::VERSION => {
+            CapsetId::Venus if self.config.venus && version == venus::capset::VERSION => {
                 Some(venus::capset::Capset::new(self.config).as_bytes().to_vec())
             }
             _ => None,
@@ -244,16 +245,21 @@ impl Renderer {
 
     // ---- contexts ----
 
-    pub fn context_create(&mut self, id: CtxId, flags: u32, name: String) -> Result<(), Error> {
+    pub fn context_create(
+        &mut self,
+        id: CtxId,
+        capset: CapsetId,
+        name: String,
+    ) -> Result<(), Error> {
         // A guest reusing a live id is the guest's error, not ours: rejected rather than
         // replacing an entry it still holds. Zero needs no check -- `CtxId` cannot be zero.
         if self.contexts.contains_key(&id) {
             return Err(Error::ContextExists);
         }
-        self.contexts.insert(id, Context { id, flags, name, last_fence: BTreeMap::new() });
-        // A venus context gets venus state. The capset the guest bound is the low byte of the
-        // flags, and it is the only thing that says which renderer a submission belongs to.
-        if flags & abi::CAPSET_MASK == abi::CAPSET_VENUS
+        self.contexts.insert(id, Context { id, capset, name, last_fence: BTreeMap::new() });
+        // A venus context gets venus state; anything else gets a context and nothing behind it,
+        // and finds out when it submits.
+        if capset == CapsetId::Venus
             && let Some(v) = self.venus.as_mut()
         {
             v.context_create(id);
@@ -324,8 +330,8 @@ impl Renderer {
         let Some(c) = self.contexts.get(&ctx) else {
             return Err(Error::NoContext);
         };
-        match c.flags & abi::CAPSET_MASK {
-            abi::CAPSET_VENUS => {
+        match c.capset {
+            CapsetId::Venus => {
                 let v = self.venus.as_mut().ok_or(Error::RendererAbsent)?;
                 v.submit(ctx, buf).map_err(|e| match e {
                     venus::vkr::Error::NoContext => Error::NoContext,
