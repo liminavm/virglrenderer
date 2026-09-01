@@ -42,8 +42,10 @@ off an explicitly owned root and is reached through it. The C ABI's implicit glo
 single owned root at the shim — one place, not a habit.
 
 **C and C++ disappear; FFI never dictates design.** The C-ABI dylib is a compatibility shim with
-an end date — it will be replaced or disabled by default, and limina will consume the Rust API
-directly. **That API is the product; the C ABI is a translation of it.** So wherever the two are
+an end date. limina reaches us today through rutabaga in its libkrun fork, which links the C
+dylib; **the plan is to change rutabaga to consume this crate's Rust API directly**, at which
+point the shim serves no first-party caller. So the consumer to design for is a Rust one, and
+**that API is the product; the C ABI is a translation of it.** So wherever the two are
 in tension, the ABI takes the hit — in performance, in efficiency, in ergonomics. Never the other
 way round.
 
