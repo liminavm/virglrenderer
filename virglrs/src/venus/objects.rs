@@ -52,14 +52,19 @@ pub struct Object {
 /// rather than by someone remembering to go and delete it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Key {
-    index: u32,
-    generation: u32,
+    index: usize,
+    /// Wide on purpose. A slot is reused every time the object in it is destroyed, so this counts
+    /// create/destroy pairs on one slot -- a number a guest chooses. At 32 bits a guest could cycle
+    /// a slot back to a generation an orphaned id still holds and have that dead id name a live
+    /// object again; the cycles cost it nothing but wire commands. At 64 there is no rate at which
+    /// that finishes.
+    generation: u64,
 }
 
 /// One place in the arena, occupied or not.
 struct Entry {
     /// Bumped every time the slot is emptied, which is what invalidates every key to it.
-    generation: u32,
+    generation: u64,
     object: Option<Object>,
 }
 
@@ -72,23 +77,26 @@ struct Entry {
 struct Arena {
     entries: Vec<Entry>,
     /// Slots emptied by a removal, to be handed out again.
-    free: Vec<u32>,
+    free: Vec<usize>,
 }
 
 impl Arena {
     fn insert(&mut self, object: Object) -> Key {
         if let Some(index) = self.free.pop() {
-            let e = &mut self.entries[index as usize];
+            let e = &mut self.entries[index];
             e.object = Some(object);
             return Key { index, generation: e.generation };
         }
-        let index = u32::try_from(self.entries.len()).expect("far more objects than a guest makes");
+        // Indexed by `usize` rather than a narrower type so there is no count to check here: a
+        // guest cannot reach a length the machine could not hold the entries for anyway, and the
+        // allocation is what fails if it tries.
+        let index = self.entries.len();
         self.entries.push(Entry { generation: 0, object: Some(object) });
         Key { index, generation: 0 }
     }
 
     fn get(&self, key: Key) -> Option<&Object> {
-        let e = self.entries.get(key.index as usize)?;
+        let e = self.entries.get(key.index)?;
         if e.generation != key.generation {
             return None;
         }
@@ -96,13 +104,16 @@ impl Arena {
     }
 
     fn remove(&mut self, key: Key) -> Option<Object> {
-        let e = self.entries.get_mut(key.index as usize)?;
+        let e = self.entries.get_mut(key.index)?;
         if e.generation != key.generation {
             return None;
         }
         let object = e.object.take()?;
         // Every key to this slot, including the one just used, now names an occupant that is gone.
-        e.generation = e.generation.wrapping_add(1);
+        // Not a wrapping add: coming back around is the one thing that would make a stale key live
+        // again, so it is left to overflow loudly rather than quietly, and 64 bits puts it out of
+        // reach of anything a guest can send.
+        e.generation += 1;
         self.free.push(key.index);
         Some(object)
     }
@@ -122,7 +133,7 @@ impl Arena {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.object.as_ref().is_some_and(|o| o.parent == Some(parent)))
-                .map(|(i, e)| Key { index: i as u32, generation: e.generation })
+                .map(|(i, e)| Key { index: i, generation: e.generation })
                 .collect();
             for child in children {
                 self.remove(child);
@@ -441,6 +452,32 @@ mod tests {
         // And the id is not burned: the guest may name a new object by it.
         t.add(ObjectId(2), BUFFER, 21, None).unwrap();
         assert_eq!(t.lookup(ObjectId(2), BUFFER), Lookup::Found(21));
+    }
+
+    /// A slot cycled many times still does not hand a stale key back its object.
+    ///
+    /// The generation is a counter a guest advances for free: one create and one destroy move it
+    /// on by one, and it can do that for as long as it likes. What must never happen is the
+    /// counter coming back around to a value some orphaned id is still holding, which is why it is
+    /// 64 bits wide rather than 32. This walks a slot far enough to show the mechanism is the
+    /// counter and not luck; the width is what puts the wrap out of reach.
+    #[test]
+    fn a_slot_cycled_over_and_over_never_hands_an_orphan_its_object_back() {
+        let mut t = Table::new();
+        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
+        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
+        t.remove(ObjectId(1)).unwrap();
+        // Id 2 is now an orphan holding a key to a slot that is back in circulation.
+
+        for round in 0..500u64 {
+            t.add(ObjectId(3), IMAGE, 1000 + round, None).unwrap();
+            assert_eq!(
+                t.lookup(ObjectId(2), IMAGE),
+                Lookup::Missing,
+                "the orphan resolved again on round {round}"
+            );
+            t.remove(ObjectId(3)).unwrap();
+        }
     }
 
     /// An owner the guest names that no longer resolves is the guest's mistake, not a reason to
