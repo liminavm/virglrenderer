@@ -12,6 +12,7 @@ use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
+use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, MemoryError};
 use std::collections::BTreeMap;
 
@@ -376,7 +377,7 @@ impl Renderer {
         mem_id: u64,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        self.venus_context(ctx_id)?.driver().memory_read(mem_id, buf).map_err(|e| match e {
+        self.venus_context(ctx_id)?.memory_read(ObjectId(mem_id), buf).map_err(|e| match e {
             MemoryError::NoSuchAllocation => Error::NoAllocation,
             MemoryError::NotMappable => Error::NotMappable,
         })

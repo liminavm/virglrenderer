@@ -174,9 +174,14 @@ pub struct Driver {
     /// always "does this driver have <name>", and a hand-maintained struct of booleans is a list
     /// that has to be extended every time a new name matters.
     physical_device_exts: BTreeMap<u64, BTreeSet<String>>,
-    /// Live device memory, keyed by the *guest's* id -- because that is the name the census
-    /// reports and the VMM reads back by. See [`Memory`].
-    memory: BTreeMap<u64, Memory>,
+    /// How big each live allocation is, by the guest's id.
+    ///
+    /// Only the size. The handle and the owning device are the object table's to know, and this
+    /// map holding its own copy of them was a second answer to "where does this allocation live"
+    /// -- which is why `vkFreeMemory` had to be skipped in the destroy cascade to avoid freeing
+    /// twice. The size is a fact nothing else has: the driver may round an allocation up, and the
+    /// census reports the number the guest asked for, because that is what the guest reads back.
+    memory: BTreeMap<ObjectId, u64>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
     /// The device each queue belongs to, by host handle.
@@ -188,6 +193,28 @@ pub struct Driver {
     queues: BTreeMap<u64, u64>,
 }
 
+/// The last stand: a driver may not be dropped while it still owes Vulkan a destroy.
+///
+/// Every one of these maps is a host handle nothing else in the process names, so a `Driver` that
+/// reaches its destructor with any of them occupied has leaked whatever is in them -- and it can
+/// only have got there through host code, never through anything a guest sent, which is what makes
+/// it an assert rather than a rejection (CLAUDE.md). In normal operation it cannot fire: the
+/// `Context` that owns this tears it down on its own drop, which runs first.
+impl Drop for Driver {
+    fn drop(&mut self) {
+        assert!(
+            self.owes_nothing(),
+            "a Driver was dropped still holding host handles: {} device(s), {} allocation(s), \
+             {} pool(s), {} queue(s), instance {}",
+            self.devices.len(),
+            self.memory.len(),
+            self.pools.open.len(),
+            self.queues.len(),
+            if self.instance.is_some() { "live" } else { "gone" },
+        );
+    }
+}
+
 /// One live `VkDevice`: its entry points, and what its allocations need to know.
 struct DeviceState {
     fns: DeviceFns,
@@ -195,20 +222,6 @@ struct DeviceState {
     /// creation because it never changes, and because an allocation must not pay an instance
     /// round trip to learn whether it is host-visible.
     memory_types: Vec<VkMemoryPropertyFlags>,
-}
-
-/// One live `VkDeviceMemory`.
-///
-/// Tracked apart from the object table because the census needs two things the table does not
-/// hold: the size the guest asked for, and which device owns the allocation -- a device cannot be
-/// destroyed while its memory is live, so a teardown has to walk from one to the other.
-pub struct Memory {
-    /// The host `VkDevice` that owns it.
-    device: u64,
-    handle: u64,
-    /// `allocationSize` as the guest asked for it. The driver may have rounded up; the census
-    /// reports the guest's number because that is what the guest will read back.
-    size: u64,
 }
 
 // Every pointer these take is one the decoder allocated in the batch arena and handed to a
@@ -237,6 +250,19 @@ impl Driver {
     /// A guest command that names an instance cannot reach a handler without the object table
     /// having resolved that instance first, so in practice a handler that needs this has one --
     /// but the guest chooses the order, so it is an `Option` and never an assert.
+    /// Whether every host handle this ever held has been given back.
+    ///
+    /// The condition the bomb above checks, named once so the witness that a teardown really
+    /// empties these maps asserts the same thing the drop does rather than a restatement of it.
+    pub(super) fn owes_nothing(&self) -> bool {
+        self.instance.is_none()
+            && self.devices.is_empty()
+            && self.memory.is_empty()
+            && self.pools.open.is_empty()
+            && self.pools.owner.is_empty()
+            && self.queues.is_empty()
+    }
+
     pub fn instance(&self) -> Option<&InstanceFns> {
         self.instance.as_ref()
     }
@@ -259,13 +285,23 @@ impl Driver {
             self.empty_device(VkDevice(handle), doomed);
         }
         for (handle, d) in core::mem::take(&mut self.devices) {
-            // A device cannot be destroyed while its memory is live -- Vulkan calls that an
-            // application error, and the guest is under no obligation to have avoided it.
-            self.free_device_memory(&d.fns, handle);
             self.pools.close_device(handle);
             self.queues.retain(|_, owner| *owner != handle);
             // SAFETY: a handle this context created, and the table was loaded from it.
             unsafe { (d.fns.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
+        }
+        // A fallback, not the path that retires the census: `empty_device` does that, per device,
+        // as it frees. What can be left here is an allocation the table could name no device for,
+        // which was never freed above because there was no device to free it on. Nothing a guest
+        // sends reaches this today -- an allocate is refused before it is recorded unless its
+        // device resolved -- so it is said out loud and the record dropped, rather than left to
+        // abort a teardown that is already unwinding.
+        if !self.memory.is_empty() {
+            eprintln!(
+                "[virglrs] teardown: {} allocation(s) with no device to free them on",
+                self.memory.len()
+            );
+            self.memory.clear();
         }
         if let Some(inst) = self.instance.take() {
             let handle = VkInstance(core::mem::take(&mut self.instance_handle));
@@ -582,9 +618,11 @@ impl Driver {
                 }
                 // Freed with the pool they came from, one line above.
                 T::VK_OBJECT_TYPE_COMMAND_BUFFER | T::VK_OBJECT_TYPE_DESCRIPTOR_SET => {}
-                // Freed by `free_device_memory`, which the census keeps its own record for and
-                // which runs on this same teardown. Freeing it here as well would free it twice.
-                T::VK_OBJECT_TYPE_DEVICE_MEMORY => {}
+                // Last of all, and `empty_device` is what puts it last: anything bound to an
+                // allocation has to be destroyed before the allocation is freed.
+                T::VK_OBJECT_TYPE_DEVICE_MEMORY => {
+                    (fns.vkFreeMemory())(device, VkDeviceMemory(h), n)
+                }
                 // A queue is handed out by the device and dies with it; there is no destroy call.
                 T::VK_OBJECT_TYPE_QUEUE => {}
                 // Not device objects: the instance and its physical devices outlive this, and the
@@ -614,10 +652,25 @@ impl Driver {
         if r != VkResult::VK_SUCCESS {
             eprintln!("[virglrs] vkDeviceWaitIdle before teardown: VkResult {}", r.0);
         }
-        // Filtered here rather than by the caller, so an object can only ever be destroyed on the
-        // device the table says it belongs to.
-        for o in doomed.iter().filter(|o| o.device == Some(device.0)) {
+        // Two passes, because freeing an allocation while a buffer or an image is still bound to
+        // it is undefined. Every other kind first, then the memory underneath them -- an ordering
+        // Vulkan requires and the arena's walk order cannot be relied on to produce.
+        //
+        // Filtered by device here rather than by the caller, so an object can only ever be
+        // destroyed on the device the table says it belongs to.
+        let mine = || doomed.iter().filter(|o| o.device == Some(device.0));
+        let is_memory = |o: &Doomed| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY;
+        for o in mine().filter(|o| !is_memory(o)) {
             Self::destroy_tracked(&d.fns, device, o);
+        }
+        for o in mine().filter(|o| is_memory(o)) {
+            Self::destroy_tracked(&d.fns, device, o);
+        }
+        // The census records the freed allocations by the guest's id, and they have just stopped
+        // being live. Done after the borrow above rather than beside each free.
+        let freed: Vec<ObjectId> = mine().filter(|o| is_memory(o)).map(|o| o.id).collect();
+        for id in freed {
+            self.memory.remove(&id);
         }
     }
 
@@ -634,7 +687,6 @@ impl Driver {
         let Some(d) = self.devices.remove(&device.0) else {
             return orphans;
         };
-        self.free_device_memory(&d.fns, device.0);
         // SAFETY: a handle this context created, destroyed once -- `remove` is what makes it once.
         unsafe { (d.fns.vkDestroyDevice())(device, core::ptr::null()) };
         orphans
@@ -847,6 +899,27 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_device(&mut self, handle: u64, fns: DeviceFns) {
         self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+    }
+
+    #[cfg(test)]
+    pub(super) fn plant_allocation(&mut self, id: ObjectId, size: u64) {
+        self.memory.insert(id, size);
+    }
+
+    /// Drop planted state without destroying it, for a test that stood a driver up by hand.
+    ///
+    /// Nothing planted came from Vulkan, so there is nothing to leak and nothing to call a destroy
+    /// on -- and a planted table has only the few entry points its own test needed, so a real
+    /// teardown would abort on the first one it did not plant. A test that plants and forgets this
+    /// fails loudly on the drop rather than quietly, which is the point of the bomb.
+    #[cfg(test)]
+    pub(super) fn abandon_planted(&mut self) {
+        self.instance = None;
+        self.devices.clear();
+        self.memory.clear();
+        self.pools = Pools::default();
+        self.queues.clear();
+        self.physical_device_exts.clear();
     }
 
     /// Stand a pool up with contents already in it, as a run of allocations would have left it.
@@ -1376,7 +1449,7 @@ impl Driver {
     pub fn allocate_memory(
         &mut self,
         device: VkDevice,
-        id: u64,
+        id: ObjectId,
         info: Option<&VkMemoryAllocateInfo>,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDeviceMemory, VkResult> {
@@ -1403,40 +1476,23 @@ impl Driver {
             return Err(r);
         }
         assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
-        let size = info.allocationSize.0;
-        self.memory.insert(id, Memory { device: device.0, handle: out.0, size });
+        self.memory.insert(id, info.allocationSize.0);
         Ok(out)
     }
 
-    /// Free device memory the guest named by id.
-    pub fn free_memory(&mut self, id: u64) {
-        let Some(mem) = self.memory.remove(&id) else {
+    /// Free device memory the guest named.
+    ///
+    /// The device and the handle come from the command the guest sent, resolved by the object
+    /// table like every other input handle -- not from a record of this driver's own. The id is
+    /// only the census entry to retire.
+    pub fn free_memory(&mut self, device: VkDevice, memory: VkDeviceMemory, id: ObjectId) {
+        self.memory.remove(&id);
+        let Some(d) = self.devices.get(&device.0) else {
             return;
         };
-        let Some(d) = self.devices.get(&mem.device) else {
-            return;
-        };
-        // SAFETY: a handle this context allocated, freed once -- `remove` is what makes it once.
-        unsafe {
-            (d.fns.vkFreeMemory())(
-                VkDevice(mem.device),
-                VkDeviceMemory(mem.handle),
-                core::ptr::null(),
-            )
-        };
-    }
-
-    /// Free every allocation belonging to one device, on the way to destroying it.
-    fn free_device_memory(&mut self, d: &DeviceFns, device: u64) {
-        let mine: Vec<u64> =
-            self.memory.iter().filter(|(_, m)| m.device == device).map(|(id, _)| *id).collect();
-        for id in mine {
-            let mem = self.memory.remove(&id).expect("just collected from this map");
-            // SAFETY: a handle this context allocated on `d`'s device, freed once.
-            unsafe {
-                (d.vkFreeMemory())(VkDevice(device), VkDeviceMemory(mem.handle), core::ptr::null())
-            };
-        }
+        // SAFETY: a device and an allocation this context made; the object table took the id out
+        // before this call, so the same handle cannot arrive twice.
+        unsafe { (d.fns.vkFreeMemory())(device, memory, core::ptr::null()) };
     }
 
     /// Every live allocation, for the memory census.
@@ -1447,7 +1503,7 @@ impl Driver {
     /// so nothing is skipped and the count reads high against the C by exactly the blobs a corpus
     /// exported.
     pub fn memory_census(&self) -> Vec<Allocation> {
-        self.memory.iter().map(|(id, m)| Allocation { id: ObjectId(*id), size: m.size }).collect()
+        self.memory.iter().map(|(id, size)| Allocation { id: *id, size: *size }).collect()
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -1455,15 +1511,21 @@ impl Driver {
     /// Short buffers are the caller's business, not an error: the census reports whole sizes and
     /// the VMM caps what it reads, so a prefix is the normal request -- which is why the count
     /// comes back rather than being inferred from the buffer's length.
-    pub fn memory_read(&self, id: u64, buf: &mut [u8]) -> Result<usize, MemoryError> {
-        let Some(mem) = self.memory.get(&id) else {
+    /// The device and the handle are the caller's to resolve through the object table, which owns
+    /// both; the size is this map's, and is the one thing the table does not know.
+    pub fn memory_read(
+        &self,
+        device: VkDevice,
+        handle: VkDeviceMemory,
+        id: ObjectId,
+        buf: &mut [u8],
+    ) -> Result<usize, MemoryError> {
+        let Some(size) = self.memory.get(&id).copied() else {
             return Err(MemoryError::NoSuchAllocation);
         };
-        let Some(d) = self.devices.get(&mem.device) else {
+        let Some(d) = self.devices.get(&device.0) else {
             return Err(MemoryError::NoSuchAllocation);
         };
-        let device = VkDevice(mem.device);
-        let handle = VkDeviceMemory(mem.handle);
         let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: a device and an allocation this context made, and `ptr` is a local.
         let r = unsafe {
@@ -1479,7 +1541,7 @@ impl Driver {
         if r != VkResult::VK_SUCCESS || ptr.is_null() {
             return Err(MemoryError::NotMappable);
         }
-        let n = buf.len().min(mem.size as usize);
+        let n = buf.len().min(size as usize);
         // SAFETY: the driver mapped at least `mem.size` bytes at `ptr`, which is what `n` is
         // clamped to, and `buf` is a live slice of at least `n`. The two cannot overlap: one is
         // the driver's mapping and the other the caller's.
@@ -1594,6 +1656,97 @@ mod tests {
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32);
     const DEVICE_LOCAL: VkMemoryPropertyFlags =
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32);
+
+    /// An allocation is freed on the way out, after everything bound to it, and the census forgets
+    /// it at the same moment.
+    ///
+    /// Two facts about one allocation used to live in two places: the object table held its handle
+    /// under the guest's id, and this driver held a second copy of that handle beside the size.
+    /// The cascade had to skip `VK_OBJECT_TYPE_DEVICE_MEMORY` entirely to avoid freeing both, and
+    /// a skip arm that exists to work around a duplicated fact is the duplication still costing
+    /// something. Now the handle comes from the table like every other, and the only thing left
+    /// here is the size -- so the free happens in the cascade, and this is what pins its order.
+    #[test]
+    fn an_allocation_is_freed_after_what_was_bound_to_it_and_leaves_the_census() {
+        use std::cell::RefCell;
+
+        use super::super::proto::types::{VkAllocationCallbacks, VkBuffer};
+
+        const DEVICE: u64 = 3;
+        const BUFFER: (u64, u64) = (11, 0xb0);
+        const MEMORY: (u64, u64) = (12, 0xd0);
+
+        thread_local! { static SAW: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) }; }
+        fn saw(what: &'static str, h: u64) {
+            SAW.with_borrow_mut(|s| s.push((what, h)));
+        }
+
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            saw("wait", 0);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn buffer(_d: VkDevice, h: VkBuffer, _a: *const VkAllocationCallbacks) {
+            saw("buffer", h.0);
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            h: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+            saw("free", h.0);
+        }
+        unsafe extern "C" fn device(h: VkDevice, _a: *const VkAllocationCallbacks) {
+            saw("device", h.0);
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyBuffer(buffer);
+        fns.plant_vkFreeMemory(free);
+        fns.plant_vkDestroyDevice(device);
+
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        driver.plant_allocation(ObjectId(MEMORY.0), 4096);
+        assert_eq!(driver.memory_census().len(), 1, "the allocation is live before the teardown");
+
+        // The order the doomed list arrives in is the arena's, not Vulkan's: memory first here on
+        // purpose, so a teardown that simply walked the list would free it under a live buffer.
+        let doomed = [
+            Doomed {
+                id: ObjectId(MEMORY.0),
+                ty: VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
+                handle: MEMORY.1,
+                device: Some(DEVICE),
+            },
+            Doomed {
+                id: ObjectId(BUFFER.0),
+                ty: VkObjectType::VK_OBJECT_TYPE_BUFFER,
+                handle: BUFFER.1,
+                device: Some(DEVICE),
+            },
+            Doomed {
+                id: ObjectId(DEVICE),
+                ty: VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                handle: DEVICE,
+                device: None,
+            },
+        ];
+        // The guest's own destroy, not the context teardown: teardown ends by dropping any
+        // allocation it could not attribute to a device, and that fallback would hide whether the
+        // cascade retired this one.
+        assert!(driver.destroy_device(VkDevice(DEVICE), &doomed).is_empty(), "it owned no pools");
+
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.as_slice(),
+                [("wait", 0), ("buffer", BUFFER.1), ("free", MEMORY.1), ("device", DEVICE)],
+                "idle, then what is bound to the memory, then the memory, then the device"
+            );
+        });
+        assert!(driver.memory_census().is_empty(), "and the census stops reporting it");
+        assert!(driver.owes_nothing(), "a teardown that returns owes Vulkan nothing");
+    }
 
     /// Destroying a pool destroys everything in it, and the guest sends no command per object --
     /// so the guest ids of its contents have to come back here, for the caller to take out of

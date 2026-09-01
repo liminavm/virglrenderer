@@ -33,6 +33,15 @@ use super::proto::types::VkObjectType;
 /// One live object: the host handle, and the Vulkan type the guest must name it by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Object {
+    /// The id the guest gave it.
+    ///
+    /// The arena is reached by [`Key`], but a cascade takes objects out that no command ever
+    /// named, and their ids are what the rest of the context files them under. Carried on the
+    /// object rather than looked back up because there is no key-to-id direction to look up:
+    /// `slots` only goes the other way, and scanning it could not tell an id this cascade just
+    /// orphaned from one orphaned by an earlier destroy. Written once, in [`Table::add`], beside
+    /// the `slots` entry it mirrors -- the pair `Pools` keeps for the same reason.
+    pub id: ObjectId,
     /// What kind of object it is. Named rather than a bare i32 because a destroy has to switch on
     /// it to pick the right `vkDestroyX`, and a match on an integer is a match nobody can check.
     pub ty: VkObjectType,
@@ -138,7 +147,8 @@ impl Arena {
             VkObjectType::VK_OBJECT_TYPE_DEVICE => Some(o.handle),
             _ => inherited,
         };
-        let mut taken = vec![Doomed { ty: root.ty, handle: root.handle, device: None }];
+        let mut taken =
+            vec![Doomed { id: root.id, ty: root.ty, handle: root.handle, device: None }];
         let mut walk = vec![(key, under(&root, None))];
         while let Some((parent, device)) = walk.pop() {
             let children: Vec<Key> = self
@@ -151,7 +161,7 @@ impl Arena {
             for child in children {
                 if let Some(o) = self.remove(child) {
                     walk.push((child, under(&o, device)));
-                    taken.push(Doomed { ty: o.ty, handle: o.handle, device });
+                    taken.push(Doomed { id: o.id, ty: o.ty, handle: o.handle, device });
                 }
             }
         }
@@ -216,6 +226,9 @@ impl Slot {
 /// worked out once by the walk that takes the tree apart rather than by each caller guessing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Doomed {
+    /// The name the rest of the context knows it by, for the records keyed on the guest's id
+    /// rather than on a host handle -- the memory census is the one that matters.
+    pub id: ObjectId,
     pub ty: VkObjectType,
     pub handle: u64,
     /// `None` for the instance, its physical devices, and the devices themselves -- none of which
@@ -258,7 +271,7 @@ impl Table {
             return Err(AddError::Duplicate);
         }
         let parent = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);
-        let key = self.arena.insert(Object { ty, handle, parent });
+        let key = self.arena.insert(Object { id, ty, handle, parent });
         // An id the host once refused can be created for real later, and so can one whose object
         // died with its parent: both leave an entry here that resolves to nothing, and both are
         // overwritten rather than left beside the new object to swallow its commands.
@@ -283,11 +296,6 @@ impl Table {
         self.slots.insert(id, Slot::Ghost);
     }
 
-    /// Forget an object. Returns what was there, so the caller can destroy the host handle.
-    ///
-    /// Only a live object is taken out. A ghost outlives the destroy that names it: the guest
-    /// pipelined that destroy behind the create that failed, and every command in between is still
-    /// in flight behind it.
     /// Take an object and everything under it, root first, and hand back every one.
     ///
     /// [`Table::remove`] is the same cascade with the descendants dropped, which is right for a
@@ -304,6 +312,11 @@ impl Table {
         doomed
     }
 
+    /// Forget an object. Returns what was there, so the caller can destroy the host handle.
+    ///
+    /// Only a live object is taken out. A ghost outlives the destroy that names it: the guest
+    /// pipelined that destroy behind the create that failed, and every command in between is still
+    /// in flight behind it.
     pub fn remove(&mut self, id: ObjectId) -> Option<Object> {
         let key = self.slots.get(&id)?.key()?;
         // Everything created under it goes at the same moment, because Vulkan has just destroyed
@@ -312,6 +325,22 @@ impl Table {
         let object = self.arena.remove_tree(key)?;
         self.slots.remove(&id);
         Some(object)
+    }
+
+    /// The host `VkDevice` an id was created under, or `None` if nothing above it is a device.
+    ///
+    /// The same ancestry [`Arena::take_tree`] carries down as it destroys, asked without
+    /// destroying anything -- so a caller that needs to know which device an object lives on has
+    /// one answer to consult rather than a map of its own to keep in step.
+    pub fn device_of(&self, id: ObjectId) -> Option<u64> {
+        let mut at = self.slots.get(&id)?.key()?;
+        loop {
+            let o = self.arena.get(at)?;
+            if o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE {
+                return Some(o.handle);
+            }
+            at = o.parent?;
+        }
     }
 
     pub fn get(&self, id: ObjectId) -> Option<&Object> {
@@ -351,7 +380,7 @@ impl Table {
         // truth about it, not an omission.
         for (_, slot) in core::mem::take(&mut self.slots) {
             if let Some(o) = slot.key().and_then(|k| self.arena.remove(k)) {
-                doomed.push(Doomed { ty: o.ty, handle: o.handle, device: None });
+                doomed.push(Doomed { id: o.id, ty: o.ty, handle: o.handle, device: None });
             }
         }
         doomed
