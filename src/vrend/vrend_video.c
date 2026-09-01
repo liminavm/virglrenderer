@@ -159,6 +159,56 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
+/* Clamp a plane copy to what the SOURCE actually holds.
+ *
+ * Every reader below sizes its copy from the resource, and the resource is the aligned
+ * allocation while the source is CoreVideo's actual plane -- which holds exactly the
+ * rows the picture has. Copying the resource's height out of it reads off the end of the
+ * mapping, at any resolution where the two differ. It faults only once the pool's slack
+ * runs out before the next page, which is what makes it intermittent.
+ *
+ * The 2026-09-01 dogfood SIGSEGV is that read: a byte read, translation fault
+ * (esr 0x92000007), at a page-aligned address that was the memmove source, copying a
+ * 480-byte row. The picture's dimensions are not recoverable from the report -- the
+ * video traces were not armed -- so the row length is what is measured and the height
+ * is not. The clamp does not depend on knowing them.
+ *
+ * The backend already knows the answer and no reader asked: plane->size is the mapped
+ * extent. Derive the copy from it. A backend that leaves size zero -- the dmabuf path,
+ * which never maps -- keeps the caller's dimensions, since there is nothing to clamp to.
+ *
+ * The defect predates the composite decode target (it arrived with the mapped-plane
+ * delivery itself) and outlived the build that crashed, so it is not something the
+ * planar work introduced or fixed. */
+static bool clamp_plane_to_source(const struct virgl_video_dma_buf_plane *plane,
+                                  unsigned blocksize, const char *what,
+                                  unsigned *width, unsigned *height)
+{
+    /* Falling short is the steady state for 1080p and would log every frame. */
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("LIMINA_VIDEO_CLAMP_TRACE") ? 1 : 0;
+
+    if (!plane->size || !plane->pitch)
+        return *width && *height;
+
+    const unsigned rows = plane->size / plane->pitch;
+    const unsigned cols = blocksize ? plane->pitch / blocksize : *width;
+    const unsigned want_h = *height, want_w = *width;
+
+    if (rows < *height)
+        *height = rows;
+    if (cols < *width)
+        *width = cols;
+
+    if (trace && (want_h != *height || want_w != *width))
+        virgl_warn("%s: clamped %ux%u to %ux%u — the source holds %u rows of %u bytes "
+                   "(size %u, pitch %u)\n", what, want_w, want_h, *width, *height,
+                   rows, plane->pitch, plane->size, plane->pitch);
+
+    return *width && *height;
+}
+
 /* Upload one CPU-mapped plane of a decoded picture into the guest-visible resource.
  *
  * The dmabuf path below hands the picture over as an EGLImage and blits; a backend
@@ -180,9 +230,11 @@ static void upload_mapped_plane(struct vrend_resource *res, unsigned plane_idx,
         vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
                                  geom, &plane_count);
         if (plane_idx < plane_count) {
-            vkr_mtl_iosurface_plane_write(res->iosurface, plane_idx, plane->map,
-                                          plane->pitch, geom[plane_idx].height,
-                                          geom[plane_idx].width * geom[plane_idx].bpp);
+            unsigned w = geom[plane_idx].width, h = geom[plane_idx].height;
+
+            if (clamp_plane_to_source(plane, geom[plane_idx].bpp, "iosurface plane", &w, &h))
+                vkr_mtl_iosurface_plane_write(res->iosurface, plane_idx, plane->map,
+                                              plane->pitch, h, w * geom[plane_idx].bpp);
             return;
         }
     }
@@ -199,12 +251,16 @@ static void upload_mapped_plane(struct vrend_resource *res, unsigned plane_idx,
         return;
     }
 
+    unsigned up_w = res->base.width0, up_h = res->base.height0;
+
+    if (!clamp_plane_to_source(plane, blocksize, "plane upload", &up_w, &up_h))
+        return;
+
     /* VideoToolbox pads plane rows, so the source stride is not the width. */
     glBindTexture(GL_TEXTURE_2D, res->gl_id);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, plane->pitch / blocksize);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                    res->base.width0, res->base.height0,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, up_w, up_h,
                     entry->glformat, entry->gltype, plane->map);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -249,6 +305,12 @@ static void writeback_plane_to_guest(struct vrend_resource *res, unsigned plane_
     blocksize = geom[plane_idx].bpp;
     width = geom[plane_idx].width;
     height_in = geom[plane_idx].height;
+
+    /* The extent check below bounds the DESTINATION. The source walk further down reads
+     * plane->map + y * plane->pitch and needs its own bound, for the same reason the
+     * uploads do. */
+    if (!clamp_plane_to_source(plane, blocksize, "writeback", &width, &height_in))
+        return;
     size_t row, stride, offset, height, extent, storage;
     /* Every reason to skip is a legitimate steady state, so none of them can log per
      * frame. But when the guest ends up reading an unwritten target the skip IS the
