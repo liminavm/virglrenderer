@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use super::proto::types::VkRingCreateInfoMESA;
+use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
 use crate::ids::ResourceHandle;
 
@@ -233,6 +233,9 @@ pub struct Ring {
     pub layout: RingLayout,
     /// The memory those offsets are into.
     pub map: Arc<GuestMap>,
+    /// Where answers to commands that arrived on *this* ring go. Per-ring and not per-context:
+    /// see [`ReplyStream`].
+    pub reply: Option<ReplyStream>,
 }
 
 impl Ring {
@@ -247,7 +250,7 @@ impl Ring {
         // would be checking the guest against itself.
         let map = resources.shm(handle).ok_or(RingError::NoResource(handle))?;
         let layout = RingLayout::parse(map.len(), info).map_err(RingError::Layout)?;
-        Ok(Ring { layout, map })
+        Ok(Ring { layout, map, reply: None })
     }
 
     /// How far the guest says it has written.
@@ -286,6 +289,77 @@ impl Ring {
             return false;
         }
         self.map.store_u32(at, value)
+    }
+}
+
+/// Where the answers to one stream's commands are written.
+///
+/// Every stream that can carry commands has its own: each ring has one, and so does the context's
+/// own submission path. They are emphatically not one shared slot. A reply belongs in the buffer
+/// the guest is waiting on for *that* stream, so collapsing them would answer one ring's caller
+/// into another ring's buffer -- a wrong answer delivered as if it were right, which is worse than
+/// no answer. The C reaches the same arrangement by embedding a `vkr_cs_encoder` in both
+/// `struct vkr_ring` and `struct vkr_context`.
+///
+/// Like a [`Ring`], it holds a share of the mapping rather than a way to find one, so the guest
+/// dropping the resource cannot leave it pointing at freed memory.
+pub struct ReplyStream {
+    map: Arc<GuestMap>,
+    /// The window inside the mapping the guest set aside for answers, validated against the
+    /// mapping's real length when it was set.
+    window: Region,
+    /// How far into the window the next answer goes, relative to `window.begin()`.
+    pos: usize,
+}
+
+/// Why a guest's reply stream was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyStreamError {
+    /// No resource by that name, or one with no host mapping.
+    NoResource(ResourceHandle),
+    /// The window does not fit the memory behind the resource. Reported with the real size, not
+    /// the one the guest claimed, because the guest's claim is what is in doubt.
+    OutOfRange { offset: usize, size: usize, resource: usize },
+}
+
+impl ReplyStream {
+    /// Take a guest's description of where it wants answers written.
+    ///
+    /// Setting is also how the position is reset: the guest re-establishes a stream before each
+    /// batch of replies, so a second `set` on the same window rewinds rather than being refused.
+    pub fn set(
+        resources: &dyn ShmResources,
+        stream: &VkCommandStreamDescriptionMESA,
+    ) -> Result<ReplyStream, ReplyStreamError> {
+        let handle = ResourceHandle(stream.resourceId);
+        let map = resources.shm(handle).ok_or(ReplyStreamError::NoResource(handle))?;
+        let out_of_range = ReplyStreamError::OutOfRange {
+            offset: stream.offset,
+            size: stream.size,
+            resource: map.len(),
+        };
+        // Against the mapping's real length, never the length the guest asserted -- the same
+        // reason `Ring::create` resolves the resource before parsing the layout.
+        let whole = Region::new(0, map.len()).expect("a mapping's own length cannot overflow");
+        let window = Region::new(stream.offset, stream.size)
+            .filter(|w| w.is_within(&whole))
+            .ok_or(out_of_range)?;
+        Ok(ReplyStream { map, window, pos: 0 })
+    }
+
+    /// The memory answers are written into.
+    pub fn map(&self) -> &Arc<GuestMap> {
+        &self.map
+    }
+
+    /// The window inside that memory. Every byte of it is writable.
+    pub fn window(&self) -> Region {
+        self.window
+    }
+
+    /// How far into the window the next answer goes.
+    pub fn pos(&self) -> usize {
+        self.pos
     }
 }
 
