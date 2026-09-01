@@ -10,14 +10,16 @@
 use crate::abi::{GuestIov, VmmPtr};
 use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
+use crate::guest_mem::GuestMap;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, MemoryError};
 use std::collections::BTreeMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::sync::Arc;
 
 /// Why a call failed.
 ///
@@ -46,6 +48,10 @@ pub enum Error {
     NotMappable,
     /// An import of zero bytes, which names no memory.
     ZeroSize,
+    /// An shm descriptor the host could not map. A resource whose memory we cannot reach is one
+    /// no ring can live in, so this fails at import rather than at the first command that needs
+    /// it -- the guest gets the refusal while it is still holding the thing that caused it.
+    Unmappable,
 }
 
 impl std::fmt::Display for Error {
@@ -61,6 +67,7 @@ impl std::fmt::Display for Error {
             Error::NoAllocation => "no such allocation in that context",
             Error::NotMappable => "that allocation cannot be mapped for reading",
             Error::ZeroSize => "an import of zero bytes names no memory",
+            Error::Unmappable => "that shm descriptor could not be mapped",
         };
         f.write_str(s)
     }
@@ -147,7 +154,12 @@ pub enum Backing {
     Blob(BlobDesc),
     /// Imported from a descriptor the VMM opened and handed over. The resource owns it now, and
     /// closing it is what dropping this does.
-    Imported { desc: ImportDesc, fd: OwnedFd },
+    ///
+    /// `map` is `Some` exactly when `desc.fd_type` is [`FdType::Shm`], and it is established at
+    /// the one place that builds this variant so no other code has to keep the two in step. Only
+    /// shm is host-addressable: a dma-buf or an opaque handle names memory belonging to a driver,
+    /// which the host reaches through Vulkan and never through a pointer.
+    Imported { desc: ImportDesc, fd: OwnedFd, map: Option<Arc<GuestMap>> },
 }
 
 pub struct Resource {
@@ -161,6 +173,30 @@ pub struct Resource {
     /// Contexts this resource is attached to. A resource outlives the contexts that used it, so
     /// this is what says whether an unref may actually free it.
     pub attached: Vec<CtxId>,
+}
+
+/// The resource table answering the only question venus asks of it.
+///
+/// Implemented on `Renderer` rather than handing venus the map, so the table stays private and
+/// what crosses the boundary is one share of one mapping.
+impl venus::ring::ShmResources for Renderer {
+    fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>> {
+        self.resources.get(&handle)?.shm().map(Arc::clone)
+    }
+}
+
+impl Resource {
+    /// The host mapping of this resource, for the only backing that has one.
+    ///
+    /// Cloning the `Arc` is how a ring takes a share of it: the resource stops being the sole
+    /// owner, so a guest that unrefs the resource while a ring still lives in it loses the handle
+    /// and keeps the memory, instead of leaving the ring pointing at a freed mapping.
+    pub fn shm(&self) -> Option<&Arc<GuestMap>> {
+        match &self.backing {
+            Backing::Imported { map, .. } => map.as_ref(),
+            Backing::Classic(_) | Backing::Blob(_) => None,
+        }
+    }
 }
 
 pub struct Context {
@@ -264,7 +300,28 @@ impl Renderer {
         if desc.size == 0 {
             return Err(Rejected { error: Error::ZeroSize, fd });
         }
-        self.insert(handle, Backing::Imported { desc, fd }, Vec::new());
+        // Map shm here, once, so that everything downstream holds a mapping rather than a
+        // descriptor plus a promise to map it later. A ring created from this resource clones the
+        // `Arc`, which is what lets the ring keep working after the resource is unref'd -- the C
+        // keeps a bare `const struct vkr_resource *` in the ring and is a use-after-free waiting
+        // on the guest to get the order wrong.
+        let map = match desc.fd_type {
+            FdType::Shm => {
+                let len = match usize::try_from(desc.size) {
+                    Ok(len) => len,
+                    Err(_) => return Err(Rejected { error: Error::Unmappable, fd }),
+                };
+                match GuestMap::shm(fd.as_fd(), len) {
+                    Ok(m) => Some(Arc::new(m)),
+                    Err(e) => {
+                        eprintln!("[virglrs] resource {handle}: cannot map {len} shm bytes: {e}");
+                        return Err(Rejected { error: Error::Unmappable, fd });
+                    }
+                }
+            }
+            FdType::DmaBuf | FdType::Opaque => None,
+        };
+        self.insert(handle, Backing::Imported { desc, fd, map }, Vec::new());
         Ok(())
     }
 
