@@ -147,10 +147,18 @@ pub extern "C" fn virgl_renderer_init(
     if cb.is_null() {
         return EINVAL;
     }
-    // SAFETY: the VMM's contract is that `cb` points to a valid callbacks struct for the duration
-    // of the call. We copy out what we keep and never retain the pointer.
-    let cbs = unsafe { &*cb };
-    if cbs.version < 3 {
+    // `Callbacks` is size-versioned: the VMM allocates only the prefix its `version` names, so the
+    // struct in front of us is shorter than ours whenever it was built against an older header --
+    // and `get_egl_display` is v4, so even a conforming v3 caller's allocation ends before our
+    // last field. A `&Callbacks` would therefore claim bytes the caller never owned. Every read
+    // below projects to one field and stops there, so nothing outside the version's prefix is
+    // touched.
+    //
+    // SAFETY: the VMM's contract is that `cb` points to a callbacks struct whose `version` field
+    // is initialised and whose allocation covers that version's prefix, for the duration of the
+    // call. `version` is at offset 0, inside every version.
+    let version = unsafe { (&raw const (*cb).version).read() };
+    if version < 3 {
         // v3 introduced write_context_fence, without which venus fences cannot retire at all.
         return EINVAL;
     }
@@ -164,10 +172,15 @@ pub extern "C" fn virgl_renderer_init(
     );
     // Only the two fence callbacks are read. The other six are vrend's winsys hooks, which
     // nothing here calls; they get a trait of their own when P3 needs one.
-    let sink = VmmFences {
-        cookie: VmmPtr(cookie),
-        write_fence: cbs.write_fence,
-        write_context_fence: cbs.write_context_fence,
+    //
+    // SAFETY: both fields are within the v3 prefix, which the check above proved the caller
+    // allocated. `callbacks_offsets_match_the_c_header` pins that claim to the header's layout.
+    let sink = unsafe {
+        VmmFences {
+            cookie: VmmPtr(cookie),
+            write_fence: (&raw const (*cb).write_fence).read(),
+            write_context_fence: (&raw const (*cb).write_context_fence).read(),
+        }
     };
     *g = Some(Renderer::new(Box::new(sink), config_of(flags)));
     0
