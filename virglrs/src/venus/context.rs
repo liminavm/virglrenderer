@@ -22,9 +22,19 @@ use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateMemory,
-    vn_command_vkCreateDevice, vn_command_vkCreateInstance, vn_command_vkDestroyDevice,
-    vn_command_vkDestroyInstance, vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeMemory,
-    vn_command_vkGetDeviceQueue2,
+    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateImage, vn_command_vkCreateImageView,
+    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
+    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
+    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
+    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyFence,
+    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
+    vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
+    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
 };
 use crate::vulkan::Global;
 
@@ -108,7 +118,7 @@ impl Context {
             todo,
             driver: &mut self.driver,
             global,
-            bad_id: false,
+            reject: None,
         };
 
         while dec.has_command() {
@@ -145,10 +155,11 @@ impl Context {
                 break;
             }
             dispatched += 1;
-            // A guest that named id zero, or reused one that is still live, is naming objects
-            // it cannot have. The handler had no decoder to say so; this is where it lands.
-            if h.bad_id {
-                poison(fatal, id, &dec, cmd, "named an object it cannot have");
+            // A handler that found the command itself unusable -- an id the guest cannot have, a
+            // length that would send the driver off the end of what was decoded. The handler has
+            // no decoder to say so with; this is where its verdict lands.
+            if let Some(why) = h.reject.take() {
+                poison(fatal, id, &dec, cmd, why);
             }
 
             if fatal.get() {
@@ -234,9 +245,9 @@ pub struct Handlers<'a> {
     /// The entry points that exist before an instance does. Owned by the renderer root, because
     /// they are the same for every context.
     global: &'a Global,
-    /// A guest that reused a live id or named id zero. It cannot be reported from here -- the
-    /// handler has no decoder -- so the loop reads it back and poisons.
-    bad_id: bool,
+    /// Why the handler refused the command, if it did. It cannot be reported from here -- the
+    /// handler has no decoder -- so the loop reads it back and poisons with this as the reason.
+    reject: Option<&'static str>,
 }
 
 impl Handlers<'_> {
@@ -302,6 +313,38 @@ impl Handlers<'_> {
     }
 }
 
+/// A create whose whole host action is one `vkCreateX(device, info, alloc, out)`.
+///
+/// Twenty Vulkan objects have exactly this shape, and writing them out forty times would be forty
+/// chances to transpose two arguments. The C generates the same bodies from a JSON list and still
+/// hand-writes each dispatch function, which is the split copied here: the macro is the body, the
+/// invocation list below is the dispatch, and an object that needs more than the body does not
+/// appear in the list at all -- it gets a method written out in full.
+///
+/// The device is re-checked inside `Driver`, and a miss is a refusal rather than a silent return,
+/// so the id becomes a ghost and the commands the guest already pipelined behind it are lost one
+/// at a time instead of poisoning the ring.
+macro_rules! simple_create {
+    ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
+        fn $cmd(&mut self, args: &mut $args) {
+            let host =
+                self.driver.create_object(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
+            args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+            self.plant(stringify!($cmd), args.$out, args.$shadow, host);
+        }
+    };
+}
+
+/// The destroy half of [`simple_create`]. The object table entry is removed by the generated
+/// lifecycle hook, so all this owes is the driver call.
+macro_rules! simple_destroy {
+    ($cmd:ident, $args:ty, $target:ident) => {
+        fn $cmd(&mut self, args: &mut $args) {
+            self.driver.destroy_object(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
+        }
+    };
+}
+
 impl Commands for Handlers<'_> {
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
         *self.todo.seen.entry(cmd.0).or_default() += 1;
@@ -322,7 +365,7 @@ impl Commands for Handlers<'_> {
         }
         let handle = if host == 0 { id.0 } else { host };
         if self.objects.borrow_mut().add(id, ty.0, handle).is_err() {
-            self.bad_id = true;
+            self.reject = Some("named an object it cannot have");
         }
     }
 
@@ -413,6 +456,141 @@ impl Commands for Handlers<'_> {
         // and the driver's table has nothing under it, so this needs no guard of its own.
         self.driver.free_memory(args.id_memory.0);
     }
+
+    // --------------------------------------------------------------- the simple objects
+    //
+    // One `vkCreateX`/`vkDestroyX` pair each, with no host state beyond the object table. The
+    // whole list is here rather than behind a loop in the generator so that adding one is a
+    // visible line in a diff, and so that an object needing more than the pair cannot be added by
+    // accident -- `vkCreateShaderModule` below is what that looks like.
+
+    simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence);
+    simple_destroy!(vkDestroyFence, vn_command_vkDestroyFence, fence);
+
+    simple_create!(
+        vkCreateSemaphore,
+        vn_command_vkCreateSemaphore,
+        pCreateInfo,
+        pSemaphore,
+        handle_pSemaphore
+    );
+    simple_destroy!(vkDestroySemaphore, vn_command_vkDestroySemaphore, semaphore);
+
+    simple_create!(
+        vkCreateCommandPool,
+        vn_command_vkCreateCommandPool,
+        pCreateInfo,
+        pCommandPool,
+        handle_pCommandPool
+    );
+    simple_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
+
+    simple_create!(vkCreateBuffer, vn_command_vkCreateBuffer, pCreateInfo, pBuffer, handle_pBuffer);
+    simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
+
+    simple_create!(vkCreateImage, vn_command_vkCreateImage, pCreateInfo, pImage, handle_pImage);
+    simple_destroy!(vkDestroyImage, vn_command_vkDestroyImage, image);
+
+    simple_create!(
+        vkCreateImageView,
+        vn_command_vkCreateImageView,
+        pCreateInfo,
+        pView,
+        handle_pView
+    );
+    simple_destroy!(vkDestroyImageView, vn_command_vkDestroyImageView, imageView);
+
+    simple_create!(
+        vkCreateSampler,
+        vn_command_vkCreateSampler,
+        pCreateInfo,
+        pSampler,
+        handle_pSampler
+    );
+    simple_destroy!(vkDestroySampler, vn_command_vkDestroySampler, sampler);
+
+    simple_create!(
+        vkCreateRenderPass,
+        vn_command_vkCreateRenderPass,
+        pCreateInfo,
+        pRenderPass,
+        handle_pRenderPass
+    );
+    simple_destroy!(vkDestroyRenderPass, vn_command_vkDestroyRenderPass, renderPass);
+
+    simple_create!(
+        vkCreateFramebuffer,
+        vn_command_vkCreateFramebuffer,
+        pCreateInfo,
+        pFramebuffer,
+        handle_pFramebuffer
+    );
+    simple_destroy!(vkDestroyFramebuffer, vn_command_vkDestroyFramebuffer, framebuffer);
+
+    simple_create!(
+        vkCreateDescriptorSetLayout,
+        vn_command_vkCreateDescriptorSetLayout,
+        pCreateInfo,
+        pSetLayout,
+        handle_pSetLayout
+    );
+    simple_destroy!(
+        vkDestroyDescriptorSetLayout,
+        vn_command_vkDestroyDescriptorSetLayout,
+        descriptorSetLayout
+    );
+
+    simple_create!(
+        vkCreateDescriptorPool,
+        vn_command_vkCreateDescriptorPool,
+        pCreateInfo,
+        pDescriptorPool,
+        handle_pDescriptorPool
+    );
+    simple_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
+
+    simple_create!(
+        vkCreatePipelineLayout,
+        vn_command_vkCreatePipelineLayout,
+        pCreateInfo,
+        pPipelineLayout,
+        handle_pPipelineLayout
+    );
+    simple_destroy!(vkDestroyPipelineLayout, vn_command_vkDestroyPipelineLayout, pipelineLayout);
+
+    simple_create!(
+        vkCreatePipelineCache,
+        vn_command_vkCreatePipelineCache,
+        pCreateInfo,
+        pPipelineCache,
+        handle_pPipelineCache
+    );
+    simple_destroy!(vkDestroyPipelineCache, vn_command_vkDestroyPipelineCache, pipelineCache);
+
+    /// The one simple object with a check in front of it.
+    ///
+    /// `codeSize` is a byte count, uniquely among Vulkan's typed arrays, and the wire carries
+    /// `codeSize / 4` words -- so a `codeSize` that is not a multiple of four decodes into an
+    /// allocation shorter than the number the driver is then handed, and the driver reads off the
+    /// end of it. The guest chooses that number, which makes rejecting it the boundary's job.
+    fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule) {
+        // SAFETY: non-null is checked first; the decoder allocated it in the batch arena.
+        let bad = args.pCreateInfo.is_null() || unsafe { (*args.pCreateInfo).codeSize } % 4 != 0;
+        if bad {
+            self.reject = Some("gave a shader a code size that is not a whole number of words");
+            return;
+        }
+        let host = self.driver.create_object(
+            args.device,
+            |d| d.vkCreateShaderModule(),
+            args.pCreateInfo,
+            args.pAllocator,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateShaderModule", args.pShaderModule, args.handle_pShaderModule, host);
+    }
+
+    simple_destroy!(vkDestroyShaderModule, vn_command_vkDestroyShaderModule, shaderModule);
 
     fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2) {
         // A queue is owned by its device and never created, so the guest's id is registered
@@ -625,7 +803,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            bad_id: false,
+            reject: None,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateDevice_EXT, 0);
@@ -689,7 +867,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            bad_id: false,
+            reject: None,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
@@ -716,5 +894,104 @@ mod tests {
                 "id {id} was offered to a failed enumeration and must not become an object"
             );
         }
+    }
+
+    /// A create the macro serves, refused because the driver is not there.
+    ///
+    /// The whole point of routing every simple object through `Driver::create_object` is that the
+    /// device is re-checked against the driver's own table rather than trusted because the object
+    /// table resolved it. A miss has to ghost, not quietly succeed: the guest is already sending
+    /// commands that name the fence.
+    #[test]
+    fn a_simple_create_with_no_device_ghosts_rather_than_registering() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::VkStructureType;
+
+        const DEVICE: u64 = 9;
+        const FENCE: u64 = 4;
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, DEVICE)
+            .unwrap();
+
+        // The object table has the device; the driver does not. That is exactly the split the
+        // re-check exists for -- a guest that destroyed a device and then created against it.
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
+        w.extend_from_slice(&DEVICE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pCreateInfo: present
+        w.extend_from_slice(
+            &(VkStructureType::VK_STRUCTURE_TYPE_FENCE_CREATE_INFO.0).to_le_bytes(),
+        );
+        w.extend_from_slice(&0u64.to_le_bytes()); // pNext: absent
+        w.extend_from_slice(&0u32.to_le_bytes()); // flags
+        w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
+        w.extend_from_slice(&1u64.to_le_bytes()); // pFence: present
+        w.extend_from_slice(&FENCE.to_le_bytes()); // the id the guest chose
+
+        let temp = Bump::new();
+        let hard = Cell::new(false);
+        let mut dec = Decoder::new(&w, &temp, &objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
+        assert!(h.reject.is_none(), "a refused create is not a protocol violation");
+
+        assert_eq!(
+            objects.lookup(ObjectId(FENCE), VkObjectType::VK_OBJECT_TYPE_FENCE.0),
+            Lookup::Ghost
+        );
+    }
+
+    /// A shader whose code size is not a whole number of words poisons the context.
+    ///
+    /// Called directly rather than over the wire: the wire path only proves the decoder round
+    /// trips, and what is under test is the guard in front of the driver call. The decoder
+    /// allocates `codeSize / 4` words with truncating division, so a `codeSize` of 7 leaves the
+    /// driver reading three bytes past a four-byte allocation -- on a number the guest chose.
+    #[test]
+    fn a_shader_whose_code_is_not_whole_words_is_refused() {
+        use super::super::proto::types::{
+            VkShaderModuleCreateInfo, vn_command_vkCreateShaderModule,
+        };
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
+        let mut args = vn_command_vkCreateShaderModule { pCreateInfo: &odd, ..Default::default() };
+        h.vkCreateShaderModule(&mut args);
+        assert!(h.reject.is_some(), "a code size of 7 must not reach the driver");
+
+        // Four is a whole word, so the guard lets it through; there is no device, so the driver
+        // refuses it -- which is a different answer from a protocol violation.
+        let whole = VkShaderModuleCreateInfo { codeSize: 4, ..Default::default() };
+        let mut args =
+            vn_command_vkCreateShaderModule { pCreateInfo: &whole, ..Default::default() };
+        h.reject = None;
+        h.vkCreateShaderModule(&mut args);
+        assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
     }
 }
