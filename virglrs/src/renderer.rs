@@ -15,6 +15,9 @@ use crate::venus;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, MemoryError};
 use std::collections::BTreeMap;
+use std::os::fd::OwnedFd;
+#[cfg(test)]
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 /// Why a call failed.
 ///
@@ -41,6 +44,8 @@ pub enum Error {
     NoAllocation,
     /// The allocation exists but the driver would not map it; see [`MemoryError::NotMappable`].
     NotMappable,
+    /// An import of zero bytes, which names no memory.
+    ZeroSize,
 }
 
 impl std::fmt::Display for Error {
@@ -55,6 +60,7 @@ impl std::fmt::Display for Error {
             Error::Poisoned => "the context is poisoned",
             Error::NoAllocation => "no such allocation in that context",
             Error::NotMappable => "that allocation cannot be mapped for reading",
+            Error::ZeroSize => "an import of zero bytes names no memory",
         };
         f.write_str(s)
     }
@@ -91,6 +97,47 @@ pub struct BlobDesc {
     pub size: u64,
 }
 
+/// Which memory an imported blob lives in.
+///
+/// Named, where [`BlobDesc`]'s `blob_mem` is not, because the import path has a defined
+/// accept-set: the C refuses everything outside it, so there is a rejection here to check. The two
+/// sets differ -- `BLOB_MEM_GUEST` and `BLOB_MEM_HOST3D_GUEST` are creatable but not importable --
+/// which is exactly the distinction a bare `u32` in this position would lose.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlobMem {
+    Host3d,
+    GuestVram,
+}
+
+/// What kind of descriptor an import arrived on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FdType {
+    DmaBuf,
+    Opaque,
+    Shm,
+}
+
+/// An imported blob as the VMM described it -- everything except the descriptor itself, which is
+/// passed separately because passing it is a transfer of ownership and the type says so.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImportDesc {
+    pub blob_mem: BlobMem,
+    pub fd_type: FdType,
+    pub size: u64,
+}
+
+/// A refused import, handing the descriptor back to the caller that still owns it.
+///
+/// An import that fails must not close the descriptor: the caller passed it expecting the transfer
+/// to happen only on success, and a caller that then closes what we already closed is corrupting
+/// whatever has since been opened under that number. Returning it in the error makes forgetting
+/// impossible -- there is no path that yields an `Err` without also yielding the descriptor.
+#[derive(Debug)]
+pub struct Rejected {
+    pub error: Error,
+    pub fd: OwnedFd,
+}
+
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
 pub enum Backing {
@@ -98,8 +145,9 @@ pub enum Backing {
     Classic(ClassicDesc),
     /// Created from `virgl_renderer_resource_create_blob`.
     Blob(BlobDesc),
-    /// Imported from a file descriptor the VMM already owns.
-    Imported { blob_mem: u32, fd_type: u32, size: u64 },
+    /// Imported from a descriptor the VMM opened and handed over. The resource owns it now, and
+    /// closing it is what dropping this does.
+    Imported { desc: ImportDesc, fd: OwnedFd },
 }
 
 pub struct Resource {
@@ -199,15 +247,24 @@ impl Renderer {
         Ok(())
     }
 
+    /// Take over a descriptor the VMM opened.
+    ///
+    /// The descriptor is *taken*: once this returns `Ok`, closing it is ours to do, and
+    /// [`Self::resource_unref`] does it by dropping the resource. Every refusal hands it back --
+    /// see [`Rejected`].
     pub fn resource_import(
         &mut self,
         handle: ResourceHandle,
-        blob_mem: u32,
-        fd_type: u32,
-        size: u64,
-    ) -> Result<(), Error> {
-        self.free_handle(handle)?;
-        self.insert(handle, Backing::Imported { blob_mem, fd_type, size }, Vec::new());
+        desc: ImportDesc,
+        fd: OwnedFd,
+    ) -> Result<(), Rejected> {
+        if let Err(error) = self.free_handle(handle) {
+            return Err(Rejected { error, fd });
+        }
+        if desc.size == 0 {
+            return Err(Rejected { error: Error::ZeroSize, fd });
+        }
+        self.insert(handle, Backing::Imported { desc, fd }, Vec::new());
         Ok(())
     }
 
@@ -420,6 +477,65 @@ mod tests {
 
     fn renderer(config: Config) -> Renderer {
         Renderer::new(Box::new(NoSink), config)
+    }
+
+    /// A real descriptor to hand over. Any would do; a pipe's read end is the cheapest.
+    fn a_descriptor() -> OwnedFd {
+        let mut fds = [0 as std::ffi::c_int; 2];
+        // SAFETY: `pipe` fills two ints at the pointer it is given; `fds` is exactly that.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "the test needs a pipe");
+        // SAFETY: `pipe` succeeded, so both are open descriptors this test owns.
+        unsafe {
+            libc::close(fds[1]);
+            OwnedFd::from_raw_fd(fds[0])
+        }
+    }
+
+    fn is_open(fd: std::os::fd::RawFd) -> bool {
+        // SAFETY: `F_GETFD` only reads the flags of whatever is under `fd`, or fails if nothing is.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    fn import_desc(size: u64) -> ImportDesc {
+        ImportDesc { blob_mem: BlobMem::Host3d, fd_type: FdType::DmaBuf, size }
+    }
+
+    /// An imported descriptor is closed when the resource holding it goes.
+    ///
+    /// The shim used to read `res_handle`, `blob_mem`, `fd_type` and `size` out of the import
+    /// arguments and never touch `fd` at all, so every import leaked a descriptor for the life of
+    /// the process -- a VMM importing per frame runs out of them.
+    #[test]
+    fn unref_closes_the_descriptor_the_import_took() {
+        let fd = a_descriptor();
+        let raw = fd.as_raw_fd();
+        let mut r = renderer(Config::default());
+        let h = ResourceHandle(1);
+        r.resource_import(h, import_desc(4096), fd).expect("a fresh handle and a real size");
+        assert!(is_open(raw), "the resource holds the descriptor while it lives");
+        r.resource_unref(h);
+        assert!(!is_open(raw), "dropping the resource closes it");
+    }
+
+    /// A refused import gives the descriptor back, still open.
+    ///
+    /// The C rejects a zero-size import before it takes the fd, so a caller whose import was
+    /// refused still owns it and will close it itself. Closing it here as well would leave that
+    /// caller closing a number something else has since been opened under.
+    #[test]
+    fn a_refused_import_hands_the_descriptor_back() {
+        let fd = a_descriptor();
+        let raw = fd.as_raw_fd();
+        let mut r = renderer(Config::default());
+        let rej = r
+            .resource_import(ResourceHandle(1), import_desc(0), fd)
+            .expect_err("zero bytes names no memory");
+        assert_eq!(rej.error, Error::ZeroSize);
+        assert_eq!(rej.fd.into_raw_fd(), raw, "the same descriptor, not another");
+        assert!(is_open(raw), "and it was not closed on the way out");
+        // SAFETY: `into_raw_fd` above gave up ownership without closing; this test is what owns it
+        // now, and closes it here.
+        unsafe { libc::close(raw) };
     }
 
     /// A capset is advertised and filled by the same predicate.

@@ -20,6 +20,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
 
 use crate::abi::{
@@ -29,7 +30,7 @@ use crate::abi::{
 use crate::config::{CapsetId, Config};
 use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
-use crate::renderer::{self, Renderer};
+use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 
 /// Decode a capset id the guest chose.
 ///
@@ -100,7 +101,7 @@ fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
         ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned
-        | NoAllocation | NotMappable => EINVAL,
+        | NoAllocation | NotMappable | ZeroSize => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
     }
 }
@@ -391,12 +392,59 @@ pub extern "C" fn virgl_renderer_resource_import_blob(args: *const ImportBlobArg
     }
     // SAFETY: valid for the duration of the call by the VMM's contract; copied out below.
     let a = unsafe { &*args };
-    with(EINVAL, |r| {
-        match r.resource_import(ResourceHandle(a.res_handle), a.blob_mem, a.fd_type, a.size) {
-            Ok(()) => 0,
-            Err(e) => errno(e),
+    // Every refusal that does not need the renderer happens first, while the descriptor is still
+    // plainly the caller's -- the ABI transfers it only on success, so nothing may be constructed
+    // that would close it on the way out.
+    let (Some(blob_mem), Some(fd_type)) = (blob_mem_of(a.blob_mem), fd_type_of(a.fd_type)) else {
+        return EINVAL;
+    };
+    if a.fd < 0 {
+        return EINVAL;
+    }
+    let desc = ImportDesc { blob_mem, fd_type, size: a.size };
+    // SAFETY: `a.fd` is non-negative and the ABI's contract is that a successful import takes it.
+    // Both paths below account for it: the renderer files it under the resource, or hands it back
+    // and `return_fd` releases it without closing.
+    let fd = unsafe { OwnedFd::from_raw_fd(a.fd) };
+    // Spelled out rather than run through `with`, because `with`'s not-initialized answer is a
+    // value constructed before the call and dropped after it -- and dropping this one would close
+    // a descriptor the caller still owns.
+    let mut g = root().lock().expect("the renderer lock is never held across a panic");
+    let Some(r) = g.as_mut() else {
+        return_fd(fd, a.fd);
+        return EINVAL;
+    };
+    match r.resource_import(ResourceHandle(a.res_handle), desc, fd) {
+        Ok(()) => 0,
+        Err(rej) => {
+            return_fd(rej.fd, a.fd);
+            errno(rej.error)
         }
-    })
+    }
+}
+
+/// `blob_mem` as the import path accepts it. Creation accepts more; see [`BlobMem`].
+fn blob_mem_of(v: u32) -> Option<BlobMem> {
+    match v {
+        abi::BLOB_MEM_HOST3D => Some(BlobMem::Host3d),
+        abi::BLOB_MEM_GUEST_VRAM => Some(BlobMem::GuestVram),
+        _ => None,
+    }
+}
+
+fn fd_type_of(v: u32) -> Option<FdType> {
+    match v {
+        abi::BLOB_FD_TYPE_DMABUF => Some(FdType::DmaBuf),
+        abi::BLOB_FD_TYPE_OPAQUE => Some(FdType::Opaque),
+        abi::BLOB_FD_TYPE_SHM => Some(FdType::Shm),
+        _ => None,
+    }
+}
+
+/// Release a refused import's descriptor without closing it: the caller still owns it.
+fn return_fd(fd: OwnedFd, expected: c_int) {
+    let raw = fd.into_raw_fd();
+    assert_eq!(raw, expected, "an import handed back a descriptor other than the one it took");
 }
 
 #[unsafe(no_mangle)]
@@ -1069,6 +1117,30 @@ const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Import accepts exactly the `blob_mem` and `fd_type` values the C accepts, and no others.
+    ///
+    /// The shim used to pass both through as bare `u32`s, so an import naming memory this build
+    /// cannot serve -- or a descriptor kind it cannot interpret -- was filed as a live resource
+    /// and answered 0. Creation's accept-set is wider than import's, which is why this cannot be
+    /// one list: `BLOB_MEM_GUEST` and `BLOB_MEM_HOST3D_GUEST` are creatable and not importable.
+    ///
+    /// Ground truth: `virgl_renderer_resource_import_blob` in `src/virglrenderer.c`.
+    #[test]
+    fn import_names_the_blob_mems_and_fd_types_the_c_accepts() {
+        assert_eq!(blob_mem_of(0x0002), Some(BlobMem::Host3d));
+        assert_eq!(blob_mem_of(0x0004), Some(BlobMem::GuestVram));
+        for v in [0x0000, 0x0001, 0x0003, 0x0005, u32::MAX] {
+            assert_eq!(blob_mem_of(v), None, "blob_mem {v:#x} is not importable");
+        }
+
+        assert_eq!(fd_type_of(0x0001), Some(FdType::DmaBuf));
+        assert_eq!(fd_type_of(0x0002), Some(FdType::Opaque));
+        assert_eq!(fd_type_of(0x0003), Some(FdType::Shm));
+        for v in [0x0000, 0x0004, u32::MAX] {
+            assert_eq!(fd_type_of(v), None, "fd_type {v:#x} names no descriptor kind");
+        }
+    }
 
     /// A guest picks this byte, and picking a wrong one must not be mistaken for picking venus.
     ///
