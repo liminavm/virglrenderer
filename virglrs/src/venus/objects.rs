@@ -379,21 +379,27 @@ mod tests {
         assert_eq!(t.lookup(ObjectId(7), IMAGE), Lookup::Found(2));
     }
 
-    /// The reason parentage is a key and not the guest's id for the parent.
+    /// What the generation is actually for.
     ///
-    /// A slot freed by one object is handed to the next, so an object's place in the arena says
-    /// nothing about which object it is. The generation beside it does, and it is what stops a
-    /// freshly created parent from inheriting a dead one's orphans.
+    /// An id the guest destroys by name loses its entry here, so it would answer `Missing`
+    /// whatever the arena did. The ids that keep their entry are the ones a *cascade* orphaned --
+    /// and the slots that cascade freed are the first ones handed to the next create. Without the
+    /// generation beside the index, an orphan's key would come to name whatever moved in.
     #[test]
-    fn a_reused_arena_slot_does_not_answer_to_the_dead_objects_key() {
+    fn an_orphans_stale_key_does_not_come_to_name_whatever_reuses_its_slot() {
         let mut t = Table::new();
         t.add(ObjectId(1), BUFFER, 10, None).unwrap();
+        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
+        // Takes the child with it, and hands both their places back to be used again. Id 2 keeps
+        // its entry: nothing walked back here to delete it, which is the whole trade.
         t.remove(ObjectId(1)).unwrap();
 
-        // Same place, different occupant -- and the id that named the first one is not fooled.
-        t.add(ObjectId(2), IMAGE, 20, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(2), IMAGE), Lookup::Found(20));
-        assert_eq!(t.lookup(ObjectId(1), BUFFER), Lookup::Missing);
+        let newcomer = t.add(ObjectId(3), IMAGE, 30, None);
+        assert_eq!(newcomer, Ok(()));
+        assert_eq!(t.lookup(ObjectId(3), IMAGE), Lookup::Found(30));
+        // Same slot, same object type, different occupant. The generation is the only thing
+        // separating them, and a guest naming id 2 must not be handed 30.
+        assert_eq!(t.lookup(ObjectId(2), IMAGE), Lookup::Missing);
     }
 
     /// Destroying a parent destroys what hangs off it, however deep -- Vulkan does exactly this
