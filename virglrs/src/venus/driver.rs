@@ -603,6 +603,39 @@ impl Driver {
         Ok(unsafe { f(device, a, ptr(info), out) })
     }
 
+    /// A physical-device enumeration, in whichever of Vulkan's two calls the guest asked for.
+    ///
+    /// `out` is `None` for the count query -- the guest asking how many there are, with no array
+    /// behind it -- and `Some` for the fill, where the slice's own length is what the driver is
+    /// told it has room for. The count comes back either way, and the caller writes it where the
+    /// guest can read it.
+    ///
+    /// `VK_INCOMPLETE` is the driver having more than the guest asked for. That is the guest's
+    /// business rather than an error: it sized the array and it gets what fits.
+    pub fn pd_enumerate<T, R>(
+        &self,
+        pd: VkPhysicalDevice,
+        out: Option<&mut [T]>,
+        pick: impl FnOnce(
+            &InstanceFns,
+        )
+            -> Option<unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut T) -> R>,
+    ) -> Result<(u32, R), VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let (mut n, array) = match out {
+            Some(s) => (s.len() as u32, s.as_mut_ptr()),
+            None => (0, core::ptr::null_mut()),
+        };
+        // SAFETY: `pd` is a handle this instance returned, and `n` is initialised to the length of
+        // the array `array` points at -- the pair the caller handed us as one slice.
+        let r = unsafe { f(pd, &mut n, array) };
+        Ok((n, r))
+    }
+
     /// The loader's own version, before any instance exists.
     ///
     /// The one query with no handle in it at all: the guest may ask it before `vkCreateInstance`,
