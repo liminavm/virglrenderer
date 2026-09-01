@@ -74,6 +74,7 @@
 #include "vrend_debug.h"
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
+#include "vrend_iov.h"
 #include "vrend_video.h"
 
 struct vrend_context;
@@ -179,6 +180,74 @@ static void upload_mapped_plane(struct vrend_resource *res,
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+/* limina: also land the decoded plane in the guest's own memory.
+ *
+ * upload_mapped_plane() above puts the pixels in a host GL texture, which is all a
+ * guest that samples the target needs. A guest that *exports* it needs more: the fd
+ * has to name storage that actually holds the frame. Guest mesa refuses an export
+ * whose laid-out size exceeds the storage behind it -- correctly, since the classic
+ * per-plane resource has a one-page stub BO however large the picture -- and the
+ * refusal costs Firefox its hardware decoder.
+ *
+ * So when the guest allocated the plane in guest memory (VIRGL_CAP_V2_VIDEO_GUEST_PLANES,
+ * which is what tells it that doing so is worthwhile), write the frame there too. The
+ * texture upload stays: sampling must not start depending on the guest's copy being
+ * read back, and the readback only happens once per batch.
+ *
+ * Layout is the guest's, taken from SET_TYPE (vrend_resource::guest_pixels_*); each
+ * plane is its own resource, so only index 0 of that array applies here.
+ */
+static void writeback_plane_to_guest(struct vrend_resource *res,
+                                     const struct virgl_video_dma_buf_plane *plane)
+{
+    unsigned blocksize = util_format_get_blocksize(res->base.format);
+    size_t row, stride, offset, height, extent;
+
+    if (!blocksize)
+        return;
+
+    /* Nothing to write into: a host-only resource, which is the pre-existing case. */
+    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs))
+        return;
+
+    row = (size_t)res->base.width0 * blocksize;
+    height = res->base.height0;
+    stride = res->guest_pixels_stride[0] ? res->guest_pixels_stride[0] : row;
+    offset = res->guest_pixels_offset[0];
+
+    if (stride < row) {
+        virgl_error("%s: guest stride %zu < row %zu for %ux%u %s\n", __func__,
+                    stride, row, res->base.width0, res->base.height0,
+                    util_format_name(res->base.format));
+        return;
+    }
+
+    /* Check the whole extent before copying any of it. A half-written frame is worse
+     * than an unwritten one: it plays, and only a checksum would ever catch it. */
+    extent = offset + (height ? (height - 1) * stride + row : 0);
+    if (res->guest_pixels_map) {
+        if (extent > res->guest_pixels_map_size) {
+            virgl_error("%s: layout needs %zu bytes, guest map holds %zu\n", __func__,
+                        extent, res->guest_pixels_map_size);
+            return;
+        }
+    } else if (extent > vrend_get_iovec_size(res->iov, res->num_iovs)) {
+        virgl_error("%s: layout needs %zu bytes, guest iovecs hold %zu\n", __func__,
+                    extent, vrend_get_iovec_size(res->iov, res->num_iovs));
+        return;
+    }
+
+    for (size_t y = 0; y < height; y++) {
+        const char *src = (const char *)plane->map + y * plane->pitch;
+        size_t dst = offset + y * stride;
+
+        if (res->guest_pixels_map)
+            memcpy((char *)res->guest_pixels_map + dst, src, row);
+        else
+            vrend_write_to_iovec(res->iov, res->num_iovs, dst, src, row);
+    }
+}
+
 static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
                                        const struct virgl_video_dma_buf *dmabuf)
 {
@@ -199,6 +268,7 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
 
         if (dmabuf->planes[i].fd < 0 && dmabuf->planes[i].map) {
             upload_mapped_plane(res, &dmabuf->planes[i]);
+            writeback_plane_to_guest(res, &dmabuf->planes[i]);
             continue;
         }
 

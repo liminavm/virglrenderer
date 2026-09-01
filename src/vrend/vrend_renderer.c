@@ -14301,6 +14301,13 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
 
 #ifdef ENABLE_VIDEO
    vrend_video_fill_caps(caps);
+   /* limina: gate the guest-backed decode-target planes on there being a decoder at
+    * all. A host advertising no video caps is never asked for a decode target, and a
+    * guest that allocated real guest memory for one against a host that never writes
+    * it back would export an honest-looking fd naming a black frame -- strictly worse
+    * than today's refuse-and-fall-back. */
+   if (caps->v2.num_video_caps)
+      caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_VIDEO_GUEST_PLANES;
 #else
    caps->v2.num_video_caps = 0;
 #endif
