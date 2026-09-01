@@ -16,15 +16,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::cs::{Handle, ObjectId};
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkBuffer, VkBufferCopy, VkBufferImageCopy,
+    VkAllocationCallbacks, VkBaseInStructure, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy,
     VkBufferMemoryBarrier, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
     VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorSet, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkImage,
-    VkImageLayout, VkImageMemoryBarrier, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkPhysicalDevice,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlags, VkQueue, VkRect2D, VkRenderPassBeginInfo, VkResult,
-    VkStructureType, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkImage, VkImageLayout,
+    VkImageMemoryBarrier, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint,
+    VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueue, VkRect2D,
+    VkRenderPassBeginInfo, VkResult, VkSemaphore, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -173,6 +176,13 @@ pub struct Driver {
     memory: BTreeMap<u64, Memory>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
+    /// The device each queue belongs to, by host handle.
+    ///
+    /// A queue is never created and never destroyed -- `vkGetDeviceQueue2` hands back one the
+    /// device already owns -- but `vkQueueSubmit` carries only the queue, so this is the way back
+    /// to the entry points. The same problem [`Pools::device_of`] solves for a command buffer, and
+    /// kept apart from it because a queue owns nothing and takes nothing with it when it goes.
+    queues: BTreeMap<u64, u64>,
 }
 
 /// One live `VkDevice`: its entry points, and what its allocations need to know.
@@ -245,6 +255,7 @@ impl Driver {
             // application error, and the guest is under no obligation to have avoided it.
             self.free_device_memory(&d.fns, handle);
             self.pools.close_device(handle);
+            self.queues.retain(|_, owner| *owner != handle);
             // SAFETY: a handle this context created, and the table was loaded from it.
             unsafe { (d.fns.vkDestroyDevice())(VkDevice(handle), core::ptr::null()) };
         }
@@ -464,7 +475,7 @@ impl Driver {
 
     /// A device's queue, which is owned by the device and never created or destroyed.
     pub fn device_queue(
-        &self,
+        &mut self,
         device: VkDevice,
         info: Option<&VkDeviceQueueInfo2>,
     ) -> Option<VkQueue> {
@@ -473,7 +484,13 @@ impl Driver {
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
         unsafe { (d.fns.vkGetDeviceQueue2())(device, ptr(info), &mut out) };
-        (out.0 != 0).then_some(out)
+        if out.0 == 0 {
+            return None;
+        }
+        // Asking twice for the same queue is how a guest works, not a mistake: Vulkan hands back
+        // the same handle each time, and the answer recorded here is the same both times.
+        self.queues.insert(out.0, device.0);
+        Some(out)
     }
 
     /// Destroy a device and forget its entry points.
@@ -488,6 +505,7 @@ impl Driver {
         // behind it -- a device this table has already forgotten must still not leave records
         // behind that vouch for its objects.
         let orphans = self.pools.close_device(device.0);
+        self.queues.retain(|_, owner| *owner != device.0);
         let Some(d) = self.devices.remove(&device.0) else {
             return orphans;
         };
@@ -715,6 +733,15 @@ impl Driver {
     pub(super) fn plant_pool(&mut self, device: u64, pool: u64, children: &[(u64, ObjectId)]) {
         self.pools.open(device, pool);
         self.pools.adopt(pool, children.iter().copied());
+    }
+
+    /// Point a queue at a device, as `device_queue` would have.
+    ///
+    /// Test scaffolding. The real path needs a driver that answers `vkGetDeviceQueue2`, and what
+    /// the tests want to ask about is what a submit does once the answer is in.
+    #[cfg(test)]
+    pub(super) fn plant_queue(&mut self, device: u64, queue: u64) {
+        self.queues.insert(queue, device);
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
@@ -1011,6 +1038,150 @@ impl Driver {
         Some(())
     }
 
+    // ----------------------------------------------------------------------- sync
+    //
+    // Submitting work and waiting for it. `vkWaitForFences` blocks the caller for as long as the
+    // guest asked -- up to forever -- and is passed through with the guest's timeout intact: a
+    // clamp would answer `VK_TIMEOUT` for a fence that had not timed out, which is a lie the guest
+    // cannot tell from the truth. What keeps that honest is that this is the guest's own thread's
+    // work, not ours to finish early.
+
+    /// The entry points of the device a queue belongs to.
+    ///
+    /// `None` is a queue this context never retrieved -- a guest naming one it does not have. The
+    /// object table is what usually stops that; this is the second answer for when the two
+    /// disagree, so it is a rejection and never an assert. See [`Driver::recorder`].
+    fn submitter(&self, queue: VkQueue) -> Option<&DeviceFns> {
+        self.devices.get(self.queues.get(&queue.0)?).map(|d| &d.fns)
+    }
+
+    /// `vkQueueSubmit`. Every handle inside a `VkSubmitInfo` -- the wait and signal semaphores,
+    /// the command buffers -- was resolved by the decoder as it read them, so what arrives here is
+    /// already the driver's own.
+    pub fn queue_submit(
+        &self,
+        queue: VkQueue,
+        submits: &[VkSubmitInfo],
+        fence: VkFence,
+    ) -> Option<VkResult> {
+        let d = self.submitter(queue)?;
+        // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
+        // takes a null array for it -- so the slice's own pointer is passed either way.
+        // SAFETY: a queue this context retrieved, and `submits` is an arena allocation live for
+        // the call whose count is its own length.
+        Some(unsafe { (d.vkQueueSubmit())(queue, submits.len() as u32, submits.as_ptr(), fence) })
+    }
+
+    /// `vkResetFences`.
+    pub fn reset_fences(&self, device: VkDevice, fences: &[VkFence]) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: `device` is a handle in this table, and the count Vulkan wants is the slice's
+        // own length. The same holds for the wait below.
+        unsafe { (d.fns.vkResetFences())(device, fences.len() as u32, fences.as_ptr()) }
+    }
+
+    /// `vkWaitForFences`. Blocks for up to `timeout` nanoseconds, as the guest asked.
+    pub fn wait_for_fences(
+        &self,
+        device: VkDevice,
+        fences: &[VkFence],
+        wait_all: VkBool32,
+        timeout: u64,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: as above.
+        unsafe {
+            (d.fns.vkWaitForFences())(
+                device,
+                fences.len() as u32,
+                fences.as_ptr(),
+                wait_all,
+                timeout,
+            )
+        }
+    }
+
+    /// `vkWaitSemaphoreResourceMESA`: export the semaphore's payload to a sync fd, then drop it.
+    ///
+    /// The export is the entire operation. Exporting a `SYNC_FD` payload is what resolves the
+    /// semaphore's pending signal into something outside Vulkan, and the guest asked for that and
+    /// nothing else -- so the descriptor is closed the moment it exists, as the C does.
+    pub fn export_semaphore_sync_fd(
+        &self,
+        device: VkDevice,
+        semaphore: VkSemaphore,
+    ) -> Result<VkResult, NoSyncFd> {
+        let d = self.sync_fd_device(device, |f| f.has_vkGetSemaphoreFdKHR())?;
+        let info = VkSemaphoreGetFdInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+            pNext: core::ptr::null(),
+            semaphore,
+            handleType:
+                VkExternalSemaphoreHandleTypeFlagBits::VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        };
+        // KosmicKrisp answers `VK_SUCCESS` with no descriptor at all -- measured over the venus
+        // corpus, 71568 exports and not one non-negative fd. Handled rather than asserted: what
+        // the guest asked for is that the payload move, and a driver is free to have moved it
+        // somewhere that is not a file.
+        let mut fd: core::ffi::c_int = -1;
+        // SAFETY: `device` is a handle in this table; `info` and `fd` are ours and outlive the
+        // call.
+        let r = unsafe { (d.vkGetSemaphoreFdKHR())(device, &info, &mut fd) };
+        if fd >= 0 {
+            // SAFETY: a descriptor this call just produced and nothing else holds. Closing it is
+            // the whole point -- the payload has already moved.
+            unsafe { libc::close(fd) };
+        }
+        Ok(r)
+    }
+
+    /// `vkImportSemaphoreResourceMESA` for resource id 0: import an already-signaled payload.
+    ///
+    /// A `SYNC_FD` import of `-1` is Vulkan's spelling of "this semaphore is signaled now", which
+    /// is what a guest's window system uses to hand itself an image it never waited for. The
+    /// import is temporary, so it is undone by the first wait that consumes it.
+    pub fn import_signaled_semaphore(
+        &self,
+        device: VkDevice,
+        semaphore: VkSemaphore,
+    ) -> Result<VkResult, NoSyncFd> {
+        let d = self.sync_fd_device(device, |f| f.has_vkImportSemaphoreFdKHR())?;
+        let info = VkImportSemaphoreFdInfoKHR {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+            pNext: core::ptr::null(),
+            semaphore,
+            flags: VkFlags(VkSemaphoreImportFlagBits::VK_SEMAPHORE_IMPORT_TEMPORARY_BIT.0 as u32),
+            handleType:
+                VkExternalSemaphoreHandleTypeFlagBits::VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+            fd: -1,
+        };
+        // SAFETY: `device` is a handle in this table and `info` is ours for the call.
+        Ok(unsafe { (d.vkImportSemaphoreFdKHR())(device, &info) })
+    }
+
+    /// The entry points for a sync-fd operation, or why there are none.
+    ///
+    /// Both callers reach the driver through an extension the guest asked for by name, so the
+    /// proc table's own `.expect()` is not the right failure: a driver that does not export the
+    /// one being asked for is a host we cannot serve on, not a host invariant we broke. Each
+    /// caller names the entry point it is about to use and no other -- a driver that exports half
+    /// of `VK_KHR_external_semaphore_fd` can still serve the half it has.
+    fn sync_fd_device(
+        &self,
+        device: VkDevice,
+        exports: impl FnOnce(&DeviceFns) -> bool,
+    ) -> Result<&DeviceFns, NoSyncFd> {
+        let d = self.devices.get(&device.0).ok_or(NoSyncFd::NoDevice)?;
+        if !exports(&d.fns) {
+            return Err(NoSyncFd::Unsupported);
+        }
+        Ok(&d.fns)
+    }
+
     // ------------------------------------------------------------ binding and updating
     //
     // Commands that change an existing object rather than create one. They register nothing and
@@ -1204,6 +1375,18 @@ pub struct Allocation {
     pub id: ObjectId,
     /// Its size in bytes, padded to the blob the guest may map it as -- see [`pad_for_blob`].
     pub size: u64,
+}
+
+/// Why a sync-fd operation was not attempted. Neither is a host invariant: one is a guest naming
+/// a device it does not have, the other a driver this build cannot do venus sync on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoSyncFd {
+    /// No device behind the handle.
+    NoDevice,
+    /// The driver exports neither half of `VK_KHR_external_semaphore_fd`. There is nothing to
+    /// substitute: a semaphore whose payload cannot be moved is one the guest's next submit waits
+    /// on forever, so saying so is better than pretending it worked.
+    Unsupported,
 }
 
 /// Why an allocation could not be read.
