@@ -22,7 +22,8 @@ use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateCommandBuffers,
-    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory, vn_command_vkCreateBuffer,
+    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
+    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory2, vn_command_vkCreateBuffer,
     vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateImage, vn_command_vkCreateImageView,
@@ -36,7 +37,7 @@ use super::proto::types::{
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
     vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
-    vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
+    vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2, vn_command_vkUpdateDescriptorSets,
 };
 use crate::vulkan::Global;
 
@@ -327,6 +328,25 @@ impl Handlers<'_> {
     /// will reach needs a decision recorded against it. The ones a short answer did not fill, and
     /// all of them when the enumeration failed outright, are refusals: left alone they would be
     /// registered as their own handles and the guest would hold objects that do not exist.
+    /// An array argument the guest sent, checked against the count it claimed.
+    ///
+    /// The decoder nulls the pointer when the guest encoded the array as absent, and leaves the
+    /// claimed count where it was -- so the pair can disagree, and a driver handed the pair walks
+    /// off the end of nothing. Absent-and-zero is the ordinary optional array and passes through
+    /// as an empty one. Absent-but-counted is a command that cannot be carried out, and refusing
+    /// it is the honest answer: doing nothing and reporting success would leave the guest drawing
+    /// from buffers it believes are bound.
+    fn counted<T>(&mut self, count: u32, ptr: *const T) -> Option<u32> {
+        if !ptr.is_null() {
+            return Some(count);
+        }
+        if count != 0 {
+            self.reject = Some("counted an array it did not send");
+            return None;
+        }
+        Some(0)
+    }
+
     fn ghost_range<T: Handle>(&mut self, out: *const T, range: core::ops::Range<usize>) {
         for i in range {
             // SAFETY: `i` is inside the array, which the decoder allocated with `asked` elements.
@@ -700,6 +720,39 @@ impl Commands for Handlers<'_> {
             args.pQueue,
             args.handle_pQueue,
             host.map(|q| q.0).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+        );
+    }
+
+    // -------------------------------------------------------------- binding and updating
+    //
+    // Nothing here creates or destroys an object, so nothing here plants a handle. They are served
+    // because a later `vkQueueSubmit` is only safe to pass through once the objects it names are
+    // fully built: an image with no memory bound and a descriptor set that was never written are
+    // undefined behaviour at draw time, not errors the driver reports.
+
+    fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2) {
+        let Some(n) = self.counted(args.bindInfoCount, args.pBindInfos) else { return };
+        args.ret =
+            self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), n, args.pBindInfos);
+    }
+
+    fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2) {
+        let Some(n) = self.counted(args.bindInfoCount, args.pBindInfos) else { return };
+        args.ret =
+            self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), n, args.pBindInfos);
+    }
+
+    fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets) {
+        let Some(nw) = self.counted(args.descriptorWriteCount, args.pDescriptorWrites) else {
+            return;
+        };
+        let Some(nc) = self.counted(args.descriptorCopyCount, args.pDescriptorCopies) else {
+            return;
+        };
+        self.driver.update_descriptor_sets(
+            args.device,
+            (nw, args.pDescriptorWrites),
+            (nc, args.pDescriptorCopies),
         );
     }
 }
@@ -1092,6 +1145,60 @@ mod tests {
         h.reject = None;
         h.vkCreateShaderModule(&mut args);
         assert!(h.reject.is_none(), "a whole number of words is not a protocol violation");
+    }
+
+    /// A command that claims an array and sends none is refused, not quietly done as nothing.
+    ///
+    /// The decoder nulls the pointer for an absent array and leaves the guest's count alone, so
+    /// the pair reaches the handler disagreeing. Passing it on walks the driver off the end of
+    /// nothing; treating it as an empty array reports success for a bind that never happened, and
+    /// the guest then draws from a buffer it believes has memory. Only a refusal is honest.
+    #[test]
+    fn an_array_the_guest_counted_but_did_not_send_is_refused() {
+        use super::super::proto::types::{VkBindBufferMemoryInfo, vn_command_vkBindBufferMemory2};
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        let mut args = vn_command_vkBindBufferMemory2 {
+            bindInfoCount: 3,
+            pBindInfos: core::ptr::null(),
+            ..Default::default()
+        };
+        h.vkBindBufferMemory2(&mut args);
+        assert!(h.reject.is_some(), "three binds with no array behind them must not pass");
+
+        // No array and nothing counted is the ordinary optional array, and binding nothing is a
+        // legal no-op -- a different answer from a protocol violation.
+        h.reject = None;
+        let mut args = vn_command_vkBindBufferMemory2 {
+            bindInfoCount: 0,
+            pBindInfos: core::ptr::null(),
+            ..Default::default()
+        };
+        h.vkBindBufferMemory2(&mut args);
+        assert!(h.reject.is_none(), "binding nothing is not a protocol violation");
+
+        // An array that is there passes the guard; there is no device, so the driver refuses it,
+        // which is again not a protocol violation.
+        h.reject = None;
+        let info = VkBindBufferMemoryInfo::default();
+        let mut args = vn_command_vkBindBufferMemory2 {
+            bindInfoCount: 1,
+            pBindInfos: &info,
+            ..Default::default()
+        };
+        h.vkBindBufferMemory2(&mut args);
+        assert!(h.reject.is_none(), "an array the guest actually sent is not a violation");
     }
 
     /// A refused pool allocation ghosts every id in the run, not just the first.
