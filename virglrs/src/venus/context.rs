@@ -17,7 +17,7 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
-use super::cs::wire_array;
+use super::cs::{wire_array, wire_array_mut};
 use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -27,14 +27,14 @@ use super::proto::types::{
     vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory2, vn_command_vkCreateBuffer,
     vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
     vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
     vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
     vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyFence,
     vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
     vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
@@ -338,6 +338,15 @@ impl Handlers<'_> {
     /// writes that never happened.
     fn array<'w, T>(&mut self, count: u32, ptr: *const T) -> Option<&'w [T]> {
         let a = wire_array(count, ptr);
+        if a.is_none() {
+            self.reject = Some("counted an array it did not send");
+        }
+        a
+    }
+
+    /// [`Handlers::array`] for the shadow array a command writes host handles back into.
+    fn array_mut<'w, T>(&mut self, count: u32, ptr: *mut T) -> Option<&'w mut [T]> {
+        let a = wire_array_mut(count, ptr);
         if a.is_none() {
             self.reject = Some("counted an array it did not send");
         }
@@ -719,6 +728,38 @@ impl Commands for Handlers<'_> {
             host.map(|q| q.0).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
         );
     }
+
+    // ------------------------------------------------------------------------ pipelines
+    //
+    // Not a `simple_create`: one command makes a run of them, and it is the only create that can
+    // come back part real. What that costs is in [`Driver::create_pipelines`]; what is left here
+    // is the all-or-nothing the guest sees.
+
+    fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines) {
+        let Some(infos) = self.array(args.createInfoCount, args.pCreateInfos) else { return };
+        let Some(out) = self.array_mut(args.createInfoCount, args.handle_pPipelines) else {
+            return;
+        };
+        let count = infos.len();
+        let host = self.driver.create_pipelines(
+            args.device,
+            |d| d.vkCreateGraphicsPipelines(),
+            args.pipelineCache,
+            infos,
+            args.pAllocator,
+            out,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            // A pipeline the host refuses is a shader the guest cannot draw with, which is worth
+            // saying out loud -- unlike a descriptor pool running dry, it is not something a
+            // working guest does on purpose.
+            eprintln!("[virglrs] vkCreateGraphicsPipelines refused by the driver");
+            self.ghost_range(args.pPipelines, 0..count);
+        }
+    }
+
+    simple_destroy!(vkDestroyPipeline, vn_command_vkDestroyPipeline, pipeline);
 
     // -------------------------------------------------------------- binding and updating
     //
@@ -1190,6 +1231,55 @@ mod tests {
         };
         h.vkBindBufferMemory2(&mut args);
         assert!(h.reject.is_none(), "an array the guest actually sent is not a violation");
+    }
+
+    /// A refused pipeline run ghosts every id in it, not just the first.
+    ///
+    /// One command makes a run of pipelines and the guest is answered all-or-nothing, so a
+    /// refusal owes a decision about every id it named. An id left undecided is registered as its
+    /// own handle by the unserved-command fiction, and the next `vkCmdBindPipeline` hands the
+    /// driver a number the guest invented.
+    #[test]
+    fn a_refused_pipeline_run_ghosts_the_whole_run() {
+        use super::super::proto::types::{
+            VkGraphicsPipelineCreateInfo, VkPipeline, vn_command_vkCreateGraphicsPipelines,
+        };
+
+        const IDS: [u64; 3] = [41, 42, 43];
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+
+        // There is no device, so the driver refuses the whole run -- which is the only way to
+        // reach the refusal path without a driver that fails on demand.
+        let infos = [VkGraphicsPipelineCreateInfo::default(); IDS.len()];
+        let ids = IDS.map(VkPipeline);
+        let mut shadow = [VkPipeline(0); IDS.len()];
+        let mut args = vn_command_vkCreateGraphicsPipelines {
+            createInfoCount: IDS.len() as u32,
+            pCreateInfos: infos.as_ptr(),
+            pPipelines: ids.as_ptr() as *mut VkPipeline,
+            handle_pPipelines: shadow.as_mut_ptr(),
+            ..Default::default()
+        };
+        h.vkCreateGraphicsPipelines(&mut args);
+
+        assert_ne!(args.ret, VkResult::VK_SUCCESS, "no device means no pipelines");
+        for id in IDS {
+            assert!(
+                objects.borrow().is_ghost(ObjectId(id)),
+                "every id in a refused run is a ghost, not just the first"
+            );
+        }
     }
 
     /// A refused pool allocation ghosts every id in the run, not just the first.

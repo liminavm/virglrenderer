@@ -284,6 +284,17 @@ pub fn wire_array<'a, T>(count: u32, ptr: *const T) -> Option<&'a [T]> {
     Some(unsafe { core::slice::from_raw_parts(ptr, count as usize) })
 }
 
+/// [`wire_array`] for an array a command writes back into -- the shadow the generated lifecycle
+/// hook reads host handles out of.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn wire_array_mut<'a, T>(count: u32, ptr: *mut T) -> Option<&'a mut [T]> {
+    if ptr.is_null() {
+        return (count == 0).then_some(&mut []);
+    }
+    // SAFETY: as `wire_array`, and the shadow is written by nothing else while the handler runs.
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr, count as usize) })
+}
+
 /// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
 /// cannot parse.
 ///
