@@ -1433,8 +1433,65 @@ class RustGen:
                     if self.gen.is_serializable(c)]
         for ty in commands:
             out += self._command_fns(ty, gaps)
+            out += self._command_accessors(ty, gaps)
         out += self._dispatch_fns(commands, gaps)
         return '\n'.join(out)
+
+    def _command_accessors(self, ty, gaps):
+        """The arrays a command carries, as slices, on the struct that carries them.
+
+        An array is a count and a pointer, and a `vn_command_*` has to keep both: a slice is two
+        words where C has one, and venus-protocol's own encoder reads these structs through a
+        pointer (see `render_layout_oracle`). So the reconciliation happens here instead -- once
+        per array, in generated code, which is the only place that can do it soundly.
+
+        The lifetime is what makes that true. The slice is `&'a [T]` where `'a` is the struct's,
+        which the decode tied to the arena the elements came from; a free function taking a bare
+        count and a bare pointer can only invent a lifetime, and its caller is then free to invent
+        a longer one than the arena has. The shadow arrays go the other way -- `&mut` borrowed
+        from the struct -- so no two callers can hold one at once.
+
+        What `None` means is deliberately not decided here. See `cs::wire_array`.
+        """
+        rows = []
+        for var in ty.variables:
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported:
+                # The member has no emitted decode either, so there is no array to hand out.
+                continue
+            if shape[0] == 'dynamic':
+                rows.append((self.field_name(var.name), self.base_name(var.ty), shape[1], False))
+        for f, rs, shape in self.shadows(ty):
+            if shape[0] == 'dynamic':
+                mutable = rs.startswith('*mut ')
+                rows.append((f, rs.split(' ', 1)[1], shape[1], mutable))
+
+        if not rows:
+            return []
+        out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
+        for f, elem, count, mutable in rows:
+            sig = ('pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem) if mutable
+                   else "pub fn %s(&self) -> Option<&'a [%s]>" % (f, elem))
+            call = 'wire_array_mut' if mutable else 'wire_array'
+            # The count expression is the decode's, which counts in `u64` because that is what the
+            # wire holds. A slice is indexed in `usize`, and one cast says so once.
+            n = count[:-len(' as u64')] if count.endswith(' as u64') else count
+            if n.startswith('(') and n.endswith(')'):
+                n = n[1:-1]
+            out += ['    /// `%s`, reconciled with the count the guest sent beside it.' % f,
+                    '    ' + sig + ' {',
+                    "        // The count is the decode's own expression, so the slice can only be",
+                    '        // as long as the array the decoder allocated. `val` is what that',
+                    '        // expression names.',
+                    '        let val = self;',
+                    '        // SAFETY: the decoder allocated this member from the batch arena,',
+                    "        // sized to that count, and the arena outlives the struct's `'a`.",
+                    '        unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'
+                    % (call, n, f, 'mut' if mutable else 'const'),
+                    '    }',
+                    '']
+        return out[:-1] + ['}', '']
 
     def _handle_fns(self, ty):
         objtype = 'VkObjectType::%s' % ty.attrs['c_objtype']

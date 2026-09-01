@@ -368,11 +368,16 @@ impl Driver {
         let guest_info = *info;
         // The extension list's size was checked against this count as it decoded, so the pair
         // cannot arrive split; a guest that asked for none simply gets an empty list.
+        // SAFETY: a `Vk*` struct keeps C's pointers, so this pair is reconciled here rather than
+        // by a generated accessor. The decoder allocated the list from the batch arena, sized to
+        // this count, and the arena outlives this call.
         let guest = read_names(
-            super::cs::wire_array(
-                guest_info.enabledExtensionCount,
-                guest_info.ppEnabledExtensionNames,
-            )
+            unsafe {
+                super::cs::wire_array(
+                    guest_info.enabledExtensionCount as usize,
+                    guest_info.ppEnabledExtensionNames,
+                )
+            }
             .unwrap_or_default(),
         );
         let wanted = self.device_extensions(pd, &guest.iter().map(|s| &**s).collect::<Vec<_>>());
