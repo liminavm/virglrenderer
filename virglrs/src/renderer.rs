@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 
-use crate::abi::{self, Callbacks, CreateBlobArgs, GuestIov, ResourceCreateArgs, VmmPtr};
+use crate::abi::{self, Callbacks, GuestIov, VmmPtr};
 use crate::fence::Retirement;
 use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
@@ -55,14 +55,42 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A classic texture or buffer, as the guest described it -- everything about the resource except
+/// the handle it is filed under, which is the caller's to name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClassicDesc {
+    pub target: u32,
+    pub format: u32,
+    pub bind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub array_size: u32,
+    pub last_level: u32,
+    pub nr_samples: u32,
+    pub flags: u32,
+}
+
+/// Host memory the guest maps, or a handle a context exported.
+///
+/// `blob_mem` and `blob_flags` stay bare integers until the blob path is served: naming their
+/// values means rejecting the ones we do not know, and a rejection nothing exercises is a
+/// rejection nobody has checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlobDesc {
+    pub blob_mem: u32,
+    pub blob_flags: u32,
+    pub blob_id: BlobId,
+    pub size: u64,
+}
+
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
 pub enum Backing {
     /// Created from `virgl_renderer_resource_create` -- a classic texture or buffer.
-    Classic(ResourceCreateArgs),
-    /// Created from `virgl_renderer_resource_create_blob` -- host memory the guest maps, or a
-    /// handle exported by a context.
-    Blob { blob_mem: u32, blob_flags: u32, blob_id: BlobId, size: u64 },
+    Classic(ClassicDesc),
+    /// Created from `virgl_renderer_resource_create_blob`.
+    Blob(BlobDesc),
     /// Imported from a file descriptor the VMM already owns.
     Imported { blob_mem: u32, fd_type: u32, size: u64 },
 }
@@ -141,47 +169,25 @@ impl Renderer {
 
     pub fn resource_create(
         &mut self,
-        args: &ResourceCreateArgs,
+        handle: ResourceHandle,
+        desc: ClassicDesc,
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
-        let handle = ResourceHandle(args.handle);
         // A guest-chosen handle that is already live is the guest's error, not ours: reject it
         // rather than replacing an entry something else still holds.
         self.free_handle(handle)?;
-        self.resources.insert(
-            handle,
-            Resource {
-                handle,
-                backing: Backing::Classic(ResourceCreateArgs { ..*args }),
-                iov,
-                priv_: VmmPtr::NULL,
-                attached: Vec::new(),
-            },
-        );
+        self.insert(handle, Backing::Classic(desc), iov);
         Ok(())
     }
 
-    pub fn resource_create_blob(&mut self, args: &CreateBlobArgs) -> Result<(), Error> {
-        let handle = ResourceHandle(args.res_handle);
+    pub fn resource_create_blob(
+        &mut self,
+        handle: ResourceHandle,
+        desc: BlobDesc,
+        iov: Vec<GuestIov>,
+    ) -> Result<(), Error> {
         self.free_handle(handle)?;
-        // SAFETY: the VMM's contract for create_blob is that `iovecs` points to `num_iovs` valid
-        // entries for the duration of the call.
-        let iov = unsafe { GuestIov::from_raw(args.iovecs, args.num_iovs) };
-        self.resources.insert(
-            handle,
-            Resource {
-                handle,
-                backing: Backing::Blob {
-                    blob_mem: args.blob_mem,
-                    blob_flags: args.blob_flags,
-                    blob_id: BlobId(args.blob_id),
-                    size: args.size,
-                },
-                iov,
-                priv_: VmmPtr::NULL,
-                attached: Vec::new(),
-            },
-        );
+        self.insert(handle, Backing::Blob(desc), iov);
         Ok(())
     }
 
@@ -193,17 +199,14 @@ impl Renderer {
         size: u64,
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
-        self.resources.insert(
-            handle,
-            Resource {
-                handle,
-                backing: Backing::Imported { blob_mem, fd_type, size },
-                iov: Vec::new(),
-                priv_: VmmPtr::NULL,
-                attached: Vec::new(),
-            },
-        );
+        self.insert(handle, Backing::Imported { blob_mem, fd_type, size }, Vec::new());
         Ok(())
+    }
+
+    /// File a resource under a handle `free_handle` has already cleared.
+    fn insert(&mut self, handle: ResourceHandle, backing: Backing, iov: Vec<GuestIov>) {
+        let r = Resource { handle, backing, iov, priv_: VmmPtr::NULL, attached: Vec::new() };
+        self.resources.insert(handle, r);
     }
 
     /// Check a guest-chosen resource handle before anything is inserted under it.

@@ -26,7 +26,7 @@ use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
-use crate::ids::{CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::renderer::{self, Renderer};
 
 /// Translate a renderer failure into the errno the C ABI answers with.
@@ -231,6 +231,41 @@ pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
 
 // ---------------------------------------------------------------- resources
 
+/// Split the ABI's create args into the handle it names and the resource it describes.
+///
+/// Field by field on purpose. A `From` impl would have to live beside one of the two types, which
+/// means either the C layout appearing in the renderer or the renderer's type appearing in the
+/// ABI module -- and the whole point of the split is that neither knows the other.
+fn classic_desc(a: &ResourceCreateArgs) -> (ResourceHandle, renderer::ClassicDesc) {
+    let desc = renderer::ClassicDesc {
+        target: a.target,
+        format: a.format,
+        bind: a.bind,
+        width: a.width,
+        height: a.height,
+        depth: a.depth,
+        array_size: a.array_size,
+        last_level: a.last_level,
+        nr_samples: a.nr_samples,
+        flags: a.flags,
+    };
+    (ResourceHandle(a.handle), desc)
+}
+
+/// The blob the ABI's create args describe.
+///
+/// `ctx_id` is dropped: nothing reads it today, and when host3d blobs land its Rust shape is
+/// `Option<CtxId>` rather than a `u32`, because a guest-memory blob legitimately has no context
+/// and zero is how the ABI spells that.
+fn blob_desc(a: &CreateBlobArgs) -> renderer::BlobDesc {
+    renderer::BlobDesc {
+        blob_mem: a.blob_mem,
+        blob_flags: a.blob_flags,
+        blob_id: BlobId(a.blob_id),
+        size: a.size,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_create(
     args: *mut ResourceCreateArgs,
@@ -242,8 +277,9 @@ pub extern "C" fn virgl_renderer_resource_create(
     }
     // SAFETY: the VMM's contract is that `args` is valid for the call; the fields are copied out.
     let a = unsafe { &*args };
+    let (handle, desc) = classic_desc(a);
     let iov = read_iov(iov, num_iovs);
-    with(EINVAL, |r| match r.resource_create(a, iov) {
+    with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
         Ok(()) => 0,
         Err(e) => errno(e),
     })
@@ -256,7 +292,12 @@ pub extern "C" fn virgl_renderer_resource_create_blob(args: *const CreateBlobArg
     }
     // SAFETY: valid for the duration of the call by the VMM's contract; copied out below.
     let a = unsafe { &*args };
-    with(EINVAL, |r| match r.resource_create_blob(a) {
+    let handle = ResourceHandle(a.res_handle);
+    let desc = blob_desc(a);
+    // SAFETY: the VMM's contract for create_blob is that `iovecs` points to `num_iovs` valid
+    // entries for the duration of the call. Done here so the renderer never sees a raw pointer.
+    let iov = unsafe { GuestIov::from_raw(a.iovecs, a.num_iovs) };
+    with(EINVAL, |r| match r.resource_create_blob(handle, desc, iov) {
         Ok(()) => 0,
         Err(e) => errno(e),
     })
@@ -927,6 +968,67 @@ const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing else checks this. No corpus calls `virgl_renderer_resource_create` -- the venus
+    /// replayer binds only the blob entry point, and the classic path belongs to vrend, which
+    /// arrives in P3 -- so a transposed pair here would compile clean and leave every gate green
+    /// while handing the renderer a texture with its width and height swapped.
+    ///
+    /// The values are deliberately all different, so any crossed pair fails rather than only the
+    /// pairs someone thought to check.
+    #[test]
+    fn the_abi_create_args_reach_the_renderer_field_for_field() {
+        let a = ResourceCreateArgs {
+            handle: 1,
+            target: 2,
+            format: 3,
+            bind: 4,
+            width: 5,
+            height: 6,
+            depth: 7,
+            array_size: 8,
+            last_level: 9,
+            nr_samples: 10,
+            flags: 11,
+        };
+        let (handle, d) = classic_desc(&a);
+        assert_eq!(handle, ResourceHandle(1));
+        assert_eq!(
+            d,
+            renderer::ClassicDesc {
+                target: 2,
+                format: 3,
+                bind: 4,
+                width: 5,
+                height: 6,
+                depth: 7,
+                array_size: 8,
+                last_level: 9,
+                nr_samples: 10,
+                flags: 11,
+            }
+        );
+    }
+
+    /// Likewise, and additionally that `ctx_id` does not silently become something else -- it is
+    /// the one field of the five that the renderer deliberately does not receive.
+    #[test]
+    fn the_abi_blob_args_reach_the_renderer_without_the_context() {
+        let a = CreateBlobArgs {
+            res_handle: 1,
+            ctx_id: 2,
+            blob_mem: 3,
+            blob_flags: 4,
+            blob_id: 5,
+            size: 6,
+            iovecs: core::ptr::null(),
+            num_iovs: 0,
+        };
+        assert_eq!(
+            blob_desc(&a),
+            renderer::BlobDesc { blob_mem: 3, blob_flags: 4, blob_id: BlobId(5), size: 6 }
+        );
+    }
 
     /// The one thing lost when the Rust API stopped speaking errno: nothing else checks that a
     /// cause still reaches the guest as the code it used to. `ENOTSUP` is the code that matters --
