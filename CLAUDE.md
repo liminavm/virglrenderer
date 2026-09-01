@@ -41,10 +41,18 @@ current context (`force_ctx_0`), which is where the data races we have chased li
 off an explicitly owned root and is reached through it. The C ABI's implicit global becomes a
 single owned root at the shim — one place, not a habit.
 
-**C and C++ disappear; FFI never dictates design.** The best case is that the C-ABI dylib is
-eventually replaced or disabled by default. So wherever the ABI is in tension with the Rust
-design, the ABI takes the hit — in performance, in efficiency, in ergonomics. Never the other
+**C and C++ disappear; FFI never dictates design.** The C-ABI dylib is a compatibility shim with
+an end date — it will be replaced or disabled by default, and limina will consume the Rust API
+directly. **That API is the product; the C ABI is a translation of it.** So wherever the two are
+in tension, the ABI takes the hit — in performance, in efficiency, in ergonomics. Never the other
 way round.
+
+Concretely: C's idiosyncrasies stop at `ffi.rs` and never leak inward. No errno in a Rust
+signature, no bare-integer id where a newtype belongs, no `bool` standing in for a `Result`, no
+`repr(C)` argument struct in a Rust API, and no concept — like the implicit global context — that
+exists only because a C header says so. Review every signature against one question: **would this
+still make sense if `ffi.rs` were deleted?** If the answer needs a C header to explain it, the
+translation belongs in the shim.
 
 **Generated code is generated.** The venus decoder is emitted from templates. Fixing a bug by
 editing generated output puts it somewhere no one will find it and the next regeneration eats
