@@ -51,10 +51,19 @@ way round.
 
 Concretely: C's idiosyncrasies stop at `ffi.rs` and never leak inward. No errno in a Rust
 signature, no bare-integer id where a newtype belongs, no `bool` standing in for a `Result`, no
-`repr(C)` argument struct in a Rust API, and no concept — like the implicit global context — that
-exists only because a C header says so. Review every signature against one question: **would this
-still make sense if `ffi.rs` were deleted?** If the answer needs a C header to explain it, the
+`repr(C)` argument struct in a Rust API, no length travelling beside the array it measures, and no
+concept — like the implicit global context — that exists only because a C header says so. Review
+every signature against one question: **would this still make sense if `ffi.rs` were deleted?** If the answer needs a C header to explain it, the
 translation belongs in the shim.
+
+**Two values that must agree are one value.** A count and its pointer, an offset and its base, a
+capacity and its buffer. Passed onward as a pair, every layer in between has to be trusted to keep
+them in step — and the layer that quietly repairs a mismatch is worse than the one that crashes,
+because it reports success for work it did not do. Reconcile the pair once, at the boundary that
+knows the truth (the decoder for a wire array, `ffi.rs` for a C one), and pass a slice or a newtype
+from there on. Where the wire genuinely lets the two disagree, that same boundary is where the
+guest's version is rejected — never averaged, never clamped. The pair may reappear only as the
+arguments of the foreign call that needs it, rebuilt from the single value.
 
 **Generated code is generated.** The venus decoder is emitted from templates. Fixing a bug by
 editing generated output puts it somewhere no one will find it and the next regeneration eats

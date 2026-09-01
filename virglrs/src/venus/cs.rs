@@ -259,14 +259,22 @@ impl<'a> Decoder<'a> {
 /// The array a decoded command carries, reconciled into a slice.
 ///
 /// A decoded command holds an array the way the wire spells it: the guest's count, and separately
-/// a pointer that is null when the guest encoded the array as absent. The two are independent on
-/// the wire -- "no array, count 7" is a thing a guest can send, and a slice cannot express it --
-/// so the generated structs have to keep them apart. Nothing above the decoder should: past here
-/// an array is a slice, and a length that disagrees with its contents is unrepresentable.
+/// a pointer that is null when the guest encoded the array as absent. Whether the two may disagree
+/// depends on the array, and both kinds exist:
 ///
-/// `None` is exactly that disagreement -- an array the guest counted and did not send. It is a
-/// command that cannot be carried out, never an empty one: a caller that treated it as empty
-/// would report a bind or a write that never happened.
+/// * A **required** array's size is checked against the count as it decodes, and a guest that
+///   disagrees with itself poisons before any handler runs. Here the pair cannot arrive split, and
+///   this function's `None` is defence in depth.
+/// * An **optional** array -- `pResolveAttachments`, `pWaitSemaphoreValues`, `vkFreeCommandBuffers`
+///   and some eighty other members and arguments -- decodes its size *unchecked*, because "null,
+///   with a count of seven" is precisely what Vulkan means by an optional array sharing another
+///   field's count. Here the pair genuinely arrives split, and reconciling it is the whole job.
+///
+/// Which of the two a given array is, is the generator's business and not a handler's. Past this
+/// point an array is a slice, and a length that disagrees with its contents cannot be written down.
+///
+/// `None` is a count with no array behind it. It is a command that cannot be carried out, never an
+/// empty one: a caller that treated it as empty would report a bind or a write that never happened.
 ///
 /// Lives here rather than beside the handlers because the invariant it rests on is the decoder's:
 /// this module allocated the array, and knows how long it lives.

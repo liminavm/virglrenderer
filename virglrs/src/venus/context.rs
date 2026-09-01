@@ -1181,10 +1181,15 @@ mod tests {
 
     /// A command that claims an array and sends none is refused, not quietly done as nothing.
     ///
-    /// The decoder nulls the pointer for an absent array and leaves the guest's count alone, so
-    /// the pair reaches the handler disagreeing. Passing it on walks the driver off the end of
-    /// nothing; treating it as an empty array reports success for a bind that never happened, and
-    /// the guest then draws from a buffer it believes has memory. Only a refusal is honest.
+    /// Called directly rather than over the wire, and deliberately so. `vkBindBufferMemory2`'s
+    /// array is a *required* one, so the decoder checks its size against the count and poisons
+    /// before a handler could ever see the pair disagree -- there is no wire that reaches this.
+    /// What is under test is the verdict [`Handlers::array`] returns, which the eighty-odd
+    /// optional arrays *can* reach, and which every handler that carries one will rely on.
+    ///
+    /// The verdict has to be a refusal. Passing a count with no array behind it on to the driver
+    /// walks it off the end of nothing; calling it empty reports success for a bind that never
+    /// happened, and the guest then draws from a buffer it believes has memory.
     #[test]
     fn an_array_the_guest_counted_but_did_not_send_is_refused() {
         use super::super::proto::types::{VkBindBufferMemoryInfo, vn_command_vkBindBufferMemory2};
