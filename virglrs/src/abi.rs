@@ -168,3 +168,43 @@ impl GuestIov {
         s.iter().map(|e| GuestIov { base: VmmPtr(e.iov_base), len: e.iov_len }).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `virgl_renderer_init` reads `Callbacks` field by field rather than through a `&Callbacks`,
+    /// because the C's struct is size-versioned and so is shorter than ours for anything below v4.
+    /// Those projections are in bounds only if our field order matches the header's, so pin the
+    /// offsets.
+    ///
+    /// Ground truth: `offsetof` under `cc` on `src/virglrenderer.h`.
+    #[test]
+    fn callbacks_offsets_match_the_c_header() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(Callbacks, version), 0);
+        assert_eq!(offset_of!(Callbacks, write_fence), 8);
+        assert_eq!(offset_of!(Callbacks, create_gl_context), 16);
+        assert_eq!(offset_of!(Callbacks, destroy_gl_context), 24);
+        assert_eq!(offset_of!(Callbacks, make_current), 32);
+        assert_eq!(offset_of!(Callbacks, get_drm_fd), 40);
+        assert_eq!(offset_of!(Callbacks, write_context_fence), 48);
+        assert_eq!(offset_of!(Callbacks, get_server_fd), 56);
+        assert_eq!(offset_of!(Callbacks, get_egl_display), 64);
+        assert_eq!(size_of::<Callbacks>(), 72);
+    }
+
+    /// The version gate in `virgl_renderer_init` is what makes those projections legal: a caller
+    /// declaring v3 allocates through `get_server_fd` and no further. Both fields the shim reads
+    /// must therefore end inside that prefix -- and `get_egl_display`, being v4, must not, or a
+    /// `&Callbacks` would be claiming bytes even a conforming caller never allocated.
+    #[test]
+    fn the_fields_init_reads_end_inside_the_v3_prefix() {
+        use std::mem::{offset_of, size_of};
+        let ptr = size_of::<*mut c_void>();
+        let v3_prefix = offset_of!(Callbacks, get_server_fd) + ptr;
+        assert!(offset_of!(Callbacks, write_fence) + ptr <= v3_prefix);
+        assert!(offset_of!(Callbacks, write_context_fence) + ptr <= v3_prefix);
+        assert!(offset_of!(Callbacks, get_egl_display) >= v3_prefix);
+    }
+}
