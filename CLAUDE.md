@@ -10,10 +10,16 @@ switch point, and no obligation to older users at any point.
 We are not porting for fashion. The language is the point: it is meant to remove whole classes
 of the bugs this renderer has cost us. Every rule below is that reason, applied.
 
-**Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules — the Vulkan, GLES and
-Objective-C bindings, and the guest-memory mapping — and every unsafe block carries a `SAFETY:`
-comment naming the invariant and who upholds it. The rest of the renderer is safe Rust. An
-unsafe block outside those modules is a design failure, not a shortcut.
+**Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules and nowhere else. They are:
+the Vulkan, GLES and Objective-C bindings (`vulkan.rs`, `venus/driver.rs`); the guest-memory
+mapping; the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder (`venus/cs.rs`), which owns
+the arena every decoded pointer points into. Every unsafe block carries a `SAFETY:` comment naming
+the invariant and who upholds it. The rest of the renderer is safe Rust, and an unsafe block
+outside these modules is a design failure, not a shortcut.
+
+The list is exhaustive on purpose: a module that starts needing unsafe is a module whose types are
+wrong. Handlers in `venus/context.rs` in particular must stay safe — when one needs a raw pointer,
+the fix is for the generator to hand it a reference or a slice, not for the handler to dereference.
 
 **Make bad state unrepresentable; fail the build, not the run.** Use the type system in our
 favour. The concrete form this takes here: virgl is a soup of bare `uint32_t` — resource
