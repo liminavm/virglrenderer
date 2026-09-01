@@ -28,12 +28,12 @@ use super::proto::types::{
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
-    vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
     vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
     vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
@@ -1231,6 +1231,22 @@ mod tests {
             .expect("this file ends in its own test module");
         let n = handlers.matches("unsafe").count();
         assert_eq!(n, 0, "venus/context.rs is not on the list of modules allowed unsafe");
+    }
+
+    #[test]
+    fn a_blob_is_as_long_as_the_count_beside_it() {
+        // A blob is the array wall's case with the element type left unsaid: vk.xml calls it
+        // `void`, the wire counts it in bytes. So the door has to hand back exactly the bytes
+        // the count claims -- planting more than the count says must not widen the slice.
+        let bytes = [0xde_u8, 0xad, 0xbe, 0xef, 0x11, 0x22];
+        let mut args = vn_command_vkCmdPushConstants::default();
+        assert!(!args.has_pValues(), "a blob the guest never sent");
+        args.size = 4;
+        assert!(args.pValues().is_none(), "a count with no blob behind it is refused, not emptied");
+        args.plant_pValues(&bytes);
+        assert_eq!(args.pValues(), Some(&bytes[..]), "the plant sets the count and the pointer");
+        args.size = 4;
+        assert_eq!(args.pValues(), Some(&bytes[..4]), "the count measures it, not the pointer");
     }
 
     /// The pairing the whole shadow mechanism exists for: the guest names an object by an id it
