@@ -9484,7 +9484,7 @@ static void vrend_resource_iosurface_init(struct vrend_resource *gr,
     * and sync becomes a pure completion barrier. */
    if (egl) {
       void *img =
-         virgl_egl_image_from_iosurface(egl, vkr_mtl_iosurface_get_ref(surf));
+         virgl_egl_image_from_iosurface(egl, vkr_mtl_iosurface_get_ref(surf), 0, 0);
       if (img) {
          gr->egl_image = img;
          gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
@@ -15171,7 +15171,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                vkr_mtl_iosurface_lookup(res->iosurface_id, &ios_base, &ios_size);
             if (ios) {
                limina_fail_stage = "egl-image";
-               void *ios_image = virgl_egl_image_from_iosurface(egl, ios);
+               void *ios_image = virgl_egl_image_from_iosurface(egl, ios, 0, 0);
                if (ios_image) {
                   limina_fail_stage = "alloc-texture";
                   gr->egl_image = ios_image;
