@@ -36,8 +36,14 @@ impl fmt::Display for CtxKey {
 /// references but does not contain.
 #[derive(Clone, Debug)]
 pub enum Ctl {
-    CtxCreate { ctx_id: u32, context_init: u32, name: String },
-    CtxDestroy { ctx_id: u32 },
+    CtxCreate {
+        ctx_id: u32,
+        context_init: u32,
+        name: String,
+    },
+    CtxDestroy {
+        ctx_id: u32,
+    },
     CreateBlob {
         res_handle: u32,
         ctx_id: u32,
@@ -48,10 +54,22 @@ pub enum Ctl {
         num_iovs: u32,
     },
     /// Arrived as a host fd from outside the renderer; a replayer cannot reconstruct it.
-    ImportBlob { res_handle: u32, fd_type: u32, size: u64 },
-    AttachResource { ctx_id: u32, res_handle: u32 },
-    DetachResource { ctx_id: u32, res_handle: u32 },
-    ResourceUnref { res_handle: u32 },
+    ImportBlob {
+        res_handle: u32,
+        fd_type: u32,
+        size: u64,
+    },
+    AttachResource {
+        ctx_id: u32,
+        res_handle: u32,
+    },
+    DetachResource {
+        ctx_id: u32,
+        res_handle: u32,
+    },
+    ResourceUnref {
+        res_handle: u32,
+    },
 }
 
 /// One stream record. `Cmd` payloads are venus wire bytes; the replay ABI strips the reply bit in
@@ -205,10 +223,7 @@ fn parse_journal(blob: &[u8], ctx: CtxKey) -> Result<Vec<JournalEntry>> {
         let klass = c.take(4)?[0]; // u8 klass + 3 bytes of pad
         let ring_key = c.u64()?;
         let size = c.u32()? as usize;
-        let wire = c
-            .payload(size)
-            .map_err(|e| format!("{ctx}: journal entry {i}: {e}"))?
-            .to_vec();
+        let wire = c.payload(size).map_err(|e| format!("{ctx}: journal entry {i}: {e}"))?.to_vec();
         out.push(JournalEntry { seq, cmd_type, klass, ring_key, wire });
     }
     Ok(out)
@@ -299,7 +314,10 @@ pub fn parse(blob: &[u8]) -> Result<Corpus> {
     // rather than swapping arbitrarily -- and a duplicate tick is a recorder bug, so say it.
     records.sort_by_key(Record::tick);
     if let Some(w) = records.windows(2).find(|w| w[0].tick() == w[1].tick()) {
-        return Err(format!("two records share tick {}: the execution clock is broken", w[0].tick()));
+        return Err(format!(
+            "two records share tick {}: the execution clock is broken",
+            w[0].tick()
+        ));
     }
 
     Ok(Corpus { flags, prologues, records })

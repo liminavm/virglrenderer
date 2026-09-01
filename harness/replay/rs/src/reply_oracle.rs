@@ -179,7 +179,8 @@ fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
                 args,
             ));
         };
-        let Some(size) = vn_reply_oracle_args(&mut dec, &mut enc, &fill_arena, &mut Fill::new(), cmd, &mut also)
+        let Some(size) =
+            vn_reply_oracle_args(&mut dec, &mut enc, &fill_arena, &mut Fill::new(), cmd, &mut also)
         else {
             tally.note(key, Outcome::Unknown, || "this protocol has no such command".into());
             return true;
@@ -271,5 +272,9 @@ fn main() -> ExitCode {
         }
     }
     println!("{ok} replies matched, {bad} did not");
-    if bad == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if bad == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
