@@ -8,11 +8,11 @@
 //! the C's implicit global, is a no-op here because nothing reads such a thing.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 
-use crate::abi::{self, Callbacks, GuestIov, VmmPtr};
-use crate::fence::Retirement;
-use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::abi::{self, GuestIov, VmmPtr};
+use crate::fence::{FenceSink, Retirement};
+use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
 
 /// Why a call failed.
@@ -127,12 +127,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(cookie: *mut c_void, cb: &Callbacks, flags: c_int) -> Renderer {
+    pub fn new(fences: Box<dyn FenceSink>, flags: c_int) -> Renderer {
         Renderer {
             flags,
             resources: BTreeMap::new(),
             contexts: BTreeMap::new(),
-            fences: Retirement::start(cookie, cb),
+            fences: Retirement::start(fences),
             venus: (flags & abi::VENUS != 0).then(|| venus::vkr::Vkr::new(flags)),
         }
     }
@@ -307,8 +307,8 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn create_fence(&mut self, client_fence_id: u32) {
-        self.fences.retire_global(client_fence_id);
+    pub fn create_fence(&mut self, fence: ClientFenceId) {
+        self.fences.retire_global(fence);
     }
 
     // ---- venus ----

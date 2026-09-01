@@ -26,8 +26,38 @@ use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
-use crate::ids::{BlobId, CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::fence;
+use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::renderer::{self, Renderer};
+
+/// The VMM's callback table, as a place for retired fences to go.
+///
+/// The C ABI's half of [`FenceSink`]: it holds the two entry points the renderer can reach and
+/// the opaque token they are called with. A callback the VMM did not supply means that kind of
+/// fence is dropped -- which is the C table's contract, and not something a Rust implementor
+/// should inherit, so the optionality stops here.
+///
+/// No `unsafe impl Send` is needed: [`VmmPtr`] already carries that justification in the module
+/// that owns the boundary, and an `extern "C" fn` is `Send` on its own.
+struct VmmFences {
+    cookie: VmmPtr,
+    write_fence: Option<extern "C" fn(*mut c_void, u32)>,
+    write_context_fence: Option<extern "C" fn(*mut c_void, u32, u32, u64)>,
+}
+
+impl fence::FenceSink for VmmFences {
+    fn context_fence(&mut self, ctx: CtxId, ring: RingIdx, fence: FenceId) {
+        if let Some(f) = self.write_context_fence {
+            f(self.cookie.0, ctx.get(), ring.0, fence.0);
+        }
+    }
+
+    fn global_fence(&mut self, fence: ClientFenceId) {
+        if let Some(f) = self.write_fence {
+            f(self.cookie.0, fence.0);
+        }
+    }
+}
 
 /// Translate a renderer failure into the errno the C ABI answers with.
 ///
@@ -101,7 +131,14 @@ pub extern "C" fn virgl_renderer_init(
         "[virglrs] init flags={flags:#x} -- {}",
         crate::renderer::unsupported_renderers(flags)
     );
-    *g = Some(Renderer::new(cookie, cbs, flags));
+    // Only the two fence callbacks are read. The other six are vrend's winsys hooks, which
+    // nothing here calls; they get a trait of their own when P3 needs one.
+    let sink = VmmFences {
+        cookie: VmmPtr(cookie),
+        write_fence: cbs.write_fence,
+        write_context_fence: cbs.write_context_fence,
+    };
+    *g = Some(Renderer::new(Box::new(sink), flags));
     0
 }
 
@@ -655,7 +692,7 @@ pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_create_fence(client_fence_id: c_int, _ctx_id: u32) -> c_int {
     with(EINVAL, |r| {
-        r.create_fence(client_fence_id as u32);
+        r.create_fence(ClientFenceId(client_fence_id as u32));
         0
     })
 }

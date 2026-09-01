@@ -38,6 +38,11 @@ id!(
     FenceId(u64)
 );
 id!(
+    /// A fence on the legacy global path, named by the VMM rather than by a guest ring. Its own
+    /// namespace: it shares nothing with [`FenceId`], which is per (context, ring).
+    ClientFenceId(u32)
+);
+id!(
     /// A ring within a context. Ring 0 is the context's own command stream.
     RingIdx(u32)
 );
