@@ -36,7 +36,7 @@
 //! reads them already treats every byte as hostile.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -186,6 +186,97 @@ impl GuestMap {
     }
 }
 
+/// The host's page size, which is what a mapping's length has to be a multiple of.
+pub fn page_size() -> usize {
+    // SAFETY: a plain sysconf query with no pointers involved.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(n > 0, "the host must report a page size");
+    n as usize
+}
+
+/// Round a length up to a whole number of pages, or `None` if that overflows.
+///
+/// The VMM maps a resource with `MAP_FIXED`, which requires a page-aligned size, so the rounded
+/// length is the resource's real size -- not a detail of the allocation. Everything that checks an
+/// offset against the resource has to check it against this, or it refuses layouts that fit.
+pub fn page_round(len: usize) -> Option<usize> {
+    let page = page_size();
+    len.checked_add(page - 1).map(|n| n & !(page - 1))
+}
+
+/// Create an anonymous shared file of `len` bytes and map it.
+///
+/// This is the host minting memory for the guest rather than receiving it -- the C's
+/// `os_create_anonymous_file` followed by the `mmap` in `vkr_context_create_resource_from_shm`.
+/// The descriptor comes back with the mapping because the VMM will eventually want it: it is what
+/// the guest maps on its side, and closing it here would make that impossible to offer later.
+///
+/// The file never appears in a directory anyone can open: on Linux it has no name at all, and on
+/// macOS its name is unlinked before this returns.
+pub fn anonymous_shm(len: usize, debug_name: &str) -> io::Result<(OwnedFd, GuestMap)> {
+    let len = page_round(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "size overflows when paged"))?;
+    let fd = anonymous_fd(debug_name)?;
+    // The file starts empty; this is what gives it the length the mapping needs.
+    // SAFETY: `fd` is a live descriptor this function just created and still owns.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let map = GuestMap::shm(fd.as_fd(), len)?;
+    Ok((fd, map))
+}
+
+/// A descriptor for a file with no directory entry, by whatever route the host offers.
+fn anonymous_fd(debug_name: &str) -> io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new(debug_name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name has a NUL in it"))?;
+        // SAFETY: `name` is a live NUL-terminated string for the duration of the call.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: memfd_create returned a fresh descriptor that nothing else owns.
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS has no memfd, so this is shm_open under a name that is unlinked immediately. The
+        // name only has to survive until then, but it still has to be unique, because two workers
+        // racing on the same one would share memory that is supposed to be private.
+        //
+        // shm_open rejects O_CLOEXEC with EINVAL here, so close-on-exec is set afterwards.
+        for attempt in 0..32u32 {
+            let name = format!("/{}-{}-{}\0", debug_name, std::process::id(), attempt);
+            // SAFETY: `name` is NUL-terminated above and live for the duration of the call.
+            let fd = unsafe {
+                libc::shm_open(
+                    name.as_ptr().cast::<libc::c_char>(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: shm_open returned a fresh descriptor that nothing else owns; taking
+                // ownership here is what closes it on every path out.
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                // SAFETY: `owned` is live; both calls take the descriptor and no pointers.
+                unsafe {
+                    libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                    libc::shm_unlink(name.as_ptr().cast::<libc::c_char>());
+                }
+                return Ok(owned);
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(err);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, "no unused shm name in 32 tries"))
+    }
+}
+
 impl Drop for GuestMap {
     fn drop(&mut self) {
         // SAFETY: this pointer and length came from the `mmap` in `shm` and have not changed
@@ -326,6 +417,45 @@ mod tests {
         };
         assert!(m.store_u32(0, 0x1234), "still writable with the descriptor long gone");
         assert_eq!(m.load_u32(0), Some(0x1234));
+    }
+
+    #[test]
+    fn a_minted_mapping_is_page_rounded_and_usable() {
+        let page = page_size();
+        // The size the venus corpus asks for a ring resource, which is not a whole page.
+        let (fd, m) = anonymous_shm(0x24000 - 1, "virglrs-test").expect("minted");
+        assert_eq!(m.len() % page, 0, "the length is a whole number of pages");
+        assert!(m.len() >= 0x24000 - 1, "and is at least what was asked for");
+        assert!(m.len() < 0x24000 - 1 + page, "without rounding further than one page");
+
+        assert!(m.copy_in(0, b"ring"), "the memory is there and writable");
+        let mut out = [0u8; 4];
+        assert!(m.copy_out(0, &mut out));
+        assert_eq!(&out, b"ring");
+
+        // The descriptor comes back with it, because the VMM will need it to map its own side.
+        let second = GuestMap::shm(fd.as_fd(), m.len()).expect("the descriptor still names it");
+        assert_eq!(second.load_u32(0), m.load_u32(0), "and it is the same memory");
+    }
+
+    /// Every minting must be its own memory. On macOS the name is reused across attempts only on
+    /// EEXIST, and a bug there would hand two resources the same bytes.
+    #[test]
+    fn two_minted_mappings_are_not_the_same_memory() {
+        let (_a_fd, a) = anonymous_shm(0x1000, "virglrs-test").expect("one");
+        let (_b_fd, b) = anonymous_shm(0x1000, "virglrs-test").expect("two");
+        assert!(a.store_u32(0, 0xaaaa_aaaa));
+        assert!(b.store_u32(0, 0xbbbb_bbbb));
+        assert_eq!(a.load_u32(0), Some(0xaaaa_aaaa), "the second did not overwrite the first");
+        assert_eq!(b.load_u32(0), Some(0xbbbb_bbbb));
+    }
+
+    #[test]
+    fn a_page_round_that_would_overflow_is_refused() {
+        assert_eq!(page_round(0), Some(0));
+        assert_eq!(page_round(1), Some(page_size()));
+        assert_eq!(page_round(page_size()), Some(page_size()), "an exact page is left alone");
+        assert_eq!(page_round(usize::MAX), None, "rather than wrapping to something small");
     }
 
     #[test]
