@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::ids::{CtxId, RingId};
 
 use super::context::{Context, Unimplemented};
+use super::ring::ShmResources;
 use crate::vulkan::Global;
 
 /// Why a venus call could not be served. Both are the caller's mistake, not ours: a context that
@@ -68,14 +69,29 @@ impl Vkr {
     }
 
     /// Run a submission on one context.
-    pub fn submit(&mut self, id: CtxId, buf: &[u8]) -> Result<(), Error> {
+    pub fn submit(
+        &mut self,
+        id: CtxId,
+        buf: &[u8],
+        resources: &dyn ShmResources,
+    ) -> Result<(), Error> {
         let ctx = self.contexts.get_mut(&id).ok_or(Error::NoContext)?;
-        if ctx.submit(buf, &mut self.todo, &self.global) { Ok(()) } else { Err(Error::Poisoned) }
+        if ctx.submit(buf, &mut self.todo, &self.global, resources) {
+            Ok(())
+        } else {
+            Err(Error::Poisoned)
+        }
     }
 
-    pub fn submit_ring(&mut self, id: CtxId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
+    pub fn submit_ring(
+        &mut self,
+        id: CtxId,
+        ring: RingId,
+        buf: &[u8],
+        resources: &dyn ShmResources,
+    ) -> Result<(), Error> {
         let ctx = self.contexts.get_mut(&id).ok_or(Error::NoContext)?;
-        if ctx.submit_ring(ring, buf, &mut self.todo, &self.global) {
+        if ctx.submit_ring(ring, buf, &mut self.todo, &self.global, resources) {
             Ok(())
         } else {
             Err(Error::Poisoned)

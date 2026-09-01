@@ -11,6 +11,7 @@
 
 use bumpalo::Bump;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 
 use crate::ids::{CtxId, RingId};
 
@@ -34,21 +35,22 @@ use super::proto::types::{
     vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
     vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
     vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
-    vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
-    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
-    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
-    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyFence,
-    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
+    vn_command_vkCreateSampler, vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule,
+    vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
+    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
+    vn_command_vkDestroyDevice, vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer,
+    vn_command_vkDestroyImage, vn_command_vkDestroyImageView, vn_command_vkDestroyInstance,
+    vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
-    vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
-    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
-    vn_command_vkEnumerateInstanceVersion, vn_command_vkEnumeratePhysicalDeviceGroups,
-    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
-    vn_command_vkFreeMemory, vn_command_vkGetBufferMemoryRequirements2,
-    vn_command_vkGetDeviceQueue2, vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
-    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
-    vn_command_vkGetPhysicalDeviceExternalFenceProperties,
+    vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler, vn_command_vkDestroySemaphore,
+    vn_command_vkDestroyShaderModule, vn_command_vkEndCommandBuffer,
+    vn_command_vkEnumerateDeviceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
+    vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
+    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements2,
+    vn_command_vkGetImageSubresourceLayout, vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
@@ -59,6 +61,7 @@ use super::proto::types::{
     vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
     vn_command_vkWaitSemaphoreResourceMESA,
 };
+use super::ring::{Ring, RingError, ShmResources};
 use crate::vulkan::Global;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
@@ -80,6 +83,11 @@ pub struct Context {
     /// The second number is what says how far a corpus actually got.
     pub dispatched: u64,
     pub unhandled: u64,
+    /// The rings this context has stood up, by the object id the guest named them with.
+    ///
+    /// One map, so a ring has exactly one owner. Destroying the context drops it, which is what
+    /// releases the share each ring holds of its resource's mapping.
+    rings: BTreeMap<RingId, Ring>,
 }
 
 impl Context {
@@ -92,6 +100,7 @@ impl Context {
             replay: false,
             dispatched: 0,
             unhandled: 0,
+            rings: BTreeMap::new(),
         }
     }
 
@@ -119,7 +128,13 @@ impl Context {
     /// Returns false when the context was poisoned -- by this batch or by an earlier one. The C
     /// bails early on an already-fatal context for the same reason: a stream we stopped trusting
     /// does not become trustworthy because the guest sent more of it.
-    pub fn submit(&mut self, buf: &[u8], todo: &mut Unimplemented, global: &Global) -> bool {
+    pub fn submit(
+        &mut self,
+        buf: &[u8],
+        todo: &mut Unimplemented,
+        global: &Global,
+        resources: &dyn ShmResources,
+    ) -> bool {
         if self.fatal.get() {
             return false;
         }
@@ -142,6 +157,8 @@ impl Context {
             driver: &mut self.driver,
             global,
             reject: None,
+            resources,
+            rings: &mut self.rings,
         };
 
         while dec.has_command() {
@@ -209,8 +226,9 @@ impl Context {
         buf: &[u8],
         todo: &mut Unimplemented,
         global: &Global,
+        resources: &dyn ShmResources,
     ) -> bool {
-        self.submit(buf, todo, global)
+        self.submit(buf, todo, global, resources)
     }
 
     /// The driver state, for the teardown that has to destroy what it holds.
@@ -304,6 +322,10 @@ pub struct Handlers<'a> {
     /// Why the handler refused the command, if it did. It cannot be reported from here -- the
     /// handler has no decoder -- so the loop reads it back and poisons with this as the reason.
     reject: Option<&'static str>,
+    /// The renderer's resource table, for the one command that needs guest memory by name.
+    resources: &'a dyn ShmResources,
+    /// The rings this context has stood up. Held mutably because creating one is a command.
+    rings: &'a mut BTreeMap<RingId, Ring>,
 }
 
 impl Handlers<'_> {
@@ -1067,6 +1089,55 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    // ------------------------------------------------------------------------ rings
+    //
+    // A ring is the guest's own command buffer in memory both sides can see. These two commands
+    // arrive on the context's stream, never on a ring's, and they are what makes a ring exist.
+
+    fn vkCreateRingMESA(&mut self, args: &mut vn_command_vkCreateRingMESA<'_>) {
+        let id = RingId(args.ring);
+        let Some(info) = args.pCreateInfo else {
+            self.reject = Some("asked to create a ring with no description of it");
+            return;
+        };
+
+        // A ring id already in use is the guest contradicting itself. Refusing rather than
+        // replacing matters: the entry that is already there owns a share of a mapping, and
+        // dropping it silently would strand whatever is still reading from it.
+        if self.rings.contains_key(&id) {
+            self.reject = Some("created a ring under an id that is already a ring");
+            return;
+        }
+
+        let ring = match Ring::create(self.resources, info) {
+            Ok(r) => r,
+            Err(RingError::NoResource(h)) => {
+                eprintln!("[virglrs] vkCreateRingMESA: resource {h} is not a mapped shm resource");
+                self.reject = Some("created a ring in a resource that has no host mapping");
+                return;
+            }
+            Err(RingError::Layout(e)) => {
+                eprintln!("[virglrs] vkCreateRingMESA: ring {id}: {e:?}");
+                self.reject = Some("created a ring with a layout we will not touch");
+                return;
+            }
+        };
+
+        // Registering is the whole of it. Nothing reads from a ring yet, so there is no thread to
+        // start and no `ctx->replaying` to check before starting it -- when there is, this is
+        // where the replay path and the live one diverge.
+        self.rings.insert(id, ring);
+    }
+
+    fn vkDestroyRingMESA(&mut self, args: &mut vn_command_vkDestroyRingMESA<'_>) {
+        let id = RingId(args.ring);
+        // Dropping the entry is the teardown: it releases this ring's share of the resource's
+        // mapping, and the mapping goes when the last share does.
+        if self.rings.remove(&id).is_none() {
+            self.reject = Some("destroyed a ring that was never created");
+        }
+    }
+
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
     // the honest channel and refusal is not: a driver without `VK_EXT_image_drm_format_modifier`
     // is an answer the guest asked for and can act on, not a reason to take its ring down. The
@@ -1533,6 +1604,62 @@ impl Unimplemented {
 
 #[cfg(test)]
 mod tests {
+    /// A resource table with nothing in it, for the tests that are not about rings. A ring
+    /// handler reaching for a resource here gets the same answer a guest naming a bogus one does.
+    struct NoResources;
+
+    impl ShmResources for NoResources {
+        fn shm(
+            &self,
+            _: crate::ids::ResourceHandle,
+        ) -> Option<std::sync::Arc<crate::guest_mem::GuestMap>> {
+            None
+        }
+    }
+
+    static NO_RESOURCES: NoResources = NoResources;
+
+    /// A resource table with one mapped shm resource in it, for the ring tests.
+    struct OneShm(crate::ids::ResourceHandle, std::sync::Arc<crate::guest_mem::GuestMap>);
+
+    impl ShmResources for OneShm {
+        fn shm(
+            &self,
+            handle: crate::ids::ResourceHandle,
+        ) -> Option<std::sync::Arc<crate::guest_mem::GuestMap>> {
+            (handle == self.0).then(|| std::sync::Arc::clone(&self.1))
+        }
+    }
+
+    const RING_RES: crate::ids::ResourceHandle = crate::ids::ResourceHandle(449);
+
+    /// A resource minted the way the renderer mints one for a ring, at the size the venus corpus
+    /// actually asks for.
+    fn ring_table() -> OneShm {
+        let (fd, map) =
+            crate::guest_mem::anonymous_shm(0x24000, "virglrs-ringtest").expect("minted");
+        drop(fd);
+        OneShm(RING_RES, std::sync::Arc::new(map))
+    }
+
+    /// The layout the venus corpus asks for, give or take: a window with three control words, a
+    /// power-of-two buffer and a small extra region.
+    fn ring_info() -> crate::venus::proto::types::VkRingCreateInfoMESA {
+        crate::venus::proto::types::VkRingCreateInfoMESA {
+            resourceId: RING_RES.0,
+            offset: 0,
+            size: 0x200c4,
+            headOffset: 0,
+            tailOffset: 4,
+            statusOffset: 8,
+            bufferOffset: 0xc0,
+            bufferSize: 0x20000,
+            extraOffset: 0x200c0,
+            extraSize: 4,
+            ..Default::default()
+        }
+    }
+
     use super::*;
 
     fn header(cmd: VkCommandTypeEXT, flags: u32) -> Vec<u8> {
@@ -1553,11 +1680,14 @@ mod tests {
         let mut ctx = Context::new(CtxId::new(1).unwrap());
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g), "a stubbed decoder must poison");
+        assert!(
+            !ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES),
+            "a stubbed decoder must poison"
+        );
         assert!(ctx.fatal());
 
         // The poison outlives the batch: a stream we stopped trusting stays untrusted.
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g));
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES));
     }
 
     /// A command that wants an answer has nowhere to be answered into, so it poisons -- but only
@@ -1573,7 +1703,7 @@ mod tests {
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
         full.extend_from_slice(&0u64.to_le_bytes()); // no allocator
-        assert!(!ctx.submit(&full, &mut todo, &g));
+        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES));
         assert_eq!(ctx.unhandled, 1);
 
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
@@ -1581,9 +1711,155 @@ mod tests {
         // what separates the two paths is whether the command was dispatched at all.
         let mut ctx = Context::new(CtxId::new(1).unwrap());
         ctx.replay_begin();
-        assert!(!ctx.submit(&full, &mut todo, &g));
+        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES));
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.unhandled, 0);
+    }
+
+    /// The witness the RingId split owed: two rings whose ids differ only above bit 32 are two
+    /// rings. Under the old `ring_id as u32` these collapsed into one, and the second create
+    /// would have found the first already there.
+    #[test]
+    fn two_ring_ids_differing_only_above_bit_32_are_two_rings() {
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
+
+        let t = ring_table();
+        let info = ring_info();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new();
+        let mut rings = BTreeMap::new();
+
+        let low: u64 = 0x0000_0001_dead_beef;
+        let high: u64 = 0x0000_0002_dead_beef;
+        assert_eq!(low as u32, high as u32, "the two ids are identical in their low word");
+
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            resources: &t,
+            rings: &mut rings,
+        };
+        for ring in [low, high] {
+            let mut args = Create { ring, pCreateInfo: Some(&info), ..Default::default() };
+            h.vkCreateRingMESA(&mut args);
+            assert_eq!(h.reject, None, "ring {ring:#x} is a layout we accept");
+        }
+        assert_eq!(rings.len(), 2, "two ids, two rings");
+        assert!(rings.contains_key(&RingId(low)) && rings.contains_key(&RingId(high)));
+    }
+
+    /// A ring id the guest is already using is the guest contradicting itself. Refusing rather
+    /// than replacing is deliberate and stricter than the C, which appends the duplicate and lets
+    /// `lookup_ring` silently return whichever it finds first -- so a destroy tears down one ring
+    /// while the other keeps a share of the mapping that nothing can reach any more.
+    #[test]
+    fn a_ring_id_already_in_use_is_refused_and_the_first_ring_survives() {
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
+        use super::super::proto::types::vn_command_vkDestroyRingMESA as Destroy;
+
+        let t = ring_table();
+        let info = ring_info();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new();
+        let mut rings = BTreeMap::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            resources: &t,
+            rings: &mut rings,
+        };
+
+        let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
+        h.vkCreateRingMESA(&mut first);
+        assert_eq!(h.reject, None);
+        h.rings[&RingId(7)].set_head(0x1234);
+
+        let mut again = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
+        h.vkCreateRingMESA(&mut again);
+        assert!(h.reject.is_some(), "the second create under the same id is refused");
+        assert_eq!(h.rings.len(), 1, "and did not add a second entry");
+        assert_eq!(
+            h.rings[&RingId(7)].map.load_u32(0),
+            Some(0x1234),
+            "the ring that was already there is untouched"
+        );
+
+        // And destroying it is the only thing that removes it.
+        h.reject = None;
+        let mut gone = Destroy { ring: 7, ..Default::default() };
+        h.vkDestroyRingMESA(&mut gone);
+        assert_eq!(h.reject, None);
+        assert!(h.rings.is_empty());
+
+        let mut twice = Destroy { ring: 7, ..Default::default() };
+        h.vkDestroyRingMESA(&mut twice);
+        assert!(h.reject.is_some(), "destroying a ring that is not there is refused");
+    }
+
+    /// A ring in a resource the host cannot address is refused, not quietly skipped. This is the
+    /// case that took the whole corpus down until blobs got their memory: without a mapping there
+    /// is nothing to read commands out of, and pretending otherwise would report success for a
+    /// ring that can never deliver a command.
+    #[test]
+    fn a_ring_in_a_resource_with_no_host_mapping_is_refused() {
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
+
+        let info = ring_info();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new();
+        let mut rings = BTreeMap::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+        };
+        let mut args = Create { ring: 1, pCreateInfo: Some(&info), ..Default::default() };
+        h.vkCreateRingMESA(&mut args);
+        assert!(h.reject.is_some());
+        assert!(rings.is_empty(), "and nothing was registered");
+    }
+
+    /// A ring with no description at all. The guest sent the command; the decoder gave us no
+    /// struct, so there is nothing to validate and nothing to create.
+    #[test]
+    fn a_ring_create_with_no_description_is_refused() {
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
+
+        let t = ring_table();
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new();
+        let mut rings = BTreeMap::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            resources: &t,
+            rings: &mut rings,
+        };
+        let mut args = Create { ring: 1, pCreateInfo: None, ..Default::default() };
+        h.vkCreateRingMESA(&mut args);
+        assert!(h.reject.is_some());
+        assert!(rings.is_empty());
     }
 
     /// Nothing in this file's handlers reaches for `unsafe`, and this is what keeps it that way.
@@ -1683,12 +1959,15 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_none(), "a query this driver can answer is not refused");
@@ -1767,12 +2046,15 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceProperties(&mut args);
         assert!(h.reject.is_none());
@@ -1804,12 +2086,15 @@ mod tests {
         let mut args2 = vn_command_vkGetPhysicalDeviceProperties2::default();
         args2.plant_pProperties(&mut asked2);
 
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceProperties2(&mut args2);
         assert!(h.reject.is_none());
@@ -1848,12 +2133,15 @@ mod tests {
         let mut out = 0u32;
         args.plant_pApiVersion(&mut out);
 
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkEnumerateInstanceVersion(&mut args);
         assert!(h.reject.is_none(), "a real loader answering is never a reason to poison a ring");
@@ -1867,12 +2155,15 @@ mod tests {
 
         // No `pApiVersion` at all: nothing to fill, and that is the guest's fault, not the host's.
         let mut empty = Cmd::default();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkEnumerateInstanceVersion(&mut empty);
         assert!(h.reject.is_some(), "a query with nowhere to answer is refused, not answered");
@@ -1937,12 +2228,15 @@ mod tests {
         args.plant_pPhysicalDeviceGroupCount(&mut n);
         args.plant_pPhysicalDeviceGroupProperties(&mut props);
 
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert!(h.reject.is_none());
@@ -1963,12 +2257,15 @@ mod tests {
         args.instance = INSTANCE;
         args.plant_pPhysicalDeviceGroupCount(&mut n);
         args.plant_pPhysicalDeviceGroupProperties(&mut props);
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert_eq!(
@@ -2051,12 +2348,15 @@ mod tests {
         args.plant_pPropertyCount(&mut n);
         args.plant_pLayerName(c"VK_LAYER_KHRONOS_validation");
 
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkEnumerateDeviceExtensionProperties(&mut args);
         assert!(h.reject.is_some(), "a layer this renderer has no way to load");
@@ -2113,12 +2413,15 @@ mod tests {
         let mut args = Cmd::default();
         args.physicalDevice = PD;
         args.plant_pQueueFamilyPropertyCount(&mut n);
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -2133,12 +2436,15 @@ mod tests {
         args.physicalDevice = PD;
         args.plant_pQueueFamilyPropertyCount(&mut n);
         args.plant_pQueueFamilyProperties(&mut props);
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -2177,12 +2483,15 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetImageDrmFormatModifierPropertiesEXT(&mut args);
 
@@ -2211,12 +2520,15 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query with nowhere to put the answer");
@@ -2229,12 +2541,15 @@ mod tests {
         };
         let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
         args.plant_pFeatures(&mut asked);
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query this driver does not export");
@@ -2390,12 +2705,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateDevice_EXT, 0);
@@ -2454,12 +2772,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
@@ -2513,12 +2834,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
@@ -2564,12 +2888,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
@@ -2640,12 +2967,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         // Counted without planting: the pointer stays null, which is the one shape the
@@ -2690,12 +3020,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         // There is no device, so the driver refuses the whole run -- which is the only way to
@@ -2734,12 +3067,15 @@ mod tests {
         let mut driver = Driver::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         let info = VkCommandBufferAllocateInfo {
@@ -2905,12 +3241,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         // The pool arrives as the host handle the lookup resolved, which is what the driver is
         // keyed by. There is no device registered, so the driver call is skipped -- the object
@@ -3011,12 +3350,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyDevice_EXT, 0);
         w.extend_from_slice(&DEVICE.to_le_bytes());
@@ -3146,12 +3488,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT, 0);
         w.extend_from_slice(&INSTANCE.to_le_bytes());
@@ -3209,12 +3554,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         // Driven over the wire rather than by calling the handler, because the handler is only
         // half of a destroy: the generated lifecycle hook is what tells the table an object died,
@@ -3351,12 +3699,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
         let cb = VkCommandBuffer(CB.0);
 
@@ -3519,12 +3870,15 @@ mod tests {
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
             reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
         };
 
         // A submit is two submit infos and a fence. The fence has to arrive as itself: it is the
