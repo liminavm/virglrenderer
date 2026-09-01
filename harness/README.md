@@ -88,6 +88,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   empty array for every count. Anything about the *contents* a handler passes to the driver needs
   its own witness — a unit test beside the handler — until the census covers enough served state to
   be pinned. `venus-roundtrip` does not help there either: it never calls a handler.
+
+  The witness has a seam to hang off: `Device::plant_*` puts a plain function of the entry point's
+  own shape into a proc table, and `Driver::plant_device`/`plant_pool` stand that table up as a
+  device a handler can record into. A test then reads back what actually crossed the boundary —
+  see `a_recording_handler_hands_the_driver_what_the_guest_sent`, which the one-element-too-many
+  sabotage does fail.
 - The layout oracle is the third leg of the same feature, and it runs as a plain unit test:
   `cargo test --features reply-oracle` in `virglrs/`. `venus-roundtrip` proves the wire and
   `venus-reply-oracle` proves the replies, but both compare *bytes*, and the reply oracle only

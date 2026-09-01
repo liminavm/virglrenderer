@@ -23,11 +23,16 @@ use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandTypeEXT, VkFlags, VkObjectType, VkResult, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
-    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory2, vn_command_vkCreateBuffer,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory2,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
+    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
+    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateSampler,
     vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
     vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
@@ -36,8 +41,9 @@ use super::proto::types::{
     vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
-    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
-    vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2, vn_command_vkUpdateDescriptorSets,
+    vn_command_vkEndCommandBuffer, vn_command_vkEnumeratePhysicalDevices,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory, vn_command_vkGetDeviceQueue2,
+    vn_command_vkResetCommandBuffer, vn_command_vkUpdateDescriptorSets,
 };
 use crate::vulkan::Global;
 
@@ -350,6 +356,22 @@ impl Handlers<'_> {
         for id in orphans {
             table.remove(id);
         }
+    }
+
+    /// Every recording command's verdict on whether it reached the driver at all.
+    ///
+    /// The only way one can fail before the submit: the command buffer resolved in the object
+    /// table but the driver has no pool record for it, so there is no device to record through.
+    /// The two disagreeing is not something a guest can arrange, but it is also not something to
+    /// record blindly past -- so the ring stops rather than the process.
+    fn recorded(&mut self, done: Option<()>) {
+        if done.is_none() {
+            self.no_recorder();
+        }
+    }
+
+    fn no_recorder(&mut self) {
+        self.reject = Some("recorded into a command buffer with no device behind it");
     }
 
     fn ghost_ids<T: Handle>(&mut self, ids: &[T]) {
@@ -809,6 +831,168 @@ impl Commands for Handlers<'_> {
             return;
         };
         self.driver.update_descriptor_sets(args.device, writes, copies);
+    }
+
+    // ---------------------------------------------------------------------- recording
+    //
+    // What a frame is made of. Every one of these takes a command buffer and records into it,
+    // and Vulkan defers what could go wrong to the submit -- so with the single exception of
+    // `vkBeginCommandBuffer`, which can run the pool dry, none of them has an answer to give.
+    //
+    // None carries a device: a command buffer knows its own, and the driver walks back to it
+    // through the pool. Nor does any of them check that the command buffer is still alive. The
+    // object table is that check -- a destroyed pool takes its buffers' ids out of it, so a guest
+    // naming one stops its own ring at the lookup, before a handler is reached.
+
+    fn vkBeginCommandBuffer(&mut self, args: &mut vn_command_vkBeginCommandBuffer<'_>) {
+        let Some(ret) = self.driver.begin_command_buffer(args.commandBuffer, args.pBeginInfo)
+        else {
+            return self.no_recorder();
+        };
+        args.ret = ret;
+    }
+
+    fn vkEndCommandBuffer(&mut self, args: &mut vn_command_vkEndCommandBuffer<'_>) {
+        let Some(ret) = self.driver.end_command_buffer(args.commandBuffer) else {
+            return self.no_recorder();
+        };
+        args.ret = ret;
+    }
+
+    fn vkResetCommandBuffer(&mut self, args: &mut vn_command_vkResetCommandBuffer<'_>) {
+        let Some(ret) = self.driver.reset_command_buffer(args.commandBuffer, args.flags) else {
+            return self.no_recorder();
+        };
+        args.ret = ret;
+    }
+
+    fn vkCmdPipelineBarrier(&mut self, args: &mut vn_command_vkCmdPipelineBarrier<'_>) {
+        // Three independent arrays, each optional: a barrier may name memory, buffers, images,
+        // or any mix. An absent one is the guest barring nothing of that kind, not a violation.
+        let memory = self.array_or_empty(args.pMemoryBarriers());
+        let buffers = self.array_or_empty(args.pBufferMemoryBarriers());
+        let images = self.array_or_empty(args.pImageMemoryBarriers());
+        let done = self.driver.cmd_pipeline_barrier(
+            args.commandBuffer,
+            args.srcStageMask,
+            args.dstStageMask,
+            args.dependencyFlags,
+            memory,
+            buffers,
+            images,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginRenderPass(&mut self, args: &mut vn_command_vkCmdBeginRenderPass<'_>) {
+        let done = self.driver.cmd_begin_render_pass(
+            args.commandBuffer,
+            args.pRenderPassBegin,
+            args.contents,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdEndRenderPass(&mut self, args: &mut vn_command_vkCmdEndRenderPass<'_>) {
+        let done = self.driver.cmd_end_render_pass(args.commandBuffer);
+        self.recorded(done);
+    }
+
+    fn vkCmdBindPipeline(&mut self, args: &mut vn_command_vkCmdBindPipeline<'_>) {
+        let done = self.driver.cmd_bind_pipeline(
+            args.commandBuffer,
+            args.pipelineBindPoint,
+            args.pipeline,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBindDescriptorSets(&mut self, args: &mut vn_command_vkCmdBindDescriptorSets<'_>) {
+        // The sets are what the command is for, so counting some and sending none is a violation.
+        // The dynamic offsets are their own array with their own count, and a pipeline layout
+        // with no dynamic descriptors legitimately binds none.
+        let Some(sets) = self.array(args.pDescriptorSets()) else { return };
+        let offsets = self.array_or_empty(args.pDynamicOffsets());
+        let done = self.driver.cmd_bind_descriptor_sets(
+            args.commandBuffer,
+            args.pipelineBindPoint,
+            args.layout,
+            args.firstSet,
+            sets,
+            offsets,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDraw(&mut self, args: &mut vn_command_vkCmdDraw<'_>) {
+        let done = self.driver.cmd_draw(
+            args.commandBuffer,
+            args.vertexCount,
+            args.instanceCount,
+            args.firstVertex,
+            args.firstInstance,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
+        let Some(viewports) = self.array(args.pViewports()) else { return };
+        let done = self.driver.cmd_set_viewport(args.commandBuffer, args.firstViewport, viewports);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetScissor(&mut self, args: &mut vn_command_vkCmdSetScissor<'_>) {
+        let Some(scissors) = self.array(args.pScissors()) else { return };
+        let done = self.driver.cmd_set_scissor(args.commandBuffer, args.firstScissor, scissors);
+        self.recorded(done);
+    }
+
+    fn vkCmdBindVertexBuffers(&mut self, args: &mut vn_command_vkCmdBindVertexBuffers<'_>) {
+        // One count, two arrays. Both accessors read that same count, so the two slices are the
+        // same length by construction -- the driver asserts it rather than trusting the pair.
+        let Some(buffers) = self.array(args.pBuffers()) else { return };
+        let Some(offsets) = self.array(args.pOffsets()) else { return };
+        let done = self.driver.cmd_bind_vertex_buffers(
+            args.commandBuffer,
+            args.firstBinding,
+            buffers,
+            offsets,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdFillBuffer(&mut self, args: &mut vn_command_vkCmdFillBuffer<'_>) {
+        let done = self.driver.cmd_fill_buffer(
+            args.commandBuffer,
+            args.dstBuffer,
+            args.dstOffset,
+            args.size,
+            args.data,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyBuffer(&mut self, args: &mut vn_command_vkCmdCopyBuffer<'_>) {
+        let Some(regions) = self.array(args.pRegions()) else { return };
+        let done = self.driver.cmd_copy_buffer(
+            args.commandBuffer,
+            args.srcBuffer,
+            args.dstBuffer,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyBufferToImage(&mut self, args: &mut vn_command_vkCmdCopyBufferToImage<'_>) {
+        let Some(regions) = self.array(args.pRegions()) else { return };
+        let done = self.driver.cmd_copy_buffer_to_image(
+            args.commandBuffer,
+            args.srcBuffer,
+            args.dstImage,
+            args.dstImageLayout,
+            regions,
+        );
+        self.recorded(done);
     }
 }
 
@@ -1526,5 +1710,148 @@ mod tests {
                 "id {id} was freed with its pool and must stop naming anything"
             );
         }
+    }
+
+    /// What a recording handler hands the driver is exactly what the guest sent -- no more, no
+    /// less, and in order.
+    ///
+    /// The boundary nothing else in the harness can see. The wire round trip never calls an
+    /// accessor; the replay gate counts commands accounted for, not what they did, and measurably
+    /// so -- an accessor handing back one element too many replays with every command accepted
+    /// and the census unchanged. So the driver is stood up out of planted entry points and asked
+    /// what it was called with.
+    ///
+    /// Three shapes, which is what the fifteen recording commands are made of: one counted array,
+    /// two arrays under one count, and a command with a result to carry back.
+    #[test]
+    fn a_recording_handler_hands_the_driver_what_the_guest_sent() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandBufferBeginInfo, VkDeviceSize, VkViewport,
+            vn_command_vkBeginCommandBuffer, vn_command_vkCmdBindVertexBuffers,
+            vn_command_vkCmdSetViewport,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        /// The host handle of the one command buffer, and the guest id it was allocated under.
+        const CB: (u64, u64) = (11, 110);
+
+        #[derive(Default)]
+        struct Saw {
+            viewports: Vec<(u32, Vec<f32>)>,
+            vertex_buffers: Vec<(u32, Vec<u64>, Vec<u64>)>,
+            began: u32,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn set_viewport(
+            _cb: VkCommandBuffer,
+            first: u32,
+            count: u32,
+            p: *const VkViewport,
+        ) {
+            // SAFETY: the wrapper under test passes a slice's own pointer and length.
+            let vps = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            SAW.with_borrow_mut(|s| s.viewports.push((first, vps.iter().map(|v| v.x).collect())));
+        }
+
+        unsafe extern "C" fn bind_vertex_buffers(
+            _cb: VkCommandBuffer,
+            first: u32,
+            count: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+        ) {
+            // SAFETY: as above -- one count, and the wrapper asserts both slices share it.
+            let (b, o) = unsafe {
+                (
+                    core::slice::from_raw_parts(buffers, count as usize),
+                    core::slice::from_raw_parts(offsets, count as usize),
+                )
+            };
+            SAW.with_borrow_mut(|s| {
+                s.vertex_buffers.push((
+                    first,
+                    b.iter().map(|h| h.0).collect(),
+                    o.iter().map(|v| v.0).collect(),
+                ))
+            });
+        }
+
+        unsafe extern "C" fn begin(
+            _cb: VkCommandBuffer,
+            _info: *const VkCommandBufferBeginInfo,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.began += 1);
+            VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetViewport(set_viewport);
+        fns.plant_vkCmdBindVertexBuffers(bind_vertex_buffers);
+        fns.plant_vkBeginCommandBuffer(begin);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        driver.plant_pool(DEVICE, POOL, &[(CB.0, ObjectId(CB.1))]);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        let cb = VkCommandBuffer(CB.0);
+
+        // One counted array: three viewports, and a first-index that is not zero so that a
+        // wrapper passing the count where the index goes cannot pass unnoticed.
+        let vps: [VkViewport; 3] =
+            core::array::from_fn(|i| VkViewport { x: 10.0 + i as f32, ..Default::default() });
+        let mut args = vn_command_vkCmdSetViewport::default();
+        args.commandBuffer = cb;
+        args.firstViewport = 2;
+        args.plant_pViewports(&vps);
+        h.vkCmdSetViewport(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(s.viewports, [(2, vec![10.0, 11.0, 12.0])], "all three, in order, at 2");
+        });
+
+        // Two arrays under one count: they have to arrive the same length and stay paired.
+        let buffers = [VkBuffer(0x100), VkBuffer(0x200)];
+        let offsets = [VkDeviceSize(64), VkDeviceSize(128)];
+        let mut args = vn_command_vkCmdBindVertexBuffers::default();
+        args.commandBuffer = cb;
+        args.firstBinding = 1;
+        args.plant_pBuffers(&buffers);
+        args.plant_pOffsets(&offsets);
+        h.vkCmdBindVertexBuffers(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(s.vertex_buffers, [(1, vec![0x100, 0x200], vec![64, 128])]);
+        });
+
+        // A result the guest is owed: the driver's answer has to reach the reply, not be
+        // replaced by a success the renderer invented.
+        let mut args = vn_command_vkBeginCommandBuffer { commandBuffer: cb, ..Default::default() };
+        h.vkBeginCommandBuffer(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(args.ret, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        SAW.with_borrow(|s| assert_eq!(s.began, 1));
+
+        // And a command buffer the driver has no device for stops the ring rather than being
+        // recorded into nothing.
+        let mut args = vn_command_vkCmdSetViewport::default();
+        args.commandBuffer = VkCommandBuffer(0xdead);
+        args.plant_pViewports(&vps);
+        h.vkCmdSetViewport(&mut args);
+        assert!(h.reject.is_some(), "there is no device to record into");
     }
 }
