@@ -42,13 +42,15 @@ use super::proto::types::{
     vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
-    vn_command_vkEndCommandBuffer, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
-    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateInstanceVersion,
+    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
+    vn_command_vkFreeMemory, vn_command_vkGetBufferMemoryRequirements2,
+    vn_command_vkGetDeviceQueue2, vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
     vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
     vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
+    vn_command_vkGetPhysicalDeviceImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
     vn_command_vkGetPhysicalDeviceProperties2, vn_command_vkImportSemaphoreResourceMESA,
     vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer, vn_command_vkResetFences,
@@ -916,6 +918,49 @@ impl Commands for Handlers<'_> {
         );
     }
 
+    // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
+    // the honest channel and refusal is not: a driver without `VK_EXT_image_drm_format_modifier`
+    // is an answer the guest asked for and can act on, not a reason to take its ring down. The
+    // void queries above have no such field, which is why refusal is all they have.
+
+    fn vkEnumerateInstanceVersion(&mut self, args: &mut vn_command_vkEnumerateInstanceVersion<'_>) {
+        // No handle anywhere in it: the guest may ask before any instance exists, so this is the
+        // one query answered off the global table.
+        let asked = self.driver.instance_version(self.global);
+        let Some(out) = self.fills(args.pApiVersion_mut()) else { return };
+        match asked {
+            Ok(v) => {
+                *out = cap_api_version(v);
+                args.ret = VkResult::VK_SUCCESS;
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
+    fn vkGetPhysicalDeviceImageFormatProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceImageFormatProperties2<'_>,
+    ) {
+        let (pd, info) = (args.physicalDevice, args.pImageFormatInfo);
+        let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
+        args.ret = self
+            .driver
+            .pd_query_info(pd, info, out, |i| i.try_vkGetPhysicalDeviceImageFormatProperties2())
+            .unwrap_or_else(|e| e);
+    }
+
+    fn vkGetImageDrmFormatModifierPropertiesEXT(
+        &mut self,
+        args: &mut vn_command_vkGetImageDrmFormatModifierPropertiesEXT<'_>,
+    ) {
+        let (device, image) = (args.device, args.image);
+        let Some(out) = self.fills(args.pProperties_mut()) else { return };
+        args.ret = self
+            .driver
+            .dev_query_arg(device, image, out, |d| d.try_vkGetImageDrmFormatModifierPropertiesEXT())
+            .unwrap_or_else(|e| e);
+    }
+
     fn vkGetPhysicalDeviceProperties(
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceProperties<'_>,
@@ -1584,6 +1629,50 @@ mod tests {
             "the guest reads this build's ceiling, with the driver's own patch level"
         );
         assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
+
+        driver.abandon_planted();
+    }
+
+    /// Where a command has a field designed to say "no", that field is the answer and refusal is
+    /// not. A guest asking for an extension this driver lacks has asked a fair question; poisoning
+    /// its ring answers a different one.
+    #[test]
+    fn a_query_with_a_ret_reports_the_refusal_instead_of_poisoning() {
+        use super::super::proto::types::{
+            VkImage, VkImageDrmFormatModifierPropertiesEXT,
+            vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
+        };
+
+        const DEVICE: VkDevice = VkDevice(0x700);
+
+        // A device whose table has no `VK_EXT_image_drm_format_modifier` in it.
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE.0, crate::vulkan::Device::default());
+
+        let mut props = VkImageDrmFormatModifierPropertiesEXT::default();
+        let mut args = vn_command_vkGetImageDrmFormatModifierPropertiesEXT::default();
+        args.device = DEVICE;
+        args.image = VkImage(1);
+        args.plant_pProperties(&mut props);
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkGetImageDrmFormatModifierPropertiesEXT(&mut args);
+
+        assert!(h.reject.is_none(), "a fair question is not a poisoned ring");
+        assert_eq!(
+            args.ret,
+            VkResult::VK_ERROR_EXTENSION_NOT_PRESENT,
+            "and the answer goes back where the command has room for it"
+        );
 
         driver.abandon_planted();
     }

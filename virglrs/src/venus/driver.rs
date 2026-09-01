@@ -603,6 +603,26 @@ impl Driver {
         Ok(unsafe { f(device, a, ptr(info), out) })
     }
 
+    /// The loader's own version, before any instance exists.
+    ///
+    /// The one query with no handle in it at all: the guest may ask it before `vkCreateInstance`,
+    /// so it is answered off the global table rather than this driver's state. Named rather than
+    /// generic because it has exactly one shape and one caller, and a seventh primitive to carry
+    /// it would be more machinery than the call.
+    pub fn instance_version(&self, global: &Global) -> Result<u32, VkResult> {
+        let f = global
+            .try_vkEnumerateInstanceVersion()
+            .ok_or(VkResult::VK_ERROR_INCOMPATIBLE_DRIVER)?;
+        let mut version = 0u32;
+        // SAFETY: `version` is a live local for the length of the call, which is the whole of
+        // what this entry point touches.
+        let r = unsafe { f(&mut version) };
+        if r != VkResult::VK_SUCCESS {
+            return Err(r);
+        }
+        Ok(version)
+    }
+
     /// The instance's physical devices, into a caller-owned slice.
     ///
     /// Vulkan's two-call idiom collapses here: the guest already asked the count, so the slice is
