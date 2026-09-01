@@ -123,7 +123,7 @@ invariants a port owes, none of which the C encodes as a type:
    language-neutral. `vn_protocol.py`'s `Gen` class emits C *statements* — the
    `VariableInfo` machinery and `_sizeof/_encode/_decode_variable` are as much of the
    backend as `templates/` is — so the fork is emitter plus template, not templates
-   alone: 1.4k lines of Python emitting 161k lines of Rust. The fork lives in this tree
+   alone: 2.6k lines of Python emitting 193k lines of Rust. The fork lives in this tree
    (`virglrs/venus-gen/`) and imports the subproject's model over `sys.path`: the
    subproject is wrap-managed and any edit inside it is eaten by the next re-clone.
    The generated decode is *safe* Rust — bounds-checked slices over guest bytes,
@@ -301,10 +301,15 @@ buildable throughout as the A-side reference.
   an offset into a reply the renderer has not built yet, so the decoder and the reply encoder
   have to be designed against each other; they land with the first reply-bearing handler, and
   before the seated-GNOME gate. Neither corpus contains one, so nothing else will notice.
-  Midpoint gate, before any VM: both corpora replay to completion and their
-  scores match the fixtures pinned from the C build. Replay strips replies and needs
-  no display, so score parity is reachable with handlers alone and catches a wrong
-  handler where a boot only reports that something is broken. Ends at a seated venus
+  Midpoint gate, before any VM: both corpora replay to completion, their scores match
+  the fixtures pinned from the C build, **and every handler whose contents matter
+  carries its own witness**. Replay strips replies and needs no display, so score
+  parity is reachable with handlers alone, and it localises a failure where a boot only
+  reports that something is broken. What it cannot do is check what a handler passed
+  on: it measures that a command was *accounted for*, and a build whose every array
+  accessor hands its handler one element fewer than the guest sent replays both corpora
+  clean, census unchanged (`harness/README.md`, measured). Score parity alone is
+  therefore not the midpoint. Ends at a seated venus
   GNOME desktop, booted with the existing venus-only
   `virgl_override` limina already has for forcing venus-only flags — no new
   machinery, and no classic stubs that have to lie about capsets. Carries the replay
