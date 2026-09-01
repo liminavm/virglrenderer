@@ -9,6 +9,7 @@
 //! the protocol has. Everything version-shaped in it therefore comes from the generated
 //! [`info`](crate::venus::proto::info) table rather than from a constant written here.
 
+use crate::config::Config;
 use crate::venus::proto::info;
 
 /// The number of `u32`s in the capset's extension mask. Vulkan numbers extensions from 1, and the
@@ -41,12 +42,9 @@ pub struct Capset {
     pub use_guest_vram: u32,
 }
 
-/// The flag bit that says the VMM cannot inject pages (`VIRGL_RENDERER_USE_GUEST_VRAM`).
-const USE_GUEST_VRAM: i32 = 1 << 14;
-
 impl Capset {
-    /// Build the capset this renderer advertises, given the flags it was initialized with.
-    pub fn new(flags: i32) -> Capset {
+    /// Build the capset this renderer advertises, for the configuration it was asked for.
+    pub fn new(config: Config) -> Capset {
         let mut c = Capset {
             wire_format_version: info::WIRE_FORMAT_VERSION,
             vk_xml_version: info::VK_XML_VERSION,
@@ -58,7 +56,7 @@ impl Capset {
             vk_extension_mask1: [0; MASK_WORDS],
             allow_vk_wait_syncs: 1,
             supports_multiple_timelines: 1,
-            use_guest_vram: u32::from(flags & USE_GUEST_VRAM != 0),
+            use_guest_vram: u32::from(config.guest_vram),
         };
         info::extension_mask(&mut c.vk_extension_mask1);
         // Bit 0 is the "mask is meaningful" flag, and no extension may claim it -- extension
@@ -116,7 +114,7 @@ mod tests {
         assert_eq!(at(&c.use_guest_vram), 156);
         assert_eq!(size() as usize, core::mem::size_of::<Capset>());
 
-        let c = Capset::new(0);
+        let c = Capset::new(Config::default());
         assert_eq!(c.as_bytes().len(), core::mem::size_of::<Capset>());
         // The first word of the image is the first field, which is what fixes the field order.
         assert_eq!(&c.as_bytes()[..4], &info::WIRE_FORMAT_VERSION.to_ne_bytes());
@@ -124,7 +122,7 @@ mod tests {
 
     #[test]
     fn the_mask_is_marked_meaningful_and_carries_venus() {
-        let c = Capset::new(0);
+        let c = Capset::new(Config::default());
         assert_eq!(c.vk_extension_mask1[0] & 1, 1, "guest ignores a mask without bit 0");
 
         let (_, number, version) = info::extension("VK_MESA_venus_protocol").unwrap();
@@ -132,10 +130,13 @@ mod tests {
         assert_eq!(c.vk_mesa_venus_protocol_spec_version, *version);
     }
 
+    /// The guest allocates from its own heap or not on the strength of this one word, so it has
+    /// to follow the configuration rather than a default. Which bit sets the configuration is the
+    /// shim's business, and is checked there.
     #[test]
-    fn guest_vram_follows_the_flag_it_is_named_for() {
-        assert_eq!(Capset::new(0).use_guest_vram, 0);
-        assert_eq!(Capset::new(USE_GUEST_VRAM).use_guest_vram, 1);
-        assert_eq!(Capset::new(USE_GUEST_VRAM | 0x20).use_guest_vram, 1);
+    fn guest_vram_is_reported_exactly_as_it_was_configured() {
+        assert_eq!(Capset::new(Config::default()).use_guest_vram, 0);
+        let on = Config { guest_vram: true, ..Config::default() };
+        assert_eq!(Capset::new(on).use_guest_vram, 1);
     }
 }

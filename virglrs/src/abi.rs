@@ -22,6 +22,8 @@ pub const ASYNC_FENCE_CB: c_int = 1 << 8;
 pub const RENDER_SERVER: c_int = 1 << 9;
 pub const DRM: c_int = 1 << 10;
 pub const USE_VIDEO: c_int = 1 << 11;
+/// The VMM cannot inject pages, so blobs come from the guest's own heap.
+pub const USE_GUEST_VRAM: c_int = 1 << 14;
 
 /// Capset ids the guest asks about by number.
 pub const CAPSET_VIRGL: u32 = 1;

@@ -26,9 +26,26 @@ use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
+use crate::config::Config;
 use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::renderer::{self, Renderer};
+
+/// Decode `virgl_renderer_init`'s flag word into what the renderer is being asked to be.
+///
+/// Three of the eleven flags reach the renderer. The rest choose a winsys (EGL, GLES,
+/// surfaceless, DRM), a threading model we implement unconditionally (`THREAD_SYNC`,
+/// `ASYNC_FENCE_CB`, `RENDER_SERVER`), or a feature that is vrend's (`USE_VIDEO`) -- none of them
+/// is a question the renderer answers, so none of them is carried inward.
+///
+/// Note `NO_VIRGL` inverting: the ABI names the absence, [`Config`] names the presence.
+fn config_of(flags: c_int) -> Config {
+    Config {
+        venus: flags & abi::VENUS != 0,
+        vrend: flags & abi::NO_VIRGL == 0,
+        guest_vram: flags & abi::USE_GUEST_VRAM != 0,
+    }
+}
 
 /// The VMM's callback table, as a place for retired fences to go.
 ///
@@ -129,7 +146,7 @@ pub extern "C" fn virgl_renderer_init(
     }
     eprintln!(
         "[virglrs] init flags={flags:#x} -- {}",
-        crate::renderer::unsupported_renderers(flags)
+        crate::renderer::unsupported_renderers(config_of(flags))
     );
     // Only the two fence callbacks are read. The other six are vrend's winsys hooks, which
     // nothing here calls; they get a trait of their own when P3 needs one.
@@ -138,7 +155,7 @@ pub extern "C" fn virgl_renderer_init(
         write_fence: cbs.write_fence,
         write_context_fence: cbs.write_context_fence,
     };
-    *g = Some(Renderer::new(Box::new(sink), flags));
+    *g = Some(Renderer::new(Box::new(sink), config_of(flags)));
     0
 }
 
@@ -756,7 +773,7 @@ pub extern "C" fn virgl_set_log_callback(
 pub extern "C" fn virgl_renderer_limina_dump_state() {
     with((), |r| {
         let (res, ctx) = r.counts();
-        eprintln!("[virglrs] {res} resources, {ctx} contexts, flags {:#x}", r.flags);
+        eprintln!("[virglrs] {res} resources, {ctx} contexts, {:?}", r.config);
         let todo = r.venus_todo();
         if !todo.is_empty() {
             let total: u64 = todo.iter().map(|(_, n)| n).sum();
@@ -1005,6 +1022,27 @@ const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `NO_VIRGL` is spelled inside out, and an inverted read of it is invisible: it changes a
+    /// startup log line and, in P3, whether vrend exists at all. `guest_vram` is worse -- it
+    /// reaches the guest through the capset, which decides where the guest allocates from, and no
+    /// gate here reads a capset.
+    ///
+    /// `venus` is the one bit a corpus would catch, since the replay needs the renderer to exist.
+    #[test]
+    fn the_init_flags_decode_into_the_configuration_they_name() {
+        assert_eq!(config_of(0), Config { venus: false, vrend: true, guest_vram: false });
+
+        // Every flag that means something, and one that does not, to show it changes nothing.
+        let all = abi::VENUS | abi::NO_VIRGL | abi::USE_GUEST_VRAM | abi::USE_EGL;
+        assert_eq!(config_of(all), Config { venus: true, vrend: false, guest_vram: true });
+
+        // One at a time, so a bit read for the wrong field cannot hide behind another.
+        assert!(config_of(abi::VENUS).venus);
+        assert!(!config_of(abi::NO_VIRGL).vrend, "NO_VIRGL means vrend is absent");
+        assert!(config_of(abi::USE_GUEST_VRAM).guest_vram);
+        assert_eq!(config_of(abi::USE_EGL), config_of(0), "a winsys flag reaches the renderer");
+    }
 
     /// Nothing else checks this. No corpus calls `virgl_renderer_resource_create` -- the venus
     /// replayer binds only the blob entry point, and the classic path belongs to vrend, which

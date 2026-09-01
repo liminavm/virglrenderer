@@ -7,13 +7,13 @@
 //! `static`. There are no file-scope mutables and no implicit current context -- `force_ctx_0`,
 //! the C's implicit global, is a no-op here because nothing reads such a thing.
 
-use std::collections::BTreeMap;
-use std::ffi::c_int;
-
-use crate::abi::{self, GuestIov, VmmPtr};
+use crate::abi;
+use crate::abi::{GuestIov, VmmPtr};
+use crate::config::Config;
 use crate::fence::{FenceSink, Retirement};
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::venus;
+use std::collections::BTreeMap;
 
 /// Why a call failed.
 ///
@@ -118,7 +118,7 @@ pub struct Context {
 }
 
 pub struct Renderer {
-    pub flags: c_int,
+    pub config: Config,
     resources: BTreeMap<ResourceHandle, Resource>,
     contexts: BTreeMap<CtxId, Context>,
     fences: Retirement,
@@ -127,13 +127,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(fences: Box<dyn FenceSink>, flags: c_int) -> Renderer {
+    pub fn new(fences: Box<dyn FenceSink>, config: Config) -> Renderer {
         Renderer {
-            flags,
+            config,
             resources: BTreeMap::new(),
             contexts: BTreeMap::new(),
             fences: Retirement::start(fences),
-            venus: (flags & abi::VENUS != 0).then(|| venus::vkr::Vkr::new(flags)),
+            venus: config.venus.then(|| venus::vkr::Vkr::new(config)),
         }
     }
 
@@ -156,10 +156,8 @@ impl Renderer {
     /// absent would run off the end of it.
     pub fn capset_bytes(&self, set: u32, version: u32) -> Option<Vec<u8>> {
         match set {
-            abi::CAPSET_VENUS
-                if self.flags & abi::VENUS != 0 && version == venus::capset::VERSION =>
-            {
-                Some(venus::capset::Capset::new(self.flags).as_bytes().to_vec())
+            abi::CAPSET_VENUS if self.config.venus && version == venus::capset::VERSION => {
+                Some(venus::capset::Capset::new(self.config).as_bytes().to_vec())
             }
             _ => None,
         }
@@ -368,15 +366,14 @@ impl Renderer {
     }
 }
 
-/// What this build cannot do for the flags it was given, in one phrase for the startup log.
+/// What this build cannot do for the configuration it was given, in one phrase for the startup
+/// log.
 ///
 /// venus decodes and dispatches everything but serves only part of it -- `dump_state` prints
 /// which part -- and vrend does not exist at all. Saying which is which is the difference between
 /// a log line that explains a failure and one that misleads about it.
-pub fn unsupported_renderers(flags: c_int) -> &'static str {
-    let venus = flags & abi::VENUS != 0;
-    let vrend = flags & abi::NO_VIRGL == 0;
-    match (venus, vrend) {
+pub fn unsupported_renderers(config: Config) -> &'static str {
+    match (config.venus, config.vrend) {
         (true, true) => "venus serves only part of the protocol; no vrend",
         (true, false) => "venus serves only part of the protocol",
         (false, true) => "no vrend",
