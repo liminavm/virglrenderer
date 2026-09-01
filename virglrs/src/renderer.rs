@@ -11,7 +11,7 @@ use crate::abi::{GuestIov, VmmPtr};
 use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
 use crate::guest_mem::GuestMap;
-use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::venus;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, MemoryError};
@@ -52,6 +52,15 @@ pub enum Error {
     /// no ring can live in, so this fails at import rather than at the first command that needs
     /// it -- the guest gets the refusal while it is still holding the thing that caused it.
     Unmappable,
+}
+
+/// venus's own refusals in the renderer's vocabulary. One function, because every venus entry
+/// point owes the same translation and a second copy is a second chance to disagree.
+fn venus_error(e: venus::vkr::Error) -> Error {
+    match e {
+        venus::vkr::Error::NoContext => Error::NoContext,
+        venus::vkr::Error::Poisoned => Error::Poisoned,
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -145,13 +154,52 @@ pub struct Rejected {
     pub fd: OwnedFd,
 }
 
+/// Memory this renderer minted for a blob, and the descriptor that names it.
+///
+/// The guest asks for a blob two different ways through one entry point, and `blob_id` is what
+/// separates them: a non-zero id names something the renderer already has -- a `VkDeviceMemory` to
+/// export -- while a zero id asks the renderer to supply the memory itself. Only the second kind
+/// has a `HostShm`, and [`HostShm::for_blob`] is the single place that decides, so nothing else
+/// has to keep the id and the memory in step.
+///
+/// The descriptor is kept rather than closed. The C hands it straight to the VMM in `out_blob` and
+/// keeps only the mapping; there is no `out_blob` here yet, and closing it now would make the
+/// export path impossible to add without re-plumbing this.
+pub struct HostShm {
+    pub fd: OwnedFd,
+    pub map: Arc<GuestMap>,
+}
+
+impl HostShm {
+    /// Mint memory for a blob, if this is the kind of blob that needs it.
+    ///
+    /// Mirrors the C's `vkr_context_get_blob`: `blob_id == 0` reaches
+    /// `vkr_context_create_resource_from_shm`, everything else exports memory that already exists.
+    fn for_blob(handle: ResourceHandle, desc: &BlobDesc) -> Result<Option<HostShm>, Error> {
+        if desc.blob_mem != crate::abi::BLOB_MEM_HOST3D || desc.blob_id != BlobId(0) {
+            return Ok(None);
+        }
+        let len = usize::try_from(desc.size).map_err(|_| Error::Unmappable)?;
+        match crate::guest_mem::anonymous_shm(len, "virglrs-shmem") {
+            Ok((fd, map)) => Ok(Some(HostShm { fd, map: Arc::new(map) })),
+            Err(e) => {
+                eprintln!("[virglrs] resource {handle}: cannot mint {len} shm bytes: {e}");
+                Err(Error::Unmappable)
+            }
+        }
+    }
+}
+
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
 pub enum Backing {
     /// Created from `virgl_renderer_resource_create` -- a classic texture or buffer.
     Classic(ClassicDesc),
     /// Created from `virgl_renderer_resource_create_blob`.
-    Blob(BlobDesc),
+    ///
+    /// `host` is the memory this renderer minted for the blob, present exactly when the guest
+    /// asked for one the host has to supply -- see [`HostShm`] and the one place that builds it.
+    Blob { desc: BlobDesc, host: Option<HostShm> },
     /// Imported from a descriptor the VMM opened and handed over. The resource owns it now, and
     /// closing it is what dropping this does.
     ///
@@ -177,11 +225,13 @@ pub struct Resource {
 
 /// The resource table answering the only question venus asks of it.
 ///
-/// Implemented on `Renderer` rather than handing venus the map, so the table stays private and
-/// what crosses the boundary is one share of one mapping.
-impl venus::ring::ShmResources for Renderer {
+/// On the table rather than on `Renderer`, because a venus submission needs the renderer's venus
+/// state mutably and its resources shared at the same time. Those are sibling fields, so the
+/// borrow is only disjoint if each is named separately -- a trait on the whole struct would make
+/// every submission borrow all of it.
+impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
     fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>> {
-        self.resources.get(&handle)?.shm().map(Arc::clone)
+        self.get(&handle)?.shm().map(Arc::clone)
     }
 }
 
@@ -194,7 +244,8 @@ impl Resource {
     pub fn shm(&self) -> Option<&Arc<GuestMap>> {
         match &self.backing {
             Backing::Imported { map, .. } => map.as_ref(),
-            Backing::Classic(_) | Backing::Blob(_) => None,
+            Backing::Blob { host, .. } => host.as_ref().map(|h| &h.map),
+            Backing::Classic(_) => None,
         }
     }
 }
@@ -279,7 +330,8 @@ impl Renderer {
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
-        self.insert(handle, Backing::Blob(desc), iov);
+        let host = HostShm::for_blob(handle, &desc)?;
+        self.insert(handle, Backing::Blob { desc, host }, iov);
         Ok(())
     }
 
@@ -448,20 +500,50 @@ impl Renderer {
         };
         match c.capset {
             CapsetId::Venus => {
-                let v = self.venus.as_mut().ok_or(Error::RendererAbsent)?;
-                v.submit(ctx, buf).map_err(|e| match e {
-                    venus::vkr::Error::NoContext => Error::NoContext,
-                    venus::vkr::Error::Poisoned => Error::Poisoned,
-                })
+                let (v, resources) = self.venus_and_resources();
+                let v = v.ok_or(Error::RendererAbsent)?;
+                v.submit(ctx, buf, resources).map_err(venus_error)
             }
             // vrend arrives in P3.
             _ => Err(Error::RendererUnimplemented),
         }
     }
 
-    /// The venus renderer, for the replay feed that drives it directly.
-    pub fn venus_mut(&mut self) -> Option<&mut venus::vkr::Vkr> {
-        self.venus.as_mut()
+    /// The venus renderer and the resource table, borrowed apart.
+    ///
+    /// Every venus entry point below goes through this: a submission may create a ring, which
+    /// needs a share of a resource's mapping while venus state is held mutably. Naming the two
+    /// fields is what makes that borrow legal, and doing it in one place is what stops each caller
+    /// from rediscovering it.
+    fn venus_and_resources(
+        &mut self,
+    ) -> (Option<&mut venus::vkr::Vkr>, &BTreeMap<ResourceHandle, Resource>) {
+        (self.venus.as_mut(), &self.resources)
+    }
+
+    /// Feed one replay journal entry to a context's default stream.
+    pub fn venus_replay_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
+        let (v, resources) = self.venus_and_resources();
+        v.ok_or(Error::RendererAbsent)?.submit(ctx, buf, resources).map_err(venus_error)
+    }
+
+    /// Feed one replay journal entry to a named ring's stream.
+    pub fn venus_replay_ring_cmd(
+        &mut self,
+        ctx: CtxId,
+        ring: RingId,
+        buf: &[u8],
+    ) -> Result<(), Error> {
+        let (v, resources) = self.venus_and_resources();
+        v.ok_or(Error::RendererAbsent)?.submit_ring(ctx, ring, buf, resources).map_err(venus_error)
+    }
+
+    pub fn venus_replay_begin(&mut self, ctx: CtxId) -> Result<(), Error> {
+        self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_begin(ctx).map_err(venus_error)
+    }
+
+    pub fn venus_replay_end(&mut self, ctx: CtxId) -> Result<(), Error> {
+        self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -534,6 +616,46 @@ mod tests {
 
     fn renderer(config: Config) -> Renderer {
         Renderer::new(Box::new(NoSink), config)
+    }
+
+    /// The two questions `HostShm::for_blob` answers, and it answers them from `blob_id` alone.
+    ///
+    /// One entry point serves two different guest requests: a zero id asks the renderer to supply
+    /// memory, any other id names memory it already has and asks for it to be exported. Minting
+    /// for the second kind would hand the guest fresh zeroed pages where it expected the contents
+    /// of a `VkDeviceMemory` -- a wrong answer that looks like a working one.
+    #[test]
+    fn only_a_blob_that_asks_the_host_for_memory_is_given_any() {
+        let mut r = renderer(Config::default());
+
+        let minted = BlobDesc {
+            blob_mem: crate::abi::BLOB_MEM_HOST3D,
+            blob_flags: 1,
+            blob_id: BlobId(0),
+            // The size the venus corpus asks for a ring resource: not a whole number of pages.
+            size: 0x24000 - 1,
+        };
+        r.resource_create_blob(ResourceHandle(1), minted, Vec::new()).expect("created");
+        let map = r.resource(ResourceHandle(1)).expect("there").shm().expect("has memory");
+
+        // Page-rounded, because the VMM maps with MAP_FIXED and because the ring layout is
+        // validated against this length -- un-rounded, a layout the C accepts would be refused.
+        let page = crate::guest_mem::page_size();
+        assert_eq!(map.len() % page, 0, "the mapping is a whole number of pages");
+        assert!(map.len() >= 0x24000 - 1, "and covers everything that was asked for");
+
+        // A blob naming memory that already exists gets none of its own.
+        let exported = BlobDesc { blob_id: BlobId(9), ..minted };
+        r.resource_create_blob(ResourceHandle(2), exported, Vec::new()).expect("created");
+        assert!(
+            r.resource(ResourceHandle(2)).expect("there").shm().is_none(),
+            "an export names memory the renderer already has; minting would answer with the wrong bytes"
+        );
+
+        // And so does a blob in memory that is not the host's to mint.
+        let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
+        r.resource_create_blob(ResourceHandle(3), vram, Vec::new()).expect("created");
+        assert!(r.resource(ResourceHandle(3)).expect("there").shm().is_none());
     }
 
     /// A real descriptor to hand over. Any would do; a pipe's read end is the cheapest.

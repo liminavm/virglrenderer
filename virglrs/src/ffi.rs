@@ -885,7 +885,7 @@ pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
     let Some(ctx) = CtxId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_begin(ctx)) {
+    with(EINVAL, |r| match Some(r.venus_replay_begin(ctx)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
@@ -901,7 +901,7 @@ pub extern "C" fn virgl_renderer_limina_replay_submit(
         return EINVAL;
     };
     with_bytes(cmd, size as usize, |buf| {
-        with(EINVAL, |r| match r.venus_mut().map(|v| v.submit(ctx, buf)) {
+        with(EINVAL, |r| match Some(r.venus_replay_cmd(ctx, buf)) {
             Some(Ok(())) => 0,
             _ => EINVAL,
         })
@@ -924,7 +924,7 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
         return EINVAL;
     };
     with_bytes(cmd, size as usize, |buf| {
-        with(EINVAL, |r| match r.venus_mut().map(|v| v.submit_ring(ctx, ring, buf)) {
+        with(EINVAL, |r| match Some(r.venus_replay_ring_cmd(ctx, ring, buf)) {
             Some(Ok(())) => 0,
             _ => EINVAL,
         })
@@ -937,7 +937,7 @@ pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
     let Some(ctx) = CtxId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match r.venus_mut().map(|v| v.replay_end(ctx)) {
+    with(EINVAL, |r| match Some(r.venus_replay_end(ctx)) {
         Some(Ok(())) => 0,
         _ => EINVAL,
     })
