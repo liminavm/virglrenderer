@@ -10,6 +10,7 @@
 // the one thing this boundary must never do.
 
 use core::ffi::c_void;
+use core::marker::PhantomData;
 
 use crate::venus::cs::{ObjectId, Scalar};
 
@@ -97,13 +98,20 @@ impl Default for ${ty.name} {
 
 % endfor
 /// A decoded command's arguments, and its reply where it has one.
+///
+/// `'a` is the decoder's: the wire bytes and the arena the command was decoded into, which both
+/// outlive the submission. Every member that is a reference borrows from there, and the marker is
+/// what carries the lifetime for the commands whose members are all scalars. It is a zero-sized
+/// type at the end of a `#[repr(C)]` struct, so it costs no byte and moves no member -- which the
+/// layout oracle is what actually checks.
 % for ty in GEN.supported_types[VkType.COMMAND]:
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-pub struct vn_command_${ty.name} {
+pub struct vn_command_${ty.name}<'a> {
 %   for name, rs in RUST.command_params(ty):
     pub ${name}: ${rs},
 %   endfor
+    pub _marker: PhantomData<&'a ()>,
 }
 
 % endfor
