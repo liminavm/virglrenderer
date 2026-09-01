@@ -12,7 +12,7 @@
 use bumpalo::Bump;
 use std::cell::Cell;
 
-use crate::ids::{CtxId, RingIdx};
+use crate::ids::{CtxId, RingId};
 
 use super::cs::Decoder;
 use super::cs::Handle;
@@ -205,7 +205,7 @@ impl Context {
     /// replay possible, and a real ring loop is what will need the index.
     pub fn submit_ring(
         &mut self,
-        _ring: RingIdx,
+        _ring: RingId,
         buf: &[u8],
         todo: &mut Unimplemented,
         global: &Global,

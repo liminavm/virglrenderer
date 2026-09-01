@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::config::Config;
-use crate::ids::{CtxId, RingIdx};
+use crate::ids::{CtxId, RingId};
 
 use super::context::{Context, Unimplemented};
 use crate::vulkan::Global;
@@ -73,7 +73,7 @@ impl Vkr {
         if ctx.submit(buf, &mut self.todo, &self.global) { Ok(()) } else { Err(Error::Poisoned) }
     }
 
-    pub fn submit_ring(&mut self, id: CtxId, ring: RingIdx, buf: &[u8]) -> Result<(), Error> {
+    pub fn submit_ring(&mut self, id: CtxId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
         let ctx = self.contexts.get_mut(&id).ok_or(Error::NoContext)?;
         if ctx.submit_ring(ring, buf, &mut self.todo, &self.global) {
             Ok(())

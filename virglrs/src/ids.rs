@@ -44,7 +44,20 @@ id!(
 );
 id!(
     /// A ring within a context. Ring 0 is the context's own command stream.
+    ///
+    /// This is a *timeline index*, which is what fences are keyed by. It is not the object id the
+    /// guest gives a ring on the wire -- that is [`RingId`], and the two are different concepts
+    /// that happen to share a word. Conflating them is what produced the truncation this pair of
+    /// types replaces.
     RingIdx(u32)
+);
+id!(
+    /// The object id a guest gives a ring in `vkCreateRingMESA`.
+    ///
+    /// A venus object id, 64 bits, from the same space as every other object the guest names.
+    /// Distinct from [`RingIdx`]: this one identifies *which ring object*, that one identifies
+    /// which fence timeline.
+    RingId(u64)
 );
 id!(
     /// Identifies the host-side object a blob resource exports. Meaningful only to the renderer

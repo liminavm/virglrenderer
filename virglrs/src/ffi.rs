@@ -29,7 +29,7 @@ use crate::abi::{
 };
 use crate::config::{CapsetId, Config};
 use crate::fence;
-use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
+use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 
 /// Decode a capset id the guest chose.
@@ -916,9 +916,10 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
     cmd: *mut c_void,
     size: u32,
 ) -> c_int {
-    // The ring id is the guest's 64-bit ring object; the index is what fences are keyed by. Until
-    // a ring loop exists there is nothing to key, so the command is dispatched directly.
-    let ring = RingIdx(ring_id as u32);
+    // The ring object the guest named, at its full width. This used to narrow into a `RingIdx`,
+    // which is a fence timeline index and a different concept -- two rings whose ids differed
+    // only above bit 32 became the same ring, silently.
+    let ring = RingId(ring_id);
     let Some(ctx) = CtxId::new(ctx_id) else {
         return EINVAL;
     };
