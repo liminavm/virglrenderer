@@ -202,13 +202,27 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
 {
     unsigned blocksize = util_format_get_blocksize(res->base.format);
     size_t row, stride, offset, height, extent, storage;
+    /* Every reason to skip is a legitimate steady state, so none of them can log per
+     * frame. But when the guest ends up reading an unwritten target the skip IS the
+     * fault, and silence is exactly the wrong answer -- hence one env-gated trace
+     * naming the numbers that decided it. */
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("LIMINA_VIDEO_WRITEBACK_TRACE") ? 1 : 0;
 
-    if (!blocksize)
+    if (!blocksize) {
+        if (trace)
+            virgl_warn("writeback: res fmt %d has no blocksize\n", res->base.format);
         return;
+    }
 
     /* Nothing to write into: a host-only resource, which is the pre-existing case. */
-    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs))
+    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs)) {
+        if (trace)
+            virgl_warn("writeback: no guest storage (map %p, iov %p, num_iovs %d)\n",
+                       res->guest_pixels_map, (void *)res->iov, res->num_iovs);
         return;
+    }
 
     row = (size_t)res->base.width0 * blocksize;
     height = res->base.height0;
@@ -233,6 +247,12 @@ static void writeback_plane_to_guest(struct vrend_resource *res,
     extent = offset + (height ? (height - 1) * stride + row : 0);
     storage = res->guest_pixels_map ? res->guest_pixels_map_size
                                     : vrend_get_iovec_size(res->iov, res->num_iovs);
+    if (trace)
+        virgl_warn("writeback: %ux%u %s row %zu stride %zu off %zu extent %zu storage %zu "
+                   "src pitch %u -> %s\n",
+                   res->base.width0, res->base.height0,
+                   util_format_name(res->base.format), row, stride, offset, extent,
+                   storage, plane->pitch, extent > storage ? "SKIP" : "write");
     if (extent > storage)
         return;
 
