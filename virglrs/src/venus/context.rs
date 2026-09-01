@@ -1364,4 +1364,89 @@ mod tests {
             );
         }
     }
+
+    /// A guest whose count disagrees with the array behind it never reaches a handler.
+    ///
+    /// This is the premise every generated array accessor's `SAFETY` rests on. The accessor
+    /// lengths its slice by the *count member*, while the arena allocation was sized by the
+    /// *array size on the wire*. They are only ever the same number because the decoder refuses
+    /// the command when they differ -- so if that refusal ever stopped happening, a guest sending
+    /// `count = 7` behind three elements would hand a handler a seven-element slice over a
+    /// three-element allocation, and nothing else in the harness would notice.
+    ///
+    /// `vkFreeCommandBuffers` stands in for the whole class: its array is the plain counted shape
+    /// the other hundred-odd share.
+    #[test]
+    fn a_count_that_disagrees_with_the_array_behind_it_never_reaches_a_handler() {
+        const DEVICE: u64 = 9;
+        const POOL: u64 = 10;
+        const BUFFERS: [u64; 3] = [21, 22, 23];
+
+        #[derive(Default)]
+        struct Recorder {
+            saw: Option<usize>,
+        }
+        impl Commands for Recorder {
+            fn unsupported(&mut self, _cmd: VkCommandTypeEXT) {}
+
+            fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers<'_>) {
+                self.saw = Some(args.pCommandBuffers().map_or(usize::MAX, <[_]>::len));
+            }
+
+            fn object_created(&mut self, _ty: VkObjectType, _id: ObjectId, _host: u64) {}
+            fn object_destroyed(&mut self, _ty: VkObjectType, _id: ObjectId) {}
+        }
+
+        /// The wire for a free of `sent` buffers that claims to be freeing `counted` of them.
+        fn wire(counted: u32, sent: &[u64]) -> Vec<u8> {
+            let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT, 0);
+            w.extend_from_slice(&DEVICE.to_le_bytes());
+            w.extend_from_slice(&POOL.to_le_bytes());
+            w.extend_from_slice(&counted.to_le_bytes());
+            w.extend_from_slice(&(sent.len() as u64).to_le_bytes());
+            for id in sent {
+                w.extend_from_slice(&id.to_le_bytes());
+            }
+            w
+        }
+
+        fn run(w: &[u8], objects: &Shared) -> (Option<usize>, bool) {
+            let temp = Bump::new();
+            let hard = Cell::new(false);
+            let mut dec = Decoder::new(w, &temp, objects, &hard);
+            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _flags = dec.decode_scalar::<VkFlags>();
+            let mut h = Recorder::default();
+            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+            (h.saw, dec.fatal())
+        }
+
+        let objects = Shared::new();
+        {
+            let mut t = objects.borrow_mut();
+            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE.0, 1).unwrap();
+            t.add(ObjectId(POOL), VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL.0, 2).unwrap();
+            for (i, id) in BUFFERS.iter().enumerate() {
+                t.add(ObjectId(*id), VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER.0, 100 + i as u64)
+                    .unwrap();
+            }
+        }
+
+        // The control: the guest agrees with itself, and the handler gets exactly what it sent.
+        let (saw, fatal) = run(&wire(BUFFERS.len() as u32, &BUFFERS), &objects);
+        assert!(!fatal, "a guest that agrees with itself is not a protocol violation");
+        assert_eq!(saw, Some(BUFFERS.len()), "the handler gets the array the guest sent");
+
+        // Overclaiming: seven counted, three sent. The ring stops and no handler runs.
+        let (saw, fatal) = run(&wire(7, &BUFFERS), &objects);
+        assert!(fatal, "a count with a shorter array behind it must poison the ring");
+        assert_eq!(saw, None, "and must not reach a handler at all");
+
+        // Underclaiming is the same violation from the other side: a handler given a count of one
+        // over a three-element allocation is not unsound, but the guest still disagreed with
+        // itself, and letting it through would mean the two numbers are not tied after all.
+        let (saw, fatal) = run(&wire(1, &BUFFERS), &objects);
+        assert!(fatal, "a count with a longer array behind it must poison the ring too");
+        assert_eq!(saw, None);
+    }
 }
