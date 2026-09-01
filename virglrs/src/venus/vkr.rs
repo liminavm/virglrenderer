@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::Config;
 use crate::ids::{CtxId, RingIdx};
 
 use super::context::{Context, Unimplemented};
@@ -27,9 +28,9 @@ pub enum Error {
 /// is what makes the capset honest: it is advertised because this exists, not because a flag was
 /// passed.
 pub struct Vkr {
-    /// The flags the renderer was initialized with. The capset reports some of them straight back
-    /// to the guest, which is why they are kept rather than consumed at startup.
-    pub flags: i32,
+    /// What the renderer was configured to be. The capset reports part of it straight back to
+    /// the guest, which is why it is kept rather than consumed at startup.
+    pub config: Config,
     contexts: BTreeMap<CtxId, Context>,
     /// The commands this build does not serve yet, counted across every context. Kept on the root
     /// because it answers a question about the build, not about a guest.
@@ -40,9 +41,9 @@ pub struct Vkr {
 }
 
 impl Vkr {
-    pub fn new(flags: i32) -> Vkr {
+    pub fn new(config: Config) -> Vkr {
         Vkr {
-            flags,
+            config,
             contexts: BTreeMap::new(),
             todo: Unimplemented::default(),
             global: crate::vulkan::global(),
