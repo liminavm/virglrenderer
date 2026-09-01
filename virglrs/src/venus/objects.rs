@@ -160,6 +160,10 @@ impl Arena {
 
     fn remove_tree(&mut self, key: Key) -> Option<Object> {
         let object = self.get(key).copied()?;
+        // Dropping the descent's result would strand host handles anywhere else; here it cannot,
+        // because the only caller is `Table::remove`, which serves a leaf destroy the guest asked
+        // for by name. A parent's destroy never comes this way -- it goes through
+        // `Table::take_tree`, whose `#[must_use]` hands the children to the driver.
         let _ = self.take_tree(key);
         Some(object)
     }
@@ -322,11 +326,6 @@ impl Table {
         self.len() == 0
     }
 
-    /// Every live object, for the teardown that destroys their host handles.
-    ///
-    /// Ordered teardown -- instance, then physical devices, then devices, then their objects, the
-    /// way the C walks its intrusive lists -- arrives with the real handles that need destroying.
-    /// There is nothing to order while a handle is a number.
     /// Empty the table, handing back every live object with the device it must be destroyed on.
     ///
     /// The teardown that actually runs. A context usually dies mid-workload with the guest still
@@ -387,6 +386,7 @@ mod tests {
 
     const BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_BUFFER;
     const IMAGE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_IMAGE;
+    const DEVICE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DEVICE;
 
     #[test]
     fn a_registered_object_resolves_only_under_its_own_type() {
@@ -577,6 +577,24 @@ mod tests {
         // buffer, which is not a device, so it inherits the nothing above it.
         assert_eq!(got, [(10, None), (20, None), (30, None)]);
         assert!(t.is_empty());
+    }
+
+    /// Teardown reaches an object several levels below the device that owns it, and the device it
+    /// names has to be the one it was made on -- destroying an image on the wrong device is worse
+    /// than leaking it. The device is worked out by descending, so the depth is the test: the
+    /// image here is a grandchild, and nothing above the device is a device at all.
+    #[test]
+    fn a_drained_object_names_the_device_it_was_made_on_however_deep_it_sits() {
+        let mut t = Table::new();
+        t.add(ObjectId(1), BUFFER, 10, None).unwrap(); // stands in for the instance
+        t.add(ObjectId(2), DEVICE, 20, Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, 30, Some(ObjectId(2))).unwrap();
+        t.add(ObjectId(4), IMAGE, 40, Some(ObjectId(3))).unwrap();
+        let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
+        got.sort_unstable();
+        // The root and the device itself are destroyed as themselves, not on a device; everything
+        // under the device, at any depth, carries the device's handle down with it.
+        assert_eq!(got, [(10, None), (20, None), (30, Some(20)), (40, Some(20))]);
     }
 }
 
