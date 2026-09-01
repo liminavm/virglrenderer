@@ -232,9 +232,25 @@ static void upload_mapped_plane(struct vrend_resource *res, unsigned plane_idx,
         if (plane_idx < plane_count) {
             unsigned w = geom[plane_idx].width, h = geom[plane_idx].height;
 
-            if (clamp_plane_to_source(plane, geom[plane_idx].bpp, "iosurface plane", &w, &h))
+            if (clamp_plane_to_source(plane, geom[plane_idx].bpp, "iosurface plane", &w, &h)) {
+                static int wtrace = -1;
+                if (wtrace < 0)
+                    wtrace = getenv("LIMINA_VIDEO_WRITEBACK_TRACE") ? 1 : 0;
+                if (wtrace) {
+                    /* Whether the SOURCE carries a picture is a separate question from
+                     * whether the write lands, and only one of them is visible later. */
+                    const unsigned char *b = plane->map;
+                    size_t probe = plane->pitch < 4096 ? plane->pitch : 4096, nz = 0;
+                    for (size_t i = 0; b && i < probe; i++)
+                        nz += b[i] != 0;
+                    virgl_warn("iosurface write: ios=%u plane %u %ux%u pitch %u "
+                               "src nonzero %zu/%zu\n",
+                               vrend_renderer_resource_get_iosurface_id(res), plane_idx, w, h,
+                               plane->pitch, nz, probe);
+                }
                 vkr_mtl_iosurface_plane_write(res->iosurface, plane_idx, plane->map,
                                               plane->pitch, h, w * geom[plane_idx].bpp);
+            }
             return;
         }
     }

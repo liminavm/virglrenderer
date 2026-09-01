@@ -2892,6 +2892,20 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
             plane = 1;
          }
 
+         /* limina: every view of a plane-backed resource, not only the ones that find an
+          * image. A consumer that views the whole planar buffer -- glupload's DirectDmabuf
+          * builds one EGLImage over it -- lands on none of these branches and samples
+          * res->gl_id, which upload_mapped_plane never fills on an IOSurface-backed
+          * target. That is a black picture with nothing logged, so log it. */
+         if (getenv("LIMINA_PLANE_VIEW_TRACE"))
+            virgl_warn("plane view probe: %ux%u res fmt %s <- view fmt %s, indexed=%d "
+                       "plane=%u aux[0]=%d aux[1]=%d iosurf_planes=%u ios=%u\n",
+                       res->base.width0, res->base.height0,
+                       util_format_name(res->base.format), util_format_name(view->format),
+                       (int)indexed, plane, !!res->aux_plane_egl_image[0],
+                       !!res->aux_plane_egl_image[1], res->iosurf_planes,
+                       vrend_renderer_resource_get_iosurface_id(res));
+
          if ((indexed || view->format != res->base.format) &&
              plane < ARRAY_SIZE(res->aux_plane_egl_image) &&
              res->aux_plane_egl_image[plane]) {
