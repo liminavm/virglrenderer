@@ -93,6 +93,19 @@ pub struct Context {
     reply: Option<ReplyStream>,
 }
 
+/// A context must be `Send`: each one is owned by whoever is driving it, and a ring's thread will
+/// take that ownership through a lock of its own. It is emphatically not `Sync` -- the object table
+/// is a `RefCell` and the poison a `Cell`, so exclusive access is the only access, which is exactly
+/// what a `Mutex` hands out.
+///
+/// A compile-time check rather than an argument: an `Rc` or a raw pointer appearing anywhere in the
+/// driver, the object table or a device's state would break this, and the compiler names the field
+/// that did it.
+const _: () = {
+    const fn is_send<T: Send>() {}
+    is_send::<Context>();
+};
+
 impl Context {
     pub fn new(id: CtxId) -> Context {
         Context {
@@ -139,15 +152,26 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
-        self.submit_on(None, buf, todo, global, resources)
+        // The context lends its own reply slot for the length of the batch. Taking it out and
+        // putting it back is what keeps one owner: nothing else can reach it while it is lent.
+        let mut reply = self.reply.take();
+        let ok = self.submit_on(None, &mut reply, buf, todo, global, resources);
+        self.reply = reply;
+        ok
     }
 
     /// Drain one submission that arrived on `on` -- a ring, or the context's own stream when
-    /// `None`. Which one it was is not bookkeeping: it decides where a reply is written, and it
-    /// decides which commands are legal at all.
+    /// `None`. Which one it was is not bookkeeping: it decides which commands are legal at all.
+    ///
+    /// `reply` is the slot answers go into, lent by whoever owns the stream: the context lends its
+    /// own, a replayed ring lends the one in its entry, and a running ring's thread will lend the
+    /// one in the body it owns. Lending rather than looking it up is what lets the same loop serve
+    /// all three without knowing where the stream lives -- and it means there is no lookup here
+    /// that a destroyed ring could make wrong.
     fn submit_on(
         &mut self,
         on: Option<RingId>,
+        reply: &mut Option<ReplyStream>,
         buf: &[u8],
         todo: &mut Unimplemented,
         global: &Global,
@@ -178,7 +202,7 @@ impl Context {
             resources,
             rings: &mut self.rings,
             current_ring: on,
-            ctx_reply: &mut self.reply,
+            reply,
         };
 
         while dec.has_command() {
@@ -258,7 +282,14 @@ impl Context {
             );
             return false;
         }
-        self.submit_on(Some(ring), buf, todo, global, resources)
+        // The ring lends its slot for the batch, exactly as the context lends its own above.
+        // A running ring's thread will own the body and lend from there instead.
+        let mut reply = self.rings.get_mut(&ring).and_then(|r| r.reply.take());
+        let ok = self.submit_on(Some(ring), &mut reply, buf, todo, global, resources);
+        if let Some(r) = self.rings.get_mut(&ring) {
+            r.reply = reply;
+        }
+        ok
     }
 
     /// The driver state, for the teardown that has to destroy what it holds.
@@ -357,8 +388,8 @@ pub struct Handlers<'a> {
     /// The ring this batch arrived on, or `None` for the context's own stream. Several commands
     /// are legal on exactly one of the two, and a reply belongs to whichever it was.
     current_ring: Option<RingId>,
-    /// The context's own reply stream. A ring's lives in the ring.
-    ctx_reply: &'a mut Option<ReplyStream>,
+    /// Where this batch's answers go, lent by whoever owns the stream it arrived on.
+    reply: &'a mut Option<ReplyStream>,
     /// The rings this context has stood up. Held mutably because creating one is a command.
     rings: &'a mut BTreeMap<RingId, Ring>,
 }
@@ -1214,19 +1245,10 @@ impl Commands for Handlers<'_> {
             }
         };
 
-        // The answer goes back to whoever asked. Collapsing these into one slot would replay
-        // clean and be wrong: a later ring's stream would silently become the earlier ring's, and
-        // its caller would be answered into a buffer it is not waiting on.
-        match self.current_ring {
-            Some(id) => {
-                let ring = self.rings.get_mut(&id).expect(
-                    "submit_ring refuses a ring that is not here, and a ring's own stream may not \
-                     destroy one",
-                );
-                ring.reply = Some(reply);
-            }
-            None => *self.ctx_reply = Some(reply),
-        }
+        // Whoever owns this stream lent us its slot, so there is nothing to route: the answer
+        // lands where the question came from by construction. Looking the ring up here instead
+        // would be a lookup that a destroyed ring could make wrong.
+        *self.reply = Some(reply);
     }
 
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
@@ -1819,106 +1841,107 @@ mod tests {
         }
     }
 
+    /// Build one command's bytes with the generator's own encoder.
+    ///
+    /// Hand-rolling the wire layout in a test would be a second implementation of it, and the one
+    /// that drifts silently. This goes through the same encoder the reply oracle checks.
+    fn wire_set_reply(
+        stream: &super::super::proto::types::VkCommandStreamDescriptionMESA,
+    ) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkSetReplyCommandStreamMESA_args, vn_sizeof_vkSetReplyCommandStreamMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkSetReplyCommandStreamMESA as Args;
+
+        let args = Args { pStream: Some(stream), ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkSetReplyCommandStreamMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkSetReplyCommandStreamMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
+    fn wire_create_ring(
+        ring: u64,
+        info: &crate::venus::proto::types::VkRingCreateInfoMESA,
+    ) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkCreateRingMESA_args, vn_sizeof_vkCreateRingMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkCreateRingMESA as Args;
+
+        let args = Args { ring, pCreateInfo: Some(info), ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkCreateRingMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkCreateRingMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
     /// Two rings, two reply streams, and they stay two.
     ///
-    /// This is the witness the per-ring slot owes. A single context-wide slot passes every gate
-    /// the corpus has -- the replay score counts commands accounted for, and one slot accounts for
-    /// them all -- while quietly answering ring A's caller into ring B's buffer. Only a test that
-    /// looks at both slots at once can tell the difference.
+    /// This is the witness the per-stream slot owes, and it runs through the real submission path
+    /// rather than poking a handler: which slot a batch writes into is decided by which slot the
+    /// caller lends, so only `submit`/`submit_ring` exercise it at all. A single context-wide slot
+    /// passes every gate the corpus has -- the replay score counts commands accounted for, and one
+    /// slot accounts for them all -- while quietly answering ring A's caller into ring B's buffer.
     #[test]
     fn a_reply_stream_belongs_to_the_ring_it_was_set_on() {
-        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
-        use super::super::proto::types::vn_command_vkSetReplyCommandStreamMESA as SetReply;
-
         let t = ring_table();
         let info = ring_info();
-        let objects = Shared::new();
+        let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let global = crate::vulkan::global();
-        let mut driver = Driver::new();
-        let mut rings = BTreeMap::new();
-        let mut ctx_reply = None;
-
-        let mut h = Handlers {
-            objects: &objects,
-            todo: &mut todo,
-            driver: &mut driver,
-            global: &global,
-            reject: None,
-            resources: &t,
-            rings: &mut rings,
-            current_ring: None,
-            ctx_reply: &mut ctx_reply,
-        };
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        ctx.replay_begin();
 
         for ring in [7u64, 9] {
-            let mut args = Create { ring, pCreateInfo: Some(&info), ..Default::default() };
-            h.vkCreateRingMESA(&mut args);
-            assert_eq!(h.reject, None, "ring {ring} is one we accept");
+            assert!(
+                ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t),
+                "ring {ring} is one we accept"
+            );
         }
 
-        // Each ring sets its own window, arriving on its own stream.
+        // Each ring's own stream sets its own window.
         for (ring, offset) in [(7u64, 0x21000usize), (9, 0x22000)] {
-            h.current_ring = Some(RingId(ring));
             let d = reply_at(offset, 0x100);
-            h.vkSetReplyCommandStreamMESA(&mut SetReply {
-                pStream: Some(&d),
-                ..Default::default()
-            });
-            assert_eq!(h.reject, None, "ring {ring}'s window fits its resource");
+            assert!(
+                ctx.submit_ring(RingId(ring), &wire_set_reply(&d), &mut todo, &g, &t),
+                "ring {ring}'s window fits its resource"
+            );
         }
 
         let window = |ring: u64| {
-            h.rings[&RingId(ring)].reply.as_ref().expect("the ring was given a stream").window()
+            ctx.rings[&RingId(ring)].reply.as_ref().expect("the ring was given a stream").window()
         };
         assert_eq!(window(7).begin(), 0x21000, "ring 7 kept the window ring 7 set");
         assert_eq!(window(9).begin(), 0x22000, "ring 9 kept the window ring 9 set");
         assert!(
-            h.ctx_reply.is_none(),
+            ctx.reply.is_none(),
             "nothing arrived on the context's own stream, so it has no reply window"
         );
     }
 
-    /// The same command on the context's own stream lands on the context, and leaves the rings
+    /// The same command on the context's own stream lands on the context and leaves the rings
     /// alone -- the other half of the routing.
     #[test]
     fn a_reply_stream_set_off_a_ring_belongs_to_the_context() {
-        use super::super::proto::types::vn_command_vkCreateRingMESA as Create;
-        use super::super::proto::types::vn_command_vkSetReplyCommandStreamMESA as SetReply;
-
         let t = ring_table();
         let info = ring_info();
-        let objects = Shared::new();
+        let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let global = crate::vulkan::global();
-        let mut driver = Driver::new();
-        let mut rings = BTreeMap::new();
-        let mut ctx_reply = None;
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        ctx.replay_begin();
 
-        let mut h = Handlers {
-            objects: &objects,
-            todo: &mut todo,
-            driver: &mut driver,
-            global: &global,
-            reject: None,
-            resources: &t,
-            rings: &mut rings,
-            current_ring: None,
-            ctx_reply: &mut ctx_reply,
-        };
-        let mut args = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
-        h.vkCreateRingMESA(&mut args);
-        assert_eq!(h.reject, None);
+        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t));
 
         let d = reply_at(0x21000, 0x100);
-        h.vkSetReplyCommandStreamMESA(&mut SetReply { pStream: Some(&d), ..Default::default() });
-        assert_eq!(h.reject, None);
+        assert!(ctx.submit(&wire_set_reply(&d), &mut todo, &g, &t));
 
         assert_eq!(
-            h.ctx_reply.as_ref().expect("the context was given a stream").window().begin(),
+            ctx.reply.as_ref().expect("the context was given a stream").window().begin(),
             0x21000
         );
-        assert!(h.rings[&RingId(7)].reply.is_none(), "the ring was not the one that asked");
+        assert!(ctx.rings[&RingId(7)].reply.is_none(), "the ring was not the one that asked");
     }
 
     /// Setting again is how the guest rewinds: it re-establishes the stream before each batch it
@@ -1945,7 +1968,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         for offset in [0x21000usize, 0x22000] {
             let d = reply_at(offset, 0x100);
@@ -1954,8 +1977,8 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(h.reject, None, "setting a stream at {offset:#x} is not a duplicate");
-            assert_eq!(h.ctx_reply.as_ref().unwrap().window().begin(), offset);
-            assert_eq!(h.ctx_reply.as_ref().unwrap().pos(), 0, "and it starts from the top");
+            assert_eq!(h.reply.as_ref().unwrap().window().begin(), offset);
+            assert_eq!(h.reply.as_ref().unwrap().pos(), 0, "and it starts from the top");
         }
     }
 
@@ -1993,7 +2016,7 @@ mod tests {
                 resources: &t,
                 rings: &mut rings,
                 current_ring: None,
-                ctx_reply: &mut ctx_reply,
+                reply: &mut ctx_reply,
             };
             let d = asked.map(|(o, s)| reply_at(o, s));
             h.vkSetReplyCommandStreamMESA(&mut SetReply {
@@ -2006,7 +2029,7 @@ mod tests {
                 "{asked:x?} against a {len:#x}-byte resource: reject was {:?}",
                 h.reject
             );
-            assert_eq!(h.ctx_reply.is_some(), taken, "a refused stream leaves nothing behind");
+            assert_eq!(h.reply.is_some(), taken, "a refused stream leaves nothing behind");
         }
     }
 
@@ -2030,12 +2053,12 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let d = reply_at(0, 0x100);
         h.vkSetReplyCommandStreamMESA(&mut SetReply { pStream: Some(&d), ..Default::default() });
         assert_eq!(h.reject, Some("set a reply stream in a resource that has no host mapping"));
-        assert!(h.ctx_reply.is_none());
+        assert!(h.reply.is_none());
     }
 
     /// Creating or destroying a ring is the context's business. A ring asking to do it is the
@@ -2063,7 +2086,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkCreateRingMESA(&mut Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() });
         assert_eq!(h.reject, None, "on the context's stream, creating is fine");
@@ -2125,7 +2148,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         for ring in [low, high] {
             let mut args = Create { ring, pCreateInfo: Some(&info), ..Default::default() };
@@ -2162,7 +2185,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
@@ -2216,7 +2239,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let mut args = Create { ring: 1, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut args);
@@ -2246,7 +2269,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let mut args = Create { ring: 1, pCreateInfo: None, ..Default::default() };
         h.vkCreateRingMESA(&mut args);
@@ -2362,7 +2385,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_none(), "a query this driver can answer is not refused");
@@ -2452,7 +2475,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceProperties(&mut args);
         assert!(h.reject.is_none());
@@ -2495,7 +2518,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceProperties2(&mut args2);
         assert!(h.reject.is_none());
@@ -2545,7 +2568,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkEnumerateInstanceVersion(&mut args);
         assert!(h.reject.is_none(), "a real loader answering is never a reason to poison a ring");
@@ -2570,7 +2593,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkEnumerateInstanceVersion(&mut empty);
         assert!(h.reject.is_some(), "a query with nowhere to answer is refused, not answered");
@@ -2646,7 +2669,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert!(h.reject.is_none());
@@ -2678,7 +2701,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert_eq!(
@@ -2772,7 +2795,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkEnumerateDeviceExtensionProperties(&mut args);
         assert!(h.reject.is_some(), "a layer this renderer has no way to load");
@@ -2840,7 +2863,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -2866,7 +2889,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -2916,7 +2939,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetImageDrmFormatModifierPropertiesEXT(&mut args);
 
@@ -2956,7 +2979,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query with nowhere to put the answer");
@@ -2980,7 +3003,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query this driver does not export");
@@ -3147,7 +3170,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateDevice_EXT, 0);
@@ -3217,7 +3240,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
@@ -3282,7 +3305,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
@@ -3339,7 +3362,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
@@ -3421,7 +3444,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         // Counted without planting: the pointer stays null, which is the one shape the
@@ -3477,7 +3500,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         // There is no device, so the driver refuses the whole run -- which is the only way to
@@ -3527,7 +3550,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         let info = VkCommandBufferAllocateInfo {
@@ -3704,7 +3727,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         // The pool arrives as the host handle the lookup resolved, which is what the driver is
         // keyed by. There is no device registered, so the driver call is skipped -- the object
@@ -3816,7 +3839,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyDevice_EXT, 0);
         w.extend_from_slice(&DEVICE.to_le_bytes());
@@ -3957,7 +3980,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT, 0);
         w.extend_from_slice(&INSTANCE.to_le_bytes());
@@ -4026,7 +4049,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         // Driven over the wire rather than by calling the handler, because the handler is only
         // half of a destroy: the generated lifecycle hook is what tells the table an object died,
@@ -4174,7 +4197,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
         let cb = VkCommandBuffer(CB.0);
 
@@ -4348,7 +4371,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             current_ring: None,
-            ctx_reply: &mut ctx_reply,
+            reply: &mut ctx_reply,
         };
 
         // A submit is two submit infos and a fence. The fence has to arrive as itself: it is the
