@@ -17,7 +17,6 @@ use crate::ids::{CtxId, RingIdx};
 use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
-use super::cs::{wire_array, wire_array_mut};
 use super::driver::Driver;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -301,54 +300,35 @@ impl Handlers<'_> {
         }
     }
 
-    /// How many objects a pool allocation asks for, read out of its create-info.
-    ///
-    /// Read before the driver call, because a refusal has to ghost exactly the ids the generated
-    /// lifecycle hook is going to walk, and that count lives inside the guest's struct.
-    fn pool_count<I>(&self, info: Option<&I>, count: impl FnOnce(&I) -> u32) -> usize {
-        info.map_or(0, |i| count(i) as usize)
-    }
-
     /// The pool an allocation names, as a host handle -- zero when the info is missing, which no
     /// live pool can be, so the driver's re-check refuses it.
     fn pool_of<I>(&self, info: Option<&I>, pool: impl FnOnce(&I) -> u64) -> u64 {
         info.map_or(0, pool)
     }
 
-    /// The array a command carries, as a slice -- or a refusal when the guest counted one it did
-    /// not send.
+    /// The verdict on an array the generated accessor could not reconcile.
     ///
-    /// The reconciliation itself is [`wire_array`]; what this adds is the verdict. A count with no
-    /// array behind it is a command that cannot be carried out, and refusing it is the only honest
-    /// answer: doing nothing and reporting success would leave the guest drawing through binds and
-    /// writes that never happened.
-    fn array<'w, T>(&mut self, count: u32, ptr: *const T) -> Option<&'w [T]> {
-        let a = wire_array(count, ptr);
+    /// The reconciliation is the accessor's -- it is the only code that knows how long the arena
+    /// allocation is. What is left is what a split pair *means*, and that is not the accessor's to
+    /// decide: a count with no array behind it is a command that cannot be carried out, and
+    /// refusing it is the only honest answer. Doing nothing and reporting success would leave the
+    /// guest drawing through binds and writes that never happened.
+    fn array<T>(&mut self, a: Option<T>) -> Option<T> {
         if a.is_none() {
             self.reject = Some("counted an array it did not send");
         }
         a
     }
 
-    /// The array a command carries, where a count with none behind it names nothing to act on.
+    /// The other honest reading of a split pair, for the arrays where it is the right one.
     ///
-    /// The other honest reading of a split pair, and the right one for exactly the arrays vk.xml
-    /// marks `noautovalidity` -- `vkFreeCommandBuffers`, `vkFreeDescriptorSets` -- where the
-    /// decoder deliberately does not check the size and so the pair can genuinely arrive apart.
-    /// Freeing "three, list not supplied" identifies nothing to free, which is not the same as
-    /// claiming work was done: there is no work to claim. Poisoning a ring over it would cost the
-    /// guest everything to punish a request that asked for nothing.
-    fn array_or_empty<'w, T>(&mut self, count: u32, ptr: *const T) -> &'w [T] {
-        wire_array(count, ptr).unwrap_or_default()
-    }
-
-    /// [`Handlers::array`] for the shadow array a command writes host handles back into.
-    fn array_mut<'w, T>(&mut self, count: u32, ptr: *mut T) -> Option<&'w mut [T]> {
-        let a = wire_array_mut(count, ptr);
-        if a.is_none() {
-            self.reject = Some("counted an array it did not send");
-        }
-        a
+    /// Exactly the arrays vk.xml marks `noautovalidity` -- `vkFreeCommandBuffers`,
+    /// `vkFreeDescriptorSets` -- where the decoder deliberately does not check the size, so the
+    /// pair can genuinely arrive apart. Freeing "three, list not supplied" identifies nothing to
+    /// free, which is not the same as claiming work was done: there is no work to claim. Poisoning
+    /// a ring over it would cost the guest everything to punish a request that asked for nothing.
+    fn array_or_empty<'w, T>(&mut self, a: Option<&'w [T]>) -> &'w [T] {
+        a.unwrap_or_default()
     }
 
     /// Refuse every id in a run the guest sent.
@@ -482,19 +462,22 @@ impl Commands for Handlers<'_> {
             return;
         }
 
-        // SAFETY: non-null, and the decoder allocated it in the arena.
-        let asked = unsafe { *args.pPhysicalDeviceCount };
-        // Both arrays were sized from this same count, and the wire's own size was checked
-        // against it as it decoded -- so one length governs the pair.
-        let Some(ids) = self.array(asked, args.pPhysicalDevices as *const _) else { return };
-        let Some(out) = self.array_mut(asked, args.handle_pPhysicalDevices) else { return };
-        let Ok(got) = self.driver.physical_devices(args.instance, out) else {
+        // Both arrays were sized from the same count, and the wire's own size was checked
+        // against it as it decoded -- so one length governs the pair, and neither accessor
+        // can hand back a slice of any other length.
+        let Some(ids) = self.array(args.pPhysicalDevices()) else { return };
+        // The shadow is borrowed from `args`, so everything else this needs off it is read first.
+        // That is the borrow doing its job: while the driver is writing host handles into the
+        // array, nothing else may be reading the struct that owns it.
+        let (instance, count_out) = (args.instance, args.pPhysicalDeviceCount);
+        let Some(out) = self.array(args.handle_pPhysicalDevices_mut()) else { return };
+        let Ok(got) = self.driver.physical_devices(instance, out) else {
             args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
             self.ghost_ids(ids);
             return;
         };
         // SAFETY: as above.
-        unsafe { *args.pPhysicalDeviceCount = got };
+        unsafe { *count_out = got };
         // What each one supports is asked once, here, because device creation is filtered against
         // it and there is no later point where the guest is guaranteed to have named them all.
         for pd in out.iter().take(got as usize) {
@@ -676,18 +659,15 @@ impl Commands for Handlers<'_> {
     // an enumeration there is no short answer between those two.
 
     fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers<'_>) {
-        // The count inside the create-info is what sized both arrays, and the wire's own size was
-        // checked against it -- so it, and not either pointer, is the one length here.
-        let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount) as u32;
-        let Some(ids) = self.array(count, args.pCommandBuffers) else { return };
-        let Some(out) = self.array_mut(count, args.handle_pCommandBuffers) else { return };
-        let host = self.driver.allocate_objects(
-            args.device,
-            self.pool_of(args.pAllocateInfo, |i| i.commandPool.raw()),
-            |d| d.vkAllocateCommandBuffers(),
-            args.pAllocateInfo,
-            out,
-        );
+        // The count inside the create-info is what sized both arrays, and the wire's own size
+        // was checked against it -- which is the count both accessors below read.
+        let Some(ids) = self.array(args.pCommandBuffers()) else { return };
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, info) = (args.device, args.pAllocateInfo);
+        let pool = self.pool_of(info, |i| i.commandPool.raw());
+        let Some(out) = self.array(args.handle_pCommandBuffers_mut()) else { return };
+        let host =
+            self.driver.allocate_objects(device, pool, |d| d.vkAllocateCommandBuffers(), info, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");
@@ -696,7 +676,7 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers<'_>) {
-        let buffers = self.array_or_empty(args.commandBufferCount, args.pCommandBuffers);
+        let buffers = self.array_or_empty(args.pCommandBuffers());
         self.driver.free_objects(
             args.device,
             |d| d.vkFreeCommandBuffers(),
@@ -706,16 +686,13 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
-        let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount) as u32;
-        let Some(ids) = self.array(count, args.pDescriptorSets) else { return };
-        let Some(out) = self.array_mut(count, args.handle_pDescriptorSets) else { return };
-        let host = self.driver.allocate_objects(
-            args.device,
-            self.pool_of(args.pAllocateInfo, |i| i.descriptorPool.raw()),
-            |d| d.vkAllocateDescriptorSets(),
-            args.pAllocateInfo,
-            out,
-        );
+        let Some(ids) = self.array(args.pDescriptorSets()) else { return };
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, info) = (args.device, args.pAllocateInfo);
+        let pool = self.pool_of(info, |i| i.descriptorPool.raw());
+        let Some(out) = self.array(args.handle_pDescriptorSets_mut()) else { return };
+        let host =
+            self.driver.allocate_objects(device, pool, |d| d.vkAllocateDescriptorSets(), info, out);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
             // Running a descriptor pool dry is a normal thing for a guest to do -- it is how a
@@ -743,19 +720,21 @@ impl Commands for Handlers<'_> {
     // is the all-or-nothing the guest sees.
 
     fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
-        let Some(infos) = self.array(args.createInfoCount, args.pCreateInfos) else { return };
-        let Some(ids) = self.array(args.createInfoCount, args.pPipelines as *const _) else {
+        let Some(infos) = self.array(args.pCreateInfos()) else { return };
+        let Some(ids) = self.array(args.pPipelines()) else {
             return;
         };
-        let Some(out) = self.array_mut(args.createInfoCount, args.handle_pPipelines) else {
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let Some(out) = self.array(args.handle_pPipelines_mut()) else {
             return;
         };
         let host = self.driver.create_pipelines(
-            args.device,
+            device,
             |d| d.vkCreateGraphicsPipelines(),
-            args.pipelineCache,
+            cache,
             infos,
-            args.pAllocator,
+            alloc,
             out,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
@@ -778,20 +757,20 @@ impl Commands for Handlers<'_> {
     // undefined behaviour at draw time, not errors the driver reports.
 
     fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2<'_>) {
-        let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
+        let Some(infos) = self.array(args.pBindInfos()) else { return };
         args.ret = self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
     fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2<'_>) {
-        let Some(infos) = self.array(args.bindInfoCount, args.pBindInfos) else { return };
+        let Some(infos) = self.array(args.pBindInfos()) else { return };
         args.ret = self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
     fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets<'_>) {
-        let Some(writes) = self.array(args.descriptorWriteCount, args.pDescriptorWrites) else {
+        let Some(writes) = self.array(args.pDescriptorWrites()) else {
             return;
         };
-        let Some(copies) = self.array(args.descriptorCopyCount, args.pDescriptorCopies) else {
+        let Some(copies) = self.array(args.pDescriptorCopies()) else {
             return;
         };
         self.driver.update_descriptor_sets(args.device, writes, copies);
@@ -1200,6 +1179,45 @@ mod tests {
     /// The verdict has to be a refusal. Passing a count with no array behind it on to the driver
     /// walks it off the end of nothing; calling it empty reports success for a bind that never
     /// happened, and the guest then draws from a buffer it believes has memory.
+    /// The generated accessor hands back the array the guest sent -- all of it, and no more.
+    ///
+    /// The count and the pointer are still two members, because `vn_command_*` has to keep C's
+    /// layout; the accessor is the one place they become one thing. Nothing else in the harness
+    /// can see it get that wrong: the wire round trip never calls an accessor, and the replay gate
+    /// counts commands accounted for rather than what they did -- an accessor handing back one
+    /// element too many replays with every command accepted and the census unchanged.
+    #[test]
+    fn a_counted_array_arrives_as_exactly_the_elements_behind_it() {
+        use super::super::proto::types::{
+            VkBindBufferMemoryInfo, VkDeviceSize, vn_command_vkBindBufferMemory2,
+        };
+
+        let infos: [VkBindBufferMemoryInfo; 3] = core::array::from_fn(|i| VkBindBufferMemoryInfo {
+            memoryOffset: VkDeviceSize(100 + i as u64),
+            ..Default::default()
+        });
+        let args = vn_command_vkBindBufferMemory2 {
+            bindInfoCount: 3,
+            pBindInfos: infos.as_ptr(),
+            ..Default::default()
+        };
+        let got = args.pBindInfos().expect("three counted, three sent");
+        assert_eq!(
+            got.iter().map(|i| i.memoryOffset.0).collect::<Vec<_>>(),
+            [100, 101, 102],
+            "the slice must be the array, not a prefix of it and not a step past its end"
+        );
+
+        // A count of none is an empty slice, not an absent one: the guest asked for no binds,
+        // which is a legal thing to ask for and a different answer from a broken pair.
+        let args = vn_command_vkBindBufferMemory2 {
+            bindInfoCount: 0,
+            pBindInfos: infos.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(args.pBindInfos().map(<[_]>::len), Some(0));
+    }
+
     #[test]
     fn an_array_the_guest_counted_but_did_not_send_is_refused() {
         use super::super::proto::types::{VkBindBufferMemoryInfo, vn_command_vkBindBufferMemory2};

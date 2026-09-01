@@ -295,29 +295,34 @@ impl<'a> Decoder<'a> {
 ///
 /// Lives here rather than beside the handlers because the invariant it rests on is the decoder's:
 /// this module allocated the array, and knows how long it lives.
-// Safe rather than `unsafe fn` for the reason `driver.rs` gives at its own module head: the
-// invariant is the decoder's and holds for every caller by construction, and marking it unsafe
-// would push an `unsafe` block into every one of the handlers that carries an array.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn wire_array<'a, T>(count: u32, ptr: *const T) -> Option<&'a [T]> {
+///
+/// # Safety
+///
+/// `'a` is unconstrained, so the caller is the one choosing how long the slice lives, and nothing
+/// in the signature stops it choosing badly. The only callers are the accessors the generator
+/// emits on `vn_command_*`, where `'a` is the struct's own -- the lifetime the decode tied to the
+/// arena. `ptr` must be null, or an allocation of at least `count` elements that lives for `'a`.
+pub unsafe fn wire_array<'a, T>(count: usize, ptr: *const T) -> Option<&'a [T]> {
     if ptr.is_null() {
         return (count == 0).then_some(&[]);
     }
-    // SAFETY: every array pointer in a decoded command is one `alloc_temp_array` returned, sized
-    // to the count decoded beside it, in the batch arena -- which outlives the submission and so
-    // outlives any `'a` a handler can hold the slice for.
-    Some(unsafe { core::slice::from_raw_parts(ptr, count as usize) })
+    // SAFETY: the caller's, above.
+    Some(unsafe { core::slice::from_raw_parts(ptr, count) })
 }
 
 /// [`wire_array`] for an array a command writes back into -- the shadow the generated lifecycle
 /// hook reads host handles out of.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn wire_array_mut<'a, T>(count: u32, ptr: *mut T) -> Option<&'a mut [T]> {
+///
+/// # Safety
+///
+/// As [`wire_array`], and nothing else may hold the array while the returned slice lives. The
+/// generated accessor borrows the command struct mutably, which is what enforces it.
+pub unsafe fn wire_array_mut<'a, T>(count: usize, ptr: *mut T) -> Option<&'a mut [T]> {
     if ptr.is_null() {
         return (count == 0).then_some(&mut []);
     }
-    // SAFETY: as `wire_array`, and the shadow is written by nothing else while the handler runs.
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr, count as usize) })
+    // SAFETY: the caller's, above.
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr, count) })
 }
 
 /// What a venus protocol supports, asked whenever a `pNext` chain must skip a struct the far side
