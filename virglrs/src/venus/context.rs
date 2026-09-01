@@ -311,6 +311,16 @@ impl Handlers<'_> {
         count(unsafe { &*info }) as usize
     }
 
+    /// The pool an allocation names, as a host handle -- zero when the info is missing, which no
+    /// live pool can be, so the driver's re-check refuses it.
+    fn pool_of<I>(&self, info: *const I, pool: impl FnOnce(&I) -> u64) -> u64 {
+        if info.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null, and the decoder allocated it in the batch arena.
+        pool(unsafe { &*info })
+    }
+
     /// Refuse a run of ids in an out-array the guest sent.
     ///
     /// The generated hook walks the whole array whatever the handler did with it, so every id it
@@ -345,6 +355,30 @@ macro_rules! simple_create {
                 self.driver.create_object(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
             self.plant(stringify!($cmd), args.$out, args.$shadow, host);
+        }
+    };
+}
+
+/// A pool, which is [`simple_create`] plus the record of what will be allocated from it.
+///
+/// Destroying a pool destroys its contents, so the driver has to know which objects a pool owns
+/// to stop answering for them afterwards; see [`Driver::create_pool`].
+macro_rules! pool_create {
+    ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
+        fn $cmd(&mut self, args: &mut $args) {
+            let host =
+                self.driver.create_pool(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
+            args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+            self.plant(stringify!($cmd), args.$out, args.$shadow, host);
+        }
+    };
+}
+
+/// The destroy half of [`pool_create`].
+macro_rules! pool_destroy {
+    ($cmd:ident, $args:ty, $target:ident) => {
+        fn $cmd(&mut self, args: &mut $args) {
+            self.driver.destroy_pool(args.device, |d| d.$cmd(), args.$target, args.pAllocator);
         }
     };
 }
@@ -490,14 +524,14 @@ impl Commands for Handlers<'_> {
     );
     simple_destroy!(vkDestroySemaphore, vn_command_vkDestroySemaphore, semaphore);
 
-    simple_create!(
+    pool_create!(
         vkCreateCommandPool,
         vn_command_vkCreateCommandPool,
         pCreateInfo,
         pCommandPool,
         handle_pCommandPool
     );
-    simple_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
+    pool_destroy!(vkDestroyCommandPool, vn_command_vkDestroyCommandPool, commandPool);
 
     simple_create!(vkCreateBuffer, vn_command_vkCreateBuffer, pCreateInfo, pBuffer, handle_pBuffer);
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
@@ -554,14 +588,14 @@ impl Commands for Handlers<'_> {
         descriptorSetLayout
     );
 
-    simple_create!(
+    pool_create!(
         vkCreateDescriptorPool,
         vn_command_vkCreateDescriptorPool,
         pCreateInfo,
         pDescriptorPool,
         handle_pDescriptorPool
     );
-    simple_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
+    pool_destroy!(vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorPool, descriptorPool);
 
     simple_create!(
         vkCreatePipelineLayout,
@@ -616,9 +650,11 @@ impl Commands for Handlers<'_> {
         let count = self.pool_count(args.pAllocateInfo, |i| i.commandBufferCount);
         let host = self.driver.allocate_objects(
             args.device,
+            self.pool_of(args.pAllocateInfo, |i| i.commandPool.raw()),
             |d| d.vkAllocateCommandBuffers(),
             args.pAllocateInfo,
             args.handle_pCommandBuffers,
+            count,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
@@ -641,9 +677,11 @@ impl Commands for Handlers<'_> {
         let count = self.pool_count(args.pAllocateInfo, |i| i.descriptorSetCount);
         let host = self.driver.allocate_objects(
             args.device,
+            self.pool_of(args.pAllocateInfo, |i| i.descriptorPool.raw()),
             |d| d.vkAllocateDescriptorSets(),
             args.pAllocateInfo,
             args.handle_pDescriptorSets,
+            count,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         if host.is_err() {
