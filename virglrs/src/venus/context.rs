@@ -42,12 +42,12 @@ use super::proto::types::{
     vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroySampler, vn_command_vkDestroySemaphore, vn_command_vkDestroyShaderModule,
-    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateInstanceVersion,
-    vn_command_vkEnumeratePhysicalDevices, vn_command_vkFreeCommandBuffers,
-    vn_command_vkFreeMemory, vn_command_vkGetBufferMemoryRequirements2,
-    vn_command_vkGetDeviceQueue2, vn_command_vkGetImageDrmFormatModifierPropertiesEXT,
-    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
-    vn_command_vkGetPhysicalDeviceExternalFenceProperties,
+    vn_command_vkEndCommandBuffer, vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkEnumerateInstanceVersion, vn_command_vkEnumeratePhysicalDevices,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
+    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements2,
+    vn_command_vkGetImageSubresourceLayout, vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
     vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
@@ -919,6 +919,42 @@ impl Commands for Handlers<'_> {
         );
     }
 
+    fn vkEnumerateDeviceExtensionProperties(
+        &mut self,
+        args: &mut vn_command_vkEnumerateDeviceExtensionProperties<'_>,
+    ) {
+        // The one query answered without asking the driver at all. What the guest may be told is
+        // not what the hardware has: it is what this build can serialize, which `Driver` derives.
+        if args.has_pLayerName() {
+            // A layer is host-side software the guest cannot see and this renderer does not load,
+            // so naming one is not a request that can be honoured or a mistake to smooth over.
+            self.reject = Some("named a layer, which no venus renderer has");
+            return;
+        }
+        if !args.has_pPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let advertised = self.driver.advertised_extensions(args.physicalDevice);
+        if !args.has_pProperties() {
+            if let Some(count) = args.pPropertyCount_mut() {
+                *count = advertised.len() as u32;
+            }
+            args.ret = VkResult::VK_SUCCESS;
+            return;
+        }
+        let Some(out) = self.array(args.pProperties_mut()) else { return };
+        // Vulkan's own short-answer rule: the guest gets what it sized for, and being told there
+        // were more is not an error it has to recover from.
+        let n = out.len().min(advertised.len());
+        out[..n].copy_from_slice(&advertised[..n]);
+        args.ret =
+            if n < advertised.len() { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS };
+        if let Some(count) = args.pPropertyCount_mut() {
+            *count = n as u32;
+        }
+    }
+
     fn vkGetPhysicalDeviceQueueFamilyProperties2(
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceQueueFamilyProperties2<'_>,
@@ -1665,6 +1701,91 @@ mod tests {
             "the guest reads this build's ceiling, with the driver's own patch level"
         );
         assert_eq!(asked.driverVersion, 0xabcd, "and everything else the driver said is untouched");
+
+        driver.abandon_planted();
+    }
+
+    /// The guest is told what this build can serialize, and never what the driver merely has.
+    ///
+    /// Three of the extensions this renderer puts on its own devices are host-side machinery --
+    /// Metal interop, the portability subset -- with no wire encoding at all. Advertising one
+    /// would have the guest enable it, send one of its structs, and get its ring poisoned for
+    /// doing exactly what it was told it could.
+    #[test]
+    fn the_guest_is_told_only_the_extensions_this_build_can_serialize() {
+        use super::super::proto::info;
+        use super::super::proto::types::{VkExtensionProperties, VkPhysicalDevice};
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(7);
+
+        // What a driver hands back: two the protocol knows, two it does not.
+        let mut driver = Driver::new();
+        driver.plant_extensions(
+            PD,
+            &[
+                "VK_KHR_external_memory_fd",
+                "VK_EXT_metal_objects",
+                "VK_EXT_external_memory_dma_buf",
+                "VK_KHR_portability_subset",
+            ],
+        );
+
+        let advertised = driver.advertised_extensions(PD);
+        let names: Vec<String> = advertised
+            .iter()
+            .map(|e| {
+                e.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["VK_EXT_external_memory_dma_buf", "VK_KHR_external_memory_fd"],
+            "the host's own Metal and portability extensions are not the guest's business"
+        );
+        assert_eq!(
+            advertised[0].specVersion,
+            info::spec_version("VK_EXT_external_memory_dma_buf"),
+            "and the version is the one whose structs this decoder knows"
+        );
+        assert_ne!(advertised[0].specVersion, 0);
+
+        // A physical device nobody enumerated has nothing to say, rather than a panic.
+        assert!(driver.advertised_extensions(VkPhysicalDevice(999)).is_empty());
+        let _ = VkExtensionProperties::default();
+
+        driver.abandon_planted();
+    }
+
+    /// A layer is host-side software a venus guest cannot see and this renderer does not load, so
+    /// naming one is not a request that can be honoured or a mistake worth smoothing over.
+    #[test]
+    fn naming_a_layer_is_refused_rather_than_ignored() {
+        use super::super::proto::types::{
+            VkPhysicalDevice, vn_command_vkEnumerateDeviceExtensionProperties as Cmd,
+        };
+
+        let mut driver = Driver::new();
+        driver.plant_extensions(VkPhysicalDevice(1), &["VK_KHR_external_memory_fd"]);
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        let mut n = 0u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = VkPhysicalDevice(1);
+        args.plant_pPropertyCount(&mut n);
+        args.plant_pLayerName(c"VK_LAYER_KHRONOS_validation");
+
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+        };
+        h.vkEnumerateDeviceExtensionProperties(&mut args);
+        assert!(h.reject.is_some(), "a layer this renderer has no way to load");
+        assert_eq!(n, 0, "and nothing was answered");
 
         driver.abandon_planted();
     }
