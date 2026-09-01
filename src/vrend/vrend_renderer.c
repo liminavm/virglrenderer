@@ -9772,6 +9772,28 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
       vrend_resource_gbm_init(gr, format);
 #ifdef __APPLE__
       vrend_resource_iosurface_init(gr, format);
+
+      /* Refuse a composite target we could not back with a planar surface, rather than
+       * hand back a resource whose plane views cannot work.
+       *
+       * A guest only asks for this shape because we advertised VIDEO_PLANAR_TARGET, and
+       * it is built to fall back to per-plane buffers when the create is refused. Letting
+       * it succeed instead is worse than either: the plane views find no aux image and
+       * fall through to the texture-view branch, which is view_class_unsupported for a
+       * planar format and puts the context in error for its lifetime.
+       *
+       * Only our own capset-gated guest creates a classic planar resource on this host,
+       * so nothing else can reach this. */
+      struct guest_plane refuse_planes[VIRGL_GBM_MAX_PLANES];
+      uint32_t refuse_plane_count = 0;
+      vrend_guest_plane_layout(format, gr->base.width0, gr->base.height0,
+                               refuse_planes, &refuse_plane_count);
+      if (refuse_plane_count > 1 && !gr->aux_plane_egl_image[0]) {
+         virgl_error("no planar surface for a %ux%u %s target; refusing the create so the "
+                     "guest falls back to per-plane buffers\n",
+                     gr->base.width0, gr->base.height0, util_format_name(format));
+         return -EINVAL;
+      }
 #endif
       if (gr->gbm_bo && !has_bit(gr->storage_bits, VREND_STORAGE_EGL_IMAGE))
          return 0;
