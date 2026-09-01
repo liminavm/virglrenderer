@@ -73,6 +73,17 @@ pub struct Driver {
     /// Live device memory, keyed by the *guest's* id -- because that is the name the census
     /// reports and the VMM reads back by. See [`Memory`].
     memory: BTreeMap<u64, Memory>,
+    /// Live command and descriptor pools, by host handle, each with the objects allocated from it.
+    ///
+    /// Destroying a pool destroys everything in it, and nothing in the guest's stream says so --
+    /// so without this the object table would keep resolving ids whose driver objects are gone,
+    /// and the next command naming one would hand the driver a freed handle. See
+    /// [`Driver::pool_child`].
+    pools: BTreeMap<u64, BTreeSet<u64>>,
+    /// Every pool-allocated object, by host handle, pointing back at its pool. The reverse of
+    /// `pools`, because the question a command asks is "is this buffer still alive", and answering
+    /// it by searching every pool would be a scan on the hottest path there is.
+    pool_children: BTreeMap<u64, u64>,
 }
 
 /// One live `VkDevice`: its entry points, and what its allocations need to know.
@@ -440,16 +451,23 @@ impl Driver {
     /// `out` is the shadow array the decoder allocated, so the driver writes host handles straight
     /// into the place the generated lifecycle hook will read them from.
     pub fn allocate_objects<T: Handle, I>(
-        &self,
+        &mut self,
         device: VkDevice,
+        pool: u64,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
         info: *const I,
         out: *mut T,
+        count: usize,
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         if info.is_null() || out.is_null() {
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+        }
+        // The pool is re-checked here for the same reason the device is: the guest may have
+        // destroyed it, and an id the object table still resolves is not a live driver object.
+        if !self.pools.contains_key(&pool) {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
@@ -458,12 +476,30 @@ impl Driver {
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
+        for i in 0..count {
+            // SAFETY: `i` is inside the array the decoder sized to `count`, and the driver filled
+            // it -- Vulkan fills every element of a pool allocation or none.
+            let child = unsafe { *out.add(i) }.raw();
+            if child != 0 {
+                self.pools.entry(pool).or_default().insert(child);
+                self.pool_children.insert(child, pool);
+            }
+        }
         Ok(())
     }
 
+    /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
+    ///
+    /// The check every command that *uses* a command buffer owes before handing it to the driver:
+    /// the object table resolves an id to a handle, but only this says the handle still names
+    /// something.
+    pub fn pool_child(&self, handle: u64) -> bool {
+        self.pool_children.contains_key(&handle)
+    }
+
     /// Free a run of objects back to the pool they came from.
-    pub fn free_objects<T: Handle, P: Copy>(
-        &self,
+    pub fn free_objects<T: Handle, P: Handle>(
+        &mut self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const T),
         pool: P,
@@ -473,12 +509,57 @@ impl Driver {
         let Some(d) = self.devices.get(&device.0) else {
             return;
         };
-        if count == 0 || objects.is_null() {
+        if count == 0 || objects.is_null() || !self.pools.contains_key(&pool.raw()) {
             return;
         }
         // SAFETY: handles this context allocated, in the arena array the decoder sized to `count`.
         // The generated lifecycle hook removes the ids from the object table exactly once.
         unsafe { proc(&d.fns)(device, pool, count, objects) };
+        let children = self.pools.entry(pool.raw()).or_default();
+        for i in 0..count as usize {
+            // SAFETY: as above.
+            let child = unsafe { *objects.add(i) }.raw();
+            children.remove(&child);
+            self.pool_children.remove(&child);
+        }
+    }
+
+    /// Create a pool, and start tracking what will be allocated from it.
+    pub fn create_pool<T: Handle, I>(
+        &mut self,
+        device: VkDevice,
+        proc: impl FnOnce(
+            &DeviceFns,
+        ) -> unsafe extern "C" fn(
+            VkDevice,
+            *const I,
+            *const VkAllocationCallbacks,
+            *mut T,
+        ) -> VkResult,
+        info: *const I,
+        alloc: *const VkAllocationCallbacks,
+    ) -> Result<u64, VkResult> {
+        let handle = self.create_object(device, proc, info, alloc)?;
+        self.pools.insert(handle, BTreeSet::new());
+        Ok(handle)
+    }
+
+    /// Destroy a pool, and with it everything allocated from it.
+    ///
+    /// Vulkan frees a pool's objects when the pool goes, without a command per object -- so this
+    /// is the only place their handles stop being live, and forgetting them here is what keeps a
+    /// later command from reaching the driver with one.
+    pub fn destroy_pool<T: Handle>(
+        &mut self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, *const VkAllocationCallbacks),
+        pool: T,
+        alloc: *const VkAllocationCallbacks,
+    ) {
+        for child in self.pools.remove(&pool.raw()).unwrap_or_default() {
+            self.pool_children.remove(&child);
+        }
+        self.destroy_object(device, proc, pool, alloc);
     }
 
     // ------------------------------------------------------------------- device memory
@@ -674,12 +755,37 @@ fn read_names(names: *const *const std::ffi::c_char, count: usize) -> Vec<String
 
 #[cfg(test)]
 mod tests {
+    use super::super::proto::types::VkCommandPool;
     use super::*;
 
     const HOST_VISIBLE: VkMemoryPropertyFlags =
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32);
     const DEVICE_LOCAL: VkMemoryPropertyFlags =
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32);
+
+    /// Destroying a pool destroys everything in it, and the guest sends no command per object --
+    /// so if the pool's contents stay tracked here, a later command naming one gets past the
+    /// re-check and reaches the driver with a handle Vulkan already freed.
+    #[test]
+    fn a_pool_forgets_its_contents_when_it_is_destroyed() {
+        let mut d = Driver::default();
+        d.pools.insert(7, BTreeSet::from([11, 12]));
+        d.pool_children.insert(11, 7);
+        d.pool_children.insert(12, 7);
+        assert!(d.pool_child(11) && d.pool_child(12));
+
+        // No device is registered, so the driver call itself is skipped -- the bookkeeping is
+        // what is under test, and it has to happen either way.
+        d.destroy_pool(
+            VkDevice(0),
+            |f| f.vkDestroyCommandPool(),
+            VkCommandPool(7),
+            core::ptr::null(),
+        );
+        assert!(!d.pool_child(11), "a buffer outlived the pool it came from");
+        assert!(!d.pool_child(12), "a buffer outlived the pool it came from");
+        assert!(!d.pools.contains_key(&7));
+    }
 
     /// The census reports the padded size, so this rule is directly what a score compares.
     #[test]
