@@ -78,10 +78,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
   feed, the decode loop, the object table — and every command is accounted for rather than merely
   parsed, which is what separates it from `venus-roundtrip`. Both corpora reach `cmds N/N` with no
-  `FAIL` line. It cannot be compared against a pinned score: no command is served yet, so there is
-  no device memory to census and nothing to hash. What it catches is the layer between the bytes
-  and Vulkan, and it caught two things already — a `VK_NULL_HANDLE` treated as a missing object,
-  and every command after the first that named one.
+  `FAIL` line. What it catches is the layer between the bytes and Vulkan, and it caught two things
+  already — a `VK_NULL_HANDLE` treated as a missing object, and every command after the first that
+  named one.
+
+  **It measures that a command was accounted for, not that it was carried out correctly.** Measured
+  by sabotage: an array accessor handing a handler one element more than the guest sent replays both
+  corpora with every command accepted and the census unchanged, and so does one handing back an
+  empty array for every count. Anything about the *contents* a handler passes to the driver needs
+  its own witness — a unit test beside the handler — until the census covers enough served state to
+  be pinned. `venus-roundtrip` does not help there either: it never calls a handler.
 - The layout oracle is the third leg of the same feature, and it runs as a plain unit test:
   `cargo test --features reply-oracle` in `virglrs/`. `venus-roundtrip` proves the wire and
   `venus-reply-oracle` proves the replies, but both compare *bytes*, and the reply oracle only
