@@ -16,11 +16,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::cs::{Handle, ObjectId};
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkCopyDescriptorSet, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkInstance,
-    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineCache, VkQueue,
-    VkResult, VkStructureType, VkWriteDescriptorSet,
+    VkAllocationCallbacks, VkBaseInStructure, VkBuffer, VkBufferCopy, VkBufferImageCopy,
+    VkBufferMemoryBarrier, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
+    VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorSet, VkDevice, VkDeviceCreateInfo,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkExtensionProperties, VkFlags, VkImage,
+    VkImageLayout, VkImageMemoryBarrier, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlags, VkQueue, VkRect2D, VkRenderPassBeginInfo, VkResult,
+    VkStructureType, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -97,6 +101,14 @@ impl Pools {
 
     fn is_open(&self, pool: u64) -> bool {
         self.open.contains_key(&pool)
+    }
+
+    /// The device that owns the pool a handle came from.
+    ///
+    /// A `vkCmd*` carries only its command buffer: Vulkan does not repeat the device, because a
+    /// command buffer already knows its own. Here it does not, so the pool is the way back.
+    fn device_of(&self, handle: u64) -> Option<u64> {
+        self.open.get(self.owner.get(&handle)?).map(|p| p.device)
     }
 
     /// Record objects freshly allocated from a pool. Both directions, or neither.
@@ -684,6 +696,16 @@ impl Driver {
         self.pools.release(objects.iter().map(|h| h.raw()));
     }
 
+    /// Register a device with a hand-built proc table, as `create_device` would have.
+    ///
+    /// Test scaffolding, and the other half of `Device::plant_*`: together they let a test watch
+    /// what a handler hands the driver, which is the boundary nothing else in the harness can
+    /// see. See `plant_pool` for why the real path is out of reach.
+    #[cfg(test)]
+    pub(super) fn plant_device(&mut self, handle: u64, fns: DeviceFns) {
+        self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+    }
+
     /// Stand a pool up with contents already in it, as a run of allocations would have left it.
     ///
     /// Test scaffolding. Reaching the real path needs a live device and a driver that answers,
@@ -731,6 +753,262 @@ impl Driver {
         let orphans = self.pools.close(pool.raw());
         self.destroy_object(device, proc, pool, alloc);
         orphans
+    }
+
+    // -------------------------------------------------------------------- recording
+    //
+    // A `vkCmd*` records into a command buffer and answers nothing: Vulkan defers every error it
+    // could report to the submit. So none of these return a result, and what they can still fail
+    // at is finding the device -- see `recorder`, which is why they return `Option<()>` rather
+    // than nothing at all.
+    //
+    // Each is written out rather than folded into a closure-taking helper. The entry points differ
+    // in arity, not just in name, and the whole reason these live here is that the `unsafe extern`
+    // call belongs in the Vulkan binding module: a helper generic enough to cover all of them
+    // would take the call itself from the caller, which is the one thing it must not do.
+
+    /// The entry points of the device that owns a command buffer.
+    ///
+    /// `None` is a command buffer this context has no pool record for. That is a guest naming
+    /// one it does not have -- the object table is what usually stops it, and this is the second
+    /// answer for the case where the two disagree -- so it is a rejection and never an assert.
+    fn recorder(&self, cb: VkCommandBuffer) -> Option<&DeviceFns> {
+        self.devices.get(&self.pools.device_of(cb.0)?).map(|d| &d.fns)
+    }
+
+    /// `vkBeginCommandBuffer`. The one recording command with a result, because it is the one
+    /// that can run the pool out of memory before anything has been recorded.
+    pub fn begin_command_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        info: Option<&VkCommandBufferBeginInfo>,
+    ) -> Option<VkResult> {
+        let d = self.recorder(cb)?;
+        // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
+        // live for the call. The same holds for every call in this section.
+        Some(unsafe { (d.vkBeginCommandBuffer())(cb, ptr(info)) })
+    }
+
+    pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        Some(unsafe { (d.vkEndCommandBuffer())(cb) })
+    }
+
+    pub fn reset_command_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        flags: VkCommandBufferResetFlags,
+    ) -> Option<VkResult> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        Some(unsafe { (d.vkResetCommandBuffer())(cb, flags) })
+    }
+
+    /// `vkCmdPipelineBarrier`, whose three arrays are independent of each other -- a barrier may
+    /// name memory, buffers, images, or any mix of them.
+    // Vulkan's own signature, one argument per parameter. Folding the three count-and-array pairs
+    // into a struct would be a second definition of what vk.xml already says.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_pipeline_barrier(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkPipelineStageFlags,
+        dst: VkPipelineStageFlags,
+        dependency: VkDependencyFlags,
+        memory: &[VkMemoryBarrier],
+        buffers: &[VkBufferMemoryBarrier],
+        images: &[VkImageMemoryBarrier],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; every count is its own slice's length.
+        unsafe {
+            (d.vkCmdPipelineBarrier())(
+                cb,
+                src,
+                dst,
+                dependency,
+                memory.len() as u32,
+                memory.as_ptr(),
+                buffers.len() as u32,
+                buffers.as_ptr(),
+                images.len() as u32,
+                images.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_begin_render_pass(
+        &self,
+        cb: VkCommandBuffer,
+        begin: Option<&VkRenderPassBeginInfo>,
+        contents: VkSubpassContents,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdBeginRenderPass())(cb, ptr(begin), contents) };
+        Some(())
+    }
+
+    pub fn cmd_end_render_pass(&self, cb: VkCommandBuffer) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdEndRenderPass())(cb) };
+        Some(())
+    }
+
+    pub fn cmd_bind_pipeline(
+        &self,
+        cb: VkCommandBuffer,
+        bind_point: VkPipelineBindPoint,
+        pipeline: VkPipeline,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdBindPipeline())(cb, bind_point, pipeline) };
+        Some(())
+    }
+
+    pub fn cmd_bind_descriptor_sets(
+        &self,
+        cb: VkCommandBuffer,
+        bind_point: VkPipelineBindPoint,
+        layout: VkPipelineLayout,
+        first_set: u32,
+        sets: &[VkDescriptorSet],
+        dynamic_offsets: &[u32],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; both counts are their own slice's length.
+        unsafe {
+            (d.vkCmdBindDescriptorSets())(
+                cb,
+                bind_point,
+                layout,
+                first_set,
+                sets.len() as u32,
+                sets.as_ptr(),
+                dynamic_offsets.len() as u32,
+                dynamic_offsets.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_draw(
+        &self,
+        cb: VkCommandBuffer,
+        vertices: u32,
+        instances: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdDraw())(cb, vertices, instances, first_vertex, first_instance) };
+        Some(())
+    }
+
+    pub fn cmd_set_viewport(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        viewports: &[VkViewport],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { (d.vkCmdSetViewport())(cb, first, viewports.len() as u32, viewports.as_ptr()) };
+        Some(())
+    }
+
+    pub fn cmd_set_scissor(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        scissors: &[VkRect2D],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { (d.vkCmdSetScissor())(cb, first, scissors.len() as u32, scissors.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdBindVertexBuffers`, whose one count governs two arrays.
+    ///
+    /// That they are the same length is a host invariant, not a guest one: both come from the
+    /// same generated accessor, which lengths them from the same member. A guest cannot make them
+    /// differ, so a difference here would be ours.
+    pub fn cmd_bind_vertex_buffers(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        buffers: &[VkBuffer],
+        offsets: &[VkDeviceSize],
+    ) -> Option<()> {
+        assert_eq!(buffers.len(), offsets.len(), "one count governs both arrays");
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the length both slices share.
+        unsafe {
+            (d.vkCmdBindVertexBuffers())(
+                cb,
+                first,
+                buffers.len() as u32,
+                buffers.as_ptr(),
+                offsets.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_fill_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        size: VkDeviceSize,
+        data: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdFillBuffer())(cb, buffer, offset, size, data) };
+        Some(())
+    }
+
+    pub fn cmd_copy_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkBuffer,
+        dst: VkBuffer,
+        regions: &[VkBufferCopy],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { (d.vkCmdCopyBuffer())(cb, src, dst, regions.len() as u32, regions.as_ptr()) };
+        Some(())
+    }
+
+    pub fn cmd_copy_buffer_to_image(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkBuffer,
+        dst: VkImage,
+        layout: VkImageLayout,
+        regions: &[VkBufferImageCopy],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe {
+            (d.vkCmdCopyBufferToImage())(
+                cb,
+                src,
+                dst,
+                layout,
+                regions.len() as u32,
+                regions.as_ptr(),
+            )
+        };
+        Some(())
     }
 
     // ------------------------------------------------------------ binding and updating
