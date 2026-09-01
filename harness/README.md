@@ -193,6 +193,11 @@ crosses the ABI. `VIRGL_PREFIX` selects the build under test, so pointing it at 
 how the port gets checked — the same variable `vrend-replay.sh`, `vkr-replay.sh` and `build.sh`
 resolve, so one setting drives every layer at once; `--pin` re-records, and is only for a change to the ABI that is meant.
 
+**No gate here has a manual install step, and adding one to a ladder buys nothing.** A script that
+scores `virglrs/prefix` builds and installs it first — `abi-fixture.sh` and `vkr-replay.sh` both
+do — so what gets measured is always the tree as it stands. A prefix nobody here owns gets a
+staleness warning instead, and the caller decides.
+
 Both failures are invisible to every other layer here. A missing symbol shows up at `dlopen` and
 nowhere earlier; a wrong field offset never shows up at all — it compiles clean on both sides and
 corrupts at runtime. The layout comes from the compiler (`abi-dump.c`, built against the header),
