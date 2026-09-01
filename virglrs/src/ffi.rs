@@ -26,10 +26,25 @@ use crate::abi::{
     self, Box3, Callbacks, CreateBlobArgs, DebugCallback, FreeDataCallback, GlCtxParam, GuestIov,
     ImportBlobArgs, LogCallback, ResourceCreateArgs, ResourceInfo, ResourceInfoExt, VmmPtr,
 };
-use crate::config::Config;
+use crate::config::{CapsetId, Config};
 use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingIdx};
 use crate::renderer::{self, Renderer};
+
+/// Decode a capset id the guest chose.
+///
+/// The context-create form arrives inside a flag word, whose other bits the header reserves and
+/// nothing uses; `get_cap_set` passes the same id bare. Masking is done here so no unknown byte
+/// reaches the renderer as a number -- an id we have no name for is [`CapsetId::Unknown`], which
+/// is a value the renderer can match on rather than one it has to compare against constants.
+fn capset_of(raw: u32) -> CapsetId {
+    match raw & abi::CAPSET_MASK {
+        abi::CAPSET_VIRGL => CapsetId::Virgl,
+        abi::CAPSET_VIRGL2 => CapsetId::Virgl2,
+        abi::CAPSET_VENUS => CapsetId::Venus,
+        other => CapsetId::Unknown(other as u8),
+    }
+}
 
 /// Decode `virgl_renderer_init`'s flag word into what the renderer is being asked to be.
 ///
@@ -245,7 +260,7 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
         return EINVAL;
     };
     let name = read_name(name, nlen);
-    with(EINVAL, |r| match r.context_create(id, ctx_flags, name) {
+    with(EINVAL, |r| match r.context_create(id, capset_of(ctx_flags), name) {
         Ok(()) => 0,
         Err(e) => errno(e),
     })
@@ -677,7 +692,7 @@ pub extern "C" fn virgl_renderer_get_fd_for_texture2(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_get_cap_set(set: u32, max_ver: *mut u32, max_size: *mut u32) {
-    let (v, s) = with((0, 0), |r| r.capset_max(set).unwrap_or((0, 0)));
+    let (v, s) = with((0, 0), |r| r.capset_max(capset_of(set)).unwrap_or((0, 0)));
     if !max_ver.is_null() {
         // SAFETY: caller-provided out-pointer, checked non-null.
         unsafe { *max_ver = v };
@@ -695,7 +710,7 @@ pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_
     if caps.is_null() {
         return;
     }
-    let Some(bytes) = with(None, |r| r.capset_bytes(set, version)) else {
+    let Some(bytes) = with(None, |r| r.capset_bytes(capset_of(set), version)) else {
         return;
     };
     // SAFETY: `caps` is the caller's buffer, which it sized from `virgl_renderer_get_cap_set` for
@@ -1032,6 +1047,27 @@ const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest picks this byte, and picking a wrong one must not be mistaken for picking venus.
+    ///
+    /// The venus arm is gate-covered -- the replayer creates its contexts with it -- but the mask
+    /// is not: the id arrives inside a flag word whose upper bits the header reserves, so reading
+    /// the whole word would turn a venus context with any reserved bit set into an unknown one,
+    /// and its every submission into ENOTSUP.
+    #[test]
+    fn a_capset_id_is_named_and_the_flag_word_around_it_is_ignored() {
+        assert_eq!(capset_of(abi::CAPSET_VIRGL), CapsetId::Virgl);
+        assert_eq!(capset_of(abi::CAPSET_VIRGL2), CapsetId::Virgl2);
+        assert_eq!(capset_of(abi::CAPSET_VENUS), CapsetId::Venus);
+
+        // Reserved bits above the low byte belong to no capset and must not change the answer.
+        assert_eq!(capset_of(abi::CAPSET_VENUS | 0xdead_ff00), CapsetId::Venus);
+
+        // An id we have no name for keeps its value rather than becoming one we do have a name
+        // for -- collapsing it onto a known capset would route a guest to the wrong renderer.
+        assert_eq!(capset_of(0), CapsetId::Unknown(0));
+        assert_eq!(capset_of(0x42), CapsetId::Unknown(0x42));
+    }
 
     /// `NO_VIRGL` is spelled inside out, and an inverted read of it is invisible: it changes a
     /// startup log line and, in P3, whether vrend exists at all. `guest_vram` is worse -- it
