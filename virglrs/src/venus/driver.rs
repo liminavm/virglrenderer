@@ -387,6 +387,43 @@ impl Driver {
         self.physical_device_exts.insert(pd.0, names);
     }
 
+    /// What the guest is told a physical device supports.
+    ///
+    /// Deliberately not what the driver supports, and derived from that list rather than stored
+    /// beside it -- the two are different facts and only one of them is a fact about hardware.
+    /// An extension this build cannot *serialize* must not be advertised: the guest would enable
+    /// it, send one of its structs, and the decoder would poison the ring for asking. Three of
+    /// `HOST_EXTENSIONS` are exactly that case -- Metal interop and the portability subset are
+    /// how the host does its half of the work, and no venus guest has any business seeing them.
+    ///
+    /// The spec version is this protocol's, not the driver's, for the same reason: it is the
+    /// version whose structs the decoder knows.
+    ///
+    /// The driver is never asked again. `learn_extensions` asked once, and the answer does not
+    /// change for the life of the instance.
+    pub fn advertised_extensions(&self, pd: VkPhysicalDevice) -> Vec<VkExtensionProperties> {
+        let Some(names) = self.physical_device_exts.get(&pd.0) else {
+            return Vec::new();
+        };
+        names
+            .iter()
+            .filter_map(|name| {
+                let version = crate::venus::proto::info::spec_version(name);
+                if version == 0 {
+                    return None;
+                }
+                let mut out = VkExtensionProperties { specVersion: version, ..Default::default() };
+                // `learn_extensions` read these back out of a 256-byte array, so a name too long
+                // to fit cannot have come from there.
+                assert!(name.len() < out.extensionName.len(), "extension name from the driver");
+                for (slot, b) in out.extensionName.iter_mut().zip(name.bytes()) {
+                    *slot = b as core::ffi::c_char;
+                }
+                Some(out)
+            })
+            .collect()
+    }
+
     fn supports(&self, pd: VkPhysicalDevice, name: &str) -> bool {
         self.physical_device_exts.get(&pd.0).is_some_and(|s| s.contains(name))
     }
@@ -1076,6 +1113,13 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_device(&mut self, handle: u64, fns: DeviceFns) {
         self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+    }
+
+    /// Record what a physical device supports, as `learn_extensions` would have off a real
+    /// driver. Test scaffolding: the real path needs an instance and a loader.
+    #[cfg(test)]
+    pub(super) fn plant_extensions(&mut self, pd: VkPhysicalDevice, names: &[&str]) {
+        self.physical_device_exts.insert(pd.0, names.iter().map(|n| n.to_string()).collect());
     }
 
     /// Stand an instance table up with no loader behind it, so an instance-level query has
