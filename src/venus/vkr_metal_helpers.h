@@ -117,6 +117,13 @@ vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf,
                               uint32_t rows,
                               uint32_t row_bytes);
 
+/* Copy one plane of a planar IOSurface into the same plane of another, as many rows and
+ * bytes per row as both have. Returns 0 if either surface lacks the plane. */
+int
+vkr_mtl_iosurface_plane_copy(struct vkr_mtl_iosurface *dst,
+                             struct vkr_mtl_iosurface *src,
+                             uint32_t plane);
+
 /* Allocate a multi-planar IOSurface (no Metal texture), dictating each plane's pitch and
  * offset rather than letting IOSurface choose: the guest is handed this layout and
  * addresses the planes by it. Writes the accepted per-plane stride and offset into
