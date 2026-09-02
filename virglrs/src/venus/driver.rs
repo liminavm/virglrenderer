@@ -425,14 +425,19 @@ impl Driver {
 
     /// Record what a physical device supports, so device creation can be filtered against it.
     ///
-    /// Asked once per physical device, when the guest first enumerates them -- the answer does not
-    /// change for the life of the instance.
-    pub fn learn_extensions(&mut self, pd: VkPhysicalDevice) {
+    /// Asked once per physical device that answers, when the guest first enumerates them -- the
+    /// answer does not change for the life of the instance.
+    ///
+    /// A driver that refuses the question is reported rather than recorded as an empty answer:
+    /// nothing downstream can tell "supports no extensions" from "was never successfully asked",
+    /// and the second one silently strips from `vkCreateDevice` every extension the guest asked
+    /// for and the hardware has.
+    pub fn learn_extensions(&mut self, pd: VkPhysicalDevice) -> Result<(), VkResult> {
         if self.physical_device_exts.contains_key(&pd) {
-            return;
+            return Ok(());
         }
         let Some(inst) = self.instance.as_ref() else {
-            return;
+            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         let mut n = 0u32;
         // SAFETY: the count query with a null array is the spec's own first call.
@@ -445,7 +450,7 @@ impl Driver {
             )
         };
         if r != VkResult::VK_SUCCESS {
-            return;
+            return Err(r);
         }
         let mut props = vec![VkExtensionProperties::default(); n as usize];
         // SAFETY: `props` has room for `n`, which is what the count query just said.
@@ -458,7 +463,7 @@ impl Driver {
             )
         };
         if r != VkResult::VK_SUCCESS && r != VkResult::VK_INCOMPLETE {
-            return;
+            return Err(r);
         }
         props.truncate(n as usize);
         let names = props
@@ -468,6 +473,7 @@ impl Driver {
             })
             .collect();
         self.physical_device_exts.insert(pd, names);
+        Ok(())
     }
 
     /// What the guest is told a physical device supports.
@@ -482,8 +488,9 @@ impl Driver {
     /// The spec version is this protocol's, not the driver's, for the same reason: it is the
     /// version whose structs the decoder knows.
     ///
-    /// The driver is never asked again. `learn_extensions` asked once, and the answer does not
-    /// change for the life of the instance.
+    /// The driver is never asked again. `learn_extensions` asked once and the answer does not
+    /// change for the life of the instance -- and a device it could not ask is not enumerated to
+    /// the guest at all, so an empty answer here is a device the guest was never given.
     pub fn advertised_extensions(&self, pd: VkPhysicalDevice) -> Vec<VkExtensionProperties> {
         let Some(names) = self.physical_device_exts.get(&pd) else {
             return Vec::new();
