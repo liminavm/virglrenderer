@@ -27,7 +27,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use super::cs::{Lookup, ObjectId, Objects};
+use super::cs::{HostHandle, Lookup, ObjectId, Objects};
 use super::proto::types::VkObjectType;
 
 /// One live object: the host handle, and the Vulkan type the guest must name it by.
@@ -46,7 +46,7 @@ pub struct Object {
     /// it to pick the right `vkDestroyX`, and a match on an integer is a match nobody can check.
     pub ty: VkObjectType,
     /// The host handle, whatever Vulkan gave us for it.
-    pub handle: u64,
+    pub handle: HostHandle,
     /// What this object was created under, or `None` for the instance, which is the root.
     ///
     /// A key and not an id: an id is what the *guest* calls the parent, and the guest is free to
@@ -230,10 +230,10 @@ pub struct Doomed {
     /// rather than on a host handle -- the memory census is the one that matters.
     pub id: ObjectId,
     pub ty: VkObjectType,
-    pub handle: u64,
+    pub handle: HostHandle,
     /// `None` for the instance, its physical devices, and the devices themselves -- none of which
     /// is destroyed by a device's entry points.
-    pub device: Option<u64>,
+    pub device: Option<HostHandle>,
 }
 
 #[derive(Default)]
@@ -261,7 +261,7 @@ impl Table {
         &mut self,
         id: ObjectId,
         ty: VkObjectType,
-        handle: u64,
+        handle: HostHandle,
         owner: Option<ObjectId>,
     ) -> Result<(), AddError> {
         if id.0 == 0 {
@@ -332,7 +332,7 @@ impl Table {
     /// The same ancestry [`Arena::take_tree`] carries down as it destroys, asked without
     /// destroying anything -- so a caller that needs to know which device an object lives on has
     /// one answer to consult rather than a map of its own to keep in step.
-    pub fn device_of(&self, id: ObjectId) -> Option<u64> {
+    pub fn device_of(&self, id: ObjectId) -> Option<HostHandle> {
         let mut at = self.slots.get(&id)?.key()?;
         loop {
             let o = self.arena.get(at)?;
@@ -358,7 +358,7 @@ impl Table {
     ///
     /// `ty` is part of the question, not a check on the answer: handles are only unique within a
     /// type, and Vulkan is free to give a physical device and a buffer the same number.
-    pub fn id_of_handle(&self, ty: VkObjectType, handle: u64) -> Option<ObjectId> {
+    pub fn id_of_handle(&self, ty: VkObjectType, handle: HostHandle) -> Option<ObjectId> {
         self.arena
             .entries
             .iter()
@@ -441,11 +441,39 @@ mod tests {
     const IMAGE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_IMAGE;
     const DEVICE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DEVICE;
 
+    /// The two names of one object are two types, and the table keeps both.
+    ///
+    /// The pair was always here -- [`ObjectId`] has said so in its own doc since it was written --
+    /// but only the guest's half had a type. The host's was a bare `u64` from the table through
+    /// the driver's maps to the `Handle` trait, whose `raw()` returned the guest id at some call
+    /// sites and the host handle at others, and reading a slot the wrong way compiled.
+    ///
+    /// A handle newtype still holds one word and both readings still see it. What they cannot do
+    /// is reach a sink meant for the other: `add_ghost` takes an id, `from_host` takes a handle,
+    /// and the three sabotages that swap them no longer build.
+    #[test]
+    fn an_object_is_known_by_two_names_of_two_types() {
+        use super::super::cs::Handle;
+        use super::super::proto::types::VkBuffer;
+
+        let slot = VkBuffer(0x1234);
+        assert_eq!(slot.host(), HostHandle(0x1234));
+        assert_eq!(slot.guest_id(), ObjectId(0x1234));
+        assert_eq!(VkBuffer::from_host(HostHandle(0x1234)), slot);
+        assert_eq!(VkBuffer::null(), VkBuffer(0));
+
+        // What the table records is the host's name, under the guest's.
+        let mut t = Table::new();
+        t.add(ObjectId(7), BUFFER, HostHandle(0xfeed), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(0xfeed)));
+        assert_eq!(t.id_of_handle(BUFFER, HostHandle(0xfeed)), Some(ObjectId(7)));
+    }
+
     #[test]
     fn a_registered_object_resolves_only_under_its_own_type() {
         let mut t = Table::new();
-        t.add(ObjectId(7), BUFFER, 0xdead_beef, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(0xdead_beef));
+        t.add(ObjectId(7), BUFFER, HostHandle(0xdead_beef), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(0xdead_beef)));
         // The whole point of the table: an id is not a capability for every object type.
         assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Missing);
     }
@@ -464,8 +492,8 @@ mod tests {
         t.add_ghost(ObjectId(7));
         assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Ghost);
 
-        t.add(ObjectId(7), BUFFER, 1, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
+        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
     }
 
     /// The state the two-container shape allowed and this one cannot represent.
@@ -476,13 +504,13 @@ mod tests {
     #[test]
     fn a_refused_create_never_ghosts_an_id_that_already_names_something() {
         let mut t = Table::new();
-        t.add(ObjectId(7), BUFFER, 1, None).unwrap();
+        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
 
         // A guest naming a live id in a create, and a driver that refuses that create. Nothing
         // changed, so the object still there is the truth.
         t.add_ghost(ObjectId(7));
         assert!(!t.is_ghost(ObjectId(7)));
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
 
         // And after the guest destroys it the id names nothing at all. A ghost surviving here is
         // the whole bug: every later command naming the id would be swallowed as one lost command
@@ -506,15 +534,15 @@ mod tests {
     #[test]
     fn an_id_may_not_be_zero_or_reused_while_it_is_live() {
         let mut t = Table::new();
-        assert_eq!(t.add(ObjectId(0), BUFFER, 1, None), Err(AddError::ZeroId));
-        t.add(ObjectId(7), BUFFER, 1, None).unwrap();
-        assert_eq!(t.add(ObjectId(7), IMAGE, 2, None), Err(AddError::Duplicate));
+        assert_eq!(t.add(ObjectId(0), BUFFER, HostHandle(1), None), Err(AddError::ZeroId));
+        t.add(ObjectId(7), BUFFER, HostHandle(1), None).unwrap();
+        assert_eq!(t.add(ObjectId(7), IMAGE, HostHandle(2), None), Err(AddError::Duplicate));
         // Still the original: a refused insert must not have disturbed it.
-        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(1));
+        assert_eq!(t.lookup(ObjectId(7), BUFFER.0), Lookup::Found(HostHandle(1)));
 
         t.remove(ObjectId(7)).unwrap();
-        t.add(ObjectId(7), IMAGE, 2, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Found(2));
+        t.add(ObjectId(7), IMAGE, HostHandle(2), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(7), IMAGE.0), Lookup::Found(HostHandle(2)));
     }
 
     /// What the generation is actually for.
@@ -526,15 +554,15 @@ mod tests {
     #[test]
     fn an_orphans_stale_key_does_not_come_to_name_whatever_reuses_its_slot() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
-        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
         // Takes the child with it, and hands both their places back to be used again. Id 2 keeps
         // its entry: nothing walked back here to delete it, which is the whole trade.
         t.remove(ObjectId(1)).unwrap();
 
-        let newcomer = t.add(ObjectId(3), IMAGE, 30, None);
+        let newcomer = t.add(ObjectId(3), IMAGE, HostHandle(30), None);
         assert_eq!(newcomer, Ok(()));
-        assert_eq!(t.lookup(ObjectId(3), IMAGE.0), Lookup::Found(30));
+        assert_eq!(t.lookup(ObjectId(3), IMAGE.0), Lookup::Found(HostHandle(30)));
         // Same slot, same object type, different occupant. The generation is the only thing
         // separating them, and a guest naming id 2 must not be handed 30.
         assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
@@ -545,20 +573,20 @@ mod tests {
     #[test]
     fn destroying_a_parent_takes_every_generation_below_it() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
-        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
-        t.add(ObjectId(3), IMAGE, 30, Some(ObjectId(2))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(2))).unwrap();
         // A sibling tree that must survive: a cascade that took everything would pass a test that
         // only looked down one branch.
-        t.add(ObjectId(4), BUFFER, 40, None).unwrap();
-        t.add(ObjectId(5), IMAGE, 50, Some(ObjectId(4))).unwrap();
+        t.add(ObjectId(4), BUFFER, HostHandle(40), None).unwrap();
+        t.add(ObjectId(5), IMAGE, HostHandle(50), Some(ObjectId(4))).unwrap();
 
         t.remove(ObjectId(1)).unwrap();
         for id in [1, 2, 3] {
             assert!(t.get(ObjectId(id)).is_none(), "id {id} died with the root above it");
         }
-        assert_eq!(t.lookup(ObjectId(4), BUFFER.0), Lookup::Found(40));
-        assert_eq!(t.lookup(ObjectId(5), IMAGE.0), Lookup::Found(50));
+        assert_eq!(t.lookup(ObjectId(4), BUFFER.0), Lookup::Found(HostHandle(40)));
+        assert_eq!(t.lookup(ObjectId(5), IMAGE.0), Lookup::Found(HostHandle(50)));
         assert_eq!(t.len(), 2);
     }
 
@@ -568,8 +596,8 @@ mod tests {
     #[test]
     fn an_id_orphaned_by_its_parents_destroy_is_reusable_without_being_cleaned_up() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
-        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
         t.remove(ObjectId(1)).unwrap();
 
         assert_eq!(t.lookup(ObjectId(2), IMAGE.0), Lookup::Missing);
@@ -577,8 +605,8 @@ mod tests {
         // must not report one -- the host handle is already gone.
         assert!(t.remove(ObjectId(2)).is_none());
         // And the id is not burned: the guest may name a new object by it.
-        t.add(ObjectId(2), BUFFER, 21, None).unwrap();
-        assert_eq!(t.lookup(ObjectId(2), BUFFER.0), Lookup::Found(21));
+        t.add(ObjectId(2), BUFFER, HostHandle(21), None).unwrap();
+        assert_eq!(t.lookup(ObjectId(2), BUFFER.0), Lookup::Found(HostHandle(21)));
     }
 
     /// A slot cycled many times still does not hand a stale key back its object.
@@ -591,13 +619,13 @@ mod tests {
     #[test]
     fn a_slot_cycled_over_and_over_never_hands_an_orphan_its_object_back() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
-        t.add(ObjectId(2), IMAGE, 20, Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle(20), Some(ObjectId(1))).unwrap();
         t.remove(ObjectId(1)).unwrap();
         // Id 2 is now an orphan holding a key to a slot that is back in circulation.
 
         for round in 0..500u64 {
-            t.add(ObjectId(3), IMAGE, 1000 + round, None).unwrap();
+            t.add(ObjectId(3), IMAGE, HostHandle(1000 + round), None).unwrap();
             assert_eq!(
                 t.lookup(ObjectId(2), IMAGE.0),
                 Lookup::Missing,
@@ -612,23 +640,23 @@ mod tests {
     #[test]
     fn a_create_under_an_owner_that_is_already_gone_still_registers() {
         let mut t = Table::new();
-        t.add(ObjectId(9), BUFFER, 90, Some(ObjectId(1))).unwrap();
-        assert_eq!(t.lookup(ObjectId(9), BUFFER.0), Lookup::Found(90));
+        t.add(ObjectId(9), BUFFER, HostHandle(90), Some(ObjectId(1))).unwrap();
+        assert_eq!(t.lookup(ObjectId(9), BUFFER.0), Lookup::Found(HostHandle(90)));
     }
 
     #[test]
     fn draining_hands_back_every_handle_that_needs_destroying() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap();
-        t.add(ObjectId(2), IMAGE, 20, None).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap();
+        t.add(ObjectId(2), IMAGE, HostHandle(20), None).unwrap();
         // One of them hangs off the other, so a drain that walked the tree would hand back only
         // the root. Teardown wants every live handle: Vulkan is being told about each one.
-        t.add(ObjectId(3), IMAGE, 30, Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(1))).unwrap();
         let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
         got.sort_unstable();
         // Every live handle, and each with the device it has to be destroyed on: 30 hangs off the
         // buffer, which is not a device, so it inherits the nothing above it.
-        assert_eq!(got, [(10, None), (20, None), (30, None)]);
+        assert_eq!(got, [(HostHandle(10), None), (HostHandle(20), None), (HostHandle(30), None)]);
         assert!(t.is_empty());
     }
 
@@ -639,15 +667,23 @@ mod tests {
     #[test]
     fn a_drained_object_names_the_device_it_was_made_on_however_deep_it_sits() {
         let mut t = Table::new();
-        t.add(ObjectId(1), BUFFER, 10, None).unwrap(); // stands in for the instance
-        t.add(ObjectId(2), DEVICE, 20, Some(ObjectId(1))).unwrap();
-        t.add(ObjectId(3), IMAGE, 30, Some(ObjectId(2))).unwrap();
-        t.add(ObjectId(4), IMAGE, 40, Some(ObjectId(3))).unwrap();
+        t.add(ObjectId(1), BUFFER, HostHandle(10), None).unwrap(); // stands in for the instance
+        t.add(ObjectId(2), DEVICE, HostHandle(20), Some(ObjectId(1))).unwrap();
+        t.add(ObjectId(3), IMAGE, HostHandle(30), Some(ObjectId(2))).unwrap();
+        t.add(ObjectId(4), IMAGE, HostHandle(40), Some(ObjectId(3))).unwrap();
         let mut got: Vec<_> = t.take_all().into_iter().map(|d| (d.handle, d.device)).collect();
         got.sort_unstable();
         // The root and the device itself are destroyed as themselves, not on a device; everything
         // under the device, at any depth, carries the device's handle down with it.
-        assert_eq!(got, [(10, None), (20, None), (30, Some(20)), (40, Some(20))]);
+        assert_eq!(
+            got,
+            [
+                (HostHandle(10), None),
+                (HostHandle(20), None),
+                (HostHandle(30), Some(HostHandle(20))),
+                (HostHandle(40), Some(HostHandle(20))),
+            ]
+        );
     }
 }
 
