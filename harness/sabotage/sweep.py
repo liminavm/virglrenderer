@@ -63,6 +63,20 @@ SABOTAGES = [
         '',
     ),
     (
+        'a run of pool allocations is filed one object out of step',
+        'virglrs/src/venus/driver.rs',
+        '            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().0 != 0),',
+        '            out.iter().copied().zip(ids.iter().skip(1).copied()).filter(|(h, _)| h.host().0 != 0),',
+        '',
+    ),
+    (
+        'a refused run of pool allocations leaves its ids plain missing',
+        'virglrs/src/venus/context.rs',
+        '            eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");\n            self.ghost_ids(ids);',
+        '            eprintln!("[virglrs] vkAllocateCommandBuffers refused by the driver");',
+        '',
+    ),
+    (
         'the census reports storage a guest only borrowed',
         'virglrs/src/venus/driver.rs',
         '            .filter(|(_, a)| a.censused())',

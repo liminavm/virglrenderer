@@ -1563,6 +1563,18 @@ impl Driver {
         self.pools.adopt(pool, children.iter().copied());
     }
 
+    /// The guest id a pool has filed a host handle under, if it holds it at all.
+    ///
+    /// Test scaffolding, beside [`Driver::plant_pool`] because it is the same seam read the other
+    /// way. What a run of pool allocations has to get right is the *pairing* -- a run recorded
+    /// shifted by one resolves every id to a live object that belongs to another, which nothing
+    /// afterwards can detect -- and a pairing is only observable by asking about both halves.
+    #[cfg(test)]
+    pub(super) fn pool_child_id<P: PoolOf>(&self, pool: P, child: P::Child) -> Option<ObjectId> {
+        let p = self.pools.open.get(&TypedHandle::of(pool))?;
+        p.children.get(&TypedHandle::of(child)).copied()
+    }
+
     /// Point a queue at a device, as `device_queue` would have.
     ///
     /// Test scaffolding. The real path needs a driver that answers `vkGetDeviceQueue2`, and what
