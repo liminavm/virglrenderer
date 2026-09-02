@@ -172,6 +172,8 @@ vkr_mtl_refcount_census(char *buf, unsigned long len);
 /* The IOSurface ledger's two halves: allocations through these helpers, and frees. */
 long vkr_mtl_iosurface_alloc_count(void);
 long vkr_mtl_iosurface_free_count(void);
+/* CF retain count of the surface behind a handle (a LEAD, not a verdict), -1 if none. */
+long vkr_mtl_iosurface_retain_count(const struct vkr_mtl_iosurface *surf);
 
 void
 vkr_mtl_texture_release(void *mtl_texture);
