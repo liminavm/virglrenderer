@@ -481,6 +481,23 @@ impl Renderer {
         }
     }
 
+    /// Destroy every context and drop every resource, leaving the renderer as new.
+    ///
+    /// Contexts go first, and one at a time through the same path a single destroy takes: that
+    /// path is where a venus context's rings are stopped, and a bulk clear of the map would drop
+    /// the contexts while their ring threads were still running against them. The resources
+    /// outlive no one afterwards, so they go once nothing is attached to them.
+    ///
+    /// What is left is a renderer that has been initialized and nothing more -- the config, the
+    /// retirement thread and the venus renderer stay, and an id used before this call is free
+    /// again.
+    pub fn reset(&mut self) {
+        for id in self.contexts.keys().copied().collect::<Vec<_>>() {
+            self.context_destroy(id);
+        }
+        self.resources.write().expect("the resource lock is never poisoned").clear();
+    }
+
     pub fn context(&self, id: CtxId) -> Option<&Context> {
         self.contexts.get(&id)
     }
@@ -801,5 +818,31 @@ mod tests {
         let c = renderer(on).capset(CapsetId::Venus).expect("venus is served");
         assert_eq!(c.use_guest_vram, 1, "a field, read as a field");
         assert_eq!(c.as_bytes().len(), venus::capset::size() as usize);
+    }
+
+    /// A reset leaves nothing of what came before it.
+    ///
+    /// The shim used to print how many contexts and resources it was dropping and drop none of
+    /// them, so a VMM resetting between guest boots carried the previous boot's contexts into the
+    /// next one -- and the ids it had just been told were free came back `ContextExists`.
+    #[test]
+    fn a_reset_frees_the_ids_and_the_memory_it_says_it_frees() {
+        let fd = a_descriptor();
+        let raw = fd.as_raw_fd();
+        let mut r = renderer(Config::default());
+        let ctx = CtxId::new(1).unwrap();
+        let res = ResourceHandle::new(1).unwrap();
+
+        r.context_create(ctx, CapsetId::Virgl, "before".into()).expect("a fresh id");
+        r.resource_import(res, import_desc(4096), fd).expect("a fresh handle and a real size");
+        r.ctx_attach_resource(ctx, res);
+        assert_eq!(r.counts(), (1, 1));
+
+        r.reset();
+
+        assert_eq!(r.counts(), (0, 0), "nothing survives a reset");
+        assert!(!is_open(raw), "and the memory a resource held goes with it");
+        r.context_create(ctx, CapsetId::Virgl, "after".into())
+            .expect("the id the reset freed is free");
     }
 }

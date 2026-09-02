@@ -192,10 +192,7 @@ pub extern "C" fn virgl_renderer_cleanup(_cookie: *mut c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_reset() {
-    with((), |r| {
-        let (res, ctx) = r.counts();
-        eprintln!("[virglrs] reset: dropping {res} resources, {ctx} contexts");
-    });
+    with((), |r| r.reset());
 }
 
 /// The C's implicit current context. Nothing here has one, so there is nothing to force.
