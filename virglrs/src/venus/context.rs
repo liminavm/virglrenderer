@@ -678,6 +678,27 @@ impl Handlers<'_> {
         out
     }
 
+    /// The verdict on a two-call enumeration that never asked how many there are.
+    ///
+    /// Vulkan's enumerations are asked twice -- once for the count, once with room for that many --
+    /// and the count pointer is the only thing carried by both calls. Without it there is no first
+    /// call to answer and no second call to bound: the guest has described neither question.
+    ///
+    /// A predicate rather than an `Option` like its four neighbours, because the count is read
+    /// again *after* the array borrow ends and so cannot be held across it. The generator's
+    /// `has_*` accessor is the only shape that survives that, and the wording belongs here rather
+    /// than at the twelve handlers that ask.
+    /// It owns the wording, not the control flow: each of the twelve still has to return on a
+    /// `false`, and a sabotage that drops one `return` survives this. That is the residue of a
+    /// predicate, and the reason `#[must_use]` is on it -- it closes the half a type can close.
+    #[must_use]
+    fn counted(&mut self, asked: bool) -> bool {
+        if !asked {
+            self.reject = Some("enumerated without asking for a count");
+        }
+        asked
+    }
+
     /// The verdict on a query that did not say what it is asking about.
     ///
     /// The mirror of [`Vkr::fills`], and the same dishonesty from the other side. Every command
@@ -1255,8 +1276,7 @@ impl Commands for Handlers<'_> {
         // fixed array inside an out-struct, where there is nowhere to put a shadow -- so the swap
         // back to the guest's own ids is this handler's, and it has to happen before the reply
         // encodes. Left alone, the guest is handed live host pointers.
-        if !args.has_pPhysicalDeviceGroupCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pPhysicalDeviceGroupCount()) {
             return;
         }
         let instance = args.instance;
@@ -1334,8 +1354,7 @@ impl Commands for Handlers<'_> {
             self.reject = Some("named a layer, which no venus renderer has");
             return;
         }
-        if !args.has_pPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pPropertyCount()) {
             return;
         }
         let advertised = self.driver.advertised_extensions(args.physicalDevice);
@@ -1363,8 +1382,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetPhysicalDeviceQueueFamilyProperties2<'_>,
     ) {
         let pd = args.physicalDevice;
-        if !args.has_pQueueFamilyPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pQueueFamilyPropertyCount()) {
             return;
         }
         // A null array is the guest asking how many there are, which is the spec's own first call.
@@ -1563,8 +1581,7 @@ impl Commands for Handlers<'_> {
         // `vkEnumerateDeviceExtensionProperties` -- and the difference is the answer's, not a
         // policy's. There is no layer whose extensions this list belongs to: it is the renderer's
         // own, so narrowing it by a layer name narrows it to nothing the guest could have meant.
-        if !args.has_pPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pPropertyCount()) {
             return;
         }
         let speaks = crate::venus::driver::renderer_extensions();
@@ -2076,8 +2093,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetPhysicalDeviceQueueFamilyProperties<'_>,
     ) {
         let pd = args.physicalDevice;
-        if !args.has_pQueueFamilyPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pQueueFamilyPropertyCount()) {
             return;
         }
         if !args.has_pQueueFamilyProperties() {
@@ -2107,8 +2123,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetPhysicalDeviceToolProperties<'_>,
     ) {
         let pd = args.physicalDevice;
-        if !args.has_pToolCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pToolCount()) {
             return;
         }
         if !args.has_pToolProperties() {
@@ -2145,8 +2160,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR<'_>,
     ) {
         let pd = args.physicalDevice;
-        if !args.has_pTimeDomainCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pTimeDomainCount()) {
             return;
         }
         if !args.has_pTimeDomains() {
@@ -2186,8 +2200,7 @@ impl Commands for Handlers<'_> {
         let pd = args.physicalDevice;
         let (format, ty, samples) = (args.format, args.r#type, args.samples);
         let (usage, tiling) = (args.usage, args.tiling);
-        if !args.has_pPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pPropertyCount()) {
             return;
         }
         let out = if args.has_pProperties() {
@@ -2224,8 +2237,7 @@ impl Commands for Handlers<'_> {
             self.reject = Some("asked which formats are sparse without naming one");
             return;
         };
-        if !args.has_pPropertyCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pPropertyCount()) {
             return;
         }
         let out = if args.has_pProperties() {
@@ -2251,8 +2263,7 @@ impl Commands for Handlers<'_> {
         args: &mut vn_command_vkGetImageSparseMemoryRequirements<'_>,
     ) {
         let (device, image) = (args.device, args.image);
-        if !args.has_pSparseMemoryRequirementCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pSparseMemoryRequirementCount()) {
             return;
         }
         let out = if args.has_pSparseMemoryRequirements() {
@@ -2282,8 +2293,7 @@ impl Commands for Handlers<'_> {
             self.reject = Some("asked an image's sparse requirements without naming the image");
             return;
         };
-        if !args.has_pSparseMemoryRequirementCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pSparseMemoryRequirementCount()) {
             return;
         }
         let out = if args.has_pSparseMemoryRequirements() {
@@ -2314,8 +2324,7 @@ impl Commands for Handlers<'_> {
                 Some("asked an unbuilt image's sparse requirements without describing it");
             return;
         };
-        if !args.has_pSparseMemoryRequirementCount() {
-            self.reject = Some("enumerated without asking for a count");
+        if !self.counted(args.has_pSparseMemoryRequirementCount()) {
             return;
         }
         let out = if args.has_pSparseMemoryRequirements() {
@@ -4174,6 +4183,72 @@ mod tests {
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
+    }
+
+    /// An enumeration that never asked how many there are.
+    ///
+    /// The count pointer is the only thing Vulkan's two calls have in common: the first writes it,
+    /// the second is bounded by it, and a guest that sends neither has described no question.
+    /// Twelve handlers ask this, all through one helper -- the wording was inline at all twelve
+    /// before, which is how a duplicated refusal got into this file once already.
+    ///
+    /// Both families are checked, because the refusal is the same either way and their answers are
+    /// not: one carries a `VkResult` a refusal could have been written into, the other carries
+    /// nothing at all.
+    #[test]
+    fn an_enumeration_with_no_count_is_refused_before_it_is_asked() {
+        use super::super::proto::types::{
+            vn_command_vkEnumerateDeviceExtensionProperties,
+            vn_command_vkGetPhysicalDeviceQueueFamilyProperties,
+        };
+
+        const MISSING: &str = "enumerated without asking for a count";
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let t = ring_table();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &mut todo,
+                    driver: &mut driver,
+                    global: &global,
+                    reject: None,
+                    unserved: false,
+                    resources: &t,
+                    rings: &mut rings,
+                    replaying: false,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.reject
+            }};
+        }
+
+        // The `ret`-carrying family. Nothing may be written into `ret`: a refused command has no
+        // verdict, and VK_SUCCESS on an enumeration that never happened is the worst answer here.
+        let mut args = vn_command_vkEnumerateDeviceExtensionProperties::default();
+        assert!(!args.has_pPropertyCount());
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkEnumerateDeviceExtensionProperties(&mut args)),
+            Some(MISSING)
+        );
+        assert_eq!(args.ret, VkResult::default(), "no verdict for a call never made");
+
+        // The void family, which has no `ret` and so nothing but the ring to refuse with.
+        let mut args = vn_command_vkGetPhysicalDeviceQueueFamilyProperties::default();
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetPhysicalDeviceQueueFamilyProperties(&mut args)),
+            Some(MISSING)
+        );
     }
 
     /// A bitmask is its own type, at the width the wire gives it.
