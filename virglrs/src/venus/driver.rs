@@ -384,7 +384,7 @@ impl Driver {
     pub fn create_instance(
         &mut self,
         global: &Global,
-        info: Option<&VkInstanceCreateInfo>,
+        info: &VkInstanceCreateInfo,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkInstance, VkResult> {
         // One instance per context, as `objects` describes: a second would orphan the first's
@@ -395,7 +395,7 @@ impl Driver {
         let mut out = VkInstance(0);
         // SAFETY: `info` and `alloc` are the decoder's arena allocations, live for this call, and
         // `out` is a local. The guest cannot make them dangle: the arena outlives the batch.
-        let r = unsafe { (global.vkCreateInstance())(ptr(info), ptr(alloc), &mut out) };
+        let r = unsafe { (global.vkCreateInstance())(info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -504,12 +504,9 @@ impl Driver {
     pub fn create_device(
         &mut self,
         pd: VkPhysicalDevice,
-        info: Option<&VkDeviceCreateInfo>,
+        info: &VkDeviceCreateInfo,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDevice, VkResult> {
-        let Some(info) = info else {
-            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
-        };
         if self.instance.is_none() {
             // A device on an instance this context never created. The guest named an instance the
             // object table resolved, so this cannot happen without a host bug -- but it is the
@@ -645,12 +642,14 @@ impl Driver {
 
     /// A physical-device query that names what it is asking about with a struct.
     ///
-    /// `info` stays an `Option<&I>` right up to the call, which is what keeps the null the guest
-    /// is allowed to send from being a raw pointer anywhere a handler can see it.
+    /// `info` is a borrow rather than an `Option`, for the reason [`Driver::dev_ask_info`] gives:
+    /// vk.xml marks the info struct of every command routed through this family required, so
+    /// there is no null for the helper to forward. A guest that sends one anyway is a guest
+    /// asking a question it did not state, and the handler decides that before it gets here.
     pub fn pd_query_info<I, T, R>(
         &self,
         pd: VkPhysicalDevice,
-        info: Option<&I>,
+        info: &I,
         out: &mut T,
         pick: impl FnOnce(
             &InstanceFns,
@@ -662,8 +661,8 @@ impl Driver {
             .as_ref()
             .and_then(pick)
             .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
-        // SAFETY: as `pd_query`; `info` is an arena allocation live for the call, or null.
-        Ok(unsafe { f(pd, ptr(info), out) })
+        // SAFETY: as `pd_query`; `info` borrows an arena struct live for the call.
+        Ok(unsafe { f(pd, info, out) })
     }
 
     /// A physical-device query whose request is six loose scalars: only
@@ -753,19 +752,20 @@ impl Driver {
         Ok(unsafe { f(device, info) })
     }
 
-    /// A device query that names what it is asking about with a struct.
+    /// A device query that names what it is asking about with a struct. `info` is a borrow for
+    /// the reason [`Driver::pd_query_info`] gives.
     pub fn dev_query_info<I, T, R>(
         &self,
         device: VkDevice,
-        info: Option<&I>,
+        info: &I,
         out: &mut T,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut T) -> R>,
     ) -> Result<R, VkResult> {
         let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
-        // SAFETY: `device` is a handle this table was loaded from, `info` is an arena allocation
-        // live for the call or null, and `out` is a live exclusive borrow.
-        Ok(unsafe { f(device, ptr(info), out) })
+        // SAFETY: `device` is a handle this table was loaded from, `info` borrows an arena struct
+        // live for the call, and `out` is a live exclusive borrow.
+        Ok(unsafe { f(device, info, out) })
     }
 
     /// A device query about one of the device's own objects.
@@ -782,12 +782,13 @@ impl Driver {
         Ok(unsafe { f(device, a, out) })
     }
 
-    /// A device query about one of its objects, narrowed by a struct.
+    /// A device query about one of its objects, narrowed by a struct. `info` is a borrow for the
+    /// reason [`Driver::pd_query_info`] gives.
     pub fn dev_query_arg_info<A, I, T, R>(
         &self,
         device: VkDevice,
         a: A,
-        info: Option<&I>,
+        info: &I,
         out: &mut T,
         pick: impl FnOnce(
             &DeviceFns,
@@ -796,7 +797,7 @@ impl Driver {
         let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`.
-        Ok(unsafe { f(device, a, ptr(info), out) })
+        Ok(unsafe { f(device, a, info, out) })
     }
 
     /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
@@ -997,16 +998,12 @@ impl Driver {
     }
 
     /// A device's queue, which is owned by the device and never created or destroyed.
-    pub fn device_queue(
-        &mut self,
-        device: VkDevice,
-        info: Option<&VkDeviceQueueInfo2>,
-    ) -> Option<VkQueue> {
+    pub fn device_queue(&mut self, device: VkDevice, info: &VkDeviceQueueInfo2) -> Option<VkQueue> {
         let d = self.devices.get(&device.0)?;
         let mut out = VkQueue(0);
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
-        unsafe { (d.fns.vkGetDeviceQueue2())(device, ptr(info), &mut out) };
+        unsafe { (d.fns.vkGetDeviceQueue2())(device, info, &mut out) };
         if out.0 == 0 {
             return None;
         }
@@ -1195,7 +1192,7 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: Option<&I>,
+        info: &I,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<u64, VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
@@ -1204,7 +1201,7 @@ impl Driver {
         let mut out = T::from_raw(0);
         // SAFETY: `device` is a handle in this table, `info` and `alloc` are the decoder's arena
         // allocations live for this call, and `out` is a local.
-        let r = unsafe { proc(&d.fns)(device, ptr(info), ptr(alloc), &mut out) };
+        let r = unsafe { proc(&d.fns)(device, info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -1250,14 +1247,14 @@ impl Driver {
         device: VkDevice,
         pool: u64,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
-        info: Option<&I>,
+        info: &I,
         out: &mut [T],
         ids: &[ObjectId],
     ) -> Result<(), VkResult> {
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
-        if info.is_none() || out.is_empty() {
+        if out.is_empty() {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         }
         // The pool is re-checked here for the same reason the device is: the guest may have
@@ -1267,7 +1264,7 @@ impl Driver {
         }
         // SAFETY: `device` is a handle in this table; `info` is an arena allocation live for the
         // call, and `out` is the arena array the decoder sized from the count inside `info`.
-        let r = unsafe { proc(&d.fns)(device, ptr(info), out.as_mut_ptr()) };
+        let r = unsafe { proc(&d.fns)(device, info, out.as_mut_ptr()) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
@@ -1455,7 +1452,7 @@ impl Driver {
             *const VkAllocationCallbacks,
             *mut T,
         ) -> VkResult,
-        info: Option<&I>,
+        info: &I,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<u64, VkResult> {
         let handle = self.create_object(device, proc, info, alloc)?;
@@ -1507,12 +1504,12 @@ impl Driver {
     pub fn begin_command_buffer(
         &self,
         cb: VkCommandBuffer,
-        info: Option<&VkCommandBufferBeginInfo>,
+        info: &VkCommandBufferBeginInfo,
     ) -> Option<VkResult> {
         let d = self.recorder(cb)?;
         // SAFETY: a command buffer this context allocated, and `info` is an arena allocation
         // live for the call. The same holds for every call in this section.
-        Some(unsafe { (d.vkBeginCommandBuffer())(cb, ptr(info)) })
+        Some(unsafe { (d.vkBeginCommandBuffer())(cb, info) })
     }
 
     pub fn end_command_buffer(&self, cb: VkCommandBuffer) -> Option<VkResult> {
@@ -1568,12 +1565,12 @@ impl Driver {
     pub fn cmd_begin_render_pass(
         &self,
         cb: VkCommandBuffer,
-        begin: Option<&VkRenderPassBeginInfo>,
+        begin: &VkRenderPassBeginInfo,
         contents: VkSubpassContents,
     ) -> Option<()> {
         let d = self.recorder(cb)?;
         // SAFETY: as above.
-        unsafe { (d.vkCmdBeginRenderPass())(cb, ptr(begin), contents) };
+        unsafe { (d.vkCmdBeginRenderPass())(cb, begin, contents) };
         Some(())
     }
 
@@ -2100,12 +2097,9 @@ impl Driver {
         &mut self,
         device: VkDevice,
         id: ObjectId,
-        info: Option<&VkMemoryAllocateInfo>,
+        info: &VkMemoryAllocateInfo,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDeviceMemory, VkResult> {
-        let Some(info) = info else {
-            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
-        };
         let Some(d) = self.devices.get(&device.0) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
