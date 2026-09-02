@@ -2009,16 +2009,11 @@ impl Commands for Handlers<'_> {
             return;
         };
 
-        let bits = match self.driver.host_visible_memory_types(device) {
-            Ok(bits) => bits,
-            // A device this renderer has no table for is the other kind of failure: not the
-            // guest's state, ours. It goes back through the query family's refusal like every
-            // other query that could not be put at all.
-            Err(_) => {
-                self.reject = Some("asked a query this driver cannot answer");
-                return;
-            }
-        };
+        // A device this renderer has no table for is the other kind of failure: not the guest's
+        // state, ours. It goes back through the query family's own refusal rather than a second
+        // copy of its wording -- there is one policy here, so there is one place that states it.
+        let asked = self.driver.host_visible_memory_types(device);
+        let Some(bits) = self.asked(asked) else { return };
 
         // The answer has to agree with what the allocation path will do with the same resource --
         // see `Driver::host_visible_memory_types`. A guest reads this, intersects it with the
