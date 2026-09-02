@@ -22,15 +22,16 @@ use super::proto::types::{
     VkCommandBufferResetFlags, VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags,
     VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
     VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
-    VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkFramebuffer,
-    VkImage, VkImageLayout, VkImageMemoryBarrier, VkImageView, VkImportSemaphoreFdInfoKHR,
-    VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier,
-    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkObjectType, VkPhysicalDevice,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkResult, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
-    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule, VkStructureType,
-    VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
+    VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkFormat,
+    VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout,
+    VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
+    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkObjectType,
+    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint,
+    VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D,
+    VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampler, VkSamplerYcbcrConversion,
+    VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule,
+    VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -592,6 +593,90 @@ impl Driver {
             .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `pd_query`; `info` is an arena allocation live for the call, or null.
         Ok(unsafe { f(pd, ptr(info), out) })
+    }
+
+    /// A physical-device query whose request is six loose scalars: only
+    /// `vkGetPhysicalDeviceImageFormatProperties`, and it is spelled out rather than made generic
+    /// because six interchangeable-looking values in a row is precisely what a type parameter
+    /// would stop catching. The `2` spelling next door gathers the same six into a struct.
+    ///
+    /// `Ok(VK_ERROR_FORMAT_NOT_SUPPORTED)` is the driver's ordinary answer to a format probe, not
+    /// a failure to ask -- guests loop over formats expecting it. Only `Err` means this renderer
+    /// could not put the question, and only that is a refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn image_format_properties(
+        &self,
+        pd: VkPhysicalDevice,
+        format: VkFormat,
+        ty: VkImageType,
+        tiling: VkImageTiling,
+        usage: VkImageUsageFlags,
+        flags: VkImageCreateFlags,
+        out: &mut VkImageFormatProperties,
+        pick: impl FnOnce(
+            &InstanceFns,
+        ) -> Option<
+            unsafe extern "C" fn(
+                VkPhysicalDevice,
+                VkFormat,
+                VkImageType,
+                VkImageTiling,
+                VkImageUsageFlags,
+                VkImageCreateFlags,
+                *mut VkImageFormatProperties,
+            ) -> VkResult,
+        >,
+    ) -> Result<VkResult, VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `pd_query`; the six between the handle and the answer are plain scalars the
+        // guest sent, passed in the order Vulkan declares them.
+        Ok(unsafe { f(pd, format, ty, tiling, usage, flags, out) })
+    }
+
+    /// What one device in a group may do with another's memory:
+    /// `vkGetDeviceGroupPeerMemoryFeatures`.
+    ///
+    /// Three `u32`s in a row, and two of them are device indices that mean opposite things. Named
+    /// parameters are the only thing standing between "what may the local device do with the
+    /// remote one's memory" and its mirror image, which is a different answer and compiles.
+    pub fn peer_memory_features<T, R>(
+        &self,
+        device: VkDevice,
+        heap_index: u32,
+        local_device: u32,
+        remote_device: u32,
+        out: &mut T,
+        pick: impl FnOnce(
+            &DeviceFns,
+        ) -> Option<unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut T) -> R>,
+    ) -> Result<R, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `dev_query_info`; the three indices are plain scalars off the wire.
+        Ok(unsafe { f(device, heap_index, local_device, remote_device, out) })
+    }
+
+    /// A device query whose answer is the entry point's own return value, with no out-parameter
+    /// at all: the three address queries.
+    ///
+    /// The only query family where a refusal cannot be softened. There is no struct to leave
+    /// unfilled and no `VkResult` to carry an error, so a driver this renderer could not ask
+    /// leaves nothing but the zero the reply would encode -- and zero is a null address the guest
+    /// would hand straight to the GPU. `Err` here has to reach the guest as a stopped ring.
+    pub fn dev_ask_info<I, R>(
+        &self,
+        device: VkDevice,
+        info: Option<&I>,
+        pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> R>,
+    ) -> Result<R, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        // SAFETY: as `dev_query_info`; `info` is an arena allocation live for the call, or null.
+        Ok(unsafe { f(device, ptr(info)) })
     }
 
     /// A device query that names what it is asking about with a struct.

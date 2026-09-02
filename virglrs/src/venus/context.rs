@@ -49,16 +49,30 @@ use super::proto::types::{
     vn_command_vkEnumerateDeviceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkFlushMappedMemoryRanges, vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
-    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
+    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
+    vn_command_vkGetDescriptorSetLayoutSupport, vn_command_vkGetDeviceBufferMemoryRequirements,
+    vn_command_vkGetDeviceGroupPeerMemoryFeatures, vn_command_vkGetDeviceImageMemoryRequirements,
+    vn_command_vkGetDeviceImageSubresourceLayout, vn_command_vkGetDeviceMemoryCommitment,
+    vn_command_vkGetDeviceMemoryOpaqueCaptureAddress, vn_command_vkGetDeviceQueue2,
     vn_command_vkGetEventStatus, vn_command_vkGetFenceStatus,
-    vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements2,
-    vn_command_vkGetImageSubresourceLayout, vn_command_vkGetPhysicalDeviceExternalFenceProperties,
+    vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements,
+    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
+    vn_command_vkGetImageSubresourceLayout2,
+    vn_command_vkGetPhysicalDeviceExternalBufferProperties,
+    vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
-    vn_command_vkGetPhysicalDeviceFeatures2, vn_command_vkGetPhysicalDeviceFormatProperties2,
+    vn_command_vkGetPhysicalDeviceFeatures, vn_command_vkGetPhysicalDeviceFeatures2,
+    vn_command_vkGetPhysicalDeviceFormatProperties,
+    vn_command_vkGetPhysicalDeviceFormatProperties2,
+    vn_command_vkGetPhysicalDeviceImageFormatProperties,
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
-    vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
-    vn_command_vkGetPhysicalDeviceProperties2,
-    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkGetSemaphoreCounterValue,
+    vn_command_vkGetPhysicalDeviceMemoryProperties,
+    vn_command_vkGetPhysicalDeviceMemoryProperties2,
+    vn_command_vkGetPhysicalDeviceMultisamplePropertiesEXT,
+    vn_command_vkGetPhysicalDeviceProperties, vn_command_vkGetPhysicalDeviceProperties2,
+    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkGetRenderAreaGranularity,
+    vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
     vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
     vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle,
     vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
@@ -1670,6 +1684,251 @@ impl Commands for Handlers<'_> {
         self.asked(r);
     }
 
+    fn vkGetPhysicalDeviceFeatures(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceFeatures<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pFeatures_mut()) else { return };
+        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceFeatures());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceMemoryProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceMemoryProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(out) = self.fills(args.pMemoryProperties_mut()) else { return };
+        let r = self.driver.pd_query(pd, out, |i| i.try_vkGetPhysicalDeviceMemoryProperties());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceFormatProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceFormatProperties<'_>,
+    ) {
+        let (pd, format) = (args.physicalDevice, args.format);
+        let Some(out) = self.fills(args.pFormatProperties_mut()) else { return };
+        let r = self
+            .driver
+            .pd_query_arg(pd, format, out, |i| i.try_vkGetPhysicalDeviceFormatProperties());
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceMultisamplePropertiesEXT(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceMultisamplePropertiesEXT<'_>,
+    ) {
+        let (pd, samples) = (args.physicalDevice, args.samples);
+        let Some(out) = self.fills(args.pMultisampleProperties_mut()) else { return };
+        let r = self.driver.pd_query_arg(pd, samples, out, |i| {
+            i.try_vkGetPhysicalDeviceMultisamplePropertiesEXT()
+        });
+        self.asked(r);
+    }
+
+    fn vkGetPhysicalDeviceExternalBufferProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceExternalBufferProperties<'_>,
+    ) {
+        let (pd, info) = (args.physicalDevice, args.pExternalBufferInfo);
+        let Some(out) = self.fills(args.pExternalBufferProperties_mut()) else { return };
+        let r = self
+            .driver
+            .pd_query_info(pd, info, out, |i| i.try_vkGetPhysicalDeviceExternalBufferProperties());
+        self.asked(r);
+    }
+
+    fn vkGetBufferMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetBufferMemoryRequirements<'_>,
+    ) {
+        let (device, buffer) = (args.device, args.buffer);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_arg(device, buffer, out, |d| d.try_vkGetBufferMemoryRequirements());
+        self.asked(r);
+    }
+
+    fn vkGetImageMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetImageMemoryRequirements<'_>,
+    ) {
+        let (device, image) = (args.device, args.image);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r =
+            self.driver.dev_query_arg(device, image, out, |d| d.try_vkGetImageMemoryRequirements());
+        self.asked(r);
+    }
+
+    fn vkGetDeviceMemoryCommitment(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceMemoryCommitment<'_>,
+    ) {
+        let (device, memory) = (args.device, args.memory);
+        let Some(out) = self.fills(args.pCommittedMemoryInBytes_mut()) else { return };
+        let r =
+            self.driver.dev_query_arg(device, memory, out, |d| d.try_vkGetDeviceMemoryCommitment());
+        self.asked(r);
+    }
+
+    fn vkGetRenderAreaGranularity(&mut self, args: &mut vn_command_vkGetRenderAreaGranularity<'_>) {
+        let (device, pass) = (args.device, args.renderPass);
+        let Some(out) = self.fills(args.pGranularity_mut()) else { return };
+        let r =
+            self.driver.dev_query_arg(device, pass, out, |d| d.try_vkGetRenderAreaGranularity());
+        self.asked(r);
+    }
+
+    fn vkGetRenderingAreaGranularity(
+        &mut self,
+        args: &mut vn_command_vkGetRenderingAreaGranularity<'_>,
+    ) {
+        let (device, info) = (args.device, args.pRenderingAreaInfo);
+        let Some(out) = self.fills(args.pGranularity_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetRenderingAreaGranularity());
+        self.asked(r);
+    }
+
+    fn vkGetDeviceBufferMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceBufferMemoryRequirements<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetDeviceBufferMemoryRequirements());
+        self.asked(r);
+    }
+
+    fn vkGetDeviceImageMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceImageMemoryRequirements<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetDeviceImageMemoryRequirements());
+        self.asked(r);
+    }
+
+    fn vkGetDescriptorSetLayoutSupport(
+        &mut self,
+        args: &mut vn_command_vkGetDescriptorSetLayoutSupport<'_>,
+    ) {
+        let (device, info) = (args.device, args.pCreateInfo);
+        let Some(out) = self.fills(args.pSupport_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetDescriptorSetLayoutSupport());
+        self.asked(r);
+    }
+
+    fn vkGetDeviceImageSubresourceLayout(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceImageSubresourceLayout<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let Some(out) = self.fills(args.pLayout_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_info(device, info, out, |d| d.try_vkGetDeviceImageSubresourceLayout());
+        self.asked(r);
+    }
+
+    fn vkGetImageSubresourceLayout2(
+        &mut self,
+        args: &mut vn_command_vkGetImageSubresourceLayout2<'_>,
+    ) {
+        let (device, image, sub) = (args.device, args.image, args.pSubresource);
+        let Some(out) = self.fills(args.pLayout_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_arg_info(device, image, sub, out, |d| d.try_vkGetImageSubresourceLayout2());
+        self.asked(r);
+    }
+
+    /// Probe what the driver will do with one combination of format, type, tiling and usage.
+    ///
+    /// The one query in this section whose failure is an *answer*.
+    /// `VK_ERROR_FORMAT_NOT_SUPPORTED` is how a driver says no to a probe, and a guest walks
+    /// a table of formats collecting exactly that -- so it goes back in `ret` like any other
+    /// result. What is refused is the other thing: this renderer unable to put the question at
+    /// all, which leaves the properties struct as the guest sent it and no way to say so.
+    fn vkGetPhysicalDeviceImageFormatProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceImageFormatProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let (format, ty, tiling) = (args.format, args.r#type, args.tiling);
+        let (usage, flags) = (args.usage, args.flags);
+        let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
+        let r =
+            self.driver.image_format_properties(pd, format, ty, tiling, usage, flags, out, |i| {
+                i.try_vkGetPhysicalDeviceImageFormatProperties()
+            });
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
+    fn vkGetDeviceGroupPeerMemoryFeatures(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceGroupPeerMemoryFeatures<'_>,
+    ) {
+        let device = args.device;
+        let (heap, local, remote) = (args.heapIndex, args.localDeviceIndex, args.remoteDeviceIndex);
+        let Some(out) = self.fills(args.pPeerMemoryFeatures_mut()) else { return };
+        let r = self.driver.peer_memory_features(device, heap, local, remote, out, |d| {
+            d.try_vkGetDeviceGroupPeerMemoryFeatures()
+        });
+        self.asked(r);
+    }
+
+    /// The three queries whose whole answer is the number they return.
+    ///
+    /// No out-struct, so nothing here can be half-filled -- and no `VkResult` either, so
+    /// nothing can carry a refusal. A driver this renderer could not ask leaves `ret` at zero,
+    /// and zero is a null address the guest would hand to the GPU. See
+    /// [`Driver::dev_ask_info`]: the only honest thing left is to stop the ring.
+    fn vkGetBufferDeviceAddress(&mut self, args: &mut vn_command_vkGetBufferDeviceAddress<'_>) {
+        let (device, info) = (args.device, args.pInfo);
+        let r = self.driver.dev_ask_info(device, info, |d| d.try_vkGetBufferDeviceAddress());
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
+    fn vkGetBufferOpaqueCaptureAddress(
+        &mut self,
+        args: &mut vn_command_vkGetBufferOpaqueCaptureAddress<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let r = self.driver.dev_ask_info(device, info, |d| d.try_vkGetBufferOpaqueCaptureAddress());
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
+    fn vkGetDeviceMemoryOpaqueCaptureAddress(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceMemoryOpaqueCaptureAddress<'_>,
+    ) {
+        let (device, info) = (args.device, args.pInfo);
+        let r = self
+            .driver
+            .dev_ask_info(device, info, |d| d.try_vkGetDeviceMemoryOpaqueCaptureAddress());
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
     // ------------------------------------------------------------------------ pipelines
     //
     // Not a `simple_create`: one command makes a run of them, and it is the only create that can
@@ -3128,6 +3387,458 @@ mod tests {
         ));
         assert!(!ctx.submit(&batch, &mut todo, &g, &t), "no device to ask");
         assert!(ctx.fatal());
+    }
+
+    /// What one command's reply looks like when the answer is the one given, built by the
+    /// generator's own encoder for it.
+    ///
+    /// The counterpart of [`wire!`], and there for the same reason: a query's reply is a struct
+    /// laid out field by field, and writing those bytes out by hand in a test would be a second
+    /// implementation of the wire that drifts the moment vk.xml moves. What this pins is
+    /// everything between the driver's write and the guest's memory -- that the handler asked, that
+    /// the driver's answer landed in the struct the reply reads, and that the reply reached the
+    /// window the ring named. The encoder itself is pinned by the reply oracle, not here.
+    macro_rules! reply {
+        ($size:path, $encode:path, $args:expr) => {{
+            let args = $args;
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; $size(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            $encode(&mut enc, &args);
+            buf
+        }};
+    }
+
+    /// A query's answer travels the whole way: the driver writes a struct, and the guest reads
+    /// that struct out of its own window.
+    ///
+    /// The output direction, which nothing else covers. The input direction is pinned by the
+    /// timeline witness and by replay; a query's *answer* is seen by neither -- replay strips the
+    /// reply flag, and the reply oracle compares encoders against the C's without ever asking
+    /// whether a driver was called.
+    ///
+    /// `vkGetImageSubresourceLayout2` drives it because it is the maximal shape in this group: a
+    /// device, an object handle, an in-struct and an out-struct. Every field asserted on carries a
+    /// distinct non-zero value, so a reply that encoded only part of the struct cannot pass.
+    #[test]
+    fn a_querys_answer_reaches_the_guests_window() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDeviceSize, VkImage, VkImageSubresource, VkImageSubresource2,
+            VkStructureType, VkSubresourceLayout, VkSubresourceLayout2,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const WINDOW: usize = 0x21000;
+        const GUEST_DEV: u64 = 0x5001;
+        const GUEST_IMG: u64 = 0x5002;
+        const HOST_IMG: u64 = 0x811;
+
+        /// The answer, with nothing zero in it and no two fields alike.
+        fn answer() -> VkSubresourceLayout2 {
+            VkSubresourceLayout2 {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,
+                subresourceLayout: VkSubresourceLayout {
+                    offset: VkDeviceSize(0x1000),
+                    size: VkDeviceSize(0x2000),
+                    rowPitch: VkDeviceSize(0x300),
+                    arrayPitch: VkDeviceSize(0x40),
+                    depthPitch: VkDeviceSize(0x5),
+                },
+                ..Default::default()
+            }
+        }
+
+        /// One layout query as the driver saw it. Named fields rather than a tuple, so a
+        /// mismatch reads as which value moved.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Asked {
+            device: u64,
+            image: u64,
+            aspect: u32,
+            mip: u32,
+            layer: u32,
+        }
+
+        thread_local! {
+            static SAW: RefCell<Vec<Asked>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn layout(
+            device: VkDevice,
+            image: VkImage,
+            sub: *const VkImageSubresource2,
+            out: *mut VkSubresourceLayout2,
+        ) {
+            assert!(!sub.is_null() && !out.is_null(), "both structs arrive with their pointers");
+            // SAFETY: this stub stands where the driver stands: `sub` is the arena struct the
+            // decoder filled and `out` the arena slot the reply will read back, both live for the
+            // call.
+            unsafe {
+                let s = (*sub).imageSubresource;
+                SAW.with_borrow_mut(|v| {
+                    v.push(Asked {
+                        device: device.0,
+                        image: image.0,
+                        aspect: s.aspectMask.0,
+                        mip: s.mipLevel,
+                        layer: s.arrayLayer,
+                    })
+                });
+                *out = answer();
+            }
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetImageSubresourceLayout2(layout);
+        fns.plant_vkDeviceWaitIdle(idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        ctx.driver.plant_device(DEVICE, fns);
+        {
+            let mut table = ctx.objects.borrow_mut();
+            for (id, host, ty) in [
+                (GUEST_DEV, DEVICE, VkObjectType::VK_OBJECT_TYPE_DEVICE),
+                (GUEST_IMG, HOST_IMG, VkObjectType::VK_OBJECT_TYPE_IMAGE),
+            ] {
+                table.add(ObjectId(id), ty, host, None).expect("a fresh id");
+            }
+        }
+
+        let sub = VkImageSubresource2 {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+            imageSubresource: VkImageSubresource {
+                aspectMask: VkFlags(0x2),
+                mipLevel: 3,
+                arrayLayer: 5,
+            },
+            ..Default::default()
+        };
+        let mut layout_out = VkSubresourceLayout2::default();
+        let mut q = ty::vn_command_vkGetImageSubresourceLayout2::default();
+        q.device = VkDevice(GUEST_DEV);
+        q.image = VkImage(GUEST_IMG);
+        q.pSubresource = Some(&sub);
+        q.plant_pLayout(&mut layout_out);
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetImageSubresourceLayout2_args,
+            ser::vn_encode_vkGetImageSubresourceLayout2_args,
+            q,
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served query does not poison");
+        SAW.with_borrow(|v| {
+            assert_eq!(
+                *v,
+                [Asked { device: DEVICE, image: HOST_IMG, aspect: 0x2, mip: 3, layer: 5 }],
+                "host handles, and the subresource the guest asked about"
+            )
+        });
+
+        // What the guest should be looking at, built the only honest way: by handing the
+        // generator's own reply encoder the answer the driver gave.
+        let mut expect_out = answer();
+        let mut expect = ty::vn_command_vkGetImageSubresourceLayout2::default();
+        expect.plant_pLayout(&mut expect_out);
+        let want = reply!(
+            ser::vn_sizeof_vkGetImageSubresourceLayout2_reply,
+            ser::vn_encode_vkGetImageSubresourceLayout2_reply,
+            expect
+        );
+        let mut got = vec![0u8; want.len()];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, want, "the driver's whole answer, in the guest's memory");
+    }
+
+    /// A format probe the driver says no to is an answer, not a refusal.
+    ///
+    /// `VK_ERROR_FORMAT_NOT_SUPPORTED` is how a driver declines one combination of format, type,
+    /// tiling and usage, and a guest walks a table of them collecting exactly that. Treating it as
+    /// a failure to ask would stop the ring on a guest doing something completely ordinary. The
+    /// line the handler draws is between the driver's own answer and this renderer being unable to
+    /// put the question at all -- only the second is a refusal.
+    ///
+    /// It also pins the six loose scalars, which is the other reason this command is here: they
+    /// are interchangeable to the compiler and passing `usage` where `tiling` goes builds.
+    #[test]
+    fn a_format_probe_the_driver_declines_is_still_an_answer() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkFormat, VkImageFormatProperties, VkImageTiling, VkImageType,
+            VkInstance, VkPhysicalDevice,
+        };
+        use std::cell::RefCell;
+
+        const WINDOW: usize = 0x21000;
+        const GUEST_PD: u64 = 0x5001;
+        const HOST_PD: u64 = 0x711;
+        const DECLINED: VkResult = VkResult::VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+        /// One probe as the driver saw it. The six are all bare integers to the compiler, so
+        /// naming them here is what makes a swapped pair read as one.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Probe {
+            pd: u64,
+            format: i32,
+            ty: i32,
+            tiling: i32,
+            usage: u32,
+            flags: u32,
+        }
+
+        thread_local! {
+            static SAW: RefCell<Vec<Probe>> = const { RefCell::new(Vec::new()) };
+        }
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn probe(
+            pd: VkPhysicalDevice,
+            format: VkFormat,
+            ty: VkImageType,
+            tiling: VkImageTiling,
+            usage: VkFlags,
+            flags: VkFlags,
+            out: *mut VkImageFormatProperties,
+        ) -> VkResult {
+            assert!(!out.is_null(), "the handler refuses a probe with nowhere to answer");
+            SAW.with_borrow_mut(|v| {
+                v.push(Probe {
+                    pd: pd.0,
+                    format: format.0,
+                    ty: ty.0,
+                    tiling: tiling.0,
+                    usage: usage.0,
+                    flags: flags.0,
+                })
+            });
+            DECLINED
+        }
+        unsafe extern "C" fn destroy_instance(_i: VkInstance, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceImageFormatProperties(probe);
+        fns.plant_vkDestroyInstance(destroy_instance);
+        ctx.driver.plant_instance(fns);
+        ctx.objects
+            .borrow_mut()
+            .add(ObjectId(GUEST_PD), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE, HOST_PD, None)
+            .expect("a fresh id");
+
+        // Six values, no two alike, so a pair passed in the wrong order cannot look right.
+        let mut props = VkImageFormatProperties::default();
+        let mut q = ty::vn_command_vkGetPhysicalDeviceImageFormatProperties::default();
+        q.physicalDevice = VkPhysicalDevice(GUEST_PD);
+        q.format = VkFormat(37);
+        q.r#type = VkImageType(1);
+        q.tiling = VkImageTiling(2);
+        q.usage = VkFlags(0x40);
+        q.flags = VkFlags(0x800);
+        q.plant_pImageFormatProperties(&mut props);
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetPhysicalDeviceImageFormatProperties_args,
+            ser::vn_encode_vkGetPhysicalDeviceImageFormatProperties_args,
+            q,
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "the driver answered, so the ring lives on");
+        SAW.with_borrow(|v| {
+            assert_eq!(
+                *v,
+                [Probe { pd: HOST_PD, format: 37, ty: 1, tiling: 2, usage: 0x40, flags: 0x800 }],
+                "the physical device, then format, type, tiling, usage, flags, in that order"
+            )
+        });
+
+        let mut got = [0u8; 8];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(
+            i32::from_le_bytes([got[4], got[5], got[6], got[7]]),
+            DECLINED.0,
+            "the driver's refusal of this format, carried back as the answer it is"
+        );
+    }
+
+    /// The query helpers hand the driver the guest's own arguments, and refuse rather than invent.
+    ///
+    /// Two things at once, because they are the same risk seen from either side. Every helper in
+    /// this group takes a handle or a run of scalars that the compiler cannot tell apart, so a
+    /// transposition builds; and every one of them can fail to ask at all, where the only wrong
+    /// answer is a confident one -- an unfilled struct encoded as though the host had written it,
+    /// or an address of zero the guest would hand to the GPU.
+    #[test]
+    fn a_query_forwards_what_it_was_given_and_refuses_what_it_cannot_ask() {
+        use super::super::proto::types::{
+            VkBuffer, VkBufferDeviceAddressInfo, VkDeviceAddress, VkImage, VkMemoryRequirements,
+            VkPeerMemoryFeatureFlags,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const ADDRESS: u64 = 0xdead_0000_beef;
+
+        #[derive(Default)]
+        struct Saw {
+            buffers: Vec<u64>,
+            images: Vec<u64>,
+            peers: Vec<(u32, u32, u32)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn buffer_reqs(
+            _d: VkDevice,
+            buffer: VkBuffer,
+            out: *mut VkMemoryRequirements,
+        ) {
+            assert!(!out.is_null());
+            SAW.with_borrow_mut(|s| s.buffers.push(buffer.0));
+        }
+        unsafe extern "C" fn image_reqs(
+            _d: VkDevice,
+            image: VkImage,
+            out: *mut VkMemoryRequirements,
+        ) {
+            assert!(!out.is_null());
+            SAW.with_borrow_mut(|s| s.images.push(image.0));
+        }
+        unsafe extern "C" fn peers(
+            _d: VkDevice,
+            heap: u32,
+            local: u32,
+            remote: u32,
+            out: *mut VkPeerMemoryFeatureFlags,
+        ) {
+            assert!(!out.is_null());
+            SAW.with_borrow_mut(|s| s.peers.push((heap, local, remote)));
+        }
+        unsafe extern "C" fn address(
+            _d: VkDevice,
+            info: *const VkBufferDeviceAddressInfo,
+        ) -> VkDeviceAddress {
+            assert!(!info.is_null(), "a required struct arrives with its pointer");
+            VkDeviceAddress(ADDRESS)
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetBufferMemoryRequirements(buffer_reqs);
+        fns.plant_vkGetImageMemoryRequirements(image_reqs);
+        fns.plant_vkGetDeviceGroupPeerMemoryFeatures(peers);
+        fns.plant_vkGetBufferDeviceAddress(address);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        let device = VkDevice(DEVICE);
+
+        // Buffer and image requirements have identical shapes and adjacent entry points; each has
+        // to reach its own.
+        let mut reqs = VkMemoryRequirements::default();
+        let mut args = vn_command_vkGetBufferMemoryRequirements::default();
+        args.device = device;
+        args.buffer = VkBuffer(0x111);
+        args.plant_pMemoryRequirements(&mut reqs);
+        h.vkGetBufferMemoryRequirements(&mut args);
+
+        let mut reqs = VkMemoryRequirements::default();
+        let mut args = vn_command_vkGetImageMemoryRequirements::default();
+        args.device = device;
+        args.image = VkImage(0x222);
+        args.plant_pMemoryRequirements(&mut reqs);
+        h.vkGetImageMemoryRequirements(&mut args);
+
+        // Three `u32`s, two of which mean opposite things.
+        let mut feats = VkPeerMemoryFeatureFlags::default();
+        let mut args = vn_command_vkGetDeviceGroupPeerMemoryFeatures::default();
+        args.device = device;
+        args.heapIndex = 1;
+        args.localDeviceIndex = 2;
+        args.remoteDeviceIndex = 3;
+        args.plant_pPeerMemoryFeatures(&mut feats);
+        h.vkGetDeviceGroupPeerMemoryFeatures(&mut args);
+
+        // The answer is the return value, and nothing else carries it.
+        let info = VkBufferDeviceAddressInfo::default();
+        let mut args = vn_command_vkGetBufferDeviceAddress {
+            device,
+            pInfo: Some(&info),
+            ..Default::default()
+        };
+        h.vkGetBufferDeviceAddress(&mut args);
+        assert_eq!(args.ret.0, ADDRESS, "the driver's address, not a zero of ours");
+
+        assert!(h.reject.is_none(), "every one of those was answerable");
+        SAW.with_borrow(|s| {
+            assert_eq!(s.buffers, [0x111], "the buffer went to the buffer query");
+            assert_eq!(s.images, [0x222], "and the image to the image one");
+            assert_eq!(s.peers, [(1, 2, 3)], "heap, then local, then remote");
+        });
+
+        // A query with no struct to answer into: there is nowhere to put an answer, and encoding
+        // the guest's own bytes back at it would be indistinguishable from one.
+        let mut args = vn_command_vkGetBufferMemoryRequirements::default();
+        args.device = device;
+        h.vkGetBufferMemoryRequirements(&mut args);
+        assert!(h.reject.take().is_some(), "a query with nowhere to answer");
+
+        // A query this driver has no entry point for. `vkGetRenderAreaGranularity` was never
+        // planted above, so the table has no opinion about it.
+        let mut extent = super::super::proto::types::VkExtent2D::default();
+        let mut args = vn_command_vkGetRenderAreaGranularity::default();
+        args.device = device;
+        args.plant_pGranularity(&mut extent);
+        h.vkGetRenderAreaGranularity(&mut args);
+        assert!(h.reject.take().is_some(), "a query this driver cannot answer");
+
+        // The address queries have no field in which to say no, so a failed ask must reject too:
+        // `ret` stays zero, and zero is a null address.
+        let info = super::super::proto::types::VkDeviceMemoryOpaqueCaptureAddressInfo::default();
+        let mut args = vn_command_vkGetDeviceMemoryOpaqueCaptureAddress {
+            device,
+            pInfo: Some(&info),
+            ..Default::default()
+        };
+        h.vkGetDeviceMemoryOpaqueCaptureAddress(&mut args);
+        assert!(h.reject.take().is_some(), "an address this driver cannot be asked for");
+        assert_eq!(args.ret, 0, "and nothing was invented to fill it");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
     }
 
     /// A wait or a signal that names no semaphores at all is refused, not forwarded.
