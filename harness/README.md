@@ -182,17 +182,24 @@ the renderer is perfectly deterministic.
 ### Scoring the port against the C, and what still differs
 
 A fixture is recorded from the C, so the gate ladder compares Rust to Rust and a fixture mismatch
-means a regression. Reading a Rust score against the *C's* score is a different question, and on
-`synoik` both sides now census 22 allocations and agree byte-for-byte on the twenty they share.
+means a regression. Reading a Rust score against the *C's* score is a different question. On
+`synoik` the C censuses 22 allocations and this censuses 20, and the 20 are the C's 20: every one
+agrees byte-for-byte.
 
-The equal totals are two differences cancelling, not a match. The C censuses the two `flags=0x7`
-scanout exports and skips the two allocations that import them; this does the opposite, skipping
-everything it exports and censusing the imports. Both halves are the same missing piece. On the C
-that memory is a host-pointer import of its own dedicated image's IOSurface — the memory *is* the
-surface, `vkMapMemory` refuses it, and the content read resolves through the surface instead. This
-renderer has no IOSurface, so a scanout allocation is ordinary mappable memory that exports like
-any other, and nothing marks an import as aliasing storage that lives elsewhere. Until both exist,
-`iosurface backed=0` is the third face of it.
+The two it does not report are the `flags=0x7` scanout exports. On the C that memory is a
+host-pointer import of its own dedicated image's IOSurface — the memory *is* the surface,
+`vkMapMemory` refuses it, and the content read resolves through the surface instead, so the C
+censuses it. Here a scanout allocation is ordinary mappable memory published as a blob, and the
+census reports storage once, at whoever owns it. Until the surface exists there is nothing to
+census it *as*, and `iosurface backed=0` is the other face of the same gap.
+
+Equal totals are not agreement. These two censuses read 22 against 22 while sharing only twenty
+entries, because a missing export and a missing import cancelled. Compare the ids, never the count.
+
+Claims about what a corpus contains are settled against the corpus. Both of the allocations this
+census used to over-report were imports, and that was established by printing every allocation's
+`pNext` verdict during a replay — two imports in 31 allocations, exactly the two ids in dispute —
+not by reasoning from the C's source about which ones ought to be.
 
 Before concluding anything from a hash, compute the all-zero FNV-1a for that read length. Empty
 and wrong are different findings and the score does not distinguish them: a refused command leaves
