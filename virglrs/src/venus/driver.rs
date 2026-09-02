@@ -1730,6 +1730,65 @@ impl Driver {
         unsafe { proc(&d.fns)(device, infos.len() as u32, infos.as_ptr()) }
     }
 
+    /// A device entry point whose whole request is one struct: `vkSignalSemaphore`.
+    ///
+    /// An *operation*, not a query, and the distinction decides what an error means. There is no
+    /// out-parameter here -- the reply is a bare `VkResult` -- so a refusal is a complete answer
+    /// and goes back as one. The query family next door ([`Driver::dev_query_info`] and friends)
+    /// cannot do that, because its reply carries a struct the driver never filled, which is why it
+    /// rejects instead. Pick the family by whether the guest is owed a value, not by taste.
+    ///
+    /// The entry point is optional here where it is mandatory in the groups above: the timeline
+    /// semaphore calls are Vulkan 1.2, and a driver without them exports none of the three. So
+    /// `try_` rather than the panicking accessor -- which commands the guest may send is the
+    /// guest's reading of what we advertise, and being wrong about that must cost it a command
+    /// rather than the process.
+    pub fn dev_op_info<I>(
+        &self,
+        device: VkDevice,
+        info: &I,
+        pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> VkResult>,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        let Some(f) = pick(&d.fns) else {
+            return VkResult::VK_ERROR_EXTENSION_NOT_PRESENT;
+        };
+        // SAFETY: `device` is a handle in this table, and `info` borrows an arena struct the
+        // decoder filled and outlives the call. Any counted array inside it was reconciled against
+        // the array actually sent before the struct was handed on, so the pair Vulkan reads out of
+        // it agrees with itself.
+        unsafe { f(device, info) }
+    }
+
+    /// The same, with the guest's own timeout beside it: `vkWaitSemaphores`.
+    ///
+    /// The timeout is passed exactly as it arrived, `UINT64_MAX` included, and nothing here
+    /// shortens it. A clamp would come back `VK_TIMEOUT` from a wait that did not time out, which
+    /// the guest cannot tell from a real one -- it would loop, and the loop would be ours. Blocking
+    /// this thread for as long as the guest asked is the same bargain [`Driver::wait_for_fences`]
+    /// already makes, and it is the guest's own thread being spent. A host that needs a bound on
+    /// how long a wait may sit here wants it in the replayer, never in the renderer.
+    pub fn dev_op_info_timeout<I>(
+        &self,
+        device: VkDevice,
+        info: &I,
+        timeout: u64,
+        pick: impl FnOnce(
+            &DeviceFns,
+        ) -> Option<unsafe extern "C" fn(VkDevice, *const I, u64) -> VkResult>,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        let Some(f) = pick(&d.fns) else {
+            return VkResult::VK_ERROR_EXTENSION_NOT_PRESENT;
+        };
+        // SAFETY: as `dev_op_info`; `timeout` is a plain scalar off the wire.
+        unsafe { f(device, info, timeout) }
+    }
+
     /// Write and copy descriptors: `vkUpdateDescriptorSets`.
     ///
     /// Alone among the commands here it returns nothing -- Vulkan gives it no failure to report,

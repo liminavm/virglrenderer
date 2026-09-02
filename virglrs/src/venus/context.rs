@@ -58,13 +58,15 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
     vn_command_vkGetPhysicalDeviceProperties2,
-    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkImportSemaphoreResourceMESA,
-    vn_command_vkInvalidateMappedMemoryRanges, vn_command_vkNotifyRingMESA,
-    vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer,
-    vn_command_vkResetCommandPool, vn_command_vkResetDescriptorPool, vn_command_vkResetEvent,
-    vn_command_vkResetFences, vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
-    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkUpdateDescriptorSets,
-    vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
+    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkGetSemaphoreCounterValue,
+    vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
+    vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle,
+    vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
+    vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
+    vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
+    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
+    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
+    vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
 };
 use super::ring::{ReplyStream, ReplyStreamError, Ring, RingError, ShmResources};
 use super::ring_thread::RingThread;
@@ -2000,6 +2002,58 @@ impl Commands for Handlers<'_> {
         args.ret = self.driver.object_op(args.device, |d| d.vkGetFenceStatus(), args.fence);
     }
 
+    // ----------------------------------------------------------------- timeline semaphores
+    //
+    // A binary semaphore is only ever waited on inside a submit, so the host never sees one from
+    // this side. A timeline semaphore has a counter the guest can read, raise and block on
+    // directly, and these three are how it does that.
+    //
+    // All three are forwarded with nothing added. The handles inside `VkSemaphoreWaitInfo` and
+    // `VkSemaphoreSignalInfo` are already host handles: the generated decoder resolves each one
+    // through the object table as it reads it, so a guest naming a semaphore it does not own stops
+    // its own ring before any handler is reached. `pSemaphores` and `pValues` are likewise already
+    // reconciled against `semaphoreCount` there -- a guest that disagrees with itself about how
+    // many it sent is fatal at the decode -- so there is no pair left here to check.
+
+    /// Read a timeline semaphore's counter.
+    ///
+    /// A query: the answer is the `u64` the driver writes, so a driver that cannot be asked leaves
+    /// the guest's own value in place and the ring stops rather than encode it back as an answer.
+    fn vkGetSemaphoreCounterValue(&mut self, args: &mut vn_command_vkGetSemaphoreCounterValue<'_>) {
+        let (device, semaphore) = (args.device, args.semaphore);
+        let Some(out) = self.fills(args.pValue_mut()) else { return };
+        let r = self
+            .driver
+            .dev_query_arg(device, semaphore, out, |d| d.try_vkGetSemaphoreCounterValue());
+        if let Some(ret) = self.asked(r) {
+            args.ret = ret;
+        }
+    }
+
+    /// Raise a timeline semaphore's counter from the host side.
+    fn vkSignalSemaphore(&mut self, args: &mut vn_command_vkSignalSemaphore<'_>) {
+        let Some(info) = args.pSignalInfo else {
+            self.reject = Some("signalled a semaphore it did not name");
+            return;
+        };
+        args.ret = self.driver.dev_op_info(args.device, info, |d| d.try_vkSignalSemaphore());
+    }
+
+    /// Block until a set of timeline semaphores reaches the values the guest named.
+    ///
+    /// Blocking, like `vkWaitForFences` above, and for the same reason: the guest asked to wait
+    /// and it is the guest's thread being spent. The timeout crosses untouched -- see
+    /// [`Driver::dev_op_info_timeout`] for why shortening it would be worse than blocking.
+    fn vkWaitSemaphores(&mut self, args: &mut vn_command_vkWaitSemaphores<'_>) {
+        let Some(info) = args.pWaitInfo else {
+            self.reject = Some("waited on semaphores it did not name");
+            return;
+        };
+        args.ret = self
+            .driver
+            .dev_op_info_timeout(args.device, info, args.timeout, |d| d.try_vkWaitSemaphores());
+    }
+
     /// Recycle everything a pool handed out, without destroying the pool or the objects.
     ///
     /// The object table is deliberately left alone. A reset does not free the command buffers or
@@ -2392,6 +2446,16 @@ mod tests {
         use super::super::proto::types as ty;
 
         const WINDOW: usize = 0x21000;
+        // Both timeline structs are required, so they have to be real: a null one is fatal at the
+        // decode and would never reach the device lookup this test is about.
+        let wait_info = ty::VkSemaphoreWaitInfo {
+            sType: ty::VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            ..Default::default()
+        };
+        let signal_info = ty::VkSemaphoreSignalInfo {
+            sType: ty::VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            ..Default::default()
+        };
         let batches: Vec<(&str, Vec<u8>)> = vec![
             (
                 "vkDeviceWaitIdle",
@@ -2489,6 +2553,31 @@ mod tests {
                     ser::vn_sizeof_vkInvalidateMappedMemoryRanges_args,
                     ser::vn_encode_vkInvalidateMappedMemoryRanges_args,
                     ty::vn_command_vkInvalidateMappedMemoryRanges::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkWaitSemaphores",
+                wire!(
+                    ser::vn_sizeof_vkWaitSemaphores_args,
+                    ser::vn_encode_vkWaitSemaphores_args,
+                    ty::vn_command_vkWaitSemaphores {
+                        pWaitInfo: Some(&wait_info),
+                        timeout: u64::MAX,
+                        ..Default::default()
+                    },
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkSignalSemaphore",
+                wire!(
+                    ser::vn_sizeof_vkSignalSemaphore_args,
+                    ser::vn_encode_vkSignalSemaphore_args,
+                    ty::vn_command_vkSignalSemaphore {
+                        pSignalInfo: Some(&signal_info),
+                        ..Default::default()
+                    },
                     GENERATE_REPLY
                 ),
             ),
@@ -2737,6 +2826,346 @@ mod tests {
             SENTINEL.0,
             "the driver's own result, carried all the way into the guest's memory"
         );
+    }
+
+    /// The timeline trio crosses the wire, the object table and the driver without being
+    /// rewritten on the way.
+    ///
+    /// These three are the first commands this renderer forwards whose *interesting* arguments
+    /// are nested inside a struct rather than sitting at the top of the command. That moves the
+    /// risk: the handles in `VkSemaphoreWaitInfo` are resolved one at a time by the generated
+    /// struct decoder, deep under the handler, and `pSemaphores` and `pValues` are two arrays the
+    /// guest pairs by position under one count. A resolution that never happened hands the driver
+    /// guest ids; a pairing that slipped waits on the right semaphores for the wrong values and
+    /// comes back looking like an ordinary timeout. Neither is visible to replay, which counts the
+    /// command as accounted for either way, nor to the reply oracle, which compares encoders.
+    ///
+    /// So it runs the full length -- wire, decode, object table, handler, driver, commit -- and
+    /// the arrays carry values that differ from the handles and from each other, so a transposed
+    /// pair cannot alias a correct one. `timeout` is `UINT64_MAX` because the whole point of
+    /// Option A is that it is not clamped: a renderer that shortened it would report a timeout the
+    /// guest's own wait never had.
+    #[test]
+    fn the_timeline_trio_crosses_as_the_guest_sent_it() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkSemaphore, VkSemaphoreSignalInfo, VkSemaphoreWaitInfo,
+            VkStructureType,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const WINDOW: usize = 0x21000;
+        const SENTINEL: VkResult = VkResult::VK_NOT_READY;
+        const COUNTER: u64 = 0x1234_5678_9abc;
+
+        // Guest ids on the left, host handles on the right, and no digit shared between a pair --
+        // so an id that reached the driver unresolved is unmistakable in the recording.
+        const GUEST_DEV: u64 = 0x5001;
+        const GUEST_SEM_A: u64 = 0x5002;
+        const GUEST_SEM_B: u64 = 0x5003;
+        const HOST_SEM_A: u64 = 0x901;
+        const HOST_SEM_B: u64 = 0x902;
+
+        /// One `vkWaitSemaphores` as the driver saw it. Named fields rather than a tuple because
+        /// four of the five are integers, and a mismatch has to read as which one moved.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Wait {
+            device: u64,
+            flags: u32,
+            semaphores: Vec<u64>,
+            values: Vec<u64>,
+            timeout: u64,
+        }
+
+        #[derive(Default)]
+        struct Saw {
+            waited: Vec<Wait>,
+            signalled: Vec<(u64, u64, u64)>,
+            counted: Vec<(u64, u64)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn wait(
+            device: VkDevice,
+            info: *const VkSemaphoreWaitInfo,
+            timeout: u64,
+        ) -> VkResult {
+            assert!(!info.is_null(), "a required struct arrives with its pointer");
+            // SAFETY: this stub stands where the driver stands, and reads exactly what the driver
+            // would: the struct the decoder allocated, and the two arrays it sized from the count
+            // in it. Both outlive the call.
+            let i = unsafe { &*info };
+            // A count of zero is the one case where the decoder leaves both pointers null, so it
+            // is read without touching them -- and reading it as empty rather than walking off a
+            // null is what lets a struct that arrived empty fail the comparison below instead of
+            // taking the process down with it.
+            let n = i.semaphoreCount as usize;
+            let (sems, vals): (Vec<u64>, Vec<u64>) = if n == 0 {
+                (Vec::new(), Vec::new())
+            } else {
+                assert!(
+                    !i.pSemaphores.is_null() && !i.pValues.is_null(),
+                    "a counted pair of arrays arrives with both its pointers"
+                );
+                // SAFETY: as above, now that the count and the two pointers agree.
+                unsafe {
+                    (
+                        core::slice::from_raw_parts(i.pSemaphores, n).iter().map(|s| s.0).collect(),
+                        core::slice::from_raw_parts(i.pValues, n).to_vec(),
+                    )
+                }
+            };
+            let flags = i.flags.0;
+            SAW.with_borrow_mut(|s| {
+                s.waited.push(Wait {
+                    device: device.0,
+                    flags,
+                    semaphores: sems,
+                    values: vals,
+                    timeout,
+                })
+            });
+            SENTINEL
+        }
+        unsafe extern "C" fn signal(
+            device: VkDevice,
+            info: *const VkSemaphoreSignalInfo,
+        ) -> VkResult {
+            assert!(!info.is_null());
+            // SAFETY: as `wait`.
+            let i = unsafe { &*info };
+            SAW.with_borrow_mut(|s| s.signalled.push((device.0, i.semaphore.0, i.value)));
+            SENTINEL
+        }
+        unsafe extern "C" fn counter(
+            device: VkDevice,
+            semaphore: VkSemaphore,
+            out: *mut u64,
+        ) -> VkResult {
+            assert!(!out.is_null(), "the handler refuses a query with nowhere to answer");
+            // SAFETY: `out` is the single arena slot the decoder allocated for this out-parameter.
+            unsafe { *out = COUNTER };
+            SAW.with_borrow_mut(|s| s.counted.push((device.0, semaphore.0)));
+            SENTINEL
+        }
+        /// Teardown drains the device before destroying it, and the planted table owes it both.
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(idle);
+        fns.plant_vkWaitSemaphores(wait);
+        fns.plant_vkSignalSemaphore(signal);
+        fns.plant_vkGetSemaphoreCounterValue(counter);
+        fns.plant_vkDestroyDevice(destroy_device);
+        ctx.driver.plant_device(DEVICE, fns);
+        {
+            let mut table = ctx.objects.borrow_mut();
+            for (id, host, ty) in [
+                (GUEST_DEV, DEVICE, VkObjectType::VK_OBJECT_TYPE_DEVICE),
+                (GUEST_SEM_A, HOST_SEM_A, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
+                (GUEST_SEM_B, HOST_SEM_B, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
+            ] {
+                table.add(ObjectId(id), ty, host, None).expect("a fresh id");
+            }
+        }
+
+        // The counter query goes first so its reply -- the only one carrying a value the driver
+        // wrote -- sits at the front of the window, where no other reply's size can move it.
+        let mut value = 0u64;
+        let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
+        cv.device = VkDevice(GUEST_DEV);
+        cv.semaphore = VkSemaphore(GUEST_SEM_A);
+        cv.plant_pValue(&mut value);
+
+        let sems = [VkSemaphore(GUEST_SEM_A), VkSemaphore(GUEST_SEM_B)];
+        let vals = [0x77u64, 0x99u64];
+        let info = VkSemaphoreWaitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            flags: VkFlags(0x1),
+            semaphoreCount: 2,
+            pSemaphores: sems.as_ptr(),
+            pValues: vals.as_ptr(),
+            ..Default::default()
+        };
+        let signal_info = VkSemaphoreSignalInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            semaphore: VkSemaphore(GUEST_SEM_B),
+            value: 0xabcd,
+            ..Default::default()
+        };
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetSemaphoreCounterValue_args,
+            ser::vn_encode_vkGetSemaphoreCounterValue_args,
+            cv,
+            GENERATE_REPLY
+        ));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkWaitSemaphores_args,
+            ser::vn_encode_vkWaitSemaphores_args,
+            ty::vn_command_vkWaitSemaphores {
+                device: VkDevice(GUEST_DEV),
+                pWaitInfo: Some(&info),
+                timeout: u64::MAX,
+                ..Default::default()
+            },
+            GENERATE_REPLY
+        ));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkSignalSemaphore_args,
+            ser::vn_encode_vkSignalSemaphore_args,
+            ty::vn_command_vkSignalSemaphore {
+                device: VkDevice(GUEST_DEV),
+                pSignalInfo: Some(&signal_info),
+                ..Default::default()
+            },
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "three served commands do not poison");
+
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.waited,
+                [Wait {
+                    device: DEVICE,
+                    flags: 0x1,
+                    semaphores: vec![HOST_SEM_A, HOST_SEM_B],
+                    values: vec![0x77, 0x99],
+                    timeout: u64::MAX,
+                }],
+                "host handles in order, each still against its own value, and the timeout whole"
+            );
+            assert_eq!(
+                s.signalled,
+                [(DEVICE, HOST_SEM_B, 0xabcd)],
+                "the semaphore nested in the signal struct is resolved too"
+            );
+            assert_eq!(s.counted, [(DEVICE, HOST_SEM_A)]);
+        });
+
+        // The counter query's reply: command type, result, the out-pointer's marker, the value.
+        let mut got = [0u8; 24];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(
+            u32::from_le_bytes(got[0..4].try_into().unwrap()),
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetSemaphoreCounterValue_EXT.0 as u32,
+            "the reply names the command it answers"
+        );
+        assert_eq!(
+            i32::from_le_bytes(got[4..8].try_into().unwrap()),
+            SENTINEL.0,
+            "the driver's own result, not a success this renderer invented"
+        );
+        assert_eq!(
+            u64::from_le_bytes(got[16..24].try_into().unwrap()),
+            COUNTER,
+            "the counter the driver wrote, carried into the guest's memory"
+        );
+    }
+
+    /// Reading a counter off a device this context never created is refused, not answered.
+    ///
+    /// The line between the two families this slice straddles, drawn where it is easiest to cross
+    /// by accident. `vkWaitSemaphores` next door answers an unknown device with
+    /// `VK_ERROR_INITIALIZATION_FAILED`, and that is a complete answer because its whole reply is
+    /// that result. This one's reply also carries a `u64` -- and on a failed ask nobody wrote it,
+    /// so the guest would read back the value it sent, encoded by us as though the host had put it
+    /// there. There is no result code that says "and ignore the number", so the ring stops.
+    #[test]
+    fn reading_a_counter_off_an_unknown_device_is_refused() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::VkSemaphore;
+
+        const WINDOW: usize = 0x21000;
+
+        // Ids the object table resolves, naming host handles the driver has never heard of. Both
+        // have to be registered: an id the table does not hold stops the ring at the decode
+        // instead, which would leave this test passing for a reason that has nothing to do with
+        // the handler at all.
+        const GUEST_DEV: u64 = 0x5001;
+        const GUEST_SEM: u64 = 0x5002;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        {
+            let mut table = ctx.objects.borrow_mut();
+            for (id, host, ty) in [
+                (GUEST_DEV, 3, VkObjectType::VK_OBJECT_TYPE_DEVICE),
+                (GUEST_SEM, 0x901, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
+            ] {
+                table.add(ObjectId(id), ty, host, None).expect("a fresh id");
+            }
+        }
+
+        let mut value = 0u64;
+        let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
+        cv.device = VkDevice(GUEST_DEV);
+        cv.semaphore = VkSemaphore(GUEST_SEM);
+        cv.plant_pValue(&mut value);
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetSemaphoreCounterValue_args,
+            ser::vn_encode_vkGetSemaphoreCounterValue_args,
+            cv,
+            GENERATE_REPLY
+        ));
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "no device to ask");
+        assert!(ctx.fatal());
+    }
+
+    /// A wait or a signal that names no semaphores at all is refused, not forwarded.
+    ///
+    /// The struct is required, so a guest omitting it is already fatal at the decode -- but the
+    /// handler is what stands between a null and the driver, and it has to hold on its own. There
+    /// is no honest answer to give here: the reply is a bare `VkResult`, and every value it could
+    /// carry says something happened to semaphores that were never named.
+    #[test]
+    fn a_timeline_command_with_no_struct_is_refused() {
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        let mut args = vn_command_vkWaitSemaphores { timeout: u64::MAX, ..Default::default() };
+        h.vkWaitSemaphores(&mut args);
+        assert!(h.reject.is_some(), "a wait with no wait info");
+        h.reject = None;
+
+        let mut args = vn_command_vkSignalSemaphore::default();
+        h.vkSignalSemaphore(&mut args);
+        assert!(h.reject.is_some(), "a signal with no signal info");
     }
 
     /// Waiting on a queue this context never retrieved is refused, not answered.
