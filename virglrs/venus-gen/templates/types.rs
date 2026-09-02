@@ -113,6 +113,20 @@ impl Default for ${ty.name} {
 }
 
 % endfor
+/// Structs the renderer builds for the driver, which the wire never carries.
+///
+/// Same vk.xml, outside venus's own set -- see `RustGen.RENDERER_ONLY_STRUCTS`. No serializer and
+/// no `Default`: nothing decodes one, and every field is set at the single site that builds it.
+% for ty in RUST.renderer_only_structs():
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ${ty.name} {
+%   for name, rs in RUST.struct_fields(ty):
+    pub ${name}: ${rs},
+%   endfor
+}
+
+% endfor
 /// A decoded command's arguments, and its reply where it has one.
 ///
 /// `'a` is the decoder's: the wire bytes and the arena the command was decoded into, which both
