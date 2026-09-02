@@ -254,6 +254,7 @@ impl Context {
             driver: &mut self.driver,
             global,
             reject: None,
+            unserved: false,
             resources,
             rings: &mut self.rings,
             current_ring: on,
@@ -304,6 +305,24 @@ impl Context {
             // before the commit below reads it back.
             let answer = enc.pos();
             dispatched += 1;
+
+            // No handler ran: the command was counted for the census and nothing else. That is a
+            // fine outcome for a command the guest is not waiting on -- it loses one command. It
+            // is not fine here, because the generator encoded a reply regardless, out of arguments
+            // no handler ever filled in, and a zeroed reply is shaped exactly like a successful
+            // one. There is no field in which to say "we did not do this", so the context dies
+            // saying it rather than answering with a fiction the guest cannot tell from an answer.
+            if core::mem::take(&mut h.unserved) && wants_reply {
+                unhandled += 1;
+                poison(
+                    fatal,
+                    id,
+                    &dec,
+                    cmd,
+                    "is not a command this build serves, and wants an answer",
+                );
+                break;
+            }
             // A handler that found the command itself unusable -- an id the guest cannot have, a
             // length that would send the driver off the end of what was decoded. The handler has
             // no decoder to say so with; this is where its verdict lands.
@@ -540,6 +559,11 @@ pub struct Handlers<'a> {
     /// Why the handler refused the command, if it did. It cannot be reported from here -- the
     /// handler has no decoder -- so the loop reads it back and poisons with this as the reason.
     reject: Option<&'static str>,
+    /// Whether the command that just ran reached no handler at all, and was only counted.
+    ///
+    /// Read back and cleared every command, for the same reason as `reject`: the census is a
+    /// tally, and the loop needs the per-command answer.
+    unserved: bool,
     /// The renderer's resource table, for the one command that needs guest memory by name.
     resources: &'a dyn ShmResources,
     /// The ring this batch arrived on, or `None` for the context's own stream. Several commands
@@ -800,6 +824,7 @@ fn cap_api_version(version: u32) -> u32 {
 impl Commands for Handlers<'_> {
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
         *self.todo.seen.entry(cmd.0).or_default() += 1;
+        self.unserved = true;
     }
 
     fn object_created(
@@ -2223,6 +2248,121 @@ mod tests {
         assert!(ctx.fatal());
     }
 
+    /// A command with no handler at all, with whatever header flags the caller wants.
+    ///
+    /// `vkDeviceWaitIdle` is the sharpest one to ask with: its whole reply is the command type and
+    /// a `VkResult`, and a `VkResult` of zero is `VK_SUCCESS`. A default-constructed answer to it
+    /// is therefore not obviously-wrong noise, it is the guest being told the host finished.
+    fn wire_device_wait_idle(flags: u32) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkDeviceWaitIdle_args, vn_sizeof_vkDeviceWaitIdle_args,
+        };
+        use super::super::proto::types::vn_command_vkDeviceWaitIdle as Args;
+
+        // A null device: `VK_NULL_HANDLE` is an ordinary value on the wire, so this decodes
+        // cleanly and reaches the trait default, which is the whole point of the command here.
+        let args = Args::default();
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkDeviceWaitIdle_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkDeviceWaitIdle_args(&mut enc, VkFlags(flags), &args);
+        buf
+    }
+
+    /// A command this build does not serve is counted, never answered.
+    ///
+    /// The generated dispatch encodes a reply for every command it decodes, run or not, out of the
+    /// argument struct as it stands -- and for an unserved command that struct is still all zeros.
+    /// Committing it would hand the guest a well-formed `VK_SUCCESS` for work no handler ever did,
+    /// which is indistinguishable from a real answer and is the precise failure this renderer
+    /// exists to stop making. Losing the command is fine while nobody is waiting; once someone is,
+    /// there is no field left in which to say "we did not do this", so the context stops instead.
+    #[test]
+    fn an_unserved_command_is_never_answered_with_a_fiction() {
+        const WINDOW: usize = 0x21000;
+
+        for reply_wanted in [false, true] {
+            let t = ring_table();
+            let g = crate::vulkan::global();
+            let mut todo = Unimplemented::default();
+            let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+            let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+            batch.extend_from_slice(&wire_device_wait_idle(if reply_wanted {
+                GENERATE_REPLY
+            } else {
+                0
+            }));
+
+            assert_eq!(
+                ctx.submit(&batch, &mut todo, &g, &t),
+                !reply_wanted,
+                "an unserved vkDeviceWaitIdle, reply wanted: {reply_wanted}"
+            );
+
+            // Either way it is on the census: refusing to answer is not refusing to notice.
+            assert_eq!(
+                todo.seen.get(&VkCommandTypeEXT::VK_COMMAND_TYPE_vkDeviceWaitIdle_EXT.0),
+                Some(&1),
+                "the command was counted"
+            );
+
+            // And either way the window is untouched -- there was never an answer to put in it.
+            let mut got = [0u8; 8];
+            assert!(t.1.copy_out(WINDOW, &mut got));
+            assert_eq!(got, [0; 8], "nothing was invented to fill the guest's window");
+        }
+    }
+
+    /// An answer goes back down the stream the question came up.
+    ///
+    /// The other reply witnesses all drive the context's own stream, so "the reply lands in the
+    /// window belonging to whoever asked" is true of them by having only one window to land in.
+    /// This one gives the context and a ring a window each and asks on the ring, which is the only
+    /// arrangement where writing to the wrong one is possible at all.
+    #[test]
+    fn a_reply_lands_in_the_window_of_the_ring_that_asked() {
+        const CONTEXT_WINDOW: usize = 0x21000;
+        const RING_WINDOW: usize = 0x22000;
+
+        let t = ring_table();
+        let info = ring_info();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t), "ring 7 is accepted");
+
+        // Two streams, two windows, set down the stream each belongs to -- the ring's first, so
+        // that a context-wide slot would have the context's window in it by the time the ring
+        // asks. Setting the context's first instead makes the two orders indistinguishable: a
+        // single shared slot would just carry the ring's window, and the answer would still land
+        // in the right place for the wrong reason.
+        assert!(ctx.submit_ring(
+            RingId(7),
+            &wire_set_reply(&reply_at(RING_WINDOW, 0x100)),
+            &mut todo,
+            &g,
+            &t
+        ));
+        assert!(ctx.submit(&wire_set_reply(&reply_at(CONTEXT_WINDOW, 0x100)), &mut todo, &g, &t));
+
+        // The question arrives on the ring, so the answer belongs in the ring's window.
+        assert!(ctx.submit_ring(RingId(7), &wire_seek(0, GENERATE_REPLY), &mut todo, &g, &t));
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(RING_WINDOW, &mut got));
+        assert_eq!(
+            got,
+            seek_reply_bytes(),
+            "the ring's question was answered in the ring's window"
+        );
+
+        let mut other = [0u8; 4];
+        assert!(t.1.copy_out(CONTEXT_WINDOW, &mut other));
+        assert_eq!(other, [0; 4], "the context's window is not where a ring's answers go");
+    }
+
     fn wire_create_ring(
         ring: u64,
         info: &crate::venus::proto::types::VkRingCreateInfoMESA,
@@ -2335,6 +2475,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &t,
             rings: &mut rings,
             replaying: false,
@@ -2384,6 +2525,7 @@ mod tests {
                 driver: &mut driver,
                 global: &global,
                 reject: None,
+                unserved: false,
                 resources: &t,
                 rings: &mut rings,
                 replaying: false,
@@ -2422,6 +2564,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2456,6 +2599,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &t,
             rings: &mut rings,
             replaying: false,
@@ -2519,6 +2663,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &t,
             rings: &mut rings,
             replaying: false,
@@ -2557,6 +2702,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &t,
             rings: &mut rings,
             replaying: false,
@@ -2612,6 +2758,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2643,6 +2790,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &t,
             rings: &mut rings,
             replaying: false,
@@ -2760,6 +2908,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2851,6 +3000,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2895,6 +3045,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2946,6 +3097,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -2972,6 +3124,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3049,6 +3202,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3082,6 +3236,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3177,6 +3332,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3246,6 +3402,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3273,6 +3430,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3324,6 +3482,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3365,6 +3524,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3390,6 +3550,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3558,6 +3719,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3629,6 +3791,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3695,6 +3858,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3753,6 +3917,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3836,6 +4001,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3893,6 +4059,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -3944,6 +4111,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4122,6 +4290,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4235,6 +4404,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4377,6 +4547,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4447,6 +4618,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4596,6 +4768,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
@@ -4771,6 +4944,7 @@ mod tests {
             driver: &mut driver,
             global: &global,
             reject: None,
+            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             replaying: false,
