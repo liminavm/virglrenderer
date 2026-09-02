@@ -975,8 +975,20 @@ impl Commands for Handlers<'_> {
         };
         // What each one supports is asked once, here, because device creation is filtered against
         // it and there is no later point where the guest is guaranteed to have named them all.
+        // A device whose driver refuses the question fails the whole enumeration: handing it over
+        // unlearned would advertise nothing and then quietly create devices without the
+        // extensions the guest asked for.
+        let mut learned = Ok(());
         for pd in out.iter().take(got as usize) {
-            self.driver.learn_extensions(*pd);
+            learned = self.driver.learn_extensions(*pd);
+            if learned.is_err() {
+                break;
+            }
+        }
+        if let Err(e) = learned {
+            args.ret = e;
+            self.ghost_ids(ids);
+            return;
         }
         // The count goes back last, and has to: it lives in the same struct the shadow array was
         // borrowed from, so the two cannot be held at once. That is not the borrow checker being
@@ -6021,6 +6033,48 @@ mod tests {
         // A physical device nobody enumerated has nothing to say, rather than a panic.
         assert!(driver.advertised_extensions(VkPhysicalDevice(999)).is_empty());
         let _ = VkExtensionProperties::default();
+
+        driver.abandon_planted();
+    }
+
+    /// A driver that will not say what a device supports is not a device that supports nothing.
+    ///
+    /// `learn_extensions` used to swallow the failure and record nothing, and nothing downstream
+    /// could tell that from an answer. The guest would then be told the device had no extensions
+    /// at all, and `vkCreateDevice` would quietly strip every extension it asked for -- a device
+    /// that comes back VK_SUCCESS and cannot do what the guest built it to do.
+    #[test]
+    fn a_device_whose_extensions_could_not_be_read_is_not_a_device_with_none() {
+        use super::super::proto::types::{VkExtensionProperties, VkPhysicalDevice};
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(7);
+
+        unsafe extern "C" fn refuse(
+            _pd: VkPhysicalDevice,
+            _layer: *const core::ffi::c_char,
+            _count: *mut u32,
+            _out: *mut VkExtensionProperties,
+        ) -> VkResult {
+            VkResult::VK_ERROR_OUT_OF_HOST_MEMORY
+        }
+
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkEnumerateDeviceExtensionProperties(refuse);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+
+        assert_eq!(
+            driver.learn_extensions(PD),
+            Err(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY),
+            "the driver's refusal is the answer, not an empty list"
+        );
+        assert!(
+            driver.advertised_extensions(PD).is_empty(),
+            "and nothing was recorded that a later query could mistake for one"
+        );
+
+        // A driver with no instance behind it cannot be asked at all, which is the same failure.
+        assert!(Driver::new().learn_extensions(PD).is_err());
 
         driver.abandon_planted();
     }
