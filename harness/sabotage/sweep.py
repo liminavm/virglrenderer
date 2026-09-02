@@ -126,6 +126,20 @@ SABOTAGES = [
         '',
     ),
     (
+        'a failed pipeline run leaks the pipelines it did make',
+        'virglrs/src/venus/driver.rs',
+        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline(0);",
+        '            *survivor = VkPipeline(0);',
+        '',
+    ),
+    (
+        'a failed pipeline run leaves destroyed handles in the reply',
+        'virglrs/src/venus/driver.rs',
+        "            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };\n            // The guest's reply must not carry a handle that is now gone.\n            *survivor = VkPipeline(0);",
+        '            unsafe { (d.fns.vkDestroyPipeline())(device, *survivor, ptr(alloc)) };',
+        '',
+    ),
+    (
         'the census reports storage a guest only borrowed',
         'virglrs/src/venus/driver.rs',
         '            .filter(|(_, a)| a.censused())',
