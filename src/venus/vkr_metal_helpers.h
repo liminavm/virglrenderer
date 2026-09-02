@@ -169,6 +169,10 @@ vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_
 void
 vkr_mtl_refcount_census(char *buf, unsigned long len);
 
+/* The IOSurface ledger's two halves: allocations through these helpers, and frees. */
+long vkr_mtl_iosurface_alloc_count(void);
+long vkr_mtl_iosurface_free_count(void);
+
 void
 vkr_mtl_texture_release(void *mtl_texture);
 

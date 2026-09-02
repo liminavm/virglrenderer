@@ -9444,6 +9444,8 @@ int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane
                                   const void *src, uint32_t src_stride, uint32_t rows,
                                   uint32_t row_bytes);
 void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
+long vkr_mtl_iosurface_alloc_count(void);
+long vkr_mtl_iosurface_free_count(void);
 /* From vkr_budget: charge what follows to the shared classic-resource bucket rather than
  * to whichever venus context this thread served last. */
 void vkr_budget_set_vrend(void);
@@ -9577,8 +9579,17 @@ static void vrend_resource_iosurface_init_planes(struct vrend_resource *gr,
    uint32_t offset[VIRGL_GBM_MAX_PLANES] = { 0 };
    struct vkr_mtl_iosurface *surf = vkr_mtl_iosurface_alloc_planar(
       w, h, '420f', 2, plane_width, plane_height, plane_bpe, stride, offset);
-   if (!surf)
+   if (!surf) {
+      /* This is the failure that turns into a refused create and, on the guest, a poisoned
+       * context; it must not be silent. The live count says whether the surface store is
+       * simply full -- a leak shows as a count that only ever grows. */
+      virgl_warn("iosurface planes: %ux%u %s allocation FAILED (planar IOSurfaces live %ld = "
+                 "%ld allocated - %ld freed); the create will be refused\n",
+                 w, h, util_format_name(format),
+                 (long)(vkr_mtl_iosurface_alloc_count() - vkr_mtl_iosurface_free_count()),
+                 (long)vkr_mtl_iosurface_alloc_count(), (long)vkr_mtl_iosurface_free_count());
       return;
+   }
 
    void *images[2] = { NULL, NULL };
    for (uint32_t i = 0; i < 2; i++) {
