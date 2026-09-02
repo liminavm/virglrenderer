@@ -61,6 +61,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 
 #include "pipe/p_video_state.h"
@@ -244,6 +245,15 @@ static void codec_unregister(struct virgl_video_codec *codec)
  * goes to a logger the embedder may not have installed, and the failure modes here
  * are all "nothing happened", which a silent path cannot distinguish. */
 static int vt_trace = -1;
+
+/* limina probe: the submitting thread, for comparing two clients whose input is
+ * byte-identical but whose outcome is not. */
+static unsigned long long vt_tid(void)
+{
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    return (unsigned long long)tid;
+}
 
 #define VT_TRACE(...) do {                                              \
     if (vt_trace < 0)                                                   \
@@ -462,7 +472,8 @@ struct virgl_video_codec *virgl_video_create_codec(
         codec_register(codec);
     }
 
-    VT_TRACE("create_codec: profile %d %ux%u%s\n", args->profile, args->width, args->height,
+    VT_TRACE("create_codec: codec %p tid %llu profile %d %ux%u%s\n", (void *)codec,
+             vt_tid(), args->profile, args->width, args->height,
              args->profile != PIPE_VIDEO_PROFILE_AV1_MAIN ? ""
                  : !codec->av1_decode ? " (no AV1 silicon; capture only)"
                  : !codec->hw_av1     ? " (no AV1 silicon; decoding in software)" : "");
@@ -680,6 +691,8 @@ static void decode_output(void *codec_ref, void *frame_ref, OSStatus status,
     (void)pts;
     (void)duration;
 
+    VT_TRACE("decode_output: codec %p tid %llu status %d image %p\n", (void *)codec,
+             vt_tid(), (int)status, (void *)image);
     if (status != noErr) {
         virgl_error("video: decode failed, status %d\n", (int)status);
         return;
@@ -876,6 +889,17 @@ have_format:
              codec->frame_width, codec->frame_height, codec->frame_profile,
              codec->frame_bit_depth, codec->frame_subsampling, target_format,
              (const char *)&(uint32_t){ __builtin_bswap32((uint32_t)pixel_format) });
+    /* The description is derived, not submitted: two clients whose frames hash the same
+     * can still get different sessions if the fields it is built from differ. */
+    {
+        CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(codec->format);
+        VT_TRACE("ensure_session: codec %p tid %llu\n", (void *)codec, vt_tid());
+        VT_TRACE("ensure_session: format desc %dx%d codec '%.4s', config %zu bytes\n",
+                 dim.width, dim.height,
+                 (const char *)&(uint32_t){ __builtin_bswap32(
+                     (uint32_t)CMFormatDescriptionGetMediaSubType(codec->format)) },
+                 codec->frame_config_len);
+    }
     status = VTDecompressionSessionCreate(kCFAllocatorDefault, codec->format, NULL,
                                           pixel_attrs, &callback, &codec->session);
     CFRelease(pixel_attrs);
@@ -1348,6 +1372,8 @@ static int submit_unit(struct virgl_video_codec *codec, const uint8_t *data, siz
     }
 
     status = VTDecompressionSessionDecodeFrame(codec->session, sample, 0, NULL, &info);
+    VT_TRACE("submit_unit: codec %p tid %llu target %p len %zu -> status %d info 0x%x\n",
+             (void *)codec, vt_tid(), (void *)target, len, (int)status, (unsigned)info);
     if (status != noErr) {
         virgl_error("video: VTDecompressionSessionDecodeFrame failed, status %d\n",
                     (int)status);

@@ -66,6 +66,8 @@
  */
 
 
+#include <time.h>
+
 #include "util/u_format.h"
 
 #include "virgl_video.h"
@@ -1029,8 +1031,42 @@ int vrend_video_decode_bitstream(struct vrend_video_context *ctx,
             continue;
         }
 
-        vrend_read_from_iovec(res->iov, res->num_iovs, 0,
-                              res->ptr, buffer_sizes[i]);
+        {
+            /* The read is silent about how much it got, and a resource whose backing has
+             * not been attached yet has no iovecs at all -- so a bitstream that never
+             * arrived is indistinguishable here from one full of zeros, and only
+             * VideoToolbox complains, much later and about the wrong thing. */
+            size_t got = vrend_read_from_iovec(res->iov, res->num_iovs, 0,
+                                               res->ptr, buffer_sizes[i]);
+            if (!res->iov || !res->num_iovs || got < buffer_sizes[i])
+                virgl_warn("%s: bs res %d gave %zu of %u bytes (iov %p, num_iovs %d)\n",
+                           __func__, buffer_handles[i], got, buffer_sizes[i],
+                           (void *)res->iov, res->num_iovs);
+
+            /* An all-zero bitstream is either memory the guest never wrote, or memory whose
+             * write has not reached us yet. Re-reading the SAME iovecs a moment later tells
+             * the two apart, and only one of them is a coherency problem. */
+            if (getenv("LIMINA_BS_REREAD") && buffer_sizes[i] >= 8) {
+                /* Whether the whole buffer is wrong or only part of it separates a bad
+                 * scatter-gather translation from a buffer that was never written. */
+                const uint8_t *all = (const uint8_t *)res->ptr;
+                size_t nz = 0, first_nz = buffer_sizes[i];
+                for (size_t k = 0; k < buffer_sizes[i]; k++)
+                    if (all[k]) { nz++; if (first_nz == buffer_sizes[i]) first_nz = k; }
+                virgl_warn("BSSTAT handle=%u res=%p iov=%p n=%d size=%u nonzero=%zu "
+                           "first_nz=%zu\n", buffer_handles[i], (void *)res,
+                           (void *)res->iov, res->num_iovs, buffer_sizes[i], nz, first_nz);
+                const uint8_t *p8 = (const uint8_t *)res->ptr;
+                if (!p8[0] && !p8[1] && !p8[2] && !p8[3]) {
+                    struct timespec ts = { 0, 2 * 1000 * 1000 };
+                    nanosleep(&ts, NULL);
+                    vrend_read_from_iovec(res->iov, res->num_iovs, 0,
+                                          res->ptr, buffer_sizes[i]);
+                    virgl_warn("%s: bs res %d was zero; after 2ms re-read: %02x %02x %02x %02x\n",
+                               __func__, buffer_handles[i], p8[0], p8[1], p8[2], p8[3]);
+                }
+            }
+        }
         bs_buffers[num_bs] = res->ptr;
         bs_sizes[num_bs] = buffer_sizes[i];
         num_bs++;
