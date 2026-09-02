@@ -18,7 +18,7 @@
 #[path = "corpus.rs"]
 mod corpus;
 
-use std::cell::Cell;
+use std::sync::atomic::AtomicBool;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
@@ -80,7 +80,7 @@ fn first_divergence(want: &[u8], got: &[u8]) -> String {
 
 fn round_trip(wire: &[u8], tally: &mut Tally) {
     let temp = Bump::new();
-    let hard = Cell::new(false);
+    let hard = AtomicBool::new(false);
     let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
     let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
     let flags = dec.decode_scalar::<VkFlags>();

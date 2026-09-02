@@ -146,6 +146,36 @@ impl GuestMap {
         true
     }
 
+    /// Clear bits in a control word without disturbing the others.
+    ///
+    /// The counterpart to [`GuestMap::fetch_or_u32`] and sequentially consistent for the same
+    /// reason: the C's `vkr_ring_unset_status_bits` clears the IDLE bit as the ring leaves its
+    /// park, and the guest is reading that word to decide whether it must ring the doorbell.
+    #[must_use]
+    pub fn fetch_and_u32(&self, at: usize, keep: u32) -> bool {
+        let Some(p) = self.word(at) else { return false };
+        // SAFETY: as `load_u32`.
+        unsafe { &*p }.fetch_and(keep, Ordering::SeqCst);
+        true
+    }
+
+    /// Read a control word with sequential consistency rather than acquire.
+    ///
+    /// This exists for exactly one caller: the ring's park handshake. A parking ring stores the
+    /// IDLE bit and then loads the tail to check nothing arrived in between; the guest stores the
+    /// tail and then loads the status to decide whether to ring the doorbell. If either load may
+    /// be reordered before the other side's store, both can miss, and the ring sleeps on work that
+    /// is already there with no one left to wake it. Acquire does not prevent that -- only a pair
+    /// of sequentially consistent operations orders the two stores against the two loads.
+    ///
+    /// The C names the same requirement in `vkr_ring_load_tail_seqcst`, whose comment records that
+    /// the 2 ms poll it replaced existed only to survive this race.
+    pub fn load_u32_seqcst(&self, at: usize) -> Option<u32> {
+        let p = self.word(at)?;
+        // SAFETY: as `load_u32`.
+        Some(unsafe { &*p }.load(Ordering::SeqCst))
+    }
+
     /// Copy bytes out of guest memory into a host buffer.
     ///
     /// Returns whether the range lay inside the mapping. The copy may tear if the guest writes the

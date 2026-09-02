@@ -22,6 +22,7 @@
 //!   handler, do not encode a reply". An id the guest simply invented is *hard*, not soft.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bumpalo::Bump;
 
@@ -114,7 +115,7 @@ pub struct Decoder<'a> {
     temp_used: Cell<usize>,
     objects: &'a dyn Objects,
     /// Shared with the ring loop, which stops when it is set.
-    hard: &'a Cell<bool>,
+    hard: &'a AtomicBool,
     /// Per-command: this command named a ghost and must be dropped.
     soft: Cell<bool>,
 }
@@ -124,7 +125,7 @@ impl<'a> Decoder<'a> {
         buf: &'a [u8],
         temp: &'a Bump,
         objects: &'a dyn Objects,
-        hard: &'a Cell<bool>,
+        hard: &'a AtomicBool,
     ) -> Self {
         Decoder {
             buf,
@@ -150,7 +151,7 @@ impl<'a> Decoder<'a> {
     /// Poison the stream. Takes `&self` because the generated code reaches it from paths that only
     /// hold a shared borrow, exactly as the C does.
     pub fn set_fatal(&self) {
-        self.hard.set(true);
+        self.hard.store(true, Ordering::Release);
     }
 
     /// Poison this command only -- it named an object the host never created.
@@ -161,12 +162,12 @@ impl<'a> Decoder<'a> {
     /// What the generated dispatch wrappers ask: should this command be skipped? Both flavours say
     /// yes, and that identity is the containment mechanism.
     pub fn fatal(&self) -> bool {
-        self.hard.get() || self.soft.get()
+        self.hard.load(Ordering::Acquire) || self.soft.get()
     }
 
     /// What the ring loop asks: is the stream itself unusable?
     pub fn hard_fatal(&self) -> bool {
-        self.hard.get()
+        self.hard.load(Ordering::Acquire)
     }
 
     /// End of a command: the soft poison does not outlive it.
@@ -689,7 +690,7 @@ mod tests {
     #[test]
     fn a_zero_length_array_is_still_aligned() {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
         dec.alloc_temp_array::<u8>(1).unwrap();
         let empty = dec.alloc_temp_array::<u64>(0).unwrap();
@@ -700,7 +701,7 @@ mod tests {
     #[test]
     fn a_short_stream_poisons_instead_of_panicking() {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = [1u8, 0, 0, 0];
         let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
         assert_eq!(dec.decode_scalar::<u32>(), 1);
@@ -718,7 +719,7 @@ mod tests {
     #[test]
     fn a_string_the_guest_left_unterminated_is_terminated_anyway() {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = *b"VK_KHR_a";
         let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
         let out = dec.decode_c_string(8).expect("eight bytes are there to read");
@@ -729,7 +730,7 @@ mod tests {
     #[test]
     fn an_array_size_the_guest_disagrees_with_poisons() {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = 7u64.to_le_bytes();
         let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
         assert_eq!(dec.decode_array_size(3), 0);
@@ -739,7 +740,7 @@ mod tests {
     #[test]
     fn an_implausible_array_size_is_refused_before_it_is_allocated() {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
         assert!(dec.alloc_temp_array::<u32>(usize::MAX / 2).is_none());
@@ -764,12 +765,12 @@ mod tests {
         let buf = [0u8; 16];
 
         for size in [usize::MAX, usize::MAX - 1, usize::MAX - 2, usize::MAX - 3] {
-            let hard = Cell::new(false);
+            let hard = AtomicBool::new(false);
             let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
             assert!(dec.decode_c_string(size).is_none(), "{size:#x} must not be read");
             assert!(dec.hard_fatal(), "{size:#x} must poison the stream");
 
-            let hard = Cell::new(false);
+            let hard = AtomicBool::new(false);
             let mut dec = Decoder::new(&buf, &temp, &IdentityObjects, &hard);
             assert!(dec.decode_blob(size).is_none(), "{size:#x} must not be read");
             assert!(dec.hard_fatal(), "{size:#x} must poison the stream");
@@ -785,7 +786,7 @@ mod tests {
             }
         }
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &AllGhosts, &hard);
         assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);
@@ -806,7 +807,7 @@ mod tests {
             }
         }
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
         assert_eq!(dec.lookup_object(ObjectId(0), 0), 0);
@@ -824,7 +825,7 @@ mod tests {
             }
         }
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
         assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);

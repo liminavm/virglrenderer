@@ -151,7 +151,7 @@ mod tests {
     use super::types::*;
     use crate::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
     use bumpalo::Bump;
-    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
 
     /// Decode a struct from wire bytes and encode it straight back. The gate P2 rests on, in
     /// miniature: the guest's own encoder wrote these bytes, so reproducing them exactly is a
@@ -163,7 +163,7 @@ mod tests {
         encode: fn(&mut Encoder<'_>, &T),
     ) {
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
         let mut val = T::default();
         decode(&mut dec, &mut val);
@@ -267,7 +267,7 @@ mod tests {
         }
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut h = Only::default();
 
         // vkDestroyInstance: an instance id and an absent allocator.
