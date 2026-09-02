@@ -128,6 +128,9 @@ fn with<T>(err: T, f: impl FnOnce(&mut Renderer) -> T) -> T {
 }
 
 const ENOTSUP: c_int = -libc::ENOTSUP;
+/// Distinct from `ENOTSUP` on Darwin (102, not 45), and named separately because the header
+/// promises this one by name for `virgl_renderer_resource_map_fixed`.
+const EOPNOTSUPP: c_int = -libc::EOPNOTSUPP;
 const EINVAL: c_int = -libc::EINVAL;
 const ENOMEM: c_int = -libc::ENOMEM;
 
@@ -223,9 +226,135 @@ pub extern "C" fn virgl_renderer_get_dev_fd(_ctx_id: c_int) -> c_int {
     -1
 }
 
+/// The request struct a tag names, checked against what the caller says it sent.
+///
+/// Three numbers have to agree before a byte is touched: the length the caller passed, the length
+/// it wrote into its own header, and the length of the struct the tag names. They are one value
+/// pretending to be three, and this is the boundary that reconciles them -- above it the answer is
+/// a `&mut T` or a refusal, and nothing further down takes a length from the caller.
+///
+/// The C reads `hdr->stype` before checking any of them, which is a read of memory the caller
+/// never promised was there. Not copied.
+///
+/// # Safety
+///
+/// `args` must be null or point to `size` readable, writable, aligned bytes that outlive the call.
+unsafe fn execute_arg<'a, T>(args: *mut c_void, size: u32) -> Option<&'a mut T> {
+    if args.is_null() || size as usize != core::mem::size_of::<T>() {
+        return None;
+    }
+    if !args.cast::<T>().is_aligned() {
+        return None;
+    }
+    // SAFETY: non-null, aligned, and the caller's promise covers exactly `size_of::<T>()` bytes,
+    // which is what `size` was just checked to be.
+    let arg = unsafe { &mut *args.cast::<T>() };
+    Some(arg)
+}
+
+/// The C ABI's one extensible call: a tagged struct in, the same struct out, filled in.
+///
+/// It exists only because a C header needs a way to grow without new symbols, so it lives here
+/// whole and there is no Rust API behind it -- a Rust caller asks the renderer the question
+/// directly (CLAUDE.md).
+///
+/// # Safety
+///
+/// `execute_args` must be null or point to `execute_size` readable, writable, aligned bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_execute(_execute_args: *mut c_void, _execute_size: u32) -> c_int {
-    todo_phase!("P2: venus execute")
+pub unsafe extern "C" fn virgl_renderer_execute(
+    execute_args: *mut c_void,
+    execute_size: u32,
+) -> c_int {
+    // Only enough to learn the tag. The tag names the struct, the struct is what the rest of the
+    // request is read through, and `execute_arg` is what checks the caller's length against it.
+    if execute_args.is_null()
+        || (execute_size as usize) < core::mem::size_of::<abi::ExecuteHdr>()
+        || !execute_args.cast::<abi::ExecuteHdr>().is_aligned()
+    {
+        return EINVAL;
+    }
+    // SAFETY: non-null, aligned, and the caller promised at least `execute_size` bytes, which was
+    // just checked to cover a header. `ExecuteHdr` is the prefix of every request struct.
+    let hdr = unsafe { &*execute_args.cast::<abi::ExecuteHdr>() };
+    execute_tagged(hdr.stype, hdr.stype_version, execute_args, execute_size)
+}
+
+/// Dispatch on the tag, once the request is known to be big enough to have one.
+///
+/// A version this build does not speak is refused whole rather than per structure: the version
+/// says how to read every field, so serving one structure out of a request written to a newer
+/// layout would be reading the wrong bytes with confidence.
+fn execute_tagged(stype: u32, version: u32, args: *mut c_void, size: u32) -> c_int {
+    if version != 0 {
+        return EINVAL;
+    }
+    match stype {
+        abi::STRUCTURE_TYPE_SUPPORTED_STRUCTURES => {
+            // SAFETY: the caller's promise on `virgl_renderer_execute`, passed through.
+            let Some(q) = (unsafe { execute_arg::<abi::SupportedStructures>(args, size) }) else {
+                return EINVAL;
+            };
+            supported_structures(q)
+        }
+        abi::STRUCTURE_TYPE_EXPORT_QUERY => {
+            // SAFETY: the caller's promise on `virgl_renderer_execute`, passed through.
+            let Some(q) = (unsafe { execute_arg::<abi::ExportQuery>(args, size) }) else {
+                return EINVAL;
+            };
+            export_query(q)
+        }
+        _ => EINVAL,
+    }
+}
+
+/// What this build can answer, for a caller that would rather ask than guess.
+fn supported_structures(q: &mut abi::SupportedStructures) -> c_int {
+    if q.hdr.size as usize != core::mem::size_of::<abi::SupportedStructures>() {
+        return EINVAL;
+    }
+    q.out_supported_structures_mask = if q.in_stype_version == 0 {
+        abi::STRUCTURE_TYPE_EXPORT_QUERY | abi::STRUCTURE_TYPE_SUPPORTED_STRUCTURES
+    } else {
+        // A version this build does not speak: it serves nothing there, which is not the same
+        // as an error. The caller asked what version N holds and the honest answer is "nothing".
+        0
+    };
+    0
+}
+
+/// How a resource could be exported to another process, which here is never.
+///
+/// Every answer is the "not exportable" one the header defines: a zero `out_fourcc` says so, and
+/// the invalid modifier says no layout is being claimed. That is not a stub. A dma-buf is the only
+/// thing this call can describe, macOS has none, and the scanout path deliberately goes the other
+/// way -- limina reads an IOSurface id off the resource and composites it, never a descriptor.
+///
+/// Which is also why asking for the descriptors themselves is refused rather than answered with
+/// `-1`: a caller that set `in_export_fds` wants file descriptors, and handing it a closed one
+/// dressed as success is how a VMM comes to `mmap` nothing.
+fn export_query(q: &mut abi::ExportQuery) -> c_int {
+    if q.hdr.size as usize != core::mem::size_of::<abi::ExportQuery>() {
+        return EINVAL;
+    }
+    // What the request asks for is settled before any resource is looked up: the answer is the
+    // same for every resource in this tree, so a lookup could only make the refusal arrive later.
+    if q.in_export_fds != 0 {
+        return EINVAL;
+    }
+    let Some(handle) = ResourceHandle::new(q.in_resource_id) else {
+        return EINVAL;
+    };
+    if with(None, |r| r.with_resource(handle, |_| ())).is_none() {
+        return EINVAL;
+    }
+    q.out_num_fds = 1;
+    q.out_fourcc = 0;
+    q.out_fds[0] = -1;
+    q.out_strides[0] = 0;
+    q.out_offsets[0] = 0;
+    q.out_modifier = abi::DRM_FORMAT_MOD_INVALID;
+    0
 }
 
 // ---------------------------------------------------------------- contexts
@@ -596,13 +725,27 @@ pub extern "C" fn virgl_renderer_resource_get_info_ext(
     todo_phase!("P3: resource info needs the pipe resource")
 }
 
+/// Hand a resource's storage to another process as a file descriptor.
+///
+/// Refused, always, and that is the finished answer rather than a stub. Every descriptor kind this
+/// call can name is a Linux one -- dma-buf, an opaque driver fd, POSIX shm -- and a blob here is
+/// either the guest's own pages or host memory published as an address. Neither has an fd, and
+/// minting one would be inventing a second way to reach storage that already has an owner.
+///
+/// The C reaches the same place by a longer road: it refuses a `map_ptr` blob outright (a
+/// host-visible venus blob is shared by pointer and has no descriptor), and its remaining arms
+/// call an export callback the proxy context does not implement.
+///
+/// rutabaga calls this unconditionally from `create_blob` and reads a failure as "no handle", so
+/// the refusal is the expected path and not an error anyone reports. The scanout route is
+/// deliberately elsewhere: limina reads an IOSurface id off the resource and composites that.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_export_blob(
     _res_id: u32,
     _fd_type: *mut u32,
     _fd: *mut c_int,
 ) -> c_int {
-    todo_phase!("P2: blob export")
+    EINVAL
 }
 
 /// Where a blob resource lives, for the three ABI calls that each want part of the same answer.
@@ -636,9 +779,29 @@ pub extern "C" fn virgl_renderer_resource_map(
     0
 }
 
+/// Map a resource over an address the caller has already chosen.
+///
+/// `-EOPNOTSUPP`, which the header defines as this call's way of saying the mechanism is not
+/// available and that [`virgl_renderer_resource_map`] should be tried instead. It is an answer,
+/// not a gap: the C serves this with `MAP_FIXED` over a dma-buf or shm descriptor, or by a
+/// context's own `resource_map` callback, and this tree has neither -- there is no fd to map from
+/// and no address the host can move storage to after the fact.
+///
+/// limina does not take this road anyway. It reads the host address with
+/// `virgl_renderer_resource_get_map_ptr` and lets the hypervisor place it, which is the direction
+/// that works when the memory belongs to a Vulkan driver rather than to a descriptor.
+///
+/// The resource is still resolved first, so a VMM naming one that does not exist is told that
+/// rather than told the feature is missing -- two different bugs on the caller's side.
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_resource_map_fixed(_res_handle: u32, _addr: *mut c_void) -> c_int {
-    todo_phase!("P2: blob mapping")
+pub extern "C" fn virgl_renderer_resource_map_fixed(res_handle: u32, _addr: *mut c_void) -> c_int {
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return EINVAL;
+    };
+    if with(None, |r| r.with_resource(handle, |_| ())).is_none() {
+        return EINVAL;
+    }
+    EOPNOTSUPP
 }
 
 #[unsafe(no_mangle)]
@@ -1245,6 +1408,161 @@ mod tests {
         for v in [0x0000, 0x0004, u32::MAX] {
             assert_eq!(fd_type_of(v), None, "fd_type {v:#x} names no descriptor kind");
         }
+    }
+
+    /// `virgl_renderer_execute` reconciles three statements of one length -- the caller's
+    /// argument, the caller's own header field, and the struct its tag names -- and writes into
+    /// the caller's memory only once they agree.
+    ///
+    /// Driven through the exported symbol, because everything being checked is what happens to a
+    /// pointer and a length that arrived together from outside.
+    ///
+    /// Ground truth: `virgl_renderer_execute` in `src/virglrenderer.c`.
+    #[test]
+    fn execute_answers_what_this_build_serves_and_refuses_the_rest() {
+        use std::mem::size_of;
+
+        fn asked(version: u32, size: u32) -> abi::SupportedStructures {
+            abi::SupportedStructures {
+                hdr: abi::ExecuteHdr {
+                    stype: abi::STRUCTURE_TYPE_SUPPORTED_STRUCTURES,
+                    stype_version: 0,
+                    size,
+                },
+                in_stype_version: version,
+                out_supported_structures_mask: 0xdead_beef,
+            }
+        }
+        let whole = size_of::<abi::SupportedStructures>() as u32;
+
+        let mut q = asked(0, whole);
+        // SAFETY: a local of exactly the length being passed.
+        let r = unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) };
+        assert_eq!(r, 0);
+        assert_eq!(
+            q.out_supported_structures_mask,
+            abi::STRUCTURE_TYPE_EXPORT_QUERY | abi::STRUCTURE_TYPE_SUPPORTED_STRUCTURES,
+            "both structures, which is what this build dispatches on"
+        );
+
+        // A version this build does not speak serves nothing there. Not an error: the caller
+        // asked what version 1 holds, and "nothing" is the answer, not a failure to answer.
+        let mut q = asked(1, whole);
+        // SAFETY: as above.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, 0);
+        assert_eq!(q.out_supported_structures_mask, 0);
+
+        // A header that disagrees with the argument is refused, and refused without writing:
+        // one of the two is wrong and there is no way to tell which.
+        let mut q = asked(0, whole - 4);
+        // SAFETY: as above.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, EINVAL);
+        assert_eq!(q.out_supported_structures_mask, 0xdead_beef, "and nothing was written");
+
+        let mut q = asked(0, whole);
+        // SAFETY: the pointer is a whole struct; the *length* is the lie being tested, and it is
+        // shorter than the struct, so nothing reads past what the local owns.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole - 4) }, EINVAL);
+        assert_eq!(q.out_supported_structures_mask, 0xdead_beef);
+
+        // The version in the header governs how every field is laid out, so a version this build
+        // cannot read is refused whole rather than served structure by structure.
+        let mut q = asked(0, whole);
+        q.hdr.stype_version = 1;
+        // SAFETY: a local of exactly the length being passed.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, EINVAL);
+        assert_eq!(q.out_supported_structures_mask, 0xdead_beef);
+
+        // A tag this build does not serve, and a request with nowhere to put an answer.
+        let mut q = asked(0, whole);
+        q.hdr.stype = 1 << 5;
+        // SAFETY: a local of exactly the length being passed.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, EINVAL);
+        // SAFETY: null with a length is exactly the case being checked.
+        assert_eq!(unsafe { virgl_renderer_execute(core::ptr::null_mut(), whole) }, EINVAL);
+        // A length too short to hold even a tag. The C reads the tag first and would have read
+        // this; here there is nothing to dispatch on, so there is nothing to do but refuse.
+        // SAFETY: the pointer is a whole struct and the length is smaller than it.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), 4) }, EINVAL);
+    }
+
+    /// Nothing in this tree has a dma-buf, so the export query's every answer is the header's
+    /// own "not exportable": a zero fourcc, and a modifier that claims no layout.
+    ///
+    /// Asking for the descriptors is refused instead of answered, because a caller that set
+    /// `in_export_fds` wants file descriptors and a `-1` dressed as success is how a VMM comes to
+    /// map nothing. The resource lookup is ahead of both, so this runs with no renderer and gets
+    /// the same refusal a nonexistent resource gets -- which is the C's answer too.
+    #[test]
+    fn an_export_query_says_the_resource_cannot_be_exported() {
+        use std::mem::size_of;
+
+        let whole = size_of::<abi::ExportQuery>() as u32;
+        let mut q = abi::ExportQuery {
+            hdr: abi::ExecuteHdr {
+                stype: abi::STRUCTURE_TYPE_EXPORT_QUERY,
+                stype_version: 0,
+                size: whole,
+            },
+            in_resource_id: 1,
+            out_num_fds: 0,
+            in_export_fds: 0,
+            out_fourcc: 0xdead_beef,
+            pad: 0,
+            out_fds: [7; 4],
+            out_strides: [7; 4],
+            out_offsets: [7; 4],
+            out_modifier: 0,
+        };
+        // SAFETY: a local of exactly the length being passed.
+        assert_eq!(
+            unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) },
+            EINVAL,
+            "no renderer, so no resource -- and a resource that is not there is not exportable"
+        );
+        assert_eq!(q.out_fourcc, 0xdead_beef, "and a refusal writes nothing");
+
+        // Resource zero is how this ABI spells "no resource", and it must not reach a lookup.
+        q.in_resource_id = 0;
+        // SAFETY: as above.
+        assert_eq!(unsafe { virgl_renderer_execute((&raw mut q).cast(), whole) }, EINVAL);
+
+        // The two halves the renderer is not needed for: what a live resource would be told.
+        q.in_resource_id = 1;
+        q.in_export_fds = 1;
+        assert_eq!(export_query(&mut q), EINVAL, "descriptors are refused, never faked");
+        q.in_export_fds = 0;
+        assert_eq!(export_query(&mut q), EINVAL, "and with no renderer there is no resource");
+    }
+
+    /// The two blob calls that this platform answers by refusing, and the shape of each refusal.
+    ///
+    /// Both are finished answers rather than stubs -- see each function's own doc -- so what is
+    /// pinned here is that they are told apart: a resource that does not exist is `EINVAL`
+    /// whichever call is asked, while a resource that does exist and simply cannot be served this
+    /// way is `EOPNOTSUPP`, which the header defines as "try `virgl_renderer_resource_map`
+    /// instead". A caller that got `EINVAL` for both would go looking for its own bug.
+    ///
+    /// The live-resource arm of `map_fixed` needs an initialized renderer, which a unit test
+    /// cannot stand up without making a process-global one every other test would share; it is
+    /// reached by the ABI fixture and by limina, which does not call this at all.
+    #[test]
+    fn the_blob_calls_this_platform_cannot_serve_refuse_by_name() {
+        // Resource zero is the ABI's "no resource" and never reaches a lookup.
+        assert_eq!(virgl_renderer_resource_map_fixed(0, core::ptr::null_mut()), EINVAL);
+        // No renderer, so no resource: still the caller naming something that is not there.
+        assert_eq!(virgl_renderer_resource_map_fixed(1, core::ptr::null_mut()), EINVAL);
+        assert_ne!(EOPNOTSUPP, ENOTSUP, "the header promises EOPNOTSUPP, and Darwin's differ");
+
+        // An fd export is refused for every resource, existing or not: nothing here has one.
+        let mut fd_type = 0xdead_beefu32;
+        let mut fd = 7;
+        assert_eq!(
+            virgl_renderer_resource_export_blob(1, &raw mut fd_type, &raw mut fd),
+            EINVAL,
+            "rutabaga reads this as `no handle`, which is the truth"
+        );
+        assert_eq!((fd_type, fd), (0xdead_beef, 7), "and a refusal writes neither out-parameter");
     }
 
     /// A guest picks this byte, and picking a wrong one must not be mistaken for picking venus.

@@ -138,6 +138,50 @@ pub type DebugCallback = Option<extern "C" fn(*const c_char, *mut c_void)>;
 pub type LogCallback = Option<extern "C" fn(c_int, *const c_char, *mut c_void)>;
 pub type FreeDataCallback = Option<extern "C" fn(*mut c_void)>;
 
+/// `virgl_renderer_execute`'s structure tags, from `virglrenderer.h`. They are a bitmask as well
+/// as an enum: `SupportedStructures` answers with the union of the ones this build serves.
+pub const STRUCTURE_TYPE_EXPORT_QUERY: u32 = 1 << 0;
+pub const STRUCTURE_TYPE_SUPPORTED_STRUCTURES: u32 = 1 << 1;
+
+/// `DRM_FORMAT_MOD_INVALID`, from `drm_fourcc.h` by way of `vrend_winsys.h`. "No modifier is
+/// being stated", which is the only honest thing to say about storage that has no dma-buf.
+pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// The header every `virgl_renderer_execute` request begins with.
+///
+/// `size` is the caller's own statement of how long its struct is, and it is checked against the
+/// struct the tag names rather than trusted: the two are a pair the caller could get wrong, and
+/// this is the boundary that reconciles them (CLAUDE.md).
+#[repr(C)]
+pub struct ExecuteHdr {
+    pub stype: u32,
+    pub stype_version: u32,
+    pub size: u32,
+}
+
+/// `struct virgl_renderer_export_query`.
+#[repr(C)]
+pub struct ExportQuery {
+    pub hdr: ExecuteHdr,
+    pub in_resource_id: u32,
+    pub out_num_fds: u32,
+    pub in_export_fds: u32,
+    pub out_fourcc: u32,
+    pub pad: u32,
+    pub out_fds: [c_int; 4],
+    pub out_strides: [u32; 4],
+    pub out_offsets: [u32; 4],
+    pub out_modifier: u64,
+}
+
+/// `struct virgl_renderer_supported_structures`.
+#[repr(C)]
+pub struct SupportedStructures {
+    pub hdr: ExecuteHdr,
+    pub in_stype_version: u32,
+    pub out_supported_structures_mask: u32,
+}
+
 /// A pointer the VMM owns and we only ever hand back to it.
 ///
 /// The renderer is reached from more than one thread through the ABI, so its state must be `Send`
@@ -209,6 +253,37 @@ mod tests {
         assert_eq!(offset_of!(Callbacks, get_server_fd), 56);
         assert_eq!(offset_of!(Callbacks, get_egl_display), 64);
         assert_eq!(size_of::<Callbacks>(), 72);
+    }
+
+    /// `virgl_renderer_execute` reads its request through these structs and writes its answer
+    /// back into the caller's own storage, so every offset here is a place the shim writes into
+    /// memory it does not own. A field that drifted would corrupt silently.
+    ///
+    /// Ground truth: `harness/abi/layout.txt`, dumped by the compiler from the header.
+    #[test]
+    fn the_execute_structs_match_the_c_header() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(offset_of!(ExecuteHdr, stype), 0);
+        assert_eq!(offset_of!(ExecuteHdr, stype_version), 4);
+        assert_eq!(offset_of!(ExecuteHdr, size), 8);
+        assert_eq!(size_of::<ExecuteHdr>(), 12);
+
+        assert_eq!(offset_of!(ExportQuery, hdr), 0);
+        assert_eq!(offset_of!(ExportQuery, in_resource_id), 12);
+        assert_eq!(offset_of!(ExportQuery, out_num_fds), 16);
+        assert_eq!(offset_of!(ExportQuery, in_export_fds), 20);
+        assert_eq!(offset_of!(ExportQuery, out_fourcc), 24);
+        assert_eq!(offset_of!(ExportQuery, out_fds), 32);
+        assert_eq!(offset_of!(ExportQuery, out_strides), 48);
+        assert_eq!(offset_of!(ExportQuery, out_offsets), 64);
+        assert_eq!(offset_of!(ExportQuery, out_modifier), 80);
+        assert_eq!(size_of::<ExportQuery>(), 88);
+
+        assert_eq!(offset_of!(SupportedStructures, hdr), 0);
+        assert_eq!(offset_of!(SupportedStructures, in_stype_version), 12);
+        assert_eq!(offset_of!(SupportedStructures, out_supported_structures_mask), 16);
+        assert_eq!(size_of::<SupportedStructures>(), 20);
     }
 
     /// The version gate in `virgl_renderer_init` is what makes those projections legal: a caller
