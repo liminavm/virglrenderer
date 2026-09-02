@@ -651,12 +651,6 @@ impl Handlers<'_> {
         }
     }
 
-    /// The pool an allocation names, as a host handle -- zero when the info is missing, which no
-    /// live pool can be, so the driver's re-check refuses it.
-    fn pool_of<I>(&self, info: Option<&I>, pool: impl FnOnce(&I) -> u64) -> u64 {
-        info.map_or(0, pool)
-    }
-
     /// The verdict on an array the generated accessor could not reconcile.
     ///
     /// The reconciliation is the accessor's -- it is the only code that knows how long the arena
@@ -682,6 +676,24 @@ impl Handlers<'_> {
             self.reject = Some("asked a query with no struct to answer into");
         }
         out
+    }
+
+    /// The verdict on a query that did not say what it is asking about.
+    ///
+    /// The mirror of [`Vkr::fills`], and the same dishonesty from the other side. Every command
+    /// routed through the info-carrying query helpers has its struct marked required in vk.xml,
+    /// so an absent one is not a guest exercising an option -- it is a question with no subject.
+    /// Answering it would mean inventing the subject, and the answer would go back looking like
+    /// the host had been asked.
+    ///
+    /// The `Option` it takes is a fact about the wire, not about Vulkan: the decoder types every
+    /// by-ref member this way because a guest can always send a null. Deciding what that null
+    /// means is the handler's, and this is where the whole family decides it once.
+    fn names<'w, I>(&mut self, info: Option<&'w I>) -> Option<&'w I> {
+        if info.is_none() {
+            self.reject = Some("asked a query without saying what it is about");
+        }
+        info
     }
 
     /// The verdict on a query this renderer could not put to the driver at all.
@@ -785,8 +797,8 @@ impl Handlers<'_> {
 macro_rules! simple_create {
     ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
-            let host =
-                self.driver.create_object(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
+            let Some(info) = self.names(args.$info) else { return };
+            let host = self.driver.create_object(args.device, |d| d.$cmd(), info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
             self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
@@ -800,8 +812,8 @@ macro_rules! simple_create {
 macro_rules! pool_create {
     ($cmd:ident, $args:ty, $info:ident, $out:ident, $shadow:ident) => {
         fn $cmd(&mut self, args: &mut $args) {
-            let host =
-                self.driver.create_pool(args.device, |d| d.$cmd(), args.$info, args.pAllocator);
+            let Some(info) = self.names(args.$info) else { return };
+            let host = self.driver.create_pool(args.device, |d| d.$cmd(), info, args.pAllocator);
             args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
             self.plant(stringify!($cmd), args.$out(), args.$shadow(), host);
         }
@@ -893,7 +905,8 @@ impl Commands for Handlers<'_> {
     // they are served.
 
     fn vkCreateInstance(&mut self, args: &mut vn_command_vkCreateInstance<'_>) {
-        let host = self.driver.create_instance(self.global, args.pCreateInfo, args.pAllocator);
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_instance(self.global, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant(
             "vkCreateInstance",
@@ -957,8 +970,8 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCreateDevice(&mut self, args: &mut vn_command_vkCreateDevice<'_>) {
-        let host =
-            self.driver.create_device(args.physicalDevice, args.pCreateInfo, args.pAllocator);
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_device(args.physicalDevice, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateDevice", args.pDevice(), args.handle_pDevice_mut(), host.map(|h| h.0));
     }
@@ -983,8 +996,8 @@ impl Commands for Handlers<'_> {
         let Some(id) = self.out_id(args.pMemory()) else {
             return;
         };
-        let host =
-            self.driver.allocate_memory(args.device, id, args.pAllocateInfo, args.pAllocator);
+        let Some(info) = self.names(args.pAllocateInfo) else { return };
+        let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant(
             "vkAllocateMemory",
@@ -1124,14 +1137,15 @@ impl Commands for Handlers<'_> {
     /// allocation shorter than the number the driver is then handed, and the driver reads off the
     /// end of it. The guest chooses that number, which makes rejecting it the boundary's job.
     fn vkCreateShaderModule(&mut self, args: &mut vn_command_vkCreateShaderModule<'_>) {
-        if args.pCreateInfo.is_none_or(|i| i.codeSize % 4 != 0) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        if info.codeSize % 4 != 0 {
             self.reject = Some("gave a shader a code size that is not a whole number of words");
             return;
         }
         let host = self.driver.create_object(
             args.device,
             |d| d.vkCreateShaderModule(),
-            args.pCreateInfo,
+            info,
             args.pAllocator,
         );
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
@@ -1156,8 +1170,9 @@ impl Commands for Handlers<'_> {
         // was checked against it -- which is the count both accessors below read.
         let Some(ids) = self.array(args.pCommandBuffers()) else { return };
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
-        let (device, info) = (args.device, args.pAllocateInfo);
-        let pool = self.pool_of(info, |i| i.commandPool.raw());
+        let device = args.device;
+        let Some(info) = self.names(args.pAllocateInfo) else { return };
+        let pool = info.commandPool.raw();
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| ObjectId(h.raw())).collect();
@@ -1190,8 +1205,9 @@ impl Commands for Handlers<'_> {
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
         let Some(ids) = self.array(args.pDescriptorSets()) else { return };
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
-        let (device, info) = (args.device, args.pAllocateInfo);
-        let pool = self.pool_of(info, |i| i.descriptorPool.raw());
+        let device = args.device;
+        let Some(info) = self.names(args.pAllocateInfo) else { return };
+        let pool = info.descriptorPool.raw();
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| ObjectId(h.raw())).collect();
@@ -1215,7 +1231,8 @@ impl Commands for Handlers<'_> {
     fn vkGetDeviceQueue2(&mut self, args: &mut vn_command_vkGetDeviceQueue2<'_>) {
         // A queue is owned by its device and never created, so the guest's id is registered
         // against a handle the driver merely hands back.
-        let host = self.driver.device_queue(args.device, args.pQueueInfo);
+        let Some(info) = self.names(args.pQueueInfo) else { return };
+        let host = self.driver.device_queue(args.device, info);
         self.plant(
             "vkGetDeviceQueue2",
             args.pQueue(),
@@ -1580,7 +1597,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceImageFormatProperties2<'_>,
     ) {
-        let (pd, info) = (args.physicalDevice, args.pImageFormatInfo);
+        let pd = args.physicalDevice;
+        let Some(info) = self.names(args.pImageFormatInfo) else { return };
         let Some(out) = self.fills(args.pImageFormatProperties_mut()) else { return };
         args.ret = self
             .driver
@@ -1670,7 +1688,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceExternalFenceProperties<'_>,
     ) {
-        let (pd, info) = (args.physicalDevice, args.pExternalFenceInfo);
+        let pd = args.physicalDevice;
+        let Some(info) = self.names(args.pExternalFenceInfo) else { return };
         let Some(out) = self.fills(args.pExternalFenceProperties_mut()) else { return };
         let r = self
             .driver
@@ -1682,7 +1701,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties<'_>,
     ) {
-        let (pd, info) = (args.physicalDevice, args.pExternalSemaphoreInfo);
+        let pd = args.physicalDevice;
+        let Some(info) = self.names(args.pExternalSemaphoreInfo) else { return };
         let Some(out) = self.fills(args.pExternalSemaphoreProperties_mut()) else { return };
         let r = self.driver.pd_query_info(pd, info, out, |i| {
             i.try_vkGetPhysicalDeviceExternalSemaphoreProperties()
@@ -1694,7 +1714,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetImageMemoryRequirements2<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pInfo) else { return };
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -1706,7 +1727,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetBufferMemoryRequirements2<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pInfo) else { return };
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -1718,7 +1740,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetImageSubresourceLayout<'_>,
     ) {
-        let (device, image, sub) = (args.device, args.image, args.pSubresource);
+        let (device, image) = (args.device, args.image);
+        let Some(sub) = self.names(args.pSubresource) else { return };
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self
             .driver
@@ -1774,7 +1797,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetPhysicalDeviceExternalBufferProperties<'_>,
     ) {
-        let (pd, info) = (args.physicalDevice, args.pExternalBufferInfo);
+        let pd = args.physicalDevice;
+        let Some(info) = self.names(args.pExternalBufferInfo) else { return };
         let Some(out) = self.fills(args.pExternalBufferProperties_mut()) else { return };
         let r = self
             .driver
@@ -1828,7 +1852,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetRenderingAreaGranularity<'_>,
     ) {
-        let (device, info) = (args.device, args.pRenderingAreaInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pRenderingAreaInfo) else { return };
         let Some(out) = self.fills(args.pGranularity_mut()) else { return };
         let r = self
             .driver
@@ -1840,7 +1865,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDeviceBufferMemoryRequirements<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pInfo) else { return };
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -1852,7 +1878,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDeviceImageMemoryRequirements<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pInfo) else { return };
         let Some(out) = self.fills(args.pMemoryRequirements_mut()) else { return };
         let r = self
             .driver
@@ -1864,7 +1891,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDescriptorSetLayoutSupport<'_>,
     ) {
-        let (device, info) = (args.device, args.pCreateInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pCreateInfo) else { return };
         let Some(out) = self.fills(args.pSupport_mut()) else { return };
         let r = self
             .driver
@@ -1876,7 +1904,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDeviceImageSubresourceLayout<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let device = args.device;
+        let Some(info) = self.names(args.pInfo) else { return };
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self
             .driver
@@ -1888,7 +1917,8 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetImageSubresourceLayout2<'_>,
     ) {
-        let (device, image, sub) = (args.device, args.image, args.pSubresource);
+        let (device, image) = (args.device, args.image);
+        let Some(sub) = self.names(args.pSubresource) else { return };
         let Some(out) = self.fills(args.pLayout_mut()) else { return };
         let r = self
             .driver
@@ -1940,10 +1970,7 @@ impl Commands for Handlers<'_> {
     /// and zero is a null address the guest would hand to the GPU. See
     /// [`Driver::dev_ask_info`]: the only honest thing left is to stop the ring.
     fn vkGetBufferDeviceAddress(&mut self, args: &mut vn_command_vkGetBufferDeviceAddress<'_>) {
-        let Some(info) = args.pInfo else {
-            self.reject = Some("asked for the address of no buffer at all");
-            return;
-        };
+        let Some(info) = self.names(args.pInfo) else { return };
         let r = self.driver.dev_ask_info(args.device, info, |d| d.try_vkGetBufferDeviceAddress());
         if let Some(ret) = self.asked(r) {
             args.ret = ret;
@@ -1954,10 +1981,7 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetBufferOpaqueCaptureAddress<'_>,
     ) {
-        let Some(info) = args.pInfo else {
-            self.reject = Some("asked for the capture address of no buffer at all");
-            return;
-        };
+        let Some(info) = self.names(args.pInfo) else { return };
         let r = self
             .driver
             .dev_ask_info(args.device, info, |d| d.try_vkGetBufferOpaqueCaptureAddress());
@@ -1970,10 +1994,7 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDeviceMemoryOpaqueCaptureAddress<'_>,
     ) {
-        let Some(info) = args.pInfo else {
-            self.reject = Some("asked for the capture address of no memory at all");
-            return;
-        };
+        let Some(info) = self.names(args.pInfo) else { return };
         let r = self
             .driver
             .dev_ask_info(args.device, info, |d| d.try_vkGetDeviceMemoryOpaqueCaptureAddress());
@@ -2421,8 +2442,8 @@ impl Commands for Handlers<'_> {
     // naming one stops its own ring at the lookup, before a handler is reached.
 
     fn vkBeginCommandBuffer(&mut self, args: &mut vn_command_vkBeginCommandBuffer<'_>) {
-        let Some(ret) = self.driver.begin_command_buffer(args.commandBuffer, args.pBeginInfo)
-        else {
+        let Some(info) = self.names(args.pBeginInfo) else { return };
+        let Some(ret) = self.driver.begin_command_buffer(args.commandBuffer, info) else {
             return self.no_recorder();
         };
         args.ret = ret;
@@ -2461,11 +2482,8 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCmdBeginRenderPass(&mut self, args: &mut vn_command_vkCmdBeginRenderPass<'_>) {
-        let done = self.driver.cmd_begin_render_pass(
-            args.commandBuffer,
-            args.pRenderPassBegin,
-            args.contents,
-        );
+        let Some(begin) = self.names(args.pRenderPassBegin) else { return };
+        let done = self.driver.cmd_begin_render_pass(args.commandBuffer, begin, args.contents);
         self.recorded(done);
     }
 
@@ -4138,6 +4156,78 @@ mod tests {
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
+    }
+
+    /// The struct a command cannot be carried out without, when the guest did not send one.
+    ///
+    /// vk.xml marks the info struct of every command in these three families required, so a null
+    /// is not the guest declining an option -- it is a request with its subject missing. Before
+    /// this guard existed the null went straight through to the host driver in five of these
+    /// entry points, which is a guest handing the loader a pointer Vulkan says cannot be one.
+    ///
+    /// The wording is what is asserted rather than merely that something was refused: each of
+    /// these three would refuse for a *different* reason if the guard were gone -- no device
+    /// table, no recorder, or a driver error planted in `ret` -- and only the wording tells the
+    /// missing subject apart from those.
+    #[test]
+    fn a_required_struct_the_guest_left_out_stops_the_ring() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkMemoryRequirements2, vn_command_vkCmdBeginRenderPass,
+            vn_command_vkCreateFence, vn_command_vkGetImageMemoryRequirements2,
+        };
+
+        const MISSING: &str = "asked a query without saying what it is about";
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let t = ring_table();
+
+        macro_rules! run {
+            ($call:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                #[allow(unused_mut)]
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &mut todo,
+                    driver: &mut driver,
+                    global: &global,
+                    reject: None,
+                    unserved: false,
+                    resources: &t,
+                    rings: &mut rings,
+                    replaying: false,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                };
+                #[allow(clippy::redundant_closure_call)]
+                (|h: &mut Handlers| $call(h))(&mut h);
+                h.reject
+            }};
+        }
+
+        // A query. The out-struct is present, so the only thing missing is what to ask about.
+        let mut out = VkMemoryRequirements2::default();
+        let mut args = vn_command_vkGetImageMemoryRequirements2::default();
+        args.plant_pMemoryRequirements(&mut out);
+        assert_eq!(
+            run!(|h: &mut Handlers| h.vkGetImageMemoryRequirements2(&mut args)),
+            Some(MISSING)
+        );
+
+        // A create. Nothing may be planted for the guest to hold afterwards.
+        let mut args = vn_command_vkCreateFence::default();
+        assert_eq!(run!(|h: &mut Handlers| h.vkCreateFence(&mut args)), Some(MISSING));
+        assert_eq!(args.ret, VkResult::default(), "no verdict was invented for a call never made");
+
+        // A recording command, which has no reply at all to carry a refusal.
+        let mut args = vn_command_vkCmdBeginRenderPass {
+            commandBuffer: VkCommandBuffer(0x9001),
+            ..Default::default()
+        };
+        assert_eq!(run!(|h: &mut Handlers| h.vkCmdBeginRenderPass(&mut args)), Some(MISSING));
     }
 
     /// The two-call idiom, in the half of it that has no way to say "there were more".
@@ -7339,7 +7429,9 @@ mod tests {
 
         // A result the guest is owed: the driver's answer has to reach the reply, not be
         // replaced by a success the renderer invented.
+        let begin = VkCommandBufferBeginInfo::default();
         let mut args = vn_command_vkBeginCommandBuffer { commandBuffer: cb, ..Default::default() };
+        args.pBeginInfo = Some(&begin);
         h.vkBeginCommandBuffer(&mut args);
         assert!(h.reject.is_none());
         assert_eq!(args.ret, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY);
