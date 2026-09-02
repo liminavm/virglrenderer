@@ -91,20 +91,34 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   handler one element fewer than the guest sent replays both corpora at `cmds 506657/506657` and
   `1348/1348`, census unchanged — and KosmicKrisp's own workload counters (barriers, render pass
   starts, clears) come back byte-identical too, so the one host-side signal in the output cannot
-  see it either. Anything about the *contents* a handler passes to the driver needs its own witness
-  — a unit test beside the handler — until the census covers enough served state to be pinned.
-  `venus-roundtrip` does not help there either: it never calls a handler.
+  see it either. `venus-roundtrip` does not help: it never calls a handler or an accessor. What
+  covers that gap is two layers of witness, and `harness/sabotage/sweep.py` is what says so.
 
-  The seam for those witnesses is generated: `Device::plant_<cmd>` puts a stub entry point in a proc
-  table, `Driver::plant_device`/`plant_pool` give it something to be reached through, and
-  `vn_command_X::plant_<array>` fills an argument struct whose pointers the handlers cannot see.
-  `a_recording_handler_hands_the_driver_what_the_guest_sent` reads back what crossed over.
+  **The accessors are witnessed by generation, because the bug is in the template.** One template
+  mistake is a hundred identical bugs, so `venus-gen` emits a test per command that plants its
+  arrays, encodes with the real argument encoder, decodes with the real decoder, and asks the
+  accessor two things: its length, and which member it read. Those are the accessor's only two
+  degrees of freedom — and the second is not redundant, because where several arrays share a
+  count that is all that separates them, and where they share an element type too (`pOffsets`,
+  `pSizes`, `pStrides`) the type system does not. 52 commands are covered; the six arrays whose
+  count lives in another struct, behind an out-pointer, or in arithmetic are named in the
+  generated module, because a planter cannot establish both halves of those.
 
-  The witness has a seam to hang off: `Device::plant_*` puts a plain function of the entry point's
-  own shape into a proc table, and `Driver::plant_device`/`plant_pool` stand that table up as a
-  device a handler can record into. A test then reads back what actually crossed the boundary —
-  see `a_recording_handler_hands_the_driver_what_the_guest_sent`, which the one-element-too-many
-  sabotage does fail.
+  **What a handler does between the accessor and the driver is witnessed by hand.** The seam is
+  generated: `Device::plant_<cmd>` puts a plain function of the entry point's own shape into a
+  proc table, `Driver::plant_device`/`plant_pool` stand that table up as a device a handler can
+  record into, and `Driver::pool_child_id` reads the pairing back. See
+  `a_recording_handler_hands_the_driver_what_the_guest_sent` for the four argument shapes and
+  `a_pool_allocation_hands_over_the_run_the_guest_asked_for` for a run allocated from a pool,
+  where the guest's ids, the driver's handles and the pool's record of both are three things that
+  can go out of step with each other and nothing afterwards can tell.
+
+  **A passing suite says nothing about what it would catch, so `harness/sabotage/sweep.py` asks
+  directly.** Each entry is a one-line edit that makes the renderer wrong in a way a guest would
+  see, applied to a clean tree, tested, and reverted; `RED` names the test that noticed and
+  `SURVIVED` names a hole. Every edit asserts it matched, because a sweep reporting `RED` for an
+  edit it never made is worse than no sweep. Add an entry with each witness rather than after.
+
 - The layout oracle is the third leg of the same feature, and it runs as a plain unit test:
   `cargo test --features reply-oracle` in `virglrs/`. `venus-roundtrip` proves the wire and
   `venus-reply-oracle` proves the replies, but both compare *bytes*, and the reply oracle only
