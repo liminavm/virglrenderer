@@ -667,16 +667,19 @@ impl Driver {
     /// unfilled and no `VkResult` to carry an error, so a driver this renderer could not ask
     /// leaves nothing but the zero the reply would encode -- and zero is a null address the guest
     /// would hand straight to the GPU. `Err` here has to reach the guest as a stopped ring.
+    /// `info` is a borrow rather than an `Option`, unlike the query helpers above: all three of
+    /// these commands require their struct, so there is no null for this helper to forward. The
+    /// handler decides what an absent one means before it gets here.
     pub fn dev_ask_info<I, R>(
         &self,
         device: VkDevice,
-        info: Option<&I>,
+        info: &I,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> R>,
     ) -> Result<R, VkResult> {
         let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
-        // SAFETY: as `dev_query_info`; `info` is an arena allocation live for the call, or null.
-        Ok(unsafe { f(device, ptr(info)) })
+        // SAFETY: as `dev_query_info`; `info` borrows an arena struct live for the call.
+        Ok(unsafe { f(device, info) })
     }
 
     /// A device query that names what it is asking about with a struct.
