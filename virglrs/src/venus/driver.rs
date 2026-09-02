@@ -1452,8 +1452,21 @@ impl Driver {
     pub(super) fn plant_allocation_of(&mut self, id: ObjectId, size: u64, props: u32) {
         self.memory.insert(
             id,
-            Allocated { size, props: VkMemoryPropertyFlags(props as _), exported: None },
+            Allocated {
+                size,
+                props: VkMemoryPropertyFlags(props as _),
+                imported: false,
+                exported: None,
+            },
         );
+    }
+
+    /// Plant an allocation that aliases another context's storage -- host-visible like any
+    /// import, so that what keeps it out of the census is the aliasing and nothing else.
+    #[cfg(test)]
+    pub(super) fn plant_imported_allocation(&mut self, id: ObjectId, size: u64) {
+        self.plant_allocation(id, size);
+        self.memory.get_mut(&id).expect("just planted").imported = true;
     }
 
     /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
@@ -2282,14 +2295,12 @@ impl Driver {
         // A copy, not an edit in place: the decoder's struct is the guest's request, and the
         // round trip re-encodes it. The `pNext` chain is carried over untouched.
         let mut info = *info;
-        // Resolved once. The padding and the export both answer from the memory type's properties,
-        // and a second lookup is a second chance for them to disagree about what was allocated.
+        // Resolved once, both of them. The padding, the export and the census all answer from
+        // the memory type's properties and from whether this aliases someone else's storage; a
+        // second lookup is a second chance for two answers to disagree about one allocation.
         let props = d.memory_types.get(info.memoryTypeIndex as usize).copied();
-        info.allocationSize = VkDeviceSize(pad_for_blob(
-            info.allocationSize.0,
-            props,
-            imports_a_resource(info.pNext),
-        ));
+        let imported = imports_a_resource(info.pNext);
+        info.allocationSize = VkDeviceSize(pad_for_blob(info.allocationSize.0, props, imported));
 
         let mut out = VkDeviceMemory(0);
         // SAFETY: `info` is a local whose chain the decoder owns for the batch, `alloc` is another
@@ -2303,7 +2314,8 @@ impl Driver {
         // the fallback describes memory that cannot exist -- and describes it as addressable by
         // nothing, which is the safe reading.
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
-        self.memory.insert(id, Allocated { size: info.allocationSize.0, props, exported: None });
+        self.memory
+            .insert(id, Allocated { size: info.allocationSize.0, props, imported, exported: None });
         Ok(out)
     }
 
@@ -2333,15 +2345,16 @@ impl Driver {
 
     /// Every live allocation the census is responsible for.
     ///
-    /// Exported memory is not: its bytes are the blob's, and the VMM captures them where they
-    /// live rather than reading them a second time through here. Memory *imported* from another
-    /// context's storage is skipped for the same reason and is not skipped yet -- the import side
-    /// of the blob path does not exist, so the count still reads high against the C by exactly the
-    /// surfaces a corpus imported.
+    /// Two kinds are not. Exported memory's bytes are the blob's, and the VMM captures them where
+    /// they live rather than reading them a second time through here. Imported memory's bytes are
+    /// the *exporter's*, censused where they are owned -- reading them here would report one
+    /// buffer under two ids and read it through a mapping of memory this context does not own.
+    ///
+    /// Both are the same rule: the census reports storage once, at whoever owns it.
     pub fn memory_census(&self) -> Vec<Allocation> {
         self.memory
             .iter()
-            .filter(|(_, a)| a.exported.is_none())
+            .filter(|(_, a)| !a.imported && a.exported.is_none())
             .map(|(id, a)| Allocation { id: *id, size: a.size })
             .collect()
     }
@@ -2480,6 +2493,19 @@ struct Allocated {
     /// the host cannot address, and the VMM must be told how the guest may cache it. Two answers
     /// derived from one recorded fact cannot drift apart the way two recorded booleans can.
     props: VkMemoryPropertyFlags,
+    /// Whether it aliases storage another context owns, rather than storage of its own.
+    ///
+    /// A guest imports when one context has to reach a buffer another context rendered -- a
+    /// compositor sampling a client's window. The bytes are the exporter's, and this allocation
+    /// is a second Vulkan handle onto them, so the census must not read them here: it would
+    /// report one buffer twice, and report it through a mapping of memory this context does not
+    /// own. Recorded at the allocation because the `pNext` chain that says so is the guest's
+    /// request, and it is gone by the time anything asks.
+    ///
+    /// Orthogonal to `exported`, deliberately. Importing storage and republishing it is a chain
+    /// a guest is allowed to build, and nothing here has seen one; refusing it would be a
+    /// constraint invented rather than observed.
+    imported: bool,
     /// The host address `vkMapMemory` returned when this memory was exported as a blob.
     ///
     /// `Some` *is* the export mark: one value, not a flag beside an address that could disagree
@@ -2737,6 +2763,57 @@ mod tests {
     ///
     /// Every refusal here is a guest's doing, so each has to be an answer rather than an abort:
     /// naming memory that does not exist, exporting the same memory twice, asking for a blob
+    /// The census reports storage once, at whoever owns it -- and an import owns none. A guest
+    /// imports so one context can reach what another rendered, and the second Vulkan handle onto
+    /// those bytes is not a second buffer. Counting it would report the exporter's window twice
+    /// and read it through a mapping this context has no claim to.
+    ///
+    /// Pinned against the corpus rather than against the C's source: `synoik` allocates exactly
+    /// two imports, and they are exactly the two allocations the C's census omits and ours did
+    /// not.
+    #[test]
+    fn the_census_does_not_report_storage_a_context_only_borrows() {
+        const OWNED: ObjectId = ObjectId(20);
+        const BORROWED: ObjectId = ObjectId(21);
+        const SIZE: u64 = 4_096_000;
+
+        let mut driver = Driver::new();
+        driver.plant_allocation(OWNED, SIZE);
+        driver.plant_imported_allocation(BORROWED, SIZE);
+
+        let census = driver.memory_census();
+        assert_eq!(census.len(), 1, "the borrowed one is the exporter's to report");
+        assert_eq!(census[0].id, OWNED);
+        assert_eq!(census[0].size, SIZE);
+
+        driver.abandon_planted();
+    }
+
+    /// A `pNext` chain naming another context's resource is what makes an allocation an import,
+    /// and the guest may hang it anywhere in the chain. Reading only the head would find it
+    /// exactly when the guest happened to put it first, which is not a contract.
+    #[test]
+    fn an_import_is_recognized_wherever_the_guest_hung_it() {
+        use super::super::proto::types::{VkBaseInStructure, VkStructureType};
+
+        let mut tail = VkBaseInStructure {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+            pNext: core::ptr::null(),
+        };
+        let mut head = VkBaseInStructure {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: &raw const tail,
+        };
+        assert!(imports_a_resource((&raw const head).cast()), "found past the head");
+
+        head.pNext = core::ptr::null();
+        assert!(!imports_a_resource((&raw const head).cast()), "and not claimed when absent");
+
+        tail.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        head.pNext = &raw const tail;
+        assert!(!imports_a_resource((&raw const head).cast()));
+    }
+
     /// bigger than what backs it, or asking to map memory the host cannot address. The second of
     /// those is the one with teeth -- two resources over one storage is a state neither holder
     /// could detect afterwards.
