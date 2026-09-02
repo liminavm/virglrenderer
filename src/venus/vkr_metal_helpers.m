@@ -153,6 +153,20 @@ limina_sentinel_once(void)
    pthread_once(&once, limina_sentinel_selftest);
 }
 
+/* The two halves of the planar/scanout IOSurface ledger, for a caller that wants to say
+ * "live = allocated - freed" at the moment an allocation is refused. */
+long
+vkr_mtl_iosurface_alloc_count(void)
+{
+   return (long)atomic_load(&g_limina_n_ios_alloc);
+}
+
+long
+vkr_mtl_iosurface_free_count(void)
+{
+   return (long)atomic_load(&g_limina_n_ios_free);
+}
+
 void
 vkr_mtl_refcount_census(char *buf, unsigned long len)
 {
