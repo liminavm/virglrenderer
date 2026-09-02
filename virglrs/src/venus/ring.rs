@@ -208,6 +208,13 @@ impl RingLayout {
 pub enum RingError {
     NoResource(ResourceHandle),
     Layout(LayoutError),
+    /// The head or status word was already non-zero on a ring the host is about to start managing.
+    /// Those two words are the host's to write, so a guest presenting them dirty is describing a
+    /// ring someone else is already driving.
+    NotOurs {
+        head: u32,
+        status: u32,
+    },
 }
 
 /// The only thing venus needs from the renderer's resource table.
@@ -242,13 +249,28 @@ pub struct Ring {
     /// The guest's number, kept because it is the guest's call: it knows its own cadence, and a
     /// ring that parks too eagerly pays a doorbell round trip on the next submit.
     pub idle_timeout: Duration,
+    /// How far the host has read, free-running and masked into the buffer only when used.
+    ///
+    /// Established here rather than in the thread that advances it, because a ring restored from a
+    /// snapshot does not start at zero: the guest was quiesced with a partly-consumed buffer, and
+    /// the host resumes where it left off. A thread starting from zero on such a ring would treat
+    /// every byte the guest had already been answered for as new work.
+    pub cur: u32,
 }
 
 impl Ring {
     /// Take a guest's ring description and, if it holds up, the memory to go with it.
+    /// Take a guest's ring description and, if it holds up, the memory to go with it.
+    ///
+    /// `replaying` is what separates a guest creating a ring from a snapshot restoring one, and
+    /// the two disagree about the same two words. Live, the head and status are the host's and
+    /// must arrive zero -- a ring presenting them dirty is one another renderer is already driving.
+    /// Restored, those same words carry the cursors the guest was quiesced at, and the read
+    /// position resumes from the head rather than from the start of the buffer.
     pub fn create(
         resources: &dyn ShmResources,
         info: &VkRingCreateInfoMESA,
+        replaying: bool,
     ) -> Result<Ring, RingError> {
         let handle = ResourceHandle(info.resourceId);
         // The resource is resolved before the layout is parsed, because the layout is checked
@@ -256,7 +278,20 @@ impl Ring {
         // would be checking the guest against itself.
         let map = resources.shm(handle).ok_or(RingError::NoResource(handle))?;
         let layout = RingLayout::parse(map.len(), info).map_err(RingError::Layout)?;
-        Ok(Ring { layout, map, reply: None, idle_timeout: Duration::from_nanos(info.idleTimeout) })
+        let at = |r: &Region| {
+            map.load_u32(r.begin()).expect("a validated control word is inside the mapping")
+        };
+        let (head, status) = (at(&layout.head), at(&layout.status));
+        if !replaying && (head != 0 || status != 0) {
+            return Err(RingError::NotOurs { head, status });
+        }
+        Ok(Ring {
+            layout,
+            map,
+            reply: None,
+            idle_timeout: Duration::from_nanos(info.idleTimeout),
+            cur: if replaying { head } else { 0 },
+        })
     }
 
     /// How far the guest says it has written.
@@ -635,7 +670,7 @@ mod tests {
         let t = table(0x4000);
         let mut info = good();
         info.resourceId = HANDLE.0;
-        let ring = Ring::create(&t, &info).expect("created");
+        let ring = Ring::create(&t, &info, false).expect("created");
 
         ring.set_head(0x1234);
         drop(t); // the guest unrefs the resource while the ring is still alive
@@ -655,7 +690,7 @@ mod tests {
         let mut info = good();
         info.resourceId = HANDLE.0 + 1;
         assert_eq!(
-            Ring::create(&t, &info).err(),
+            Ring::create(&t, &info, false).err(),
             Some(RingError::NoResource(ResourceHandle(HANDLE.0 + 1))),
             "the refusal says which resource, because that is the bug"
         );
@@ -671,7 +706,7 @@ mod tests {
         info.offset = 0x1000;
         info.size = 0x2000; // would fit a 0x4000 resource; this one is 0x2000
         assert_eq!(
-            Ring::create(&t, &info).err(),
+            Ring::create(&t, &info, false).err(),
             Some(RingError::Layout(LayoutError::OutOfBounds(Part::Whole)))
         );
     }
@@ -681,7 +716,7 @@ mod tests {
         let t = table(0x4000);
         let mut info = good();
         info.resourceId = HANDLE.0;
-        let ring = Ring::create(&t, &info).expect("created");
+        let ring = Ring::create(&t, &info, false).expect("created");
 
         // The guest writes the tail; the host reads it.
         assert!(t.1.store_u32(ring.layout.tail.begin(), 42));
@@ -700,12 +735,38 @@ mod tests {
     /// `extra` offsets arrive from the guest at write time, with no layout left to have checked
     /// them. The door has to be exactly the size of the room: being inside the mapping is not
     /// enough, or the guest could write through it into the buffer or the control words.
+    /// A live ring whose head or status is already set is not ours to drive.
+    ///
+    /// Those two words are the host's half of the protocol. A guest presenting them non-zero is
+    /// describing a ring some other renderer is already reading -- or replaying a snapshot down
+    /// the live path, which is the same mistake with a friendlier cause. The C refuses this in
+    /// `vkr_ring_init_control` and makes the identical exception for replay, where those same
+    /// words carry the cursors the snapshot restored.
+    #[test]
+    fn a_ring_whose_head_or_status_is_already_set_is_refused_unless_replaying() {
+        // Absolute, because the layout's offsets are relative to the window's own start.
+        for (at, what) in [(0x1000usize, "head"), (0x1008usize, "status")] {
+            let t = table(RES);
+            let mut info = good();
+            info.resourceId = HANDLE.0;
+            assert!(t.1.store_u32(at, 7), "the control word is inside the mapping");
+
+            assert!(
+                matches!(Ring::create(&t, &info, false).err(), Some(RingError::NotOurs { .. })),
+                "a live create accepted a ring whose {what} was already written"
+            );
+            // The same words, replaying: the cursor resumes at the restored head.
+            let r = Ring::create(&t, &info, true).expect("a restored ring is accepted");
+            assert_eq!(r.cur, if at == 0x1000 { 7 } else { 0 });
+        }
+    }
+
     #[test]
     fn an_extra_write_cannot_reach_outside_the_extra_region() {
         let t = table(0x4000);
         let mut info = good();
         info.resourceId = HANDLE.0;
-        let ring = Ring::create(&t, &info).expect("created");
+        let ring = Ring::create(&t, &info, false).expect("created");
         assert_eq!(ring.layout.extra.size(), 0x40);
 
         assert!(ring.write_extra(0, 1), "the first word of extra");

@@ -131,6 +131,22 @@ impl RingThread {
     }
 }
 
+impl Drop for RingThread {
+    /// Tell the thread to stop, and do not wait for it.
+    ///
+    /// Never a join, because this can run *on the ring thread itself*: a dispatch upgrades its
+    /// weak handle on the context, and if the owner dropped the context meanwhile, the last strong
+    /// reference dies here, on the thread that would be joining itself. An orderly shutdown goes
+    /// through [`RingThread::stop`], which joins on a thread that is provably not the caller;
+    /// this is the backstop for every other path, and a detached ring loop terminates on its own
+    /// -- it can no longer reach a context, so its next dispatch is `Verdict::Poisoned`.
+    fn drop(&mut self) {
+        let _held = self.park.notified.lock().expect("the park lock is never poisoned");
+        self.started.store(false, Ordering::Release);
+        self.park.wake.notify_one();
+    }
+}
+
 /// The backoff an idle ring walks, in the shape the C settled on.
 ///
 /// Sixteen cheap yields, then short sleeps ramping to 40us and holding there, then a deep 640us.
@@ -200,7 +216,10 @@ fn run(
 ) -> Ring {
     // Where we have read up to. Free-running, like the guest's tail: both wrap at 32 bits and only
     // their difference means anything, which is why every comparison below is a wrapping one.
-    let mut cur: u32 = 0;
+    //
+    // From the ring rather than from zero: a ring restored from a snapshot resumes at the head the
+    // guest was quiesced at. See `Ring::create`.
+    let mut cur: u32 = ring.cur;
     // Bytes copied out but not yet dispatched. Held across iterations so a `Busy` verdict costs a
     // retry and not a re-read -- and, more importantly, so the position never advances past work
     // that has not run.
@@ -332,7 +351,7 @@ mod tests {
             ..Default::default()
         };
         let table = OneShm(Arc::clone(&map));
-        let r = Ring::create(&table, &info).expect("a layout we accept");
+        let r = Ring::create(&table, &info, false).expect("a layout we accept");
         (map, r)
     }
 

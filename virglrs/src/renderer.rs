@@ -284,12 +284,16 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(fences: Box<dyn FenceSink>, config: Config) -> Renderer {
+        // Built here and shared into venus, rather than reached through the renderer: a ring
+        // thread needs the table long after the call that created its ring returned, and it must
+        // not need the renderer to get it.
+        let resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>> = Arc::default();
         Renderer {
             config,
-            resources: Arc::new(RwLock::new(BTreeMap::new())),
+            resources: Arc::clone(&resources),
             contexts: BTreeMap::new(),
             fences: Retirement::start(fences),
-            venus: config.venus.then(|| venus::vkr::Vkr::new(config)),
+            venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone())),
         }
     }
 
@@ -530,32 +534,24 @@ impl Renderer {
             return Err(Error::NoContext);
         };
         match c.capset {
-            CapsetId::Venus => {
-                self.venus_submit(|v, resources| v.submit(ctx, buf, resources).map_err(venus_error))
-            }
+            CapsetId::Venus => self.venus_mut()?.submit(ctx, buf).map_err(venus_error),
             // vrend arrives in P3.
             _ => Err(Error::RendererUnimplemented),
         }
     }
 
-    /// Run one venus entry point with the resource table readable underneath it.
+    /// The venus renderer, or the error a caller gets when this build has none.
     ///
-    /// Every venus submission goes through here, because any of them may set a reply stream or
-    /// create a ring and so needs to resolve a handle. Taking the read lock in one place is also
-    /// what fixes the lock order for the caller's thread -- resources before context -- so that
-    /// the ring threads, which try both and back off, have a single order to agree with.
-    fn venus_submit(
-        &mut self,
-        f: impl FnOnce(&mut venus::vkr::Vkr, &dyn venus::ring::ShmResources) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let resources = self.resources.read().expect("the resource lock is never poisoned");
-        let v = self.venus.as_mut().ok_or(Error::RendererAbsent)?;
-        f(v, &*resources)
+    /// Venus takes the resource lock itself, inside `on_context`, because it is the side that
+    /// knows the order the ring threads have to agree with. Taking it here as well would be the
+    /// same thread reading twice, which a writer arriving in between is allowed to deadlock.
+    fn venus_mut(&mut self) -> Result<&mut venus::vkr::Vkr, Error> {
+        self.venus.as_mut().ok_or(Error::RendererAbsent)
     }
 
     /// Feed one replay journal entry to a context's default stream.
     pub fn venus_replay_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
-        self.venus_submit(|v, resources| v.submit(ctx, buf, resources).map_err(venus_error))
+        self.venus_mut()?.submit(ctx, buf).map_err(venus_error)
     }
 
     /// Feed one replay journal entry to a named ring's stream.
@@ -565,9 +561,7 @@ impl Renderer {
         ring: RingId,
         buf: &[u8],
     ) -> Result<(), Error> {
-        self.venus_submit(|v, resources| {
-            v.submit_ring(ctx, ring, buf, resources).map_err(venus_error)
-        })
+        self.venus_mut()?.submit_ring(ctx, ring, buf).map_err(venus_error)
     }
 
     pub fn venus_replay_begin(&mut self, ctx: CtxId) -> Result<(), Error> {
