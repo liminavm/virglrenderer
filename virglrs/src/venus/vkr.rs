@@ -124,8 +124,15 @@ impl Vkr {
         }
     }
 
+    /// Stand a venus context up under an id nothing is using.
+    ///
+    /// The duplicate is a host invariant, not a guest one: `Renderer::context_create` refuses an
+    /// id it already holds, so a repeat reaching here means the two maps have drifted apart.
+    /// Replacing the entry would drop a live context -- its rings and every host handle in it --
+    /// and return as though a context had been created.
     pub fn context_create(&mut self, id: CtxId) {
-        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id))));
+        let displaced = self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id))));
+        assert!(displaced.is_none(), "{id:?} already had a venus context, which this just dropped");
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
@@ -291,6 +298,20 @@ mod tests {
         let mut v = Vkr::new(Config::default(), table);
         v.context_create(ctx_id());
         (v, map)
+    }
+
+    /// A second context on a live id is caught, not served.
+    ///
+    /// The insert used to be bare, so a repeat would have replaced the entry: the previous
+    /// context's rings and every host handle it held would go, and the call would return as
+    /// though a context had been created. `Renderer::context_create` refuses the duplicate before
+    /// it gets here, which is what makes this a host invariant rather than something a guest can
+    /// provoke -- and exactly why it must fail loudly if the two maps ever drift apart.
+    #[test]
+    #[should_panic(expected = "already had a venus context")]
+    fn a_second_context_on_a_live_id_does_not_quietly_replace_the_first() {
+        let (mut v, _map) = vkr();
+        v.context_create(ctx_id());
     }
 
     fn ring_info() -> VkRingCreateInfoMESA {
