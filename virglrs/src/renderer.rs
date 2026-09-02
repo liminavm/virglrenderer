@@ -11,7 +11,9 @@ use crate::abi::{GuestIov, VmmPtr};
 use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
 use crate::guest_mem::GuestMap;
-use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
+use crate::ids::{
+    BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
+};
 use crate::venus;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError};
@@ -723,6 +725,27 @@ impl Renderer {
     /// Answered from the live state every time, never cached on the resource. That is the whole
     /// reason the resource keeps `ctx` and `mem` rather than an address: an allocation the guest
     /// has freed resolves to nothing here, where a remembered pointer would still resolve.
+    /// The IOSurface a resource is presented from, or `None` when it is not presented from one.
+    ///
+    /// Resolved the whole way down on every call, exactly like [`Self::resource_host_mapping`]:
+    /// resource, to the allocation it was published from, to the surface that allocation is. The
+    /// id is never cached anywhere along that path -- the system recycles ids immediately, so a
+    /// remembered one names whoever minted next, and releasing it would free *their* surface.
+    /// A resource whose surface has gone answers `None` because there is no longer a surface to
+    /// ask, which is the same thing said once instead of purged at each destroy site.
+    pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
+        // The lock is released before venus is asked, for the reason `resource_host_mapping`
+        // gives: a read lock held across a call into a context deadlocks against its ring thread.
+        let (ctx, mem) = self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { desc, .. } => match desc.source {
+                BlobSource::Exported { ctx, mem } => Some((ctx, mem)),
+                BlobSource::HostMinted => None,
+            },
+            Backing::Classic(_) | Backing::Imported { .. } => None,
+        })??;
+        self.venus_context(ctx, |c| c.driver().memory_surface_id(ObjectId(mem.0))).ok()?
+    }
+
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
         // The source is copied out and the resource lock released before venus is asked anything.
         // Holding a read lock across a call into a context is how a ring thread on the other side
