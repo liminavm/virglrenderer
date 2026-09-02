@@ -39,12 +39,7 @@ use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 /// reaches the renderer as a number -- an id we have no name for is [`CapsetId::Unknown`], which
 /// is a value the renderer can match on rather than one it has to compare against constants.
 fn capset_of(raw: u32) -> CapsetId {
-    match raw & abi::CAPSET_MASK {
-        abi::CAPSET_VIRGL => CapsetId::Virgl,
-        abi::CAPSET_VIRGL2 => CapsetId::Virgl2,
-        abi::CAPSET_VENUS => CapsetId::Venus,
-        other => CapsetId::Unknown(other as u8),
-    }
+    CapsetId::from_raw((raw & abi::CAPSET_MASK) as u8)
 }
 
 /// Decode `virgl_renderer_init`'s flag word into what the renderer is being asked to be.
@@ -1147,7 +1142,7 @@ fn _type_anchors(p: &GlCtxParam, s: &CStr) -> (c_int, usize) {
 }
 
 #[allow(dead_code)]
-const _ABI_ANCHORS: (c_int, u32) = (abi::CALLBACKS_VERSION, abi::CAPSET_VENUS);
+const _ABI_ANCHORS: c_int = abi::CALLBACKS_VERSION;
 
 #[cfg(test)]
 mod tests {
@@ -1185,17 +1180,17 @@ mod tests {
     /// and its every submission into ENOTSUP.
     #[test]
     fn a_capset_id_is_named_and_the_flag_word_around_it_is_ignored() {
-        assert_eq!(capset_of(abi::CAPSET_VIRGL), CapsetId::Virgl);
-        assert_eq!(capset_of(abi::CAPSET_VIRGL2), CapsetId::Virgl2);
-        assert_eq!(capset_of(abi::CAPSET_VENUS), CapsetId::Venus);
+        assert_eq!(capset_of(1), CapsetId::Virgl);
+        assert_eq!(capset_of(2), CapsetId::Virgl2);
+        assert_eq!(capset_of(4), CapsetId::Venus);
 
         // Reserved bits above the low byte belong to no capset and must not change the answer.
-        assert_eq!(capset_of(abi::CAPSET_VENUS | 0xdead_ff00), CapsetId::Venus);
+        assert_eq!(capset_of(4 | 0xdead_ff00), CapsetId::Venus);
 
         // An id we have no name for keeps its value rather than becoming one we do have a name
         // for -- collapsing it onto a known capset would route a guest to the wrong renderer.
-        assert_eq!(capset_of(0), CapsetId::Unknown(0));
-        assert_eq!(capset_of(0x42), CapsetId::Unknown(0x42));
+        assert!(matches!(capset_of(0), CapsetId::Unknown(_)));
+        assert!(matches!(capset_of(0x42), CapsetId::Unknown(_)));
     }
 
     /// `NO_VIRGL` is spelled inside out, and an inverted read of it is invisible: it changes a

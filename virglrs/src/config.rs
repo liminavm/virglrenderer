@@ -38,5 +38,37 @@ pub enum CapsetId {
     /// Not a rejection: a guest binding a renderer we do not serve still gets its context, and
     /// learns on its first submission. Refusing at creation time would fail a real desktop, which
     /// binds virgl2 contexts long before it binds a venus one.
-    Unknown(u8),
+    Unknown(UnnamedCapset),
+}
+
+/// The id behind [`CapsetId::Unknown`], which only [`CapsetId::from_raw`] can make.
+///
+/// The payload is a separate type because a variant's fields are as public as its enum, and a
+/// public `Unknown(u8)` lets anyone write `Unknown(4)` -- a second, unequal spelling of
+/// [`CapsetId::Venus`]. One number, one variant: with the field private to this module, the
+/// alias cannot be written at all rather than merely being avoided by everyone who remembers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct UnnamedCapset(u8);
+
+impl core::fmt::Debug for UnnamedCapset {
+    /// The wrapper is bookkeeping, not information: an id prints as the number it is.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl CapsetId {
+    /// The capset a virtio-gpu id names.
+    ///
+    /// Total, and the only way to reach [`CapsetId::Unknown`]. The three ids are virtio-gpu's own
+    /// numbers and live here rather than beside the C header's spelling of them, because they are
+    /// the protocol's and would outlive the shim.
+    pub fn from_raw(id: u8) -> CapsetId {
+        match id {
+            1 => CapsetId::Virgl,
+            2 => CapsetId::Virgl2,
+            4 => CapsetId::Venus,
+            other => CapsetId::Unknown(UnnamedCapset(other)),
+        }
+    }
 }

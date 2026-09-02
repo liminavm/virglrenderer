@@ -782,7 +782,7 @@ mod tests {
         );
 
         // Nothing else is served, by either answer.
-        for set in [CapsetId::Virgl, CapsetId::Virgl2, CapsetId::Unknown(9)] {
+        for set in [CapsetId::Virgl, CapsetId::Virgl2, CapsetId::from_raw(9)] {
             assert!(r.capset(set).is_none(), "{set:?} has no renderer behind it");
             assert!(r.capset_max(set).is_none(), "{set:?} must not be advertised either");
         }

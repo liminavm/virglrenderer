@@ -25,10 +25,6 @@ pub const USE_VIDEO: c_int = 1 << 11;
 /// The VMM cannot inject pages, so blobs come from the guest's own heap.
 pub const USE_GUEST_VRAM: c_int = 1 << 14;
 
-/// Capset ids the guest asks about by number.
-pub const CAPSET_VIRGL: u32 = 1;
-pub const CAPSET_VIRGL2: u32 = 2;
-pub const CAPSET_VENUS: u32 = 4;
 /// A context's capset is the low byte of the flags it was created with.
 pub const CAPSET_MASK: u32 = 0xff;
 
