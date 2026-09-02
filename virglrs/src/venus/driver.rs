@@ -23,10 +23,10 @@ use super::proto::types::{
     VkDependencyFlags, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
     VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
     VkDeviceSize, VkEvent, VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
-    VkFlags, VkFormat, VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties,
-    VkImageLayout, VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags,
-    VkImageView, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
-    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkFormat, VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout,
+    VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
+    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
     VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
     VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
     VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
@@ -1850,7 +1850,7 @@ impl Driver {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
             pNext: core::ptr::null(),
             semaphore,
-            flags: VkFlags(VkSemaphoreImportFlagBits::VK_SEMAPHORE_IMPORT_TEMPORARY_BIT.0 as u32),
+            flags: VkSemaphoreImportFlagBits::VK_SEMAPHORE_IMPORT_TEMPORARY_BIT.into(),
             handleType:
                 VkExternalSemaphoreHandleTypeFlagBits::VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
             fd: -1,
@@ -2178,7 +2178,7 @@ impl Driver {
                 handle,
                 VkDeviceSize(0),
                 VK_WHOLE_SIZE,
-                VkFlags(0),
+                VkMemoryMapFlags(0),
                 &mut ptr,
             )
         };
@@ -2379,10 +2379,12 @@ mod tests {
         assert!(chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head).is_none());
     }
 
-    const HOST_VISIBLE: VkMemoryPropertyFlags =
-        VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32);
-    const DEVICE_LOCAL: VkMemoryPropertyFlags =
-        VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32);
+    const HOST_VISIBLE: VkMemoryPropertyFlags = VkMemoryPropertyFlags(
+        VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32,
+    );
+    const DEVICE_LOCAL: VkMemoryPropertyFlags = VkMemoryPropertyFlags(
+        VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
+    );
 
     /// An allocation is freed on the way out, after everything bound to it, and the census forgets
     /// it at the same moment.

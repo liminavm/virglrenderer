@@ -2835,6 +2835,10 @@ mod tests {
         }
     }
 
+    use super::super::proto::types::{
+        VkImageAspectFlags, VkImageCreateFlags, VkImageUsageFlags, VkMemoryPropertyFlags,
+        VkSemaphoreWaitFlags, VkToolPurposeFlags,
+    };
     use super::*;
 
     fn header(cmd: VkCommandTypeEXT, flags: u32) -> Vec<u8> {
@@ -3381,7 +3385,7 @@ mod tests {
         let mut args = vn_command_vkResetCommandPool {
             device,
             commandPool: VkCommandPool(0x222),
-            flags: VkFlags(0x4),
+            flags: VkCommandPoolResetFlags(0x4),
             ..Default::default()
         };
         h.vkResetCommandPool(&mut args);
@@ -3651,7 +3655,7 @@ mod tests {
         let vals = [0x77u64, 0x99u64];
         let info = VkSemaphoreWaitInfo {
             sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-            flags: VkFlags(0x1),
+            flags: VkSemaphoreWaitFlags(0x1),
             semaphoreCount: 2,
             pSemaphores: sems.as_ptr(),
             pValues: vals.as_ptr(),
@@ -3916,7 +3920,7 @@ mod tests {
         let sub = VkImageSubresource2 {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
             imageSubresource: VkImageSubresource {
-                aspectMask: VkFlags(0x2),
+                aspectMask: VkImageAspectFlags(0x2),
                 mipLevel: 3,
                 arrayLayer: 5,
             },
@@ -3987,11 +3991,17 @@ mod tests {
         const WINDOW: usize = 0x21000;
         /// Host-visible on 1 and 3 and not on 0 and 2, so a handler that reports "all of them"
         /// or reads the wrong bit cannot land on the same mask by accident.
-        const TYPES: [VkFlags; 4] = [
-            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32),
-            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32),
-            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32),
-            VkFlags(
+        const TYPES: [VkMemoryPropertyFlags; 4] = [
+            VkMemoryPropertyFlags(
+                VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
+            ),
+            VkMemoryPropertyFlags(
+                VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32,
+            ),
+            VkMemoryPropertyFlags(
+                VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
+            ),
+            VkMemoryPropertyFlags(
                 VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32
                     | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
             ),
@@ -4159,6 +4169,38 @@ mod tests {
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
+    }
+
+    /// A bitmask is its own type, at the width the wire gives it.
+    ///
+    /// vk.xml declares all 87 of them as typedefs of `VkFlags` or `VkFlags64`, and they used to
+    /// be emitted as exactly that: 87 aliases for two types, so an image's usage and its create
+    /// flags were the same type and passing one for the other compiled. That is not a
+    /// hypothetical -- it is a sabotage that survived a whole sweep by compiling, and the same
+    /// sabotage no longer builds.
+    ///
+    /// What the alias did carry, and must not be lost with it, is the width: `VkFlags` is four
+    /// bytes and `VkFlags64` is eight, and a mask encoded at the wrong one moves every member
+    /// after it. `repr(transparent)` is what keeps that true, and this is what says so.
+    #[test]
+    fn a_bitmask_is_its_own_type_at_its_own_width() {
+        use super::super::proto::types::{
+            VkImageUsageFlagBits, VkPipelineStageFlagBits2, VkPipelineStageFlags2,
+        };
+
+        assert_eq!(size_of::<VkImageUsageFlags>(), 4, "a VkFlags mask");
+        assert_eq!(size_of::<VkPipelineStageFlags2>(), 8, "a VkFlags64 mask");
+
+        // A bit belongs to exactly one mask, and reaches it by name rather than by a cast the
+        // reader has to check the width of.
+        assert_eq!(
+            VkImageUsageFlags::from(VkImageUsageFlagBits::VK_IMAGE_USAGE_TRANSFER_SRC_BIT),
+            VkImageUsageFlags(1)
+        );
+        assert_eq!(
+            VkPipelineStageFlags2::from(VkPipelineStageFlagBits2::VK_PIPELINE_STAGE_2_COPY_BIT),
+            VkPipelineStageFlags2(1 << 32)
+        );
     }
 
     /// The struct a command cannot be carried out without, when the guest did not send one.
@@ -4382,7 +4424,7 @@ mod tests {
             // SAFETY: `count` is the length the caller sized the array to.
             let out = unsafe { core::slice::from_raw_parts_mut(out, room as usize) };
             for (i, t) in out.iter_mut().enumerate() {
-                t.purposes = VkFlags(1 << i);
+                t.purposes = VkToolPurposeFlags(1 << i);
             }
             *count = room;
             if room < TOOLS { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS }
@@ -4550,8 +4592,8 @@ mod tests {
             format: VkFormat,
             ty: VkImageType,
             tiling: VkImageTiling,
-            usage: VkFlags,
-            flags: VkFlags,
+            usage: VkImageUsageFlags,
+            flags: VkImageCreateFlags,
             out: *mut VkImageFormatProperties,
         ) -> VkResult {
             assert!(!out.is_null(), "the handler refuses a probe with nowhere to answer");
@@ -4590,8 +4632,8 @@ mod tests {
         q.format = VkFormat(37);
         q.r#type = VkImageType(1);
         q.tiling = VkImageTiling(2);
-        q.usage = VkFlags(0x40);
-        q.flags = VkFlags(0x800);
+        q.usage = VkImageUsageFlags(0x40);
+        q.flags = VkImageCreateFlags(0x800);
         q.plant_pImageFormatProperties(&mut props);
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));

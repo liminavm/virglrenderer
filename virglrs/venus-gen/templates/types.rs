@@ -54,7 +54,23 @@ impl ${ty.name} {
 
 % endfor
 % for ty in GEN.supported_types[VkType.BITMASK]:
-pub type ${ty.name} = ${RUST.base_name(ty.typedef) if ty.typedef else 'VkFlags'};
+<%
+    repr = RUST.bitmask_repr(ty)
+    bits = RUST.bits_of(ty)
+%>\
+${newtype(ty.name, repr)}\
+%   if bits:
+<%
+    ## The bits of a VkFlags64 mask are already 64-bit, so the cast would be a no-op.
+    cast = '' if RUST.enum_repr(bits) == repr else ' as %s' % repr
+%>\
+impl From<${bits.name}> for ${ty.name} {
+    fn from(bit: ${bits.name}) -> Self {
+        Self(bit.0${cast})
+    }
+}
+
+%   endif
 % endfor
 
 % for ty in GEN.supported_types[VkType.FUNCPOINTER]:
