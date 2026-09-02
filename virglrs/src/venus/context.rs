@@ -5594,6 +5594,106 @@ mod tests {
         assert!(h.reject.is_some(), "destroying a ring that is not there is refused");
     }
 
+    /// A budget refusal has to stop the context, and this handler is the only place that can say
+    /// so. The driver knows it refused and the loop knows how to poison; between them is one line
+    /// in `vkAllocateMemory`, and without it the guest is handed `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+    /// -- which venus never reads, because `vn_device_memory_alloc_simple` returns `VK_SUCCESS`
+    /// as soon as the command is on the ring. The guest would carry on with a handle to memory
+    /// that does not exist and poison its ring several commands later, on whatever touched it.
+    ///
+    /// The counter is here for the same reason as in the driver's own witness: a refusal that
+    /// arrives after the allocation costs exactly the memory the cap exists to save.
+    #[test]
+    fn an_allocation_the_budget_refuses_stops_the_context() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDeviceSize, VkMemoryAllocateInfo, VkMemoryPropertyFlags,
+            VkStructureType, vn_command_vkAllocateMemory as Alloc,
+        };
+        use std::cell::Cell;
+
+        const DEVICE: u64 = 3;
+        const CAP: u64 = 1000;
+        const SIZE: u64 = 600;
+
+        thread_local! {
+            static ASKED: Cell<u32> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            ASKED.with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+
+        let objects = Shared::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut driver = Driver::new(Account::for_test(Some(CAP)));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        driver.plant_device(VkDevice(DEVICE), fns);
+        // Not host-visible, so nothing is padded and the cap is measured in the guest's numbers.
+        driver.plant_memory_types(VkDevice(DEVICE), &[VkMemoryPropertyFlags(0)]);
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            allocationSize: VkDeviceSize(SIZE),
+            memoryTypeIndex: 0,
+        };
+
+        let mut first_out = VkDeviceMemory(0x6001);
+        let mut first = Alloc::default();
+        first.device = VkDevice(DEVICE);
+        first.pAllocateInfo = Some(&info);
+        first.plant_pMemory(&mut first_out);
+        h.vkAllocateMemory(&mut first);
+        assert_eq!(h.reject, None, "the first fits under the cap");
+        assert_eq!(first.ret, VkResult::VK_SUCCESS);
+        assert_eq!(ASKED.with(Cell::get), 1);
+
+        let mut second_out = VkDeviceMemory(0x6002);
+        let mut second = Alloc::default();
+        second.device = VkDevice(DEVICE);
+        second.pAllocateInfo = Some(&info);
+        second.plant_pMemory(&mut second_out);
+        h.vkAllocateMemory(&mut second);
+        assert!(
+            h.reject.is_some(),
+            "the second is over the cap, and the guest will never read the error it was given"
+        );
+        assert_eq!(
+            second.ret,
+            VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY,
+            "which is still set, for the guest configured to wait for it"
+        );
+        assert_eq!(ASKED.with(Cell::get), 1, "and the driver was never asked");
+
+        h.driver.abandon_planted();
+    }
+
     /// A ring in a resource the host cannot address is refused, not quietly skipped. This is the
     /// case that took the whole corpus down until blobs got their memory: without a mapping there
     /// is nothing to read commands out of, and pretending otherwise would report success for a
