@@ -44,7 +44,7 @@ struct vrend_journal_census {
    uint64_t recorded;   /* entries ever accepted (incl. later replaced/pruned) */
    uint64_t replaced;   /* latest-wins replacements */
    uint64_t pruned;     /* tombstoned by destroys */
-   uint64_t skipped;    /* durable-unknown commands seen (e.g. video) */
+   uint64_t skipped;    /* durable-unknown commands seen (no rule for them) */
    uint32_t live;       /* current entry count */
    uint64_t live_bytes; /* payload bytes across live entries */
 };

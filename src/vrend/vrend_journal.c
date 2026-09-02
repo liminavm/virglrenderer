@@ -30,7 +30,7 @@ enum vrend_journal_class {
    VREND_JOURNAL_CREATE,        /* retained until its destroy tombstone */
    VREND_JOURNAL_LATEST,        /* latest-wins per key */
    VREND_JOURNAL_TOMBSTONE,     /* prunes; not itself retained */
-   VREND_JOURNAL_UNKNOWN,       /* durable-unknown (e.g. video): counted, not kept */
+   VREND_JOURNAL_UNKNOWN,       /* durable-unknown (no rule): counted, not kept */
 };
 
 struct vrend_journal_key {
@@ -192,6 +192,14 @@ pred_begin_query(const struct vrend_journal_entry *e, uint32_t sub, uint32_t han
           e->key.k1 == handle;
 }
 
+/* Video objects live on the vrend context, not a sub-context, and their handles form
+ * one namespace per kind (codec, buffer). */
+static bool
+pred_video(const struct vrend_journal_entry *e, uint32_t create_cmd, uint32_t handle)
+{
+   return e->key.cmd == create_cmd && e->key.k1 == handle;
+}
+
 void
 vrend_journal_record(struct vrend_journal *j, const uint32_t *buf, uint32_t ndw)
 {
@@ -231,6 +239,16 @@ vrend_journal_record(struct vrend_journal *j, const uint32_t *buf, uint32_t ndw)
       key.k1 = ndw > VIRGL_PIPE_RES_CREATE_BLOB_ID ? buf[VIRGL_PIPE_RES_CREATE_BLOB_ID] : 0;
       retain(j, &key, buf, ndw);
       return;
+   case VIRGL_CCMD_CREATE_VIDEO_CODEC:
+   case VIRGL_CCMD_CREATE_VIDEO_BUFFER:
+      /* ctx-global (the video context hangs off the vrend context); keyed by handle.
+       * A codec and its decode targets are created once and then used every frame, so
+       * a restore that drops them leaves the guest decoding into nothing, silently: the
+       * per-frame commands return success whatever the lookup finds. */
+      key.sub_ctx = 0;
+      key.k1 = ndw > 1 ? buf[1] : 0;
+      retain(j, &key, buf, ndw);
+      return;
 
    /* ---- tombstones (prune, not retained) ---- */
    case VIRGL_CCMD_DESTROY_OBJECT:
@@ -241,6 +259,12 @@ vrend_journal_record(struct vrend_journal *j, const uint32_t *buf, uint32_t ndw)
       return;
    case VIRGL_CCMD_END_QUERY:
       prune_matching(j, pred_begin_query, j->cur_sub, ndw > 1 ? buf[1] : 0);
+      return;
+   case VIRGL_CCMD_DESTROY_VIDEO_CODEC:
+      prune_matching(j, pred_video, VIRGL_CCMD_CREATE_VIDEO_CODEC, ndw > 1 ? buf[1] : 0);
+      return;
+   case VIRGL_CCMD_DESTROY_VIDEO_BUFFER:
+      prune_matching(j, pred_video, VIRGL_CCMD_CREATE_VIDEO_BUFFER, ndw > 1 ? buf[1] : 0);
       return;
 
    /* ---- current-state, latest-wins ---- */
@@ -317,6 +341,11 @@ vrend_journal_record(struct vrend_journal *j, const uint32_t *buf, uint32_t ndw)
       return;
 
    /* ---- transient: re-issued by live clients, never retained ---- */
+   case VIRGL_CCMD_BEGIN_FRAME:
+   case VIRGL_CCMD_DECODE_MACROBLOCK:
+   case VIRGL_CCMD_DECODE_BITSTREAM:
+   case VIRGL_CCMD_ENCODE_BITSTREAM:
+   case VIRGL_CCMD_END_FRAME:
    case VIRGL_CCMD_NOP:
    case VIRGL_CCMD_CLEAR:
    case VIRGL_CCMD_CLEAR_TEXTURE:
@@ -340,8 +369,8 @@ vrend_journal_record(struct vrend_journal *j, const uint32_t *buf, uint32_t ndw)
       return;
 
    default:
-      /* durable-unknown (video codec etc.): counted so a guest using them is
-       * loud in the census instead of silently losing state at restore */
+      /* durable-unknown: a command with no rule here. Counted so a guest using
+       * one is loud in the census instead of silently losing state at restore. */
       j->census.skipped++;
       return;
    }
@@ -372,6 +401,8 @@ entry_klass(const struct vrend_journal_entry *e)
    case VIRGL_CCMD_CREATE_OBJECT:
    case VIRGL_CCMD_CREATE_SUB_CTX:
    case VIRGL_CCMD_PIPE_RESOURCE_CREATE:
+   case VIRGL_CCMD_CREATE_VIDEO_CODEC:
+   case VIRGL_CCMD_CREATE_VIDEO_BUFFER:
       return VREND_JOURNAL_KLASS_CREATE;
    default:
       return VREND_JOURNAL_KLASS_STATE;
@@ -390,6 +421,8 @@ entry_is_sub_scoped(const struct vrend_journal_entry *e)
    case VIRGL_CCMD_SET_TWEAKS:
    case VIRGL_CCMD_PIPE_RESOURCE_CREATE:
    case VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE:
+   case VIRGL_CCMD_CREATE_VIDEO_CODEC:
+   case VIRGL_CCMD_CREATE_VIDEO_BUFFER:
       return false;
    default:
       return true;

@@ -56,7 +56,8 @@ tests = [
    ['test_virgl_resource', 'test_virgl_resource.c'],
    ['test_virgl_transfer', 'test_virgl_transfer.c'],
    ['test_virgl_cmd', 'test_virgl_cmd.c'],
-   ['test_virgl_strbuf', 'test_virgl_strbuf.c']
+   ['test_virgl_strbuf', 'test_virgl_strbuf.c'],
+   ['test_virgl_journal', 'test_virgl_journal.c']
 ]
 
 fuzzy_tests = [
