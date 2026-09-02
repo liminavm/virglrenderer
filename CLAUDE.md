@@ -11,11 +11,17 @@ We are not porting for fashion. The language is the point: it is meant to remove
 of the bugs this renderer has cost us. Every rule below is that reason, applied.
 
 **Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules and nowhere else. They are:
-the Vulkan, GLES and Objective-C bindings (`vulkan.rs`, `venus/driver.rs`); the guest-memory
+the Vulkan and GLES bindings (`vulkan.rs`, `venus/driver.rs`); the IOSurface and Metal bindings
+(`metal.rs`), which are the only Objective-C in the tree; the guest-memory
 mapping (`guest_mem.rs`); the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder (`venus/cs.rs`), which owns
 the arena every decoded pointer points into. Every unsafe block carries a `SAFETY:` comment naming
 the invariant and who upholds it. The rest of the renderer is safe Rust, and an unsafe block
 outside these modules is a design failure, not a shortcut.
+
+`metal.rs` exists because the scanout path has no Vulkan route on this platform: KosmicKrisp
+imports an IOSurface but does not export one, so a surface has to be minted host-side. It owns the
+surface's lifetime and hands the rest of the tree a safe handle — never a raw `IOSurfaceRef`, and
+never an id, which is worth nothing the moment its surface dies.
 
 The list is exhaustive on purpose: a module that starts needing unsafe is a module whose types are
 wrong. Handlers in `venus/context.rs` in particular must stay safe — when one needs a raw pointer,
