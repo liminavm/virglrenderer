@@ -6740,6 +6740,503 @@ mod tests {
         }
     }
 
+    /// A driver with fewer devices than the guest guessed answers for the ones it has, and
+    /// refuses the rest.
+    ///
+    /// The shape the generated accessor witnesses cannot reach: this array's count is
+    /// `*pPhysicalDeviceCount`, behind an out-pointer, so nothing can plant it from a slice. It
+    /// is also the only handler where the guest's array and the host's answer may legitimately be
+    /// different lengths, and three separate things have to agree about which:
+    ///
+    /// - the count written back, which is what the guest reads to size its own array;
+    /// - the ids that become objects, which is the head of what it offered;
+    /// - the ids that become ghosts, which is the tail it offered and did not get.
+    ///
+    /// Ghosting the whole array instead would take a device the guest does hold; ghosting none
+    /// would let the hook register a GPU per id it guessed at. Both leave every command that
+    /// follows naming something -- the wrong thing.
+    ///
+    /// Extensions are learned here too, and only for the devices that came back. Learning one for
+    /// a slot the driver did not fill would file a stranger's extension list under a handle that
+    /// is about to be something else.
+    #[test]
+    fn a_short_enumeration_answers_for_what_it_got_and_refuses_the_rest() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{VkExtensionProperties, VkInstance, VkPhysicalDevice};
+        use std::cell::RefCell;
+
+        const INSTANCE: u64 = 2;
+        /// Three ids offered, two devices behind them.
+        const IDS: [u64; 3] = [21, 22, 23];
+        const HOST: [u64; 2] = [0x9100, 0x9200];
+
+        thread_local! {
+            /// Every physical device `learn_extensions` was asked about, in order.
+            static LEARNED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn enumerate(
+            _instance: VkInstance,
+            n: *mut u32,
+            out: *mut VkPhysicalDevice,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes its slice's own length and pointer, which is the
+            // pairing under test.
+            let room = unsafe { *n } as usize;
+            assert!(room >= HOST.len(), "the guest sized for three and the room says {room}");
+            // SAFETY: `out` has room for `room` elements, which the count just said.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, room) };
+            for (e, h) in out.iter_mut().zip(HOST) {
+                *e = VkPhysicalDevice(h);
+            }
+            // Fewer than asked for: the driver has two, and says so.
+            unsafe { *n = HOST.len() as u32 };
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn extensions(
+            pd: VkPhysicalDevice,
+            _layer: *const core::ffi::c_char,
+            n: *mut u32,
+            props: *mut VkExtensionProperties,
+        ) -> VkResult {
+            // SAFETY: both are the caller's locals, and the array is null on the count query.
+            unsafe {
+                if props.is_null() {
+                    LEARNED.with_borrow_mut(|l| l.push(pd.0));
+                    *n = 0;
+                } else {
+                    *n = 0;
+                }
+            }
+            VkResult::VK_SUCCESS
+        }
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(
+                ObjectId(INSTANCE),
+                VkObjectType::VK_OBJECT_TYPE_INSTANCE,
+                HostHandle(INSTANCE),
+                None,
+            )
+            .unwrap();
+
+        let mut inst = crate::vulkan::Instance::default();
+        inst.plant_vkEnumeratePhysicalDevices(enumerate);
+        inst.plant_vkEnumerateDeviceExtensionProperties(extensions);
+        let mut driver = Driver::new();
+        driver.plant_instance(inst);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
+        w.extend_from_slice(&INSTANCE.to_le_bytes());
+        w.extend_from_slice(&1u64.to_le_bytes()); // pPhysicalDeviceCount: present
+        w.extend_from_slice(&(IDS.len() as u32).to_le_bytes());
+        w.extend_from_slice(&(IDS.len() as u64).to_le_bytes()); // pPhysicalDevices: the array size
+        for id in IDS {
+            w.extend_from_slice(&id.to_le_bytes());
+        }
+
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&w, &temp, &objects, &hard);
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let _flags = dec.decode_scalar::<VkFlags>();
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert!(!dec.fatal());
+
+        // The two the driver had are real objects under the guest's own ids, each holding the
+        // handle that came back in its slot -- not the slot beside it.
+        for (id, host) in IDS.iter().zip(HOST) {
+            assert_eq!(
+                objects.lookup(ObjectId(*id), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0),
+                Lookup::Found(HostHandle(host)),
+                "id {id} holds the handle from its own slot"
+            );
+        }
+        // The third is a ghost: offered, not answered. A command naming it is absorbed rather
+        // than poisoning the context, and it is not an object the guest may use.
+        assert_eq!(
+            objects.lookup(ObjectId(IDS[2]), VkObjectType::VK_OBJECT_TYPE_PHYSICAL_DEVICE.0),
+            Lookup::Ghost,
+            "the id the driver had no device for is refused, not registered"
+        );
+
+        LEARNED.with_borrow(|l| {
+            assert_eq!(
+                l.as_slice(),
+                &HOST,
+                "extensions are learned for the devices that came back, and no others"
+            );
+        });
+
+        h.driver.abandon_planted();
+    }
+
+    /// Three commands a guest can send that name no work the host could do, each refused before
+    /// anything crosses into the driver.
+    ///
+    /// These are trust-boundary refusals (CLAUDE.md): nothing here is a host invariant, so none of
+    /// them asserts. What matters is *where* the refusal happens. Reaching the driver first and
+    /// letting it decide means handing a Vulkan implementation a length it will read past, a byte
+    /// count that is not a whole number of words, or a queue with no device -- and mesa's runtime
+    /// carries assertions on all three, on a ring thread where an abort takes the whole worker.
+    ///
+    /// So each is asked twice: that the context is poisoned, and that the driver was never called.
+    /// A test that only checked the first would pass against a handler that called the driver and
+    /// then complained.
+    #[test]
+    fn the_commands_a_guest_can_botch_are_refused_before_the_driver_sees_them() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandBuffer, VkCommandPool, VkDevice, VkFence,
+            VkPipelineLayout, VkQueue, VkShaderModule, VkShaderModuleCreateInfo,
+            VkShaderStageFlags, VkSubmitInfo, vn_command_vkCmdPushConstants,
+            vn_command_vkCreateShaderModule, vn_command_vkQueueSubmit,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        thread_local! {
+            /// Every entry point that was reached. Empty is the whole point.
+            static REACHED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn push(
+            _cb: VkCommandBuffer,
+            _layout: VkPipelineLayout,
+            _stages: VkShaderStageFlags,
+            _offset: u32,
+            _size: u32,
+            _values: *const core::ffi::c_void,
+        ) {
+            REACHED.with_borrow_mut(|r| r.push("vkCmdPushConstants"));
+        }
+
+        unsafe extern "C" fn create_shader(
+            _device: VkDevice,
+            _info: *const VkShaderModuleCreateInfo,
+            _alloc: *const VkAllocationCallbacks,
+            out: *mut VkShaderModule,
+        ) -> VkResult {
+            REACHED.with_borrow_mut(|r| r.push("vkCreateShaderModule"));
+            // A real create that succeeds returns a handle, and `Driver::create_object` asserts
+            // it -- a null one here would be testing that assert rather than the refusal.
+            // SAFETY: the caller's local.
+            unsafe { *out = VkShaderModule(0x5000) };
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn submit(
+            _queue: VkQueue,
+            _n: u32,
+            _submits: *const VkSubmitInfo,
+            _fence: VkFence,
+        ) -> VkResult {
+            REACHED.with_borrow_mut(|r| r.push("vkQueueSubmit"));
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdPushConstants(push);
+        fns.plant_vkCreateShaderModule(create_shader);
+        fns.plant_vkQueueSubmit(submit);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        // Constants pushed without saying what they are. The decoder cannot make a slice of a
+        // null pointer with a non-zero size, and pushing whatever the layout last held would hand
+        // the next draw constants the guest never sent -- so the answer is not an empty push.
+        let mut args = vn_command_vkCmdPushConstants::default();
+        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.size = 16;
+        h.vkCmdPushConstants(&mut args);
+        assert!(h.reject.is_some(), "sixteen bytes of nothing is not a push");
+        h.reject = None;
+
+        // A shader whose code is not a whole number of words. `pCode` is `uint32_t*` and the size
+        // is in bytes, so a size Vulkan cannot divide is a driver reading a partial word past the
+        // end of what the guest sent.
+        let info = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
+        let mut args = vn_command_vkCreateShaderModule::default();
+        args.device = VkDevice(DEVICE);
+        args.pCreateInfo = Some(&info);
+        h.vkCreateShaderModule(&mut args);
+        assert!(h.reject.is_some(), "seven bytes is not a whole number of words");
+        h.reject = None;
+
+        // A submit to a queue this context never retrieved. There is no device behind it, so
+        // there is no entry point to call -- and inventing a success would tell the guest work it
+        // is waiting on has been queued.
+        let mut args = vn_command_vkQueueSubmit::default();
+        args.queue = VkQueue(0xdead);
+        let submits: [VkSubmitInfo; 0] = [];
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit(&mut args);
+        assert!(h.reject.is_some(), "a queue with no device behind it cannot be submitted to");
+        h.reject = None;
+
+        REACHED.with_borrow(|r| {
+            assert!(r.is_empty(), "the driver was reached by {r:?}, after the guest was refused");
+        });
+
+        // And the same three, sent properly, do reach it -- otherwise the assertion above would
+        // hold just as well against a handler that refuses everything.
+        let values = [1u8, 2, 3, 4];
+        let mut args = vn_command_vkCmdPushConstants::default();
+        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.plant_pValues(&values);
+        h.vkCmdPushConstants(&mut args);
+        assert!(h.reject.is_none());
+
+        let info = VkShaderModuleCreateInfo { codeSize: 8, ..Default::default() };
+        let mut args = vn_command_vkCreateShaderModule::default();
+        args.device = VkDevice(DEVICE);
+        args.pCreateInfo = Some(&info);
+        h.vkCreateShaderModule(&mut args);
+        assert!(h.reject.is_none());
+
+        REACHED.with_borrow(|r| {
+            assert_eq!(r.as_slice(), &["vkCmdPushConstants", "vkCreateShaderModule"]);
+        });
+
+        h.driver.abandon_planted();
+    }
+
+    /// The three commands whose two arrays are counted separately, and the one whose payload is
+    /// counted in bytes: every array reaches the driver at its own length.
+    ///
+    /// `a_recording_handler_hands_the_driver_what_the_guest_sent` pins the shapes on a command
+    /// buffer; these are the same question asked where the driver call is not a recording. Each
+    /// pair is deliberately of unequal length, because every count crossing here is a `u32` and
+    /// passing one array's length where the other's belongs compiles.
+    ///
+    /// `vkQueueSubmit`'s empty case is here rather than with the refusals: submitting no work is
+    /// how a guest signals a fence, so it has to reach the driver, and a handler that turned an
+    /// empty array away would leave that fence unsignalled and the guest waiting on it forever.
+    #[test]
+    fn the_commands_with_two_counts_deliver_both_arrays() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkCopyDescriptorSet, VkDescriptorSet, VkDevice,
+            VkFence, VkPipelineBindPoint, VkPipelineLayout, VkQueue, VkSubmitInfo,
+            VkWriteDescriptorSet, vn_command_vkCmdBindDescriptorSets, vn_command_vkQueueSubmit,
+            vn_command_vkUpdateDescriptorSets,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        const QUEUE: u64 = 0x2200;
+
+        #[derive(Default)]
+        struct Saw {
+            /// `(firstSet, the sets, the dynamic offsets)`.
+            bound: Vec<(u32, Vec<u64>, Vec<u32>)>,
+            /// `(writes, copies)` -- the two counts, which have no reason to be equal.
+            updated: Vec<(u32, u32)>,
+            /// How many submits, and the fence they carry.
+            submitted: Vec<(u32, u64)>,
+            /// The bytes a push carried, which are the command.
+            pushed: Vec<(u32, Vec<u8>)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn bind(
+            _cb: VkCommandBuffer,
+            _bind_point: VkPipelineBindPoint,
+            _layout: VkPipelineLayout,
+            first: u32,
+            n_sets: u32,
+            sets: *const VkDescriptorSet,
+            n_offsets: u32,
+            offsets: *const u32,
+        ) {
+            // SAFETY: the wrapper passes each slice's own pointer and length.
+            let (s, o) = unsafe {
+                (
+                    core::slice::from_raw_parts(sets, n_sets as usize),
+                    core::slice::from_raw_parts(offsets, n_offsets as usize),
+                )
+            };
+            SAW.with_borrow_mut(|w| {
+                w.bound.push((first, s.iter().map(|h| h.0).collect(), o.to_vec()))
+            });
+        }
+
+        unsafe extern "C" fn update(
+            _device: VkDevice,
+            n_writes: u32,
+            _writes: *const VkWriteDescriptorSet,
+            n_copies: u32,
+            _copies: *const VkCopyDescriptorSet,
+        ) {
+            SAW.with_borrow_mut(|w| w.updated.push((n_writes, n_copies)));
+        }
+
+        unsafe extern "C" fn submit(
+            _queue: VkQueue,
+            n: u32,
+            _submits: *const VkSubmitInfo,
+            fence: VkFence,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|w| w.submitted.push((n, fence.0)));
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn push(
+            _cb: VkCommandBuffer,
+            _layout: VkPipelineLayout,
+            _stages: super::super::proto::types::VkShaderStageFlags,
+            offset: u32,
+            size: u32,
+            values: *const core::ffi::c_void,
+        ) {
+            // SAFETY: the wrapper passes the slice's own pointer and its length in bytes.
+            let b = unsafe { core::slice::from_raw_parts(values.cast::<u8>(), size as usize) };
+            SAW.with_borrow_mut(|w| w.pushed.push((offset, b.to_vec())));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBindDescriptorSets(bind);
+        fns.plant_vkUpdateDescriptorSets(update);
+        fns.plant_vkQueueSubmit(submit);
+        fns.plant_vkCmdPushConstants(push);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+        driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        let cb = VkCommandBuffer(CB.0);
+
+        // Two sets, three dynamic offsets. A layout with no dynamic descriptors legitimately
+        // binds none of the second, so the two counts are genuinely independent.
+        let sets = [VkDescriptorSet(0x300), VkDescriptorSet(0x400)];
+        let offsets = [16u32, 32, 48];
+        let mut args = vn_command_vkCmdBindDescriptorSets::default();
+        args.commandBuffer = cb;
+        args.firstSet = 5;
+        args.plant_pDescriptorSets(&sets);
+        args.plant_pDynamicOffsets(&offsets);
+        h.vkCmdBindDescriptorSets(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|w| {
+            assert_eq!(w.bound, [(5, vec![0x300, 0x400], vec![16, 32, 48])]);
+        });
+
+        // Three writes, one copy.
+        let writes = [VkWriteDescriptorSet::default(); 3];
+        let copies = [VkCopyDescriptorSet::default(); 1];
+        let mut args = vn_command_vkUpdateDescriptorSets::default();
+        args.device = VkDevice(DEVICE);
+        args.plant_pDescriptorWrites(&writes);
+        args.plant_pDescriptorCopies(&copies);
+        h.vkUpdateDescriptorSets(&mut args);
+        SAW.with_borrow(|w| assert_eq!(w.updated, [(3, 1)], "each count with its own array"));
+
+        // The bytes are the command, and the offset travels beside them without becoming them.
+        let values = [0xdeu8, 0xad, 0xbe, 0xef, 0x01];
+        let mut args = vn_command_vkCmdPushConstants::default();
+        args.commandBuffer = cb;
+        args.offset = 12;
+        args.plant_pValues(&values);
+        h.vkCmdPushConstants(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|w| {
+            assert_eq!(w.pushed, [(12, values.to_vec())], "all five bytes, at the offset given");
+        });
+
+        // No work at all, which is how a guest signals a fence. It has to reach the driver.
+        let submits: [VkSubmitInfo; 0] = [];
+        let mut args = vn_command_vkQueueSubmit::default();
+        args.queue = VkQueue(QUEUE);
+        args.fence = VkFence(0x77);
+        args.plant_pSubmits(&submits);
+        h.vkQueueSubmit(&mut args);
+        assert!(h.reject.is_none(), "an empty submit is a fence signal, not a botched command");
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|w| {
+            assert_eq!(w.submitted, [(0, 0x77)], "no work, and the fence that is waiting on it");
+        });
+
+        h.driver.abandon_planted();
+    }
+
     /// A create the macro serves, refused because the driver is not there.
     ///
     /// The whole point of routing every simple object through `Driver::create_object` is that the
