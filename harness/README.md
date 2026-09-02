@@ -179,31 +179,28 @@ every ring flow-control command, so nothing in the stream waits on the GPU: a ha
 instant `replay_end` returns can race queue work still executing and look nondeterministic when
 the renderer is perfectly deterministic.
 
-### Scoring the port against the C, and what still differs
+### Scoring the port against the C
 
 A fixture is recorded from the C, so the gate ladder compares Rust to Rust and a fixture mismatch
-means a regression. Reading a Rust score against the *C's* score is a different question. On
-`synoik` the C censuses 22 allocations and this censuses 20, and the 20 are the C's 20: every one
-agrees byte-for-byte.
+means a regression. Reading a Rust score against the *C's* score is a different question, and on
+all three corpora the answer is currently agreement: every census id, size and hash, and every
+`iosurface backed` count, matches byte-for-byte.
 
-The two it does not report are the `flags=0x7` scanout exports. On the C that memory is a
-host-pointer import of its own dedicated image's IOSurface — the memory *is* the surface,
-`vkMapMemory` refuses it, and the content read resolves through the surface instead, so the C
-censuses it. Here a scanout allocation is ordinary mappable memory published as a blob, and the
-census reports storage once, at whoever owns it. Until the surface exists there is nothing to
-census it *as*, and `iosurface backed=0` is the other face of the same gap.
+Equal totals are not agreement. These two censuses once read 22 against 22 while sharing only
+twenty entries, because a missing export and a missing import cancelled. Compare the ids, never
+the count.
 
-Equal totals are not agreement. These two censuses read 22 against 22 while sharing only twenty
-entries, because a missing export and a missing import cancelled. Compare the ids, never the count.
-
-Claims about what a corpus contains are settled against the corpus. Both of the allocations this
-census used to over-report were imports, and that was established by printing every allocation's
-`pNext` verdict during a replay — two imports in 31 allocations, exactly the two ids in dispute —
-not by reasoning from the C's source about which ones ought to be.
+Claims about what a corpus contains are settled against the corpus. That an allocation is an
+import was established by printing every allocation's `pNext` verdict during a replay — two
+imports in 31 allocations, exactly the two ids in dispute — not by reasoning from the C's source
+about which ones ought to be. The same probe is what found four `R8G8B8A8_SRGB` scanouts in a
+corpus everything else in it said was BGRA.
 
 Before concluding anything from a hash, compute the all-zero FNV-1a for that read length. Empty
 and wrong are different findings and the score does not distinguish them: a refused command leaves
-memory no one wrote, and reads as a hash like any other.
+memory no one wrote, and reads as a hash like any other. A scanout export that mints a surface
+nothing writes through scores exactly this way, and reports an empty surface as content — which is
+worse than reporting nothing.
 
 Two habits worth keeping. A count that reads zero is worth less than one that reads busy —
 `render_pass_starts=0` said neither replay rendered while the allocation-pool counters in the same
