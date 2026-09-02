@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright © 2026 the limina authors
+"""Break the renderer on purpose, and report which breakages the tests notice.
+
+A passing suite says nothing about what it would catch. This says it directly: each entry below
+is a one-line edit that makes the renderer wrong in a way a guest would see, applied to a clean
+tree, tested, and reverted. `RED` is the suite catching it. `SURVIVED` is a hole, named.
+
+    harness/sabotage/sweep.py [pattern ...]
+
+Entries are matched by substring against their name; with none, every entry runs. Each is applied
+alone, so one sabotage never masks another.
+
+The edits are exact string replacements and every one asserts it matched, so an entry whose target
+has been refactored away fails loudly instead of quietly testing nothing -- a sweep that reports
+`RED` for an edit it never made is worse than no sweep.
+"""
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+RS = ROOT / 'virglrs'
+
+# (name, path relative to the repo root, what to replace, what with, cargo test filter)
+SABOTAGES = [
+    (
+        'an array accessor hands its handler one element fewer',
+        'virglrs/venus-gen/rustgen.py',
+        "unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'\n                    % (call, n, f, 'mut' if mutable else 'const')",
+        "unsafe { cs::%s(((%s) as usize).saturating_sub(1), val.%s as *%s _) }'\n                    % (call, n, f, 'mut' if mutable else 'const')",
+        'witness',
+    ),
+    (
+        'an array accessor hands its handler one element more',
+        'virglrs/venus-gen/rustgen.py',
+        "unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'\n                    % (call, n, f, 'mut' if mutable else 'const')",
+        "unsafe { cs::%s((%s) as usize + 1, val.%s as *%s _) }'\n                    % (call, n, f, 'mut' if mutable else 'const')",
+        'witness',
+    ),
+    (
+        'a reply is committed before the command that produced it is judged',
+        'virglrs/src/venus/ring.rs',
+        '        self.pos += bytes.len();\n        Ok(())',
+        '        Ok(())',
+        '',
+    ),
+    (
+        'a reply that does not fit is written anyway',
+        'virglrs/src/venus/ring.rs',
+        '        if bytes.len() > remaining {\n            return Err(ReplyOverflow { wanted: bytes.len(), remaining });\n        }',
+        '        let bytes = &bytes[..bytes.len().min(remaining)];',
+        '',
+    ),
+    (
+        'a seek past the reply window is clamped instead of refused',
+        'virglrs/src/venus/ring.rs',
+        '        if pos > self.window.size() {\n            return false;\n        }\n        self.pos = pos;',
+        '        self.pos = pos.min(self.window.size());',
+        '',
+    ),
+    (
+        'the census reports storage a guest only borrowed',
+        'virglrs/src/venus/driver.rs',
+        '            .filter(|(_, a)| a.censused())',
+        '            .filter(|(_, a)| a.censused() || true)',
+        '',
+    ),
+]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, cwd=RS, capture_output=True, text=True, **kw)
+
+
+def main():
+    patterns = sys.argv[1:]
+    chosen = [s for s in SABOTAGES if not patterns or any(p in s[0] for p in patterns)]
+    if not chosen:
+        sys.exit('no sabotage matches %r' % patterns)
+
+    dirty = run(['git', 'status', '--porcelain'], cwd=ROOT).stdout.strip()
+    if dirty:
+        sys.exit('the tree has uncommitted changes; sweep would restore over them:\n' + dirty)
+
+    baseline = run(['cargo', 'test'])
+    if baseline.returncode != 0:
+        sys.exit('the tests do not pass before any sabotage; fix that first')
+
+    holes = []
+    for name, rel, old, new, filt in chosen:
+        path = ROOT / rel
+        original = path.read_text()
+        assert old in original, 'sabotage %r no longer matches %s' % (name, rel)
+        path.write_text(original.replace(old, new, 1))
+        try:
+            r = run(['cargo', 'test'] + ([filt] if filt else []))
+        finally:
+            path.write_text(original)
+        caught = r.returncode != 0
+        if caught:
+            n = len(re.findall(r'^    \S+::\S+$', r.stdout, re.M))
+            print('RED       %s  (%d tests)' % (name, n))
+        else:
+            holes.append(name)
+            print('SURVIVED  %s' % name)
+
+    print('\n%d of %d caught' % (len(chosen) - len(holes), len(chosen)))
+    return 1 if holes else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

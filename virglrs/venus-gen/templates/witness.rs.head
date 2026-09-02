@@ -1,0 +1,60 @@
+// What an array accessor hands back, for every command that carries one.
+//
+// The gap this closes was measured, not guessed: an accessor cut to hand its handler one element
+// fewer than the guest sent replays both corpora at `cmds N/N` with the census unchanged and
+// KosmicKrisp's own workload counters byte-identical. `venus-roundtrip` cannot see it either --
+// it never calls an accessor. So the accessors are the one emitted surface with no witness, and
+// one template mistake is a hundred identical bugs.
+//
+// Each test plants arrays into a command, encodes it with the real argument encoder, decodes it
+// with the real decoder, and asks the accessor what it sees. That chain forces four emissions to
+// agree -- planter, encoder, decoder, accessor -- and the round trip already pins the middle two
+// against wire a C encoder produced, so what this adds on top is exactly the accessor.
+//
+// Two assertions, which are the accessor's only two degrees of freedom:
+//
+// - **Length.** The count the decoder sized its allocation from, and the count the accessor
+//   builds its slice from, are two separate emissions of one expression.
+// - **Which member.** The slice must start at the pointer member it names. Where several arrays
+//   share a count, only this separates them, and where they also share an element type -- as
+//   `pOffsets`, `pSizes` and `pStrides` do -- the type system does not.
+//
+// Contents are deliberately not asserted: they are the decoder's, and the round trip pins them
+// over every recorded command. What is planted here is whatever `Default` gives, which for a
+// handle array is `VK_NULL_HANDLE` -- an ordinary wire value that resolves without consulting
+// the object table.
+//
+// Only arrays whose count is a plain member of the command are covered, because those are the
+// ones a planter can establish both halves of. The rest are named in the module's own list
+// below, so a reader can see what is not here rather than assume it is.
+
+use super::serialize::*;
+use super::types::*;
+use crate::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
+use bumpalo::Bump;
+use std::sync::atomic::AtomicBool;
+
+/// One array's verdict: the slice the accessor handed back, against what was planted.
+///
+/// `None` is a failure here and not a question. Every array these tests plant is one the guest
+/// sent, so an accessor that answers "the guest sent none" is answering about a different
+/// command than the one that was encoded.
+fn carried<T>(got: Option<&[T]>, want: usize, member: *const (), field: &str) {
+    let slice = got.unwrap_or_else(|| panic!("{field}: the accessor says the guest sent no array"));
+    assert_eq!(slice.len(), want, "{field}: the accessor's length is not the count on the wire");
+    // Compared as bare addresses. An out-handle array's accessor hands out `Guest<T>` over a
+    // member declared `*mut T`, and a blob's hands out `u8` over a `c_void` -- the element type
+    // is the accessor's business, and what is being asked here is only which member it read.
+    assert_eq!(
+        slice.as_ptr() as *const (),
+        member,
+        "{field}: the accessor handed back a different member's array"
+    );
+}
+
+/// How many elements every planted array gets.
+///
+/// More than one, so an accessor that hands back a single element or walks with the wrong stride
+/// is caught, and small enough that a failure prints legibly. Odd, so a length halved or doubled
+/// cannot land back on it.
+const N: usize = 3;

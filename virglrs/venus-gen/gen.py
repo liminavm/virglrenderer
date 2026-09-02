@@ -170,6 +170,12 @@ def main():
     (outdir / 'fill.rs').write_bytes(
         banner.encode() + fill_head.encode() + rust.render_fill(gaps).encode())
 
+    # After the two walks that fill `gaps`: a command whose encode emits a poisoning stub cannot
+    # be round-tripped, and the witnesses skip those by name rather than by a list of their own.
+    witness_head = (Path(HERE / 'templates' / 'witness.rs.head').read_text())
+    (outdir / 'witness.rs').write_bytes(
+        banner.encode() + witness_head.encode() + rust.render_witnesses(gaps).encode())
+
     # Shapes the emitter has not been taught, named where a reader will find them. A gap emits a
     # stub that poisons the stream, so the wire round trip fails on the first command needing one.
     (outdir / 'gaps.txt').write_text('\n'.join(sorted(set(gaps))) + '\n')
