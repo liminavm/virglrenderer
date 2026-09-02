@@ -58,6 +58,32 @@ pub struct ObjectId(pub u64);
 #[repr(transparent)]
 pub struct HostHandle(pub u64);
 
+/// A host handle carried with the Vulkan type it is a handle *of*.
+///
+/// [`HostHandle`] is deliberately kind-erased, and for the object table that is right -- it is
+/// keyed by a runtime `ty` because one table holds every type. A container that erases the kind
+/// without recording it has a different problem: two Vulkan types are two separate handle spaces,
+/// and a driver may hand out the same `u64` for a command pool and a descriptor pool. Keyed by the
+/// bare handle they collide; keyed by this they cannot.
+///
+/// Built from [`Handle::OBJECT_TYPE`], so no call site chooses the tag and none can choose it
+/// wrongly.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TypedHandle {
+    ty: i32,
+    handle: HostHandle,
+}
+
+impl TypedHandle {
+    pub fn of<T: Handle>(h: T) -> TypedHandle {
+        TypedHandle { ty: T::OBJECT_TYPE, handle: h.host() }
+    }
+
+    pub fn host(self) -> HostHandle {
+        self.handle
+    }
+}
+
 /// Resolves guest object ids to host objects. The decoder holds one by reference; what sits behind
 /// it is vkr's object table in the renderer and an identity map in the round-trip test.
 /// A pointer stored in an arena array -- an array of strings is an array of these.
@@ -83,6 +109,14 @@ impl Default for Ptr {
 /// a typed shadow member, so the conversion is named here rather than done with a cast at every
 /// call site, and the generator implements it for every handle type.
 pub trait Handle: Copy {
+    /// The `VkObjectType` discriminant of this handle's Vulkan type.
+    ///
+    /// An `i32` rather than the generated enum for the reason [`Objects::lookup`] takes one: this
+    /// module is the wire runtime and the enum is generated on top of it, so the discriminant is
+    /// the widest thing both sides can name. The generator fills it in from the same `c_objtype`
+    /// attribute the lookup already used, so the two cannot drift.
+    const OBJECT_TYPE: i32;
+
     /// The host handle in the slot, for a member the decoder has already resolved or the driver
     /// has just written.
     fn host(self) -> HostHandle;

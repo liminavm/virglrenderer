@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::cs::{Handle, HostHandle, ObjectId};
+use super::cs::{Handle, ObjectId, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
@@ -91,9 +91,31 @@ const HOST_EXTENSIONS: [&str; 6] = [
 /// this is the only place that still knows what they were.
 #[derive(Default)]
 struct Pools {
-    open: BTreeMap<HostHandle, Pool>,
+    open: BTreeMap<TypedHandle, Pool>,
     /// Every pool-allocated object, by host handle, pointing back at its pool.
-    owner: BTreeMap<HostHandle, HostHandle>,
+    owner: BTreeMap<TypedHandle, TypedHandle>,
+}
+
+/// A pool handle, and the one kind of object allocated from it.
+///
+/// Vulkan's two pools each hold exactly one kind: a command pool holds command buffers, a
+/// descriptor pool holds descriptor sets. Tying the two together in a type is what stops a
+/// command buffer being recorded into a descriptor pool's contents -- a transposition the pool
+/// bookkeeping cannot otherwise see, because both sides of it are handles.
+///
+/// Written out rather than generated: the pinned `vkxml.py` does not parse vk.xml's `parent`
+/// attribute, so the generator has nothing to derive this from. Two impls, and a third pool kind
+/// would fail to compile at its call site rather than pass silently.
+pub trait PoolOf: Handle {
+    type Child: Handle;
+}
+
+impl PoolOf for VkCommandPool {
+    type Child = VkCommandBuffer;
+}
+
+impl PoolOf for VkDescriptorPool {
+    type Child = VkDescriptorSet;
 }
 
 /// One live pool: the device that owns it, and what has been allocated from it.
@@ -101,47 +123,49 @@ struct Pool {
     /// Recorded so a destroyed device can take its pools with it. Vulkan destroys them for us and
     /// says nothing, and a host handle the driver is free to reuse must stop being vouched for the
     /// moment that happens.
-    device: HostHandle,
+    device: VkDevice,
     /// Host handle to the guest id it was allocated under.
-    children: BTreeMap<HostHandle, ObjectId>,
+    children: BTreeMap<TypedHandle, ObjectId>,
 }
 
 impl Pools {
-    fn open(&mut self, device: HostHandle, pool: HostHandle) {
-        self.open.insert(pool, Pool { device, children: BTreeMap::new() });
+    fn open<P: PoolOf>(&mut self, device: VkDevice, pool: P) {
+        self.open.insert(TypedHandle::of(pool), Pool { device, children: BTreeMap::new() });
     }
 
-    fn is_open(&self, pool: HostHandle) -> bool {
-        self.open.contains_key(&pool)
+    fn is_open<P: PoolOf>(&self, pool: P) -> bool {
+        self.open.contains_key(&TypedHandle::of(pool))
     }
 
     /// The device that owns the pool a handle came from.
     ///
     /// A `vkCmd*` carries only its command buffer: Vulkan does not repeat the device, because a
     /// command buffer already knows its own. Here it does not, so the pool is the way back.
-    fn device_of(&self, handle: HostHandle) -> Option<HostHandle> {
-        self.open.get(self.owner.get(&handle)?).map(|p| p.device)
+    fn device_of<T: Handle>(&self, handle: T) -> Option<VkDevice> {
+        self.open.get(self.owner.get(&TypedHandle::of(handle))?).map(|p| p.device)
     }
 
     /// Record objects freshly allocated from a pool. Both directions, or neither.
-    fn adopt(
+    fn adopt<P: PoolOf>(
         &mut self,
-        pool: HostHandle,
-        children: impl IntoIterator<Item = (HostHandle, ObjectId)>,
+        pool: P,
+        children: impl IntoIterator<Item = (P::Child, ObjectId)>,
     ) {
+        let pool = TypedHandle::of(pool);
         let Some(p) = self.open.get_mut(&pool) else {
             return;
         };
         for (handle, id) in children {
-            p.children.insert(handle, id);
-            self.owner.insert(handle, pool);
+            p.children.insert(TypedHandle::of(handle), id);
+            self.owner.insert(TypedHandle::of(handle), pool);
         }
     }
 
     /// Forget objects freed back to their pool. The pool each belongs to is looked up rather than
     /// passed in, so a caller cannot name the wrong one.
-    fn release(&mut self, children: impl IntoIterator<Item = HostHandle>) {
+    fn release<T: Handle>(&mut self, children: impl IntoIterator<Item = T>) {
         for child in children {
+            let child = TypedHandle::of(child);
             if let Some(pool) = self.owner.remove(&child)
                 && let Some(p) = self.open.get_mut(&pool)
             {
@@ -152,8 +176,9 @@ impl Pools {
 
     /// Forget a pool and everything in it, handing back the guest ids that just stopped naming
     /// anything -- the caller owes the object table their removal.
-    fn close(&mut self, pool: HostHandle) -> Vec<ObjectId> {
-        let children = self.open.remove(&pool).map(|p| p.children).unwrap_or_default();
+    fn close<P: Handle>(&mut self, pool: P) -> Vec<ObjectId> {
+        let children =
+            self.open.remove(&TypedHandle::of(pool)).map(|p| p.children).unwrap_or_default();
         for handle in children.keys() {
             self.owner.remove(handle);
         }
@@ -161,10 +186,21 @@ impl Pools {
     }
 
     /// Forget every pool a device owned, because destroying the device destroyed them.
-    fn close_device(&mut self, device: HostHandle) -> Vec<ObjectId> {
-        let doomed: Vec<HostHandle> =
+    fn close_device(&mut self, device: VkDevice) -> Vec<ObjectId> {
+        let doomed: Vec<TypedHandle> =
             self.open.iter().filter(|(_, p)| p.device == device).map(|(h, _)| *h).collect();
-        doomed.into_iter().flat_map(|pool| self.close(pool)).collect()
+        // Already a `TypedHandle`, so it goes to the map directly rather than back through
+        // `close`, which exists to build one from a caller's typed handle.
+        doomed
+            .into_iter()
+            .flat_map(|pool| {
+                let children = self.open.remove(&pool).map(|p| p.children).unwrap_or_default();
+                for handle in children.keys() {
+                    self.owner.remove(handle);
+                }
+                children.into_values()
+            })
+            .collect()
     }
 }
 
@@ -173,17 +209,17 @@ impl Pools {
 pub struct Driver {
     instance: Option<InstanceFns>,
     /// The instance's own handle, so a teardown with no command behind it can still destroy it.
-    instance_handle: HostHandle,
+    instance_handle: VkInstance,
     /// Keyed by *host* handle, not guest id. Every handler that needs a device's entry points
     /// reaches them through the `VkDevice` the lookup already resolved for it; only a destroy
     /// carries the guest id, and it does not need the table to find one.
-    devices: BTreeMap<HostHandle, DeviceState>,
+    devices: BTreeMap<VkDevice, DeviceState>,
     /// What each physical device supports, by name, keyed by host handle.
     ///
     /// A set of names rather than the C's one bool per extension: the question asked of it is
     /// always "does this driver have <name>", and a hand-maintained struct of booleans is a list
     /// that has to be extended every time a new name matters.
-    physical_device_exts: BTreeMap<HostHandle, BTreeSet<String>>,
+    physical_device_exts: BTreeMap<VkPhysicalDevice, BTreeSet<String>>,
     /// How big each live allocation is, by the guest's id.
     ///
     /// Only the size. The handle and the owning device are the object table's to know, and this
@@ -200,7 +236,7 @@ pub struct Driver {
     /// device already owns -- but `vkQueueSubmit` carries only the queue, so this is the way back
     /// to the entry points. The same problem [`Pools::device_of`] solves for a command buffer, and
     /// kept apart from it because a queue owns nothing and takes nothing with it when it goes.
-    queues: BTreeMap<HostHandle, HostHandle>,
+    queues: BTreeMap<VkQueue, VkDevice>,
 }
 
 /// The last stand: a driver may not be dropped while it still owes Vulkan a destroy.
@@ -337,7 +373,7 @@ impl Driver {
     }
 
     pub fn device(&self, device: VkDevice) -> Option<&DeviceFns> {
-        self.devices.get(&device.host()).map(|d| &d.fns)
+        self.devices.get(&device).map(|d| &d.fns)
     }
 
     /// Destroy everything this context still holds, devices before the instance.
@@ -351,13 +387,13 @@ impl Driver {
         // The same order a guest's own `vkDestroyDevice` gets: wait idle, then every object the
         // device owns, then the device. `empty_device` picks out the ones that are its.
         for handle in self.devices.keys().copied().collect::<Vec<_>>() {
-            self.empty_device(VkDevice::from_host(handle), doomed);
+            self.empty_device(handle, doomed);
         }
         for (handle, d) in core::mem::take(&mut self.devices) {
             self.pools.close_device(handle);
             self.queues.retain(|_, owner| *owner != handle);
             // SAFETY: a handle this context created, and the table was loaded from it.
-            unsafe { (d.fns.vkDestroyDevice())(VkDevice::from_host(handle), core::ptr::null()) };
+            unsafe { (d.fns.vkDestroyDevice())(handle, core::ptr::null()) };
         }
         // A fallback, not the path that retires the census: `empty_device` does that, per device,
         // as it frees. What can be left here is an allocation the table could name no device for,
@@ -373,7 +409,7 @@ impl Driver {
             self.memory.clear();
         }
         if let Some(inst) = self.instance.take() {
-            let handle = VkInstance::from_host(core::mem::take(&mut self.instance_handle));
+            let handle = core::mem::take(&mut self.instance_handle);
             // SAFETY: as above.
             unsafe { (inst.vkDestroyInstance())(handle, core::ptr::null()) };
         }
@@ -405,7 +441,7 @@ impl Driver {
         }
         assert!(out.0 != 0, "vkCreateInstance succeeded and returned a null instance");
         self.instance = Some(vulkan::instance(out));
-        self.instance_handle = out.host();
+        self.instance_handle = out;
         Ok(out)
     }
 
@@ -414,7 +450,7 @@ impl Driver {
     /// Asked once per physical device, when the guest first enumerates them -- the answer does not
     /// change for the life of the instance.
     pub fn learn_extensions(&mut self, pd: VkPhysicalDevice) {
-        if self.physical_device_exts.contains_key(&pd.host()) {
+        if self.physical_device_exts.contains_key(&pd) {
             return;
         }
         let Some(inst) = self.instance.as_ref() else {
@@ -453,7 +489,7 @@ impl Driver {
                 p.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
             })
             .collect();
-        self.physical_device_exts.insert(pd.host(), names);
+        self.physical_device_exts.insert(pd, names);
     }
 
     /// What the guest is told a physical device supports.
@@ -471,14 +507,14 @@ impl Driver {
     /// The driver is never asked again. `learn_extensions` asked once, and the answer does not
     /// change for the life of the instance.
     pub fn advertised_extensions(&self, pd: VkPhysicalDevice) -> Vec<VkExtensionProperties> {
-        let Some(names) = self.physical_device_exts.get(&pd.host()) else {
+        let Some(names) = self.physical_device_exts.get(&pd) else {
             return Vec::new();
         };
         names.iter().filter_map(|name| extension_properties(name)).collect()
     }
 
     fn supports(&self, pd: VkPhysicalDevice, name: &str) -> bool {
-        self.physical_device_exts.get(&pd.host()).is_some_and(|s| s.contains(name))
+        self.physical_device_exts.get(&pd).is_some_and(|s| s.contains(name))
     }
 
     /// The extension list to create a device with: the guest's, minus what this renderer emulates,
@@ -562,8 +598,7 @@ impl Driver {
             .iter()
             .map(|t| t.propertyFlags)
             .collect();
-        self.devices
-            .insert(out.host(), DeviceState { fns: vulkan::device(inst, out), memory_types });
+        self.devices.insert(out, DeviceState { fns: vulkan::device(inst, out), memory_types });
         Ok(out)
     }
 
@@ -599,7 +634,7 @@ impl Driver {
     /// type the very next `vkAllocateMemory` will refuse, and anything narrower hands it zero
     /// types for a buffer that binds perfectly well.
     pub fn host_visible_memory_types(&self, device: VkDevice) -> Result<u32, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let mut bits = 0u32;
         for (i, flags) in d.memory_types.iter().enumerate() {
             if flags.0 & HOST_VISIBLE_BIT != 0 {
@@ -729,7 +764,7 @@ impl Driver {
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, u32, u32, u32, *mut T) -> R>,
     ) -> Result<R, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; the three indices are plain scalars off the wire.
         Ok(unsafe { f(device, heap_index, local_device, remote_device, out) })
@@ -751,7 +786,7 @@ impl Driver {
         info: &I,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> R>,
     ) -> Result<R, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; `info` borrows an arena struct live for the call.
         Ok(unsafe { f(device, info) })
@@ -766,7 +801,7 @@ impl Driver {
         out: &mut T,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut T) -> R>,
     ) -> Result<R, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: `device` is a handle this table was loaded from, `info` borrows an arena struct
         // live for the call, and `out` is a live exclusive borrow.
@@ -781,7 +816,7 @@ impl Driver {
         out: &mut T,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, A, *mut T) -> R>,
     ) -> Result<R, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`; `a` is a handle the guest named, already resolved.
         Ok(unsafe { f(device, a, out) })
@@ -799,7 +834,7 @@ impl Driver {
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, A, *const I, *mut T) -> R>,
     ) -> Result<R, VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         // SAFETY: as `dev_query_info`.
         Ok(unsafe { f(device, a, info, out) })
@@ -915,7 +950,7 @@ impl Driver {
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, A, *mut u32, *mut T) -> R>,
     ) -> Result<(u32, R), VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         let (mut n, room, array) = split(out);
         // SAFETY: as `enumerate_into`; `a` is a handle the guest named, already resolved.
@@ -935,7 +970,7 @@ impl Driver {
         )
             -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut u32, *mut T) -> R>,
     ) -> Result<(u32, R), VkResult> {
-        let d = self.devices.get(&device.host()).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let d = self.devices.get(&device).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
         let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
         let (mut n, room, array) = split(out);
         // SAFETY: as `enumerate_into`; `info` borrows an arena struct live for the call.
@@ -1004,7 +1039,7 @@ impl Driver {
 
     /// A device's queue, which is owned by the device and never created or destroyed.
     pub fn device_queue(&mut self, device: VkDevice, info: &VkDeviceQueueInfo2) -> Option<VkQueue> {
-        let d = self.devices.get(&device.host())?;
+        let d = self.devices.get(&device)?;
         let mut out = VkQueue(0);
         // SAFETY: `device` is a handle this table was loaded from and `info` is an arena
         // allocation live for the call.
@@ -1014,7 +1049,7 @@ impl Driver {
         }
         // Asking twice for the same queue is how a guest works, not a mistake: Vulkan hands back
         // the same handle each time, and the answer recorded here is the same both times.
-        self.queues.insert(out.host(), device.host());
+        self.queues.insert(out, device);
         Some(out)
     }
 
@@ -1137,7 +1172,7 @@ impl Driver {
 
     /// Everything a device owns, torn down in the order Vulkan requires, before the device itself.
     fn empty_device(&mut self, device: VkDevice, doomed: &[Doomed]) {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return;
         };
         // Nothing may be destroyed while the device is still working on it, and the guest is not
@@ -1153,7 +1188,7 @@ impl Driver {
         //
         // Filtered by device here rather than by the caller, so an object can only ever be
         // destroyed on the device the table says it belongs to.
-        let mine = || doomed.iter().filter(|o| o.device == Some(device.host()));
+        let mine = || doomed.iter().filter(|o| o.device == Some(device));
         let is_memory = |o: &Doomed| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY;
         for o in mine().filter(|o| !is_memory(o)) {
             Self::destroy_tracked(&d.fns, device, o);
@@ -1177,9 +1212,9 @@ impl Driver {
         // Ahead of everything else, and while the device is still in the map: its objects have to
         // be destroyed before it is, and `empty_device` needs the entry points to do it.
         self.empty_device(device, doomed);
-        let orphans = self.pools.close_device(device.host());
-        self.queues.retain(|_, owner| *owner != device.host());
-        let Some(d) = self.devices.remove(&device.host()) else {
+        let orphans = self.pools.close_device(device);
+        self.queues.retain(|_, owner| *owner != device);
+        let Some(d) = self.devices.remove(&device) else {
             return orphans;
         };
         // SAFETY: a handle this context created, destroyed once -- `remove` is what makes it once.
@@ -1213,8 +1248,8 @@ impl Driver {
         ) -> VkResult,
         info: &I,
         alloc: Option<&VkAllocationCallbacks>,
-    ) -> Result<HostHandle, VkResult> {
-        let Some(d) = self.devices.get(&device.host()) else {
+    ) -> Result<T, VkResult> {
+        let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         let mut out = T::null();
@@ -1224,9 +1259,8 @@ impl Driver {
         if r != VkResult::VK_SUCCESS {
             return Err(r);
         }
-        let handle = out.host();
-        assert!(handle.0 != 0, "a create succeeded and returned a null handle");
-        Ok(handle)
+        assert!(out.host().0 != 0, "a create succeeded and returned a null handle");
+        Ok(out)
     }
 
     /// Destroy an object created by [`Driver::create_object`].
@@ -1240,7 +1274,7 @@ impl Driver {
         object: T,
         alloc: Option<&VkAllocationCallbacks>,
     ) {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return;
         };
         if object.host().0 == 0 {
@@ -1261,16 +1295,19 @@ impl Driver {
     /// into the place the generated lifecycle hook will read them from. `ids` is the same run of
     /// objects under the names the guest gave them, which the pool records alongside so that
     /// destroying it can take them out of the object table.
-    pub fn allocate_objects<T: Handle, I>(
+    pub fn allocate_objects<P: PoolOf, I>(
         &mut self,
         device: VkDevice,
-        pool: HostHandle,
-        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, *const I, *mut T) -> VkResult,
+        pool: P,
+        proc: impl FnOnce(
+            &DeviceFns,
+        )
+            -> unsafe extern "C" fn(VkDevice, *const I, *mut P::Child) -> VkResult,
         info: &I,
-        out: &mut [T],
+        out: &mut [P::Child],
         ids: &[ObjectId],
     ) -> Result<(), VkResult> {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         if out.is_empty() {
@@ -1291,7 +1328,7 @@ impl Driver {
         // Both names of each object are recorded together; see `Pools`.
         self.pools.adopt(
             pool,
-            out.iter().map(|h| h.host()).zip(ids.iter().copied()).filter(|(h, _)| h.0 != 0),
+            out.iter().copied().zip(ids.iter().copied()).filter(|(h, _)| h.host().0 != 0),
         );
         Ok(())
     }
@@ -1325,7 +1362,7 @@ impl Driver {
         alloc: Option<&VkAllocationCallbacks>,
         out: &mut [VkPipeline],
     ) -> Result<(), VkResult> {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         // One handle comes back per create-info, so the decoder sized both from the same count.
@@ -1367,23 +1404,23 @@ impl Driver {
     /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
     ///
     /// Free a run of objects back to the pool they came from.
-    pub fn free_objects<T: Handle, P: Handle>(
+    pub fn free_objects<P: PoolOf>(
         &mut self,
         device: VkDevice,
-        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const T),
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const P::Child),
         pool: P,
-        objects: &[T],
+        objects: &[P::Child],
     ) {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return;
         };
-        if objects.is_empty() || !self.pools.is_open(pool.host()) {
+        if objects.is_empty() || !self.pools.is_open(pool) {
             return;
         }
         // SAFETY: handles this context allocated, and the count Vulkan is given is the slice's own
         // length. The generated lifecycle hook removes the ids from the object table exactly once.
         unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
-        self.pools.release(objects.iter().map(|h| h.host()));
+        self.pools.release(objects.iter().copied());
     }
 
     /// Register a device with a hand-built proc table, as `create_device` would have.
@@ -1392,18 +1429,14 @@ impl Driver {
     /// what a handler hands the driver, which is the boundary nothing else in the harness can
     /// see. See `plant_pool` for why the real path is out of reach.
     #[cfg(test)]
-    pub(super) fn plant_device(&mut self, handle: HostHandle, fns: DeviceFns) {
+    pub(super) fn plant_device(&mut self, handle: VkDevice, fns: DeviceFns) {
         self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
     }
 
     /// Give a planted device the memory types `vkCreateDevice` would have read off the driver.
     /// Test scaffolding, separate from `plant_device` because most tests never look at them.
     #[cfg(test)]
-    pub(super) fn plant_memory_types(
-        &mut self,
-        handle: HostHandle,
-        types: &[VkMemoryPropertyFlags],
-    ) {
+    pub(super) fn plant_memory_types(&mut self, handle: VkDevice, types: &[VkMemoryPropertyFlags]) {
         let d = self.devices.get_mut(&handle).expect("a planted device");
         d.memory_types = types.to_vec();
     }
@@ -1412,7 +1445,7 @@ impl Driver {
     /// driver. Test scaffolding: the real path needs an instance and a loader.
     #[cfg(test)]
     pub(super) fn plant_extensions(&mut self, pd: VkPhysicalDevice, names: &[&str]) {
-        self.physical_device_exts.insert(pd.host(), names.iter().map(|n| n.to_string()).collect());
+        self.physical_device_exts.insert(pd, names.iter().map(|n| n.to_string()).collect());
     }
 
     /// Stand an instance table up with no loader behind it, so an instance-level query has
@@ -1449,11 +1482,11 @@ impl Driver {
     /// which is the one thing a unit test has no way to arrange -- and what the tests want to ask
     /// about is what happens to those contents afterwards.
     #[cfg(test)]
-    pub(super) fn plant_pool(
+    pub(super) fn plant_pool<P: PoolOf>(
         &mut self,
-        device: HostHandle,
-        pool: HostHandle,
-        children: &[(HostHandle, ObjectId)],
+        device: VkDevice,
+        pool: P,
+        children: &[(P::Child, ObjectId)],
     ) {
         self.pools.open(device, pool);
         self.pools.adopt(pool, children.iter().copied());
@@ -1464,12 +1497,12 @@ impl Driver {
     /// Test scaffolding. The real path needs a driver that answers `vkGetDeviceQueue2`, and what
     /// the tests want to ask about is what a submit does once the answer is in.
     #[cfg(test)]
-    pub(super) fn plant_queue(&mut self, device: HostHandle, queue: HostHandle) {
+    pub(super) fn plant_queue(&mut self, device: VkDevice, queue: VkQueue) {
         self.queues.insert(queue, device);
     }
 
     /// Create a pool, and start tracking what will be allocated from it.
-    pub fn create_pool<T: Handle, I>(
+    pub fn create_pool<T: PoolOf, I>(
         &mut self,
         device: VkDevice,
         proc: impl FnOnce(
@@ -1482,9 +1515,9 @@ impl Driver {
         ) -> VkResult,
         info: &I,
         alloc: Option<&VkAllocationCallbacks>,
-    ) -> Result<HostHandle, VkResult> {
+    ) -> Result<T, VkResult> {
         let handle = self.create_object(device, proc, info, alloc)?;
-        self.pools.open(device.host(), handle);
+        self.pools.open(device, handle);
         Ok(handle)
     }
 
@@ -1501,7 +1534,7 @@ impl Driver {
         pool: T,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Vec<ObjectId> {
-        let orphans = self.pools.close(pool.host());
+        let orphans = self.pools.close(pool);
         self.destroy_object(device, proc, pool, alloc);
         orphans
     }
@@ -1524,7 +1557,7 @@ impl Driver {
     /// one it does not have -- the object table is what usually stops it, and this is the second
     /// answer for the case where the two disagree -- so it is a rejection and never an assert.
     fn recorder(&self, cb: VkCommandBuffer) -> Option<&DeviceFns> {
-        self.devices.get(&self.pools.device_of(cb.host())?).map(|d| &d.fns)
+        self.devices.get(&self.pools.device_of(cb)?).map(|d| &d.fns)
     }
 
     /// `vkBeginCommandBuffer`. The one recording command with a result, because it is the one
@@ -1776,7 +1809,7 @@ impl Driver {
     /// object table is what usually stops that; this is the second answer for when the two
     /// disagree, so it is a rejection and never an assert. See [`Driver::recorder`].
     fn submitter(&self, queue: VkQueue) -> Option<&DeviceFns> {
-        self.devices.get(self.queues.get(&queue.host())?).map(|d| &d.fns)
+        self.devices.get(self.queues.get(&queue)?).map(|d| &d.fns)
     }
 
     /// `vkQueueSubmit`. Every handle inside a `VkSubmitInfo` -- the wait and signal semaphores,
@@ -1798,7 +1831,7 @@ impl Driver {
 
     /// `vkResetFences`.
     pub fn reset_fences(&self, device: VkDevice, fences: &[VkFence]) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: `device` is a handle in this table, and the count Vulkan wants is the slice's
@@ -1814,7 +1847,7 @@ impl Driver {
         wait_all: VkBool32,
         timeout: u64,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: as above.
@@ -1899,7 +1932,7 @@ impl Driver {
         device: VkDevice,
         exports: impl FnOnce(&DeviceFns) -> bool,
     ) -> Result<&DeviceFns, NoSyncFd> {
-        let d = self.devices.get(&device.host()).ok_or(NoSyncFd::NoDevice)?;
+        let d = self.devices.get(&device).ok_or(NoSyncFd::NoDevice)?;
         if !exports(&d.fns) {
             return Err(NoSyncFd::Unsupported);
         }
@@ -1924,7 +1957,7 @@ impl Driver {
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice) -> VkResult,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: `device` is a handle in this table. The same holds for every call below.
@@ -1952,7 +1985,7 @@ impl Driver {
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T) -> VkResult,
         target: T,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: `device` is a handle in this table, and `target` is one the decoder resolved
@@ -1968,7 +2001,7 @@ impl Driver {
         target: T,
         flags: F,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: as above; `flags` is a plain scalar off the wire.
@@ -1992,7 +2025,7 @@ impl Driver {
         memory: VkDeviceMemory,
         offset: VkDeviceSize,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: as above; `memory` and `offset` are the guest's own, resolved and scalar.
@@ -2015,7 +2048,7 @@ impl Driver {
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, u32, *const I) -> VkResult,
         infos: &[I],
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // An empty array is legal and the guest sends it.
@@ -2046,7 +2079,7 @@ impl Driver {
         info: &I,
         pick: impl FnOnce(&DeviceFns) -> Option<unsafe extern "C" fn(VkDevice, *const I) -> VkResult>,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         let Some(f) = pick(&d.fns) else {
@@ -2076,7 +2109,7 @@ impl Driver {
             &DeviceFns,
         ) -> Option<unsafe extern "C" fn(VkDevice, *const I, u64) -> VkResult>,
     ) -> VkResult {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         let Some(f) = pick(&d.fns) else {
@@ -2097,7 +2130,7 @@ impl Driver {
         writes: &[VkWriteDescriptorSet],
         copies: &[VkCopyDescriptorSet],
     ) {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return;
         };
         if writes.is_empty() && copies.is_empty() {
@@ -2128,7 +2161,7 @@ impl Driver {
         info: &VkMemoryAllocateInfo,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkDeviceMemory, VkResult> {
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
         };
         // A copy, not an edit in place: the decoder's struct is the guest's request, and the
@@ -2159,7 +2192,7 @@ impl Driver {
     /// only the census entry to retire.
     pub fn free_memory(&mut self, device: VkDevice, memory: VkDeviceMemory, id: ObjectId) {
         self.memory.remove(&id);
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return;
         };
         // SAFETY: a device and an allocation this context made; the object table took the id out
@@ -2195,7 +2228,7 @@ impl Driver {
         let Some(size) = self.memory.get(&id).copied() else {
             return Err(MemoryError::NoSuchAllocation);
         };
-        let Some(d) = self.devices.get(&device.host()) else {
+        let Some(d) = self.devices.get(&device) else {
             return Err(MemoryError::NoSuchAllocation);
         };
         let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -2370,7 +2403,8 @@ fn read_names(names: &[*const std::ffi::c_char]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::proto::types::VkCommandPool;
+    use super::super::cs::HostHandle;
+    use super::super::proto::types::{VkCommandBuffer, VkCommandPool};
     use super::*;
 
     /// A guest chains what it wants onto an answer's `pNext`, in whatever order it likes, and
@@ -2429,7 +2463,7 @@ mod tests {
 
         use super::super::proto::types::{VkAllocationCallbacks, VkBuffer};
 
-        const DEVICE: HostHandle = HostHandle(3);
+        const DEVICE: VkDevice = VkDevice(3);
         const BUFFER: (u64, u64) = (11, 0xb0);
         const MEMORY: (u64, u64) = (12, 0xd0);
 
@@ -2485,17 +2519,14 @@ mod tests {
             Doomed {
                 id: ObjectId(DEVICE.0),
                 ty: VkObjectType::VK_OBJECT_TYPE_DEVICE,
-                handle: DEVICE,
+                handle: DEVICE.host(),
                 device: None,
             },
         ];
         // The guest's own destroy, not the context teardown: teardown ends by dropping any
         // allocation it could not attribute to a device, and that fallback would hide whether the
         // cascade retired this one.
-        assert!(
-            driver.destroy_device(VkDevice::from_host(DEVICE), &doomed).is_empty(),
-            "it owned no pools"
-        );
+        assert!(driver.destroy_device(DEVICE, &doomed).is_empty(), "it owned no pools");
 
         SAW.with_borrow(|s| {
             assert_eq!(
@@ -2514,38 +2545,59 @@ mod tests {
     /// freed and the next command naming it hands that handle back to the driver.
     #[test]
     fn a_destroyed_pool_hands_back_the_ids_of_everything_in_it() {
-        const DEVICE: HostHandle = HostHandle(3);
+        const DEVICE: VkDevice = VkDevice(3);
 
         let mut d = Driver::default();
-        d.pools.open(DEVICE, HostHandle(7));
+        d.pools.open(DEVICE, VkCommandPool(7));
         d.pools.adopt(
-            HostHandle(7),
-            [(HostHandle(11), ObjectId(110)), (HostHandle(12), ObjectId(120))],
+            VkCommandPool(7),
+            [(VkCommandBuffer(11), ObjectId(110)), (VkCommandBuffer(12), ObjectId(120))],
         );
 
         // No device is registered, so the driver call itself is skipped -- the bookkeeping is
         // what is under test, and it has to happen either way.
-        let mut orphans = d.destroy_pool(
-            VkDevice::from_host(DEVICE),
-            |f| f.vkDestroyCommandPool(),
-            VkCommandPool(7),
-            None,
-        );
+        let mut orphans =
+            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool(7), None);
         orphans.sort_unstable_by_key(|i| i.0);
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "every id in the pool, and no other");
-        assert!(!d.pools.is_open(HostHandle(7)));
+        assert!(!d.pools.is_open(VkCommandPool(7)));
 
         // And a second destroy of the same pool has nothing left to hand back: the ids must not
         // be removed from the object table twice, because the guest may have reused them.
         assert!(
-            d.destroy_pool(
-                VkDevice::from_host(DEVICE),
-                |f| f.vkDestroyCommandPool(),
-                VkCommandPool(7),
-                None
-            )
-            .is_empty()
+            d.destroy_pool(DEVICE, |f| f.vkDestroyCommandPool(), VkCommandPool(7), None).is_empty()
         );
+    }
+
+    /// Two pool kinds may share a handle value, and must not share a record.
+    ///
+    /// A command pool and a descriptor pool are separate Vulkan handle spaces, and a driver is
+    /// free to hand out the same `u64` in each -- non-dispatchable handles routinely are small
+    /// indices. Keyed by the bare handle the two collide: opening the second overwrites the
+    /// first, and destroying either hands back the other's ids, which the caller then takes out
+    /// of the object table while the objects they name are still live.
+    #[test]
+    fn two_pools_of_different_kinds_may_share_a_handle_value() {
+        use super::super::proto::types::{VkDescriptorPool, VkDescriptorSet};
+
+        const SHARED: u64 = 7;
+
+        let mut d = Driver::default();
+        d.pools.open(VkDevice(3), VkCommandPool(SHARED));
+        d.pools.adopt(VkCommandPool(SHARED), [(VkCommandBuffer(11), ObjectId(110))]);
+        d.pools.open(VkDevice(3), VkDescriptorPool(SHARED));
+        d.pools.adopt(VkDescriptorPool(SHARED), [(VkDescriptorSet(21), ObjectId(210))]);
+
+        assert!(
+            d.pools.is_open(VkCommandPool(SHARED)),
+            "the command pool survived the second open"
+        );
+        assert!(d.pools.is_open(VkDescriptorPool(SHARED)));
+
+        // Each destroy hands back its own contents and nothing of the other's.
+        assert_eq!(d.pools.close(VkCommandPool(SHARED)), [ObjectId(110)]);
+        assert!(d.pools.is_open(VkDescriptorPool(SHARED)), "the descriptor pool outlived it");
+        assert_eq!(d.pools.close(VkDescriptorPool(SHARED)), [ObjectId(210)]);
     }
 
     /// A destroyed device takes its pools with it.
@@ -2558,20 +2610,20 @@ mod tests {
     #[test]
     fn a_device_takes_its_pools_and_their_ids_with_it() {
         let mut d = Driver::default();
-        d.pools.open(HostHandle(3), HostHandle(7));
+        d.pools.open(VkDevice(3), VkCommandPool(7));
         d.pools.adopt(
-            HostHandle(7),
-            [(HostHandle(11), ObjectId(110)), (HostHandle(12), ObjectId(120))],
+            VkCommandPool(7),
+            [(VkCommandBuffer(11), ObjectId(110)), (VkCommandBuffer(12), ObjectId(120))],
         );
-        d.pools.open(HostHandle(4), HostHandle(8));
-        d.pools.adopt(HostHandle(8), [(HostHandle(21), ObjectId(210))]);
+        d.pools.open(VkDevice(4), VkCommandPool(8));
+        d.pools.adopt(VkCommandPool(8), [(VkCommandBuffer(21), ObjectId(210))]);
 
         let mut orphans = d.destroy_device(VkDevice(3), &[]);
         orphans.sort_unstable_by_key(|i| i.0);
 
         assert_eq!(orphans, [ObjectId(110), ObjectId(120)], "its pools' ids, and no others");
-        assert!(!d.pools.is_open(HostHandle(7)), "a pool outlived its device");
-        assert!(d.pools.is_open(HostHandle(8)), "another device's pool must be untouched");
+        assert!(!d.pools.is_open(VkCommandPool(7)), "a pool outlived its device");
+        assert!(d.pools.is_open(VkCommandPool(8)), "another device's pool must be untouched");
         assert!(
             d.destroy_device(VkDevice(4), &[]) == [ObjectId(210)],
             "another device's pool must still hold its own"

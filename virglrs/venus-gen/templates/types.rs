@@ -18,7 +18,7 @@ use crate::venus::cs::{ObjectId, Scalar};
 const _: () = assert!(size_of::<*const c_void>() == 8);
 
 <%def name="newtype(name, repr)">\
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 #[repr(transparent)]
 pub struct ${name}(pub ${repr});
 
