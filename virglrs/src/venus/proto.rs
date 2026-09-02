@@ -145,6 +145,17 @@ mod layout_parity {
     }
 }
 
+/// A test per command that its array accessors hand back the array the wire carried.
+///
+/// Inside this module because that is where the array members are visible: they are
+/// `pub(in crate::venus::proto)` so nothing outside can read a pointer without its count, and the
+/// witness has to read exactly that to say the accessor named the right member.
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod witness {
+    include!(concat!(env!("OUT_DIR"), "/venus/witness.rs"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::serialize::*;

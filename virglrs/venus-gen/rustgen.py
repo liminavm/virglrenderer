@@ -1457,6 +1457,121 @@ class RustGen:
             '',
         ])
 
+    def render_witnesses(self, gaps):
+        """A test per command that its array accessors hand back what the wire carried.
+
+        Called after `render_serialize`, because a command whose own encoder emits a poisoning
+        stub for one of its members cannot be round-tripped -- `gaps` is how it says so, and
+        those commands are skipped by name rather than by a list kept here.
+        """
+        gapped = {g.split(':')[0].split('.')[0] for g in gaps}
+        commands = [c for c in self.gen.supported_types[VkType.COMMAND]
+                    if self.gen.is_serializable(c) and c.name not in gapped]
+
+        out, covered, skipped = [], 0, []
+        for ty in commands:
+            infallible = self.infallible_arrays(ty)
+            shadowed = {f for f, _, _ in self.shadows(ty)}
+            rows, missed, asserted = [], [], 0
+            for f, elem, count, mutable in self._array_rows(ty):
+                if f in shadowed:
+                    # A shadow the decoder allocates beside the wire's array. Nothing on the wire
+                    # carries it, so a round trip puts nothing in it to have got right.
+                    continue
+                # Every array is planted, whether or not it is asked about. Arrays that share a
+                # count share it on the wire too: planting one and leaving the next null makes the
+                # encoder write a count of three beside an array of none, which the decoder is
+                # right to reject -- and the test would then be reporting the shape of its own
+                # input rather than anything about the accessor.
+                plantable = self.planted_count(ty, count) is not None
+                # An out-array is the driver's to fill, so there is nothing for the wire to have
+                # carried into it and no read-only accessor over it to ask.
+                ask = plantable and not mutable
+                rows.append((f, elem, f in infallible, self._member_is_mut(ty, f), ask))
+                asserted += ask
+                if not plantable and not mutable:
+                    missed.append('%s.%s (count is %s)' % (ty.name, f, self._count_expr(count)))
+            skipped += missed
+            if not asserted:
+                continue
+            covered += asserted
+            out += self._witness(ty, rows)
+
+        out = (['/// The arrays no test below plants, and why. Each is an array whose count is not',
+                '/// a plain member of its own command, so planting a slice establishes the',
+                '/// pointer and leaves the count wherever it was -- see the planter\'s own doc.',
+                '/// They are covered by hand beside the handlers that read them.',
+                '///',
+                '/// ```text'] +
+               ['/// %s' % m for m in sorted(skipped)] +
+               ['/// ```',
+                'const _NOT_PLANTED_HERE: () = ();',
+                '']) + out
+        return '\n'.join(out)
+
+    def _witness(self, ty, rows):
+        n = ty.name
+        body = ["    let mut val = vn_command_%s::default();" % n]
+        for f, elem, _, wr, _ in rows:
+            body += ["    let %s%s: [%s; N] = core::array::from_fn(|_| %s::default());"
+                     % ('mut ' if wr else '', f, elem, elem),
+                     "    val.plant_%s(&%s%s);" % (f, 'mut ' if wr else '', f)]
+        body += self._witness_required(ty)
+        body += ["",
+                 "    let mut wire = Vec::new();",
+                 "    {",
+                 "        let mut enc = Encoder::growing(&mut wire, &AllOfIt);",
+                 "        vn_encode_%s_args(&mut enc, VkFlags(0), &val);" % n,
+                 "        assert!(!enc.fatal(), \"the encoder ran out of room it grows itself\");",
+                 "    }",
+                 "",
+                 "    let temp = Bump::new();",
+                 "    let hard = AtomicBool::new(false);",
+                 "    let mut dec = Decoder::new(&wire, &temp, &IdentityObjects, &hard);",
+                 "    // The header is the dispatcher's: it is what chose this arm, so the",
+                 "    // argument decoder starts after it.",
+                 "    let _ = dec.decode_scalar::<VkCommandTypeEXT>();",
+                 "    let _ = dec.decode_scalar::<VkFlags>();",
+                 "    let mut got = vn_command_%s::default();" % n,
+                 "    vn_decode_%s_args_temp(&mut dec, &mut got);" % n,
+                 "    assert!(!dec.fatal(), \"the decoder poisoned its own encoder's wire\");",
+                 ""]
+        for f, _, sure, _, ask in rows:
+            if not ask:
+                continue
+            got = "Some(got.%s())" % f if sure else "got.%s()" % f
+            body.append('    carried(%s, N, got.%s as *const (), "%s");' % (got, f, f))
+        return (["#[test]",
+                 "fn %s_accessors_carry_the_wire() {" % n] + body + ["}", ""])
+
+    def _witness_required(self, ty):
+        """Plant the single-value pointers the decoder refuses to do without.
+
+        Mirrors the decoder's own rule -- not optional, and size-checkable -- because the two are
+        answering one question: whether a guest that left this out sent a command at all. A
+        witness that skipped them would be testing that the decoder rejects its own encoder,
+        which it should, and learning nothing about an accessor.
+        """
+        out = []
+        for var in ty.variables:
+            if not self.gen.is_serializable(var):
+                continue
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported:
+                continue
+            if shape[0] != 'pointer' or var.is_optional() or not var.can_validate():
+                continue
+            f, base = self.field_name(var.name), self.base_name(var.ty)
+            if self.is_ref_member(ty, var):
+                out += ["    let %s_v = %s::default();" % (f, base),
+                        "    val.%s = Some(&%s_v);" % (f, f)]
+            else:
+                wr = self._member_is_mut(ty, f)
+                out += ["    let %s%s_v = %s::default();" % ('mut ' if wr else '', f, base),
+                        "    val.plant_%s(&%s%s_v);" % (f, 'mut ' if wr else '', f)]
+        return out
+
     def render_layout_table(self):
         """The Rust half of the layout parity check. See `render_layout_oracle`."""
         types, members = [], []
@@ -1992,16 +2107,41 @@ class RustGen:
         # say so; for every other array the cast is the identity.
         body = ['        self.%s = a.%s as %s _;'
                 % (f, 'as_mut_ptr()' if wr else 'as_ptr()', '*mut' if wr else '*const')]
-        m = re.fullmatch(r'val\.(\w+)', self._count_expr(count))
-        if m:
-            ct = next((self.field_type(v) for v in ty.variables if self.field_name(v.name) == m.group(1)), None)
-            if ct in ('u32', 'u64', 'usize', 'i32'):
-                body.append('        self.%s = a.len() as %s;' % (m.group(1), ct))
-        return ['    /// Plant `%s` as the decoder would have, count and pointer together.' % f,
+        sibling = self.planted_count(ty, count)
+        if sibling:
+            name, ct = sibling
+            body.append('        self.%s = a.len() as %s;' % (name, ct))
+            doc = ['    /// Plant `%s` as the decoder would have, count and pointer together.' % f]
+        else:
+            # The doc has to say which kind this is. A planter that quietly sets only the pointer,
+            # under a comment promising both, hands its caller a zero-length accessor that reads
+            # as a passing test -- which is the exact failure these accessors exist to prevent.
+            doc = ['    /// Plant `%s`\'s pointer. The count is **not** set: it is `%s`, which is'
+                   % (f, self._count_expr(count)),
+                   '    /// not a plain member of this struct, so the caller establishes it --',
+                   '    /// by building the struct that holds it, or writing through the',
+                   '    /// out-pointer that carries it. Until it does, the accessor reads empty.']
+        return doc + [
                 '    #[cfg(test)]',
                 '    pub fn plant_%s(&mut self, a: &%s [%s]) {' % (f, life, elem)] + body + [
                 '    }',
                 '']
+
+    def planted_count(self, ty, count):
+        """The member a planter can set from a slice's length, as `(name, Rust type)`.
+
+        `None` when the count is not a plain integer member of this struct -- inside another
+        struct, behind an out-pointer, or arithmetic. One answer, because the planter and the
+        witness that plants have to agree about which arrays a length can be established for:
+        a witness that planted where the planter does not set the count would assert against
+        zero and pass no matter what the accessor did.
+        """
+        m = re.fullmatch(r'val\.(\w+)', self._count_expr(count))
+        if not m:
+            return None
+        ct = next((self.field_type(v) for v in ty.variables
+                   if self.field_name(v.name) == m.group(1)), None)
+        return (m.group(1), ct) if ct in ('u32', 'u64', 'usize', 'i32') else None
 
     def _handle_fns(self, ty):
         objtype = 'VkObjectType::%s' % ty.attrs['c_objtype']
