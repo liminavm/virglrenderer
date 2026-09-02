@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use crate::config::Config;
 use crate::ids::{CtxId, RingId};
 
+use super::budget::Budget;
 use super::context::{Context, Unimplemented};
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, Verdict};
@@ -65,6 +66,10 @@ pub struct Vkr {
     ///
     /// Held as the trait, not the table, so this module still never learns what a `Resource` is.
     resources: SharedResources,
+    /// What every context together has made this process hold. One ledger per renderer, because
+    /// the host kills the *process* for the total -- see [`crate::venus::budget`]. Each context
+    /// gets a key to it and can reach nothing else, which is what makes billing structural.
+    budget: Arc<Budget>,
 }
 
 /// The resource table as everything outside the renderer sees it: shared, read-mostly, and known
@@ -121,6 +126,7 @@ impl Vkr {
             todo: Arc::new(Mutex::new(Unimplemented::default())),
             global: Arc::new(crate::vulkan::global()),
             resources,
+            budget: Budget::from_env(),
         }
     }
 
@@ -131,7 +137,8 @@ impl Vkr {
     /// Replacing the entry would drop a live context -- its rings and every host handle in it --
     /// and return as though a context had been created.
     pub fn context_create(&mut self, id: CtxId) {
-        let displaced = self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id))));
+        let displaced =
+            self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id, &self.budget))));
         assert!(displaced.is_none(), "{id:?} already had a venus context, which this just dropped");
     }
 

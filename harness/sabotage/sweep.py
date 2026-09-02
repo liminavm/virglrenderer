@@ -146,7 +146,40 @@ SABOTAGES = [
         '            .filter(|(_, a)| a.censused() || true)',
         '',
     ),
+    (
+        'an import is billed as though it were fresh storage',
+        'virglrs/src/venus/driver.rs',
+        '            Backing::Imported => None,\n        };\n        let charge = match charge.transpose() {',
+        '            Backing::Imported => Some(self.account.try_charge("device memory", size)),\n        };\n        let charge = match charge.transpose() {',
+        '',
+    ),
+    (
+        'the cap is consulted and then ignored',
+        'virglrs/src/venus/budget.rs',
+        '        if let Some(cap) = self.cap\n            && live.saturating_add(size) > cap\n        {',
+        '        if let Some(cap) = self.cap\n            && false\n        {',
+        '',
+    ),
+    (
+        'a budget refusal leaves the context running',
+        'virglrs/src/venus/driver.rs',
+        'return Err(NoMemory::OverBudget { stop: self.account.kills_context() });',
+        'return Err(NoMemory::OverBudget { stop: false });',
+        '',
+    ),
+    (
+        'a scanout is charged at the size the guest asked for, not the surface it got',
+        'virglrs/src/venus/driver.rs',
+        'Backing::Scanout(s) => Some(self.account.try_charge("IOSurface", s.alloc_size())),',
+        'Backing::Scanout(_) => Some(self.account.try_charge("IOSurface", size)),',
+        '',
+    ),
 ]
+
+# Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
+# break. A charge is a value held by the record of what it paid for, so crediting is that record
+# going away -- the edit would have to delete the field, which is a different change. An entry
+# that cannot be written because the bug cannot be written is the design working.
 
 
 def run(cmd, cwd=RS):

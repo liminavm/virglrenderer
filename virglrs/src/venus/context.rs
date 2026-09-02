@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::{CtxId, ResourceHandle, RingId};
 
+use super::budget::{Account, Budget};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
@@ -169,12 +170,12 @@ impl RingSlot {
 }
 
 impl Context {
-    pub fn new(id: CtxId) -> Context {
+    pub fn new(id: CtxId, budget: &Arc<Budget>) -> Context {
         Context {
             id,
             fatal: Arc::new(AtomicBool::new(false)),
             objects: Shared::new(),
-            driver: Driver::new(),
+            driver: Driver::new(Account::open(budget, id)),
             replay: false,
             dispatched: 0,
             unhandled: 0,
@@ -1054,6 +1055,16 @@ impl Commands for Handlers<'_> {
         let (resources, ctx) = (self.resources, self.ctx);
         let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator, &|handle| {
             resources.exported_allocation(ctx, handle)
+        });
+        // A budget refusal stops the context, and it is this handler's to say so: the guest is
+        // never going to read `ret`, which is the whole reason the budget module exists. A
+        // driver refusal is left alone -- the guest unwinds from that the way it would on
+        // hardware.
+        let host = host.map_err(|e| {
+            if let driver::NoMemory::OverBudget { stop: true } = e {
+                self.reject = Some("the host memory budget refused this allocation");
+            }
+            e.ret()
         });
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkAllocateMemory", args.pMemory(), args.handle_pMemory_mut(), host);
@@ -2965,7 +2976,7 @@ mod tests {
         assert_eq!(vn_command_name(cmd), Some("vkGetPipelineCacheData"));
 
         let g = crate::vulkan::global();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
         assert!(
@@ -2986,7 +2997,7 @@ mod tests {
         let mut todo = Unimplemented::default();
         let g = crate::vulkan::global();
 
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         let w = header(cmd, GENERATE_REPLY);
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
@@ -2997,7 +3008,7 @@ mod tests {
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
         // poison. It still names an instance nothing created, which poisons for its own reason --
         // what separates the two paths is whether the command was dispatched at all.
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
         assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES));
         assert_eq!(ctx.dispatched, 1);
@@ -3074,7 +3085,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Set the window, then seek inside it and ask for a reply. The seek is what moves the
         // answer off the top of the window, so finding it at `AT` proves the position was honoured
@@ -3105,7 +3116,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Two bytes of room for a four-byte answer.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 2));
@@ -3130,7 +3141,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap());
+            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
             batch.extend_from_slice(&wire_seek(position, 0));
@@ -3155,7 +3166,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Out of range, and asking for a reply: the seek fails and the answer must not land.
         let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
@@ -3173,7 +3184,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t), "there is nothing to seek");
         assert!(ctx.fatal());
@@ -3358,7 +3369,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap());
+            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&cmd);
@@ -3457,7 +3468,7 @@ mod tests {
         fns.plant_vkFlushMappedMemoryRanges(flush);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -3563,7 +3574,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(wait_idle);
@@ -3733,7 +3744,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
@@ -3874,7 +3885,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -4010,7 +4021,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkGetImageSubresourceLayout2(layout);
@@ -4127,7 +4138,7 @@ mod tests {
         let mapped = t.1.len() as u64;
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
@@ -4238,7 +4249,7 @@ mod tests {
         const GUEST_DEV: u64 = 0x5001;
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
@@ -4302,7 +4313,7 @@ mod tests {
         const MISSING: &str = "enumerated without asking for a count";
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
@@ -4402,7 +4413,7 @@ mod tests {
         const MISSING: &str = "asked a query without saying what it is about";
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let t = ring_table();
@@ -4497,7 +4508,7 @@ mod tests {
         let objects = Shared::new();
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceQueueFamilyProperties(families);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -4613,7 +4624,7 @@ mod tests {
         let objects = Shared::new();
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceToolProperties(tools);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -4689,7 +4700,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let speaks = crate::venus::driver::renderer_extensions();
         assert_eq!(speaks.len(), 2, "the two protocol extensions this build serializes");
@@ -4795,7 +4806,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceImageFormatProperties(probe);
@@ -4916,7 +4927,7 @@ mod tests {
         fns.plant_vkGetBufferDeviceAddress(address);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -5030,7 +5041,7 @@ mod tests {
     #[test]
     fn a_timeline_command_with_no_struct_is_refused() {
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -5074,7 +5085,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let cmd = wire!(
             ser::vn_sizeof_vkQueueWaitIdle_args,
@@ -5128,7 +5139,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap());
+            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
@@ -5169,7 +5180,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t), "ring 7 is accepted");
 
@@ -5233,7 +5244,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         for ring in [7u64, 9] {
@@ -5276,7 +5287,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t));
@@ -5305,7 +5316,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
 
@@ -5357,7 +5368,7 @@ mod tests {
             let objects = Shared::new();
             let mut todo = Unimplemented::default();
             let global = crate::vulkan::global();
-            let mut driver = Driver::new();
+            let mut driver = Driver::new(Account::for_test(None));
             let mut rings = BTreeMap::new();
             let mut ctx_reply = None;
             let mut h = Handlers {
@@ -5397,7 +5408,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut h = Handlers {
@@ -5433,7 +5444,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut h = Handlers {
@@ -5470,7 +5481,7 @@ mod tests {
     fn a_submission_for_a_ring_that_is_not_here_fails_without_poisoning() {
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap());
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(
@@ -5493,7 +5504,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
 
@@ -5538,7 +5549,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut h = Handlers {
@@ -5595,7 +5606,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut h = Handlers {
@@ -5628,7 +5639,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut h = Handlers {
@@ -5728,7 +5739,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceFeatures2(features);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
 
         let mut link = VkPhysicalDeviceVulkan11Features {
@@ -5831,7 +5842,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceProperties(properties);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
 
         let mut asked = VkPhysicalDeviceProperties::default();
@@ -5934,7 +5945,7 @@ mod tests {
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
 
         let mut args = Cmd::default();
         let mut out = 0u32;
@@ -6040,7 +6051,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkEnumeratePhysicalDeviceGroups(groups);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -6127,7 +6138,7 @@ mod tests {
         const PD: VkPhysicalDevice = VkPhysicalDevice(7);
 
         // What a driver hands back: two the protocol knows, two it does not.
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_extensions(
             PD,
             &[
@@ -6187,7 +6198,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkEnumerateDeviceExtensionProperties(refuse);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
 
         assert_eq!(
@@ -6201,7 +6212,7 @@ mod tests {
         );
 
         // A driver with no instance behind it cannot be asked at all, which is the same failure.
-        assert!(Driver::new().learn_extensions(PD).is_err());
+        assert!(Driver::new(Account::for_test(None)).learn_extensions(PD).is_err());
 
         driver.abandon_planted();
     }
@@ -6214,7 +6225,7 @@ mod tests {
             VkPhysicalDevice, vn_command_vkEnumerateDeviceExtensionProperties as Cmd,
         };
 
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_extensions(VkPhysicalDevice(1), &["VK_KHR_external_memory_fd"]);
         let objects = Shared::new();
         let mut todo = Unimplemented::default();
@@ -6285,7 +6296,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceQueueFamilyProperties2(families);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(fns);
 
         let objects = Shared::new();
@@ -6367,7 +6378,7 @@ mod tests {
         const DEVICE: VkDevice = VkDevice(0x700);
 
         // A device whose table has no `VK_EXT_image_drm_format_modifier` in it.
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(DEVICE, crate::vulkan::Device::default());
 
         let mut props = VkImageDrmFormatModifierPropertiesEXT::default();
@@ -6416,7 +6427,7 @@ mod tests {
         };
 
         // No struct to answer into.
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(crate::vulkan::Instance::default());
         let mut args = vn_command_vkGetPhysicalDeviceFeatures2::default();
         let objects = Shared::new();
@@ -6616,7 +6627,7 @@ mod tests {
 
         // A driver with no instance refuses every device without reaching Vulkan, which is the
         // refusal this test wants: the interesting half is what happens after the `Err`.
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -6694,7 +6705,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -6826,7 +6837,7 @@ mod tests {
         let mut inst = crate::vulkan::Instance::default();
         inst.plant_vkEnumeratePhysicalDevices(enumerate);
         inst.plant_vkEnumerateDeviceExtensionProperties(extensions);
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_instance(inst);
 
         let mut todo = Unimplemented::default();
@@ -6992,7 +7003,7 @@ mod tests {
         fns.plant_vkQueueSubmit(submit);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(
             VkDevice(DEVICE),
@@ -7182,7 +7193,7 @@ mod tests {
         fns.plant_vkCmdPushConstants(push);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(
             VkDevice(DEVICE),
@@ -7327,7 +7338,7 @@ mod tests {
         fns.plant_vkDestroyPipeline(destroy);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
 
         let mut todo = Unimplemented::default();
@@ -7411,7 +7422,7 @@ mod tests {
 
         // The object table has the device; the driver does not. That is exactly the split the
         // re-check exists for -- a guest that destroyed a device and then created against it.
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -7471,7 +7482,7 @@ mod tests {
         };
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -7654,7 +7665,7 @@ mod tests {
         const IDS: [u64; 3] = [41, 42, 43];
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -7707,7 +7718,7 @@ mod tests {
         const IDS: [u64; 3] = [31, 32, 33];
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -7879,7 +7890,7 @@ mod tests {
         const COMMAND_BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER;
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         {
             let mut t = objects.borrow_mut();
             for (host, id) in BUFFERS {
@@ -7999,7 +8010,7 @@ mod tests {
         fns.plant_vkDestroyDevice(device);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         {
             let mut t = objects.borrow_mut();
@@ -8109,7 +8120,8 @@ mod tests {
         fns.plant_vkDestroyFence(fence);
         fns.plant_vkDestroyDevice(device);
 
-        let mut ctx = Context::new(CtxId::new(7).expect("7 is not zero"));
+        let mut ctx =
+            Context::new(CtxId::new(7).expect("7 is not zero"), &Budget::with_cap(None, false));
         ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
         {
             let mut t = ctx.objects().borrow_mut();
@@ -8152,7 +8164,7 @@ mod tests {
         const FENCE_TY: VkObjectType = VkObjectType::VK_OBJECT_TYPE_FENCE;
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         {
             let mut t = objects.borrow_mut();
             t.add(
@@ -8243,7 +8255,7 @@ mod tests {
         const FENCE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_FENCE;
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         {
             let mut t = objects.borrow_mut();
             t.add(
@@ -8408,7 +8420,7 @@ mod tests {
         fns.plant_vkBeginCommandBuffer(begin);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(
             VkDevice(DEVICE),
@@ -8562,7 +8574,7 @@ mod tests {
         fns.plant_vkAllocateCommandBuffers(allocate);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(VkDevice(DEVICE), VkCommandPool(POOL), &[]);
 
@@ -8737,7 +8749,7 @@ mod tests {
         fns.plant_vkCmdPushConstants(push);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(
             VkDevice(DEVICE),
@@ -8930,7 +8942,7 @@ mod tests {
         fns.plant_vkImportSemaphoreFdKHR(import);
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
 
