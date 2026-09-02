@@ -82,6 +82,9 @@
 #include <dxgi1_2.h>
 #endif
 
+static void vrend_resource_fill_composite(struct vrend_context *ctx,
+                                          struct vrend_resource *res);
+
 /*
  * VIRTGPU_DRM_CAPSET_VIRGL has version 0 and 1, but they are both
  * virgl_caps_v1 and are exactly the same.
@@ -2895,8 +2898,7 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
          /* limina: every view of a plane-backed resource, not only the ones that find an
           * image. A consumer that views the whole planar buffer -- glupload's DirectDmabuf
           * builds one EGLImage over it -- lands on none of these branches and samples
-          * res->gl_id, which upload_mapped_plane never fills on an IOSurface-backed
-          * target. That is a black picture with nothing logged, so log it. */
+          * res->gl_id, filled by the composite conversion below. */
          if (getenv("LIMINA_PLANE_VIEW_TRACE"))
             virgl_warn("plane view probe: %ux%u res fmt %s <- view fmt %s, indexed=%d "
                        "plane=%u aux[0]=%d aux[1]=%d iosurf_planes=%u ios=%u\n",
@@ -2917,6 +2919,26 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
                           util_format_name(res->base.format),
                           util_format_name(view->format), plane);
          }
+
+         /* A composite view: the guest samples the planar format itself and lands on
+          * res->gl_id, the RGBA texture. On an IOSurface-backed target nothing on the
+          * decode path fills it, so from here on every delivered frame is converted
+          * into it (vrend_resource_planes_written), and the frame already there is
+          * converted now. Per-plane consumers never take this branch and never pay. */
+#ifdef __APPLE__
+         if (aux_plane < 0 && !indexed && view->format == res->base.format &&
+             res->iosurf_planes) {
+            if (!res->composite_sampled)
+               virgl_info("composite view: %ux%u %s (IOSurface id %u) is sampled whole; "
+                          "its planes will be converted into the base texture\n",
+                          res->base.width0, res->base.height0,
+                          util_format_name(res->base.format),
+                          vrend_renderer_resource_get_iosurface_id(res));
+            res->composite_sampled = true;
+            if (res->planes_dirty)
+               vrend_resource_fill_composite(ctx, res);
+         }
+#endif
       }
 
       if (view->u.tex.last_layer < view->u.tex.first_layer) {
@@ -10144,6 +10166,14 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
       long before = -1;
       if (reftrace && res->iosurface)
          before = vkr_mtl_iosurface_retain_count(res->iosurface);
+#ifdef __APPLE__
+      /* The composite pass's own imports of the planes go first, so the retain counts
+       * below keep measuring the plane images alone. */
+      if (res->plane_tex[0] || res->plane_tex[1]) {
+         glDeleteTextures(2, res->plane_tex);
+         res->plane_tex[0] = res->plane_tex[1] = 0;
+      }
+#endif
       unsigned n_aux = 0;
       long after_plane[VIRGL_GBM_MAX_PLANES] = { -1, -1, -1, -1 };
       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {
@@ -15433,6 +15463,39 @@ vrend_resource_refresh_guest_pixels(struct vrend_resource *gr)
 void vrend_renderer_begin_cmd_batch(void)
 {
    vrend_state.cmd_batch_serial++;
+}
+
+/* limina: convert an IOSurface-backed planar target's planes into its RGBA base
+ * texture, for the composite view that samples it. The pass draws in the blit context,
+ * so it can run wherever a blit can: between commands, never inside a draw's bind. */
+static void vrend_resource_fill_composite(struct vrend_context *ctx,
+                                          struct vrend_resource *res)
+{
+#ifdef __APPLE__
+   if (!res->iosurf_planes)
+      return;
+   const bool ok = vrend_renderer_convert_planes_gl(res);
+   vrend_sync_make_current(ctx->sub->gl_context);
+   if (ok)
+      res->planes_dirty = false;
+#else
+   (void)ctx;
+   (void)res;
+#endif
+}
+
+void vrend_resource_planes_written(struct vrend_context *ctx, struct vrend_resource *res)
+{
+#ifdef __APPLE__
+   if (!res->iosurf_planes)
+      return;
+   res->planes_dirty = true;
+   if (res->composite_sampled)
+      vrend_resource_fill_composite(ctx, res);
+#else
+   (void)ctx;
+   (void)res;
+#endif
 }
 
 int

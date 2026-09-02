@@ -119,6 +119,18 @@ struct vrend_resource {
     * planar; the strides are the surface's own, which the plane writes address by. */
    uint32_t iosurf_planes;
    uint32_t iosurf_plane_stride[VIRGL_GBM_MAX_PLANES];
+   /* limina: a planar target has two kinds of consumer. A plane view samples the
+    * IOSurface plane directly; a composite view (the guest sampling the planar format
+    * itself, which dri2 takes whenever the driver reports the format samplable) reads
+    * ->gl_id, the RGBA texture, which nothing on the decode path fills. So the planes
+    * are converted into ->gl_id on the GPU (vrend_renderer_convert_planes_gl), but only
+    * once a composite view exists: ->composite_sampled is set by the first such view,
+    * ->planes_dirty by every decode delivery, and the pass runs at whichever of the two
+    * comes second. ->plane_tex are the pass's own textures over the plane images, so
+    * the IOSurface is imported once per plane and not once per frame. */
+   bool composite_sampled;
+   bool planes_dirty;
+   GLuint plane_tex[2];
 #endif
 
    uint64_t size;
@@ -686,6 +698,10 @@ int vrend_renderer_export_query(struct pipe_resource *pres,
                                 struct virgl_renderer_export_query *export_query);
 
 void vrend_sync_make_current(virgl_gl_context);
+
+/* limina: the decode path delivered a new frame into a planar target's IOSurface planes.
+ * Marks its RGBA base texture stale and refills it when a composite view exists. */
+void vrend_resource_planes_written(struct vrend_context *ctx, struct vrend_resource *res);
 
 int
 vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
