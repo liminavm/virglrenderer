@@ -39,6 +39,7 @@ use super::proto::types::{
     VkSubpassContents, VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
 };
 use crate::ids::ResourceHandle;
+use crate::ids::SurfaceId;
 use crate::metal::{PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -2397,6 +2398,16 @@ impl Driver {
         };
         self.memory.insert(id, Allocated { size, backing, props, exported: None });
         Ok(out)
+    }
+
+    /// The IOSurface an allocation is backed by, asked of the surface itself.
+    ///
+    /// Never stored: an id is a name the system recycles the moment the surface it named is
+    /// released, so a remembered one is a claim about a stranger's surface. Reaching it through
+    /// the record that owns the surface is what makes "the surface is gone" and "there is no id"
+    /// the same answer.
+    pub fn memory_surface_id(&self, id: ObjectId) -> Option<SurfaceId> {
+        self.memory.get(&id)?.surface().map(Surface::id)
     }
 
     /// Where an allocation this context already owns lives, for a second allocation that names

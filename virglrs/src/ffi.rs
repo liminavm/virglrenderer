@@ -700,19 +700,21 @@ pub extern "C" fn virgl_renderer_resource_get_iosurface_id(
     if iosurface_id.is_null() {
         return EINVAL;
     }
-    // Zero means "not IOSurface-backed", which is the truth for every resource here. It must also
-    // become the answer the instant a backing is freed: ids are recycled immediately, and a stale
-    // one names a stranger's surface.
     let Some(handle) = ResourceHandle::new(res_handle) else {
         return EINVAL;
     };
     with(EINVAL, |r| {
-        r.with_resource(handle, |_| {
-            // SAFETY: caller-provided out-pointer, checked non-null.
-            unsafe { *iosurface_id = 0 };
-            0
-        })
-        .unwrap_or(EINVAL)
+        // A resource that is not here is the one refusal, as in the C. Everything else answers,
+        // and zero is the ABI's "not IOSurface-backed" -- which is also what a resource whose
+        // surface has been released says, because the id is resolved from the live surface on
+        // every call and there is no longer one to ask.
+        if r.with_resource(handle, |_| ()).is_none() {
+            return EINVAL;
+        }
+        let id = r.resource_iosurface_id(handle).map_or(0, |s| s.0);
+        // SAFETY: caller-provided out-pointer, checked non-null.
+        unsafe { *iosurface_id = id };
+        0
     })
 }
 
