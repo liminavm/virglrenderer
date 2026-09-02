@@ -5,7 +5,58 @@
 
 #include "vkr_cs.h"
 
+#include <stdio.h>
+
 #include "vkr_context.h"
+
+/* for vn_dispatch_command_name — the only generated symbol this file needs */
+#include "vn_protocol_renderer.h"
+
+const char *
+vkr_cs_command_name(uint32_t cmd_type)
+{
+   /* the generated table's default arm returns "unknown", so any value is safe */
+   return vn_dispatch_command_name((VkCommandTypeEXT)cmd_type);
+}
+
+void
+vkr_cs_decoder_report_fatal(const struct vkr_cs_decoder *dec, const char *func, int line)
+{
+   /* func/line are the vn_cs_decoder_set_fatal shim for every generated call
+    * site, so they are effectively a constant; kept only for the handful of
+    * fatals raised from our own code, which do carry a real site. */
+   const char *name = vkr_cs_command_name(dec->cur_cmd_type);
+
+   /* A nested inner stream (vkExecuteCommandStreamsMESA) or a stream switch can
+    * leave cur_cmd_start pointing into a buffer the cursor has already left, so
+    * the offset is only meaningful when it is non-negative — and the raw
+    * pointers go out regardless, which is what makes a nonsensical offset
+    * self-evident rather than misleading. */
+   char pos[128];
+   if (dec->cur_cmd_start && dec->cur >= dec->cur_cmd_start) {
+      snprintf(pos, sizeof(pos), "+%td B into it", dec->cur - dec->cur_cmd_start);
+   } else {
+      snprintf(pos, sizeof(pos), "cursor is before its start");
+   }
+
+   if (dec->dispatch_depth) {
+      vkr_log_error("cs decoder: ring FATAL at %s:%d (context %u [%s]) while decoding %s "
+                    "(type %u, dispatch #%" PRIu64 ", depth %u), %s "
+                    "[start %p cur %p end %p], %td B left in the stream%s",
+                    func, line, dec->ctx_id, dec->ctx_name ? dec->ctx_name : "?", name,
+                    dec->cur_cmd_type, dec->dispatch_seq, dec->dispatch_depth, pos,
+                    (const void *)dec->cur_cmd_start, (const void *)dec->cur,
+                    (const void *)dec->end, dec->end - dec->cur,
+                    dec->soft_error ? " (soft error already set on this command)" : "");
+   } else {
+      vkr_log_error("cs decoder: ring FATAL at %s:%d (context %u [%s]) OUTSIDE any dispatch "
+                    "— last command completed was %s (type %u, dispatch #%" PRIu64 "), "
+                    "[cur %p end %p], %td B left in the stream",
+                    func, line, dec->ctx_id, dec->ctx_name ? dec->ctx_name : "?", name,
+                    dec->cur_cmd_type, dec->dispatch_seq, (const void *)dec->cur,
+                    (const void *)dec->end, dec->end - dec->cur);
+   }
+}
 
 /* limina ghost containment — see the tombstones field in vkr_context.h. Out of
  * line because the inline lookup in vkr_cs.h cannot see struct vkr_context, and
