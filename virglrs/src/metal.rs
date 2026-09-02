@@ -98,8 +98,12 @@ const LOCK_READ_ONLY: u32 = 1;
 /// at the call site rather than a surface laid out to the wrong stride.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PixelFormat {
-    /// 32-bit BGRA, which is what every scanout on this platform is.
+    /// 32-bit BGRA, what a compositor presents.
     Bgra,
+    /// 32-bit RGBA. The same bytes in the other order, and a scanout is minted in whichever the
+    /// image was created in -- the surface describes its own channel order, so presenting one is
+    /// no more work than the other, and swapping to a canonical one would mean a copy per frame.
+    Rgba,
 }
 
 impl PixelFormat {
@@ -107,13 +111,14 @@ impl PixelFormat {
     fn fourcc(self) -> u32 {
         match self {
             PixelFormat::Bgra => u32::from_be_bytes(*b"BGRA"),
+            PixelFormat::Rgba => u32::from_be_bytes(*b"RGBA"),
         }
     }
 
     /// How many bytes one pixel takes.
     fn bytes_per_element(self) -> u32 {
         match self {
-            PixelFormat::Bgra => 4,
+            PixelFormat::Bgra | PixelFormat::Rgba => 4,
         }
     }
 }
@@ -463,10 +468,16 @@ mod tests {
     /// this boundary exists to translate.
     #[test]
     fn a_surface_that_cannot_exist_is_refused_by_name() {
-        let bgra = PixelFormat::Bgra;
-        let refused = |w, h, pitch| Surface::scanout(w, h, bgra, pitch).expect_err("refused");
-        assert_eq!(refused(0, 32, 256), SurfaceError::ZeroExtent);
-        assert_eq!(refused(64, 0, 256), SurfaceError::ZeroExtent);
-        assert_eq!(refused(64, 32, 0), SurfaceError::NoPitch);
+        for format in [PixelFormat::Bgra, PixelFormat::Rgba] {
+            let refused = |w, h, pitch| Surface::scanout(w, h, format, pitch).expect_err("refused");
+            assert_eq!(refused(0, 32, 256), SurfaceError::ZeroExtent);
+            assert_eq!(refused(64, 0, 256), SurfaceError::ZeroExtent);
+            assert_eq!(refused(64, 32, 0), SurfaceError::NoPitch);
+
+            // And each is a format the system actually has: a variant IOSurface would refuse
+            // would fail here and nowhere else, because every other test names only one of them.
+            let _guard = MINT.lock().expect("the mint lock");
+            Surface::scanout(64, 32, format, 256).expect("the system minted it");
+        }
     }
 }

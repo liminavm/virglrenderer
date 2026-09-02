@@ -2969,12 +2969,17 @@ fn dedicated_image(mut node: *const core::ffi::c_void) -> Option<VkImage> {
 /// The IOSurface format a Vulkan format is, for the formats a scanout can be.
 ///
 /// `None` is not a failure: it is a format no IOSurface has, and an image in one is simply not a
-/// window buffer. Only the two BGRA spellings, because those are what a compositor presents and
-/// guessing at the rest would mint surfaces whose bytes mean something else.
+/// window buffer. The four 8-bit spellings a compositor presents in, and no more -- guessing at
+/// the rest would mint surfaces whose bytes mean something other than what they say. sRGB and
+/// UNORM are the same bytes under different reading rules, which is the image view's business
+/// and not the surface's.
 fn pixel_format(format: VkFormat) -> Option<PixelFormat> {
     match format {
         VkFormat::VK_FORMAT_B8G8R8A8_UNORM | VkFormat::VK_FORMAT_B8G8R8A8_SRGB => {
             Some(PixelFormat::Bgra)
+        }
+        VkFormat::VK_FORMAT_R8G8B8A8_UNORM | VkFormat::VK_FORMAT_R8G8B8A8_SRGB => {
+            Some(PixelFormat::Rgba)
         }
         _ => None,
     }
