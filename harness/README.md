@@ -119,6 +119,17 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `SURVIVED` names a hole. Every edit asserts it matched, because a sweep reporting `RED` for an
   edit it never made is worse than no sweep. Add an entry with each witness rather than after.
 
+  **The host memory budget is invisible to every other gate, and that is the point.** With no
+  cap configured nothing is ever refused, so a replay scores identically whether the ledger is
+  right, wrong, or absent -- byte-identical corpora are the proof the feature changed nothing a
+  guest can see, and no evidence at all that it works. Its witnesses are the whole of its
+  coverage: `an_allocation_over_the_budget_never_reaches_the_driver` (a refusal that arrives
+  after `vkAllocateMemory` has already run costs exactly the memory the cap exists to save, and
+  only the call counter can see the difference), `a_scanout_is_charged_for_the_pages_the_surface_took`,
+  and `an_import_is_not_charged_because_its_bytes_are_the_exporters`. One sabotage that ought to
+  be there cannot be written: a charge is credited by the record that holds it going away, so
+  "a free forgets to credit" has no line to break. `sweep.py` says so where the entry would be.
+
 - The layout oracle is the third leg of the same feature, and it runs as a plain unit test:
   `cargo test --features reply-oracle` in `virglrs/`. `venus-roundtrip` proves the wire and
   `venus-reply-oracle` proves the replies, but both compare *bytes*, and the reply oracle only
