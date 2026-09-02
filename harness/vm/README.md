@@ -43,6 +43,13 @@ The surprise worth keeping: on the **enhanced** image gnome-shell renders throug
 clients, which makes it the mixed case rather than the venus one. Synoik is the desktop workload
 that is venus throughout.
 
+`--renderer c|rust` picks which build to boot, and picks the bundle with it: `Limina.app` holds
+the C, `Limina-rust.app` holds virglrs. Only the C records — the recorder is a C-tree feature, so a
+virglrs boot yields no corpus and the two legs divide accordingly: the C leg captures, the Rust leg
+is what the capture is then replayed against. Booting both on the same guest with the same client is
+how a refusal is attributed: `vkcube` running its full 25 seconds on one and segfaulting on the
+other is a gap in this tree, not in vkcube.
+
 A Vulkan client over SSH needs only `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json`
 plus `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` for a windowed one. A **GL** client needs the session's
 zink environment too, which an SSH shell does not inherit — without it the stack silently falls back
