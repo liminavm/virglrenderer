@@ -46,7 +46,8 @@ that is venus throughout.
 `--renderer c|rust` picks which build to boot, and picks the bundle with it: `Limina.app` holds
 the C, `Limina-rust.app` holds virglrs. Only the C records — the recorder is a C-tree feature, so a
 virglrs boot yields no corpus and the two legs divide accordingly: the C leg captures, the Rust leg
-is what the capture is then replayed against. Booting both on the same guest with the same client is
+is what the capture is then replayed against. A boot also reaches what replay cannot -- the ring
+transport commands, for the reasons `../README.md` gives. Booting both on the same guest with the same client is
 how a refusal is attributed: `vkcube` running its full 25 seconds on one and segfaulting on the
 other is a gap in this tree, not in vkcube.
 
