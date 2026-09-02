@@ -424,8 +424,21 @@ impl Protocol for AllOfIt {
 /// Unlike the decoder this side is trusted -- the bytes come from us -- so the only failure it can
 /// have is running out of room in the guest's reply buffer, which poisons the ring for the same
 /// reason a short read does: the guest gave us a buffer that cannot hold the answer.
+/// Where an encoder puts its bytes.
+///
+/// The two exist for two callers with genuinely different needs. The oracles hold the encoder to a
+/// buffer of exactly the size `vn_sizeof_*` predicted, so running off the end is the failure they
+/// are looking for. A reply, by contrast, is sized by the command's own shape, and the host has no
+/// reason to guess it in advance -- so it grows, and the only bound that matters is applied later,
+/// against the window the guest actually offered. Nothing is written toward a guest here either
+/// way: this is host memory, and [`ReplyStream::write`] is the one place it crosses over.
+enum Buf<'a> {
+    Fixed(&'a mut [u8]),
+    Grow(&'a mut Vec<u8>),
+}
+
 pub struct Encoder<'a> {
-    buf: &'a mut [u8],
+    buf: Buf<'a>,
     pos: usize,
     fatal: bool,
     protocol: &'a dyn Protocol,
@@ -440,8 +453,36 @@ pub struct Encoder<'a> {
 }
 
 impl<'a> Encoder<'a> {
+    /// An encoder that must fit what it is given. Overflowing is `fatal`.
     pub fn new(buf: &'a mut [u8], protocol: &'a dyn Protocol) -> Self {
-        Encoder { buf, pos: 0, fatal: false, protocol, padding: None }
+        Encoder { buf: Buf::Fixed(buf), pos: 0, fatal: false, protocol, padding: None }
+    }
+
+    /// An encoder that takes as much room as it needs from `buf`, which it empties first.
+    ///
+    /// The clear is not for correctness -- every write covers its whole advance, payload then
+    /// zero-fill, and only `..pos` is ever read back -- but for the invariant to be visible at the
+    /// one place that establishes it. A future write path that skipped bytes would otherwise leak
+    /// the previous reply into this one, silently and only sometimes.
+    pub fn growing(buf: &'a mut Vec<u8>, protocol: &'a dyn Protocol) -> Self {
+        buf.clear();
+        Encoder { buf: Buf::Grow(buf), pos: 0, fatal: false, protocol, padding: None }
+    }
+
+    /// The next `advance` bytes to write into, growing the buffer if it is allowed to.
+    ///
+    /// `None` is a fixed buffer that has run out, which is the only way an encoder fails.
+    fn room(&mut self, advance: usize) -> Option<&mut [u8]> {
+        let end = self.pos.checked_add(advance)?;
+        match &mut self.buf {
+            Buf::Fixed(b) => b.get_mut(self.pos..end),
+            Buf::Grow(v) => {
+                if v.len() < end {
+                    v.resize(end, 0);
+                }
+                v.get_mut(self.pos..end)
+            }
+        }
     }
 
     /// Start recording padded byte ranges. See the `padding` field.
@@ -475,14 +516,17 @@ impl<'a> Encoder<'a> {
 
     /// The bytes written so far.
     pub fn written(&self) -> &[u8] {
-        &self.buf[..self.pos]
+        match &self.buf {
+            Buf::Fixed(b) => &b[..self.pos],
+            Buf::Grow(v) => &v[..self.pos],
+        }
     }
 
     /// Write `val` and advance `advance` bytes, zero-filling the padding. `advance` is the wire
     /// size; `val` is the payload.
     pub fn write(&mut self, advance: usize, val: &[u8]) {
         debug_assert!(val.len() <= advance);
-        let Some(dst) = self.buf.get_mut(self.pos..self.pos + advance) else {
+        let Some(dst) = self.room(advance) else {
             self.fatal = true;
             return;
         };
@@ -572,7 +616,7 @@ impl<'a> Encoder<'a> {
     #[allow(clippy::chunks_exact_to_as_chunks)] // the chunk size is generic, not const
     pub fn encode_scalar_array<T: Scalar>(&mut self, vals: &[T]) {
         let packed = size_of_val(vals);
-        let Some(dst) = self.buf.get_mut(self.pos..self.pos + align4(packed)) else {
+        let Some(dst) = self.room(align4(packed)) else {
             self.fatal = true;
             return;
         };
