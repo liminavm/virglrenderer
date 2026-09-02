@@ -29,9 +29,10 @@ use super::proto::types::{
     VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkObjectType,
     VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint,
     VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D,
-    VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampler, VkSamplerYcbcrConversion,
-    VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule,
-    VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
+    VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits, VkSampler,
+    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkShaderModule, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -241,6 +242,65 @@ fn ptr<T>(r: Option<&T>) -> *const T {
     r.map_or(core::ptr::null(), |r| r as *const T)
 }
 
+/// One extension name and version as Vulkan's own struct, or `None` for a name this build's
+/// vk.xml does not know.
+///
+/// A version of zero is that "does not know": there is no honest properties entry to hand back for
+/// an extension whose spec version we cannot state, and inventing one would advertise it.
+fn extension_properties(name: &str) -> Option<VkExtensionProperties> {
+    let version = crate::venus::proto::info::spec_version(name);
+    if version == 0 {
+        return None;
+    }
+    let mut out = VkExtensionProperties { specVersion: version, ..Default::default() };
+    // The callers' names are either this build's own string literals or read back out of a
+    // 256-byte array by `learn_extensions`, so a name too long to fit cannot reach here.
+    assert!(name.len() < out.extensionName.len(), "extension name fits Vulkan's array");
+    for (slot, b) in out.extensionName.iter_mut().zip(name.bytes()) {
+        *slot = b as core::ffi::c_char;
+    }
+    Some(out)
+}
+
+/// The instance extensions this renderer speaks, which is not what the host loader has.
+///
+/// `vkEnumerateInstanceExtensionProperties` is the venus handshake rather than a Vulkan query: the
+/// guest is asking what the *renderer* understands on the wire, and the answer is the two protocol
+/// extensions this build serializes -- the same pair the capset states. Forwarding the host's list
+/// would answer a question the guest did not ask, and one it cannot use: it never talks to that
+/// loader.
+pub fn renderer_extensions() -> Vec<VkExtensionProperties> {
+    ["VK_EXT_command_serialization", "VK_MESA_venus_protocol"]
+        .into_iter()
+        .filter_map(extension_properties)
+        .collect()
+}
+
+/// An enumeration's out-array as the (count, pointer) pair Vulkan wants, and the room to check the
+/// answer against.
+///
+/// The pair is rebuilt here and nowhere else, which is the point (CLAUDE.md): above this line the
+/// array is one slice, and its length is both what the driver is told it has room for and what the
+/// count it writes back is measured against. `None` is the guest's count query -- no array and no
+/// room, and no bound either: answering it *is* writing a count larger than the zero it was given.
+fn split<T>(out: Option<&mut [T]>) -> (u32, Option<usize>, *mut T) {
+    match out {
+        Some(s) => (s.len() as u32, Some(s.len()), s.as_mut_ptr()),
+        None => (0, None, core::ptr::null_mut()),
+    }
+}
+
+/// The count a driver wrote back, against the room it was given.
+///
+/// A host invariant, so it asserts (CLAUDE.md): the guest cannot arrange this, and a driver that
+/// claims to have filled more than it was handed would have the reply encoder walk off the end of
+/// the arena the array lives in. Only the fill call has a bound -- see [`split`].
+fn fits(n: u32, room: Option<usize>) {
+    if let Some(room) = room {
+        assert!(n as usize <= room, "the driver enumerated more than the room it was given");
+    }
+}
+
 impl Driver {
     pub fn new() -> Driver {
         Driver::default()
@@ -406,23 +466,7 @@ impl Driver {
         let Some(names) = self.physical_device_exts.get(&pd.0) else {
             return Vec::new();
         };
-        names
-            .iter()
-            .filter_map(|name| {
-                let version = crate::venus::proto::info::spec_version(name);
-                if version == 0 {
-                    return None;
-                }
-                let mut out = VkExtensionProperties { specVersion: version, ..Default::default() };
-                // `learn_extensions` read these back out of a 256-byte array, so a name too long
-                // to fit cannot have come from there.
-                assert!(name.len() < out.extensionName.len(), "extension name from the driver");
-                for (slot, b) in out.extensionName.iter_mut().zip(name.bytes()) {
-                    *slot = b as core::ffi::c_char;
-                }
-                Some(out)
-            })
-            .collect()
+        names.iter().filter_map(|name| extension_properties(name)).collect()
     }
 
     fn supports(&self, pd: VkPhysicalDevice, name: &str) -> bool {
@@ -752,13 +796,118 @@ impl Driver {
             .as_ref()
             .and_then(pick)
             .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
-        let (mut n, array) = match out {
-            Some(s) => (s.len() as u32, s.as_mut_ptr()),
-            None => (0, core::ptr::null_mut()),
-        };
+        let (mut n, room, array) = split(out);
         // SAFETY: `h` is a handle this instance returned, and `n` is initialised to the length of
         // the array `array` points at -- the pair the caller handed us as one slice.
         let r = unsafe { f(h, &mut n, array) };
+        fits(n, room);
+        Ok((n, r))
+    }
+
+    /// The same, narrowed by a struct: `vkGetPhysicalDeviceSparseImageFormatProperties2`.
+    ///
+    /// `info` is a borrow rather than an `Option` for the reason [`Driver::dev_ask_info`] gives:
+    /// the command requires its struct, so there is no null for this helper to forward, and what
+    /// an absent one means is the handler's to decide before it gets here.
+    pub fn enumerate_info_into<H, I, T, R>(
+        &self,
+        h: H,
+        info: &I,
+        out: Option<&mut [T]>,
+        pick: impl FnOnce(
+            &InstanceFns,
+        ) -> Option<unsafe extern "C" fn(H, *const I, *mut u32, *mut T) -> R>,
+    ) -> Result<(u32, R), VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let (mut n, room, array) = split(out);
+        // SAFETY: as `enumerate_into`; `info` borrows an arena struct live for the call.
+        let r = unsafe { f(h, info, &mut n, array) };
+        fits(n, room);
+        Ok((n, r))
+    }
+
+    /// `vkGetPhysicalDeviceSparseImageFormatProperties`, whose request is six loose scalars.
+    ///
+    /// Spelled out rather than generic, for the reason [`Driver::image_format_properties`] gives:
+    /// a row of interchangeable-looking values is exactly what a type parameter would stop the
+    /// compiler catching. The 1.0 form of a query whose `2` neighbour above takes a struct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_format_properties<T>(
+        &self,
+        pd: VkPhysicalDevice,
+        format: VkFormat,
+        ty: VkImageType,
+        samples: VkSampleCountFlagBits,
+        usage: VkImageUsageFlags,
+        tiling: VkImageTiling,
+        out: Option<&mut [T]>,
+        pick: impl FnOnce(
+            &InstanceFns,
+        ) -> Option<
+            unsafe extern "C" fn(
+                VkPhysicalDevice,
+                VkFormat,
+                VkImageType,
+                VkSampleCountFlagBits,
+                VkImageUsageFlags,
+                VkImageTiling,
+                *mut u32,
+                *mut T,
+            ),
+        >,
+    ) -> Result<u32, VkResult> {
+        let f = self
+            .instance
+            .as_ref()
+            .and_then(pick)
+            .ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let (mut n, room, array) = split(out);
+        // SAFETY: as `enumerate_into`; the six scalars are plain values off the wire.
+        unsafe { f(pd, format, ty, samples, usage, tiling, &mut n, array) };
+        fits(n, room);
+        Ok(n)
+    }
+
+    /// An enumeration about one of a device's own objects: `vkGetImageSparseMemoryRequirements`.
+    pub fn dev_enumerate_arg<A, T, R>(
+        &self,
+        device: VkDevice,
+        a: A,
+        out: Option<&mut [T]>,
+        pick: impl FnOnce(
+            &DeviceFns,
+        ) -> Option<unsafe extern "C" fn(VkDevice, A, *mut u32, *mut T) -> R>,
+    ) -> Result<(u32, R), VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let (mut n, room, array) = split(out);
+        // SAFETY: as `enumerate_into`; `a` is a handle the guest named, already resolved.
+        let r = unsafe { f(device, a, &mut n, array) };
+        fits(n, room);
+        Ok((n, r))
+    }
+
+    /// The same, narrowed by a struct rather than a handle: the `2` forms of the above.
+    pub fn dev_enumerate_info<I, T, R>(
+        &self,
+        device: VkDevice,
+        info: &I,
+        out: Option<&mut [T]>,
+        pick: impl FnOnce(
+            &DeviceFns,
+        )
+            -> Option<unsafe extern "C" fn(VkDevice, *const I, *mut u32, *mut T) -> R>,
+    ) -> Result<(u32, R), VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let f = pick(&d.fns).ok_or(VkResult::VK_ERROR_EXTENSION_NOT_PRESENT)?;
+        let (mut n, room, array) = split(out);
+        // SAFETY: as `enumerate_into`; `info` borrows an arena struct live for the call.
+        let r = unsafe { f(device, info, &mut n, array) };
+        fits(n, room);
         Ok((n, r))
     }
 

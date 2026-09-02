@@ -46,19 +46,23 @@ use super::proto::types::{
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler, vn_command_vkDestroySemaphore,
     vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
-    vn_command_vkEnumerateDeviceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
+    vn_command_vkEnumerateDeviceExtensionProperties,
+    vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkFlushMappedMemoryRanges, vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
     vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
     vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
     vn_command_vkGetDescriptorSetLayoutSupport, vn_command_vkGetDeviceBufferMemoryRequirements,
     vn_command_vkGetDeviceGroupPeerMemoryFeatures, vn_command_vkGetDeviceImageMemoryRequirements,
+    vn_command_vkGetDeviceImageSparseMemoryRequirements,
     vn_command_vkGetDeviceImageSubresourceLayout, vn_command_vkGetDeviceMemoryCommitment,
     vn_command_vkGetDeviceMemoryOpaqueCaptureAddress, vn_command_vkGetDeviceQueue2,
     vn_command_vkGetEventStatus, vn_command_vkGetFenceStatus,
     vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements,
-    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
+    vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSparseMemoryRequirements,
+    vn_command_vkGetImageSparseMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
     vn_command_vkGetImageSubresourceLayout2,
+    vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR,
     vn_command_vkGetPhysicalDeviceExternalBufferProperties,
     vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
@@ -71,7 +75,11 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceMemoryProperties2,
     vn_command_vkGetPhysicalDeviceMultisamplePropertiesEXT,
     vn_command_vkGetPhysicalDeviceProperties, vn_command_vkGetPhysicalDeviceProperties2,
-    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkGetRenderAreaGranularity,
+    vn_command_vkGetPhysicalDeviceQueueFamilyProperties,
+    vn_command_vkGetPhysicalDeviceQueueFamilyProperties2,
+    vn_command_vkGetPhysicalDeviceSparseImageFormatProperties,
+    vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2,
+    vn_command_vkGetPhysicalDeviceToolProperties, vn_command_vkGetRenderAreaGranularity,
     vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
     vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
     vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle,
@@ -1520,6 +1528,39 @@ impl Commands for Handlers<'_> {
     // is an answer the guest asked for and can act on, not a reason to take its ring down. The
     // void queries above have no such field, which is why refusal is all they have.
 
+    fn vkEnumerateInstanceExtensionProperties(
+        &mut self,
+        args: &mut vn_command_vkEnumerateInstanceExtensionProperties<'_>,
+    ) {
+        // Answered without the driver, like its device-level twin and for the same reason: what
+        // the guest may be told is not what the host loader has, it is what this build speaks on
+        // the wire. See `driver::renderer_extensions`.
+        //
+        // `pLayerName` is ignored rather than refused, which is the one place this differs from
+        // `vkEnumerateDeviceExtensionProperties` -- and the difference is the answer's, not a
+        // policy's. There is no layer whose extensions this list belongs to: it is the renderer's
+        // own, so narrowing it by a layer name narrows it to nothing the guest could have meant.
+        if !args.has_pPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let speaks = crate::venus::driver::renderer_extensions();
+        if !args.has_pProperties() {
+            if let Some(count) = args.pPropertyCount_mut() {
+                *count = speaks.len() as u32;
+            }
+            args.ret = VkResult::VK_SUCCESS;
+            return;
+        }
+        let Some(out) = self.array(args.pProperties_mut()) else { return };
+        let n = out.len().min(speaks.len());
+        out[..n].copy_from_slice(&speaks[..n]);
+        args.ret = if n < speaks.len() { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS };
+        if let Some(count) = args.pPropertyCount_mut() {
+            *count = n as u32;
+        }
+    }
+
     fn vkEnumerateInstanceVersion(&mut self, args: &mut vn_command_vkEnumerateInstanceVersion<'_>) {
         // No handle anywhere in it: the guest may ask before any instance exists, so this is the
         // one query answered off the global table.
@@ -1937,6 +1978,286 @@ impl Commands for Handlers<'_> {
             .dev_ask_info(args.device, info, |d| d.try_vkGetDeviceMemoryOpaqueCaptureAddress());
         if let Some(ret) = self.asked(r) {
             args.ret = ret;
+        }
+    }
+
+    // --------------------------------------------------------- the two-call enumerations
+    //
+    // Vulkan's count-then-fill idiom, eight commands of it. The guest calls once with a null
+    // array to be told how many there are, then again with an array that size; both calls arrive
+    // here as the same command, told apart by whether `pXProperties` was sent.
+    //
+    // Two shapes, and the difference is not cosmetic. The ones with a `ret` can say
+    // `VK_INCOMPLETE` -- the driver had more than the guest sized for, which is the guest's
+    // business rather than an error. The void ones have no field to say it in: the driver simply
+    // writes what fits and lowers the count, and that lowered count is the whole of what the
+    // guest is told. Do not look for an `args.ret` in those; there is nowhere to put one.
+    //
+    // The count goes back last everywhere, and has to: it lives in the struct the array was
+    // borrowed from, so the two cannot be held at once. See `vkGetPhysicalDeviceQueueFamilyProperties2`.
+
+    fn vkGetPhysicalDeviceQueueFamilyProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceQueueFamilyProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !args.has_pQueueFamilyPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        if !args.has_pQueueFamilyProperties() {
+            let asked = self
+                .driver
+                .enumerate_into(pd, None, |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties());
+            if let Some((n, ())) = self.asked(asked)
+                && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+            {
+                *count = n;
+            }
+            return;
+        }
+        let Some(out) = self.array(args.pQueueFamilyProperties_mut()) else { return };
+        let asked = self
+            .driver
+            .enumerate_into(pd, Some(out), |i| i.try_vkGetPhysicalDeviceQueueFamilyProperties());
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pQueueFamilyPropertyCount_mut()
+        {
+            *count = n;
+        }
+    }
+
+    fn vkGetPhysicalDeviceToolProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceToolProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !args.has_pToolCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        if !args.has_pToolProperties() {
+            let asked =
+                self.driver.enumerate_into(pd, None, |i| i.try_vkGetPhysicalDeviceToolProperties());
+            match asked {
+                Ok((n, ret)) => {
+                    args.ret = ret;
+                    if let Some(count) = args.pToolCount_mut() {
+                        *count = n;
+                    }
+                }
+                Err(e) => args.ret = e,
+            }
+            return;
+        }
+        let Some(out) = self.array(args.pToolProperties_mut()) else { return };
+        let asked = self
+            .driver
+            .enumerate_into(pd, Some(out), |i| i.try_vkGetPhysicalDeviceToolProperties());
+        match asked {
+            Ok((n, ret)) => {
+                args.ret = ret;
+                if let Some(count) = args.pToolCount_mut() {
+                    *count = n;
+                }
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
+    fn vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        if !args.has_pTimeDomainCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        if !args.has_pTimeDomains() {
+            let asked = self.driver.enumerate_into(pd, None, |i| {
+                i.try_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR()
+            });
+            match asked {
+                Ok((n, ret)) => {
+                    args.ret = ret;
+                    if let Some(count) = args.pTimeDomainCount_mut() {
+                        *count = n;
+                    }
+                }
+                Err(e) => args.ret = e,
+            }
+            return;
+        }
+        let Some(out) = self.array(args.pTimeDomains_mut()) else { return };
+        let asked = self.driver.enumerate_into(pd, Some(out), |i| {
+            i.try_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR()
+        });
+        match asked {
+            Ok((n, ret)) => {
+                args.ret = ret;
+                if let Some(count) = args.pTimeDomainCount_mut() {
+                    *count = n;
+                }
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
+    fn vkGetPhysicalDeviceSparseImageFormatProperties(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceSparseImageFormatProperties<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let (format, ty, samples) = (args.format, args.r#type, args.samples);
+        let (usage, tiling) = (args.usage, args.tiling);
+        if !args.has_pPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let out = if args.has_pProperties() {
+            match self.array(args.pProperties_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self.driver.sparse_format_properties(
+            pd,
+            format,
+            ty,
+            samples,
+            usage,
+            tiling,
+            out,
+            |i| i.try_vkGetPhysicalDeviceSparseImageFormatProperties(),
+        );
+        if let Some(n) = self.asked(asked)
+            && let Some(count) = args.pPropertyCount_mut()
+        {
+            *count = n;
+        }
+    }
+
+    fn vkGetPhysicalDeviceSparseImageFormatProperties2(
+        &mut self,
+        args: &mut vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2<'_>,
+    ) {
+        let pd = args.physicalDevice;
+        let Some(info) = args.pFormatInfo else {
+            self.reject = Some("asked which formats are sparse without naming one");
+            return;
+        };
+        if !args.has_pPropertyCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let out = if args.has_pProperties() {
+            match self.array(args.pProperties_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self.driver.enumerate_info_into(pd, info, out, |i| {
+            i.try_vkGetPhysicalDeviceSparseImageFormatProperties2()
+        });
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pPropertyCount_mut()
+        {
+            *count = n;
+        }
+    }
+
+    fn vkGetImageSparseMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetImageSparseMemoryRequirements<'_>,
+    ) {
+        let (device, image) = (args.device, args.image);
+        if !args.has_pSparseMemoryRequirementCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let out = if args.has_pSparseMemoryRequirements() {
+            match self.array(args.pSparseMemoryRequirements_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self
+            .driver
+            .dev_enumerate_arg(device, image, out, |d| d.try_vkGetImageSparseMemoryRequirements());
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+        {
+            *count = n;
+        }
+    }
+
+    fn vkGetImageSparseMemoryRequirements2(
+        &mut self,
+        args: &mut vn_command_vkGetImageSparseMemoryRequirements2<'_>,
+    ) {
+        let device = args.device;
+        let Some(info) = args.pInfo else {
+            self.reject = Some("asked an image's sparse requirements without naming the image");
+            return;
+        };
+        if !args.has_pSparseMemoryRequirementCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let out = if args.has_pSparseMemoryRequirements() {
+            match self.array(args.pSparseMemoryRequirements_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self
+            .driver
+            .dev_enumerate_info(device, info, out, |d| d.try_vkGetImageSparseMemoryRequirements2());
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+        {
+            *count = n;
+        }
+    }
+
+    fn vkGetDeviceImageSparseMemoryRequirements(
+        &mut self,
+        args: &mut vn_command_vkGetDeviceImageSparseMemoryRequirements<'_>,
+    ) {
+        let device = args.device;
+        let Some(info) = args.pInfo else {
+            self.reject =
+                Some("asked an unbuilt image's sparse requirements without describing it");
+            return;
+        };
+        if !args.has_pSparseMemoryRequirementCount() {
+            self.reject = Some("enumerated without asking for a count");
+            return;
+        }
+        let out = if args.has_pSparseMemoryRequirements() {
+            match self.array(args.pSparseMemoryRequirements_mut()) {
+                Some(out) => Some(out),
+                None => return,
+            }
+        } else {
+            None
+        };
+        let asked = self.driver.dev_enumerate_info(device, info, out, |d| {
+            d.try_vkGetDeviceImageSparseMemoryRequirements()
+        });
+        if let Some((n, ())) = self.asked(asked)
+            && let Some(count) = args.pSparseMemoryRequirementCount_mut()
+        {
+            *count = n;
         }
     }
 
@@ -3570,6 +3891,277 @@ mod tests {
         let mut got = vec![0u8; want.len()];
         assert!(t.1.copy_out(WINDOW, &mut got));
         assert_eq!(got, want, "the driver's whole answer, in the guest's memory");
+    }
+
+    /// The two-call idiom, in the half of it that has no way to say "there were more".
+    ///
+    /// `vkGetPhysicalDeviceQueueFamilyProperties` returns nothing at all: where its `ret`-carrying
+    /// neighbours answer `VK_INCOMPLETE`, this one has only the count, which the driver lowers to
+    /// what it wrote. That lowered count is the whole of what the guest is told, so a handler that
+    /// forwards the array and never writes the count back leaves the guest reading its own
+    /// question as the answer.
+    #[test]
+    fn a_void_enumeration_tells_the_guest_only_what_fit() {
+        use super::super::proto::types::{
+            VkPhysicalDevice, VkQueueFamilyProperties,
+            vn_command_vkGetPhysicalDeviceQueueFamilyProperties as Cmd,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(0x711);
+        /// More families than the guest will make room for, so a short answer is a real one.
+        const FAMILIES: u32 = 3;
+
+        unsafe extern "C" fn families(
+            pd: VkPhysicalDevice,
+            count: *mut u32,
+            out: *mut VkQueueFamilyProperties,
+        ) {
+            assert_eq!(pd, PD, "the physical device the guest named");
+            // SAFETY: the caller passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = FAMILIES;
+                return;
+            }
+            let room = (*count).min(FAMILIES);
+            // SAFETY: `count` is the length the caller sized the array to, and `room` is at most
+            // that.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, room as usize) };
+            for (i, f) in out.iter_mut().enumerate() {
+                f.queueCount = 100 + i as u32;
+            }
+            *count = room;
+        }
+
+        let objects = Shared::new();
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceQueueFamilyProperties(families);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($args:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &mut todo,
+                    driver: &mut driver,
+                    global: &global,
+                    reject: None,
+                    unserved: false,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    replaying: false,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                };
+                h.vkGetPhysicalDeviceQueueFamilyProperties($args);
+                assert!(h.reject.is_none(), "a served enumeration is not a refusal");
+            }};
+        }
+
+        // The spec's first call: no array, so the count comes back as the total there are.
+        let mut n = 0u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pQueueFamilyPropertyCount(&mut n);
+        run!(&mut args);
+        assert_eq!(n, FAMILIES, "the count query is answered with how many there are");
+
+        // The second call, sized short on purpose. The guest gets what it sized for, and the
+        // count is lowered to say so -- there is no other field that could.
+        let mut props = [VkQueueFamilyProperties::default(); 2];
+        let mut n = 2u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pQueueFamilyPropertyCount(&mut n);
+        args.plant_pQueueFamilyProperties(&mut props);
+        run!(&mut args);
+        assert_eq!(n, 2, "the count comes back as what was written, not what was asked for");
+        assert_eq!(
+            [props[0].queueCount, props[1].queueCount],
+            [100, 101],
+            "the families the driver wrote reach the guest's own array"
+        );
+
+        // And the same call sized long, which is where a dropped count write-back shows: the two
+        // numbers agree in the short case above, so only a guest with room to spare can tell a
+        // handler that wrote the count from one that left the guest's own question in place.
+        let mut props = [VkQueueFamilyProperties::default(); 4];
+        let mut n = 4u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pQueueFamilyPropertyCount(&mut n);
+        args.plant_pQueueFamilyProperties(&mut props);
+        run!(&mut args);
+        assert_eq!(
+            n, FAMILIES,
+            "the count is the driver's total, never the room the guest offered"
+        );
+        assert_eq!(
+            props.map(|p| p.queueCount),
+            [100, 101, 102, 0],
+            "three families written, and the slot past them left as the guest sent it"
+        );
+
+        driver.abandon_planted();
+    }
+
+    /// The other half of the idiom, where the driver *can* say there were more.
+    ///
+    /// `VK_INCOMPLETE` is not an error the guest has to recover from: it sized the array, and being
+    /// told the answer was trimmed is what lets it size a bigger one. Passing it through as an
+    /// answer is the whole contract, and the roomy call beside it pins the count write-back --
+    /// with a guest count of four and a driver total of two, a dropped write-back reads back as
+    /// four families that were never written.
+    #[test]
+    fn a_short_enumeration_is_incomplete_and_a_roomy_one_is_not() {
+        use super::super::proto::types::{
+            VkPhysicalDevice, VkPhysicalDeviceToolProperties,
+            vn_command_vkGetPhysicalDeviceToolProperties as Cmd,
+        };
+
+        const PD: VkPhysicalDevice = VkPhysicalDevice(0x711);
+        const TOOLS: u32 = 2;
+
+        unsafe extern "C" fn tools(
+            _pd: VkPhysicalDevice,
+            count: *mut u32,
+            out: *mut VkPhysicalDeviceToolProperties,
+        ) -> VkResult {
+            // SAFETY: the caller passed a live count, and an array of that length or null.
+            let count = unsafe { &mut *count };
+            if out.is_null() {
+                *count = TOOLS;
+                return VkResult::VK_SUCCESS;
+            }
+            let room = (*count).min(TOOLS);
+            // SAFETY: `count` is the length the caller sized the array to.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, room as usize) };
+            for (i, t) in out.iter_mut().enumerate() {
+                t.purposes = VkFlags(1 << i);
+            }
+            *count = room;
+            if room < TOOLS { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS }
+        }
+
+        let objects = Shared::new();
+        let mut fns = crate::vulkan::Instance::default();
+        fns.plant_vkGetPhysicalDeviceToolProperties(tools);
+        let mut driver = Driver::new();
+        driver.plant_instance(fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+
+        macro_rules! run {
+            ($args:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &mut todo,
+                    driver: &mut driver,
+                    global: &global,
+                    reject: None,
+                    unserved: false,
+                    resources: &NO_RESOURCES,
+                    rings: &mut rings,
+                    replaying: false,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                };
+                h.vkGetPhysicalDeviceToolProperties($args);
+                assert!(h.reject.is_none(), "a short answer is an answer, not a refusal");
+            }};
+        }
+
+        let mut props = [VkPhysicalDeviceToolProperties::default(); 1];
+        let mut n = 1u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pToolCount(&mut n);
+        args.plant_pToolProperties(&mut props);
+        run!(&mut args);
+        assert_eq!(
+            args.ret,
+            VkResult::VK_INCOMPLETE,
+            "the driver had more than the guest sized for"
+        );
+        assert_eq!(n, 1, "and the count says how many of them arrived");
+
+        let mut props = [VkPhysicalDeviceToolProperties::default(); 4];
+        let mut n = 4u32;
+        let mut args = Cmd::default();
+        args.physicalDevice = PD;
+        args.plant_pToolCount(&mut n);
+        args.plant_pToolProperties(&mut props);
+        run!(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "room to spare is not a short answer");
+        assert_eq!(n, TOOLS, "the count is the driver's total, never the room the guest offered");
+
+        driver.abandon_planted();
+    }
+
+    /// The venus handshake, which is not a Vulkan query however much it looks like one.
+    ///
+    /// `vkEnumerateInstanceExtensionProperties` asks what the *renderer* understands on the wire,
+    /// not what the host loader has installed -- the guest never talks to that loader, so its list
+    /// would be an answer to a question nobody asked. The C answers it from a table of two and so
+    /// do we, off the same spec versions the capset states.
+    ///
+    /// Driven over the wire because the count write-back is only observable there: it decides how
+    /// many entries the reply encoder walks, so a handler that fills the array and forgets the
+    /// count hands the guest two real names followed by two it never wrote.
+    #[test]
+    fn the_guest_is_told_the_two_extensions_this_renderer_speaks() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::VkExtensionProperties;
+
+        const WINDOW: usize = 0x21000;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let speaks = crate::venus::driver::renderer_extensions();
+        assert_eq!(speaks.len(), 2, "the two protocol extensions this build serializes");
+
+        // Room for four, and there are two. The two numbers have to differ or a dropped
+        // write-back is invisible: the reply would encode the guest's own four and match.
+        let mut room = [VkExtensionProperties::default(); 4];
+        let mut n = 4u32;
+        let mut q = ty::vn_command_vkEnumerateInstanceExtensionProperties::default();
+        q.plant_pPropertyCount(&mut n);
+        q.plant_pProperties(&mut room);
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x1000));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkEnumerateInstanceExtensionProperties_args,
+            ser::vn_encode_vkEnumerateInstanceExtensionProperties_args,
+            q,
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "the handshake does not poison");
+
+        let mut want_props = speaks.clone();
+        let mut want_n = 2u32;
+        let mut expect = ty::vn_command_vkEnumerateInstanceExtensionProperties::default();
+        expect.ret = VkResult::VK_SUCCESS;
+        expect.plant_pPropertyCount(&mut want_n);
+        expect.plant_pProperties(&mut want_props[..]);
+        let want = reply!(
+            ser::vn_sizeof_vkEnumerateInstanceExtensionProperties_reply,
+            ser::vn_encode_vkEnumerateInstanceExtensionProperties_reply,
+            expect
+        );
+        let mut got = vec![0u8; want.len()];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, want, "both names, and a count that says two rather than four");
     }
 
     /// A format probe the driver says no to is an answer, not a refusal.
