@@ -914,6 +914,16 @@ vkr_journal_pre_dispatch(struct vn_dispatch_context *dctx)
    if (have_type)
       memcpy(&next_type, dec->cur, sizeof(next_type));
 
+   /* limina ring-FATAL attribution: stamp what we are about to decode onto the
+    * decoder, so vkr_cs_decoder_report_fatal can name the command instead of the
+    * one shim every generated call site funnels through. Deliberately ABOVE the
+    * journal gate below — a VKR_JOURNAL=0 run must still get named fatals. */
+   struct vkr_cs_decoder *wdec = (struct vkr_cs_decoder *)dctx->decoder;
+   wdec->cur_cmd_type = next_type;
+   wdec->cur_cmd_start = wdec->cur;
+   wdec->dispatch_seq++;
+   wdec->dispatch_depth++;
+
    /* If it is anything but a RECORDING command, ship this thread's pending
     * block BEFORE the dispatch starts: several non-recording commands block
     * mid-dispatch (vkWaitRingSeqnoMESA and friends), and pending captures must
@@ -1050,6 +1060,17 @@ vkr_journal_flush_removed(struct vkr_journal *j, struct vkr_journal_frame *frame
 void
 vkr_journal_post_dispatch(struct vn_dispatch_context *dctx)
 {
+   /* limina ring-FATAL attribution: pop the depth BEFORE the journal gate below,
+    * or a VKR_JOURNAL=0 run leaves the decoder permanently "in dispatch" after
+    * the first command and every later report lies about it. The identity fields
+    * are left standing on purpose: at depth 0 they name the last command that
+    * completed, which is what a fatal outside any dispatch has to report. */
+   if (dctx && dctx->decoder) {
+      struct vkr_cs_decoder *wdec = (struct vkr_cs_decoder *)dctx->decoder;
+      if (wdec->dispatch_depth)
+         wdec->dispatch_depth--;
+   }
+
    struct vkr_journal *j = vkr_journal_from_dispatch(dctx);
    if (!j)
       return;
