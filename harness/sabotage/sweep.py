@@ -100,13 +100,20 @@ def main():
             r = run(['cargo', 'test'] + ([filt] if filt else []))
         finally:
             path.write_text(original)
-        caught = r.returncode != 0
-        if caught:
-            n = len(re.findall(r'^    \S+::\S+$', r.stdout, re.M))
-            print('RED       %s  (%d tests)' % (name, n))
-        else:
+        if r.returncode == 0:
             holes.append(name)
             print('SURVIVED  %s' % name)
+            continue
+        # Which test noticed, not how many failed. `cargo test` lists the failures only when the
+        # run finishes; a panic that aborts the binary ends it early, and then the name is in the
+        # panic line instead. Reporting a count from whichever of those happened to be there is
+        # how a sweep comes to claim coverage it cannot point at.
+        named = re.findall(r"^    (\S+::\S+)$", r.stdout, re.M)
+        if not named:
+            named = re.findall(r"^thread '(\S+::\S+)'", r.stdout + r.stderr, re.M)[:1]
+        witness = ', '.join(sorted(set(named))[:2]) if named else 'the test binary failed'
+        more = len(set(named)) - 2
+        print('RED       %-58s %s%s' % (name, witness, ' +%d more' % more if more > 0 else ''))
 
     print('\n%d of %d caught' % (len(chosen) - len(holes), len(chosen)))
     return 1 if holes else 0

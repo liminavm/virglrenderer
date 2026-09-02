@@ -252,6 +252,14 @@ pub struct Driver {
 /// `Context` that owns this tears it down on its own drop, which runs first.
 impl Drop for Driver {
     fn drop(&mut self) {
+        // Not while something else is already being reported. A test that fails with planted
+        // state still in the maps drops this on the way out, and asserting there replaces the
+        // assertion that actually failed with this one -- and, because the crate aborts rather
+        // than unwinds, takes every test after it down unrun. The invariant is about normal
+        // operation, and during a panic there is no normal operation left to protect.
+        if std::thread::panicking() {
+            return;
+        }
         assert!(
             self.owes_nothing(),
             "a Driver was dropped still holding host handles: {} device(s), {} allocation(s), \
