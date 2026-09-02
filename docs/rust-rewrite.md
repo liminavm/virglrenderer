@@ -337,13 +337,16 @@ buildable throughout as the A-side reference.
   Recording scanout geometry beside the ring stream lands here too — it is what turns
   the venus IOSurface score from a count into a frame hash, and a zero-copy blob has no
   other CPU-readable copy of its pixels.
-  Booting found three commands no corpus does. `vkExecuteCommandStreamsMESA` and
-  `vkWaitRingSeqnoMESA` are the ring's carrier rather than its cargo, so the recorder
-  never writes them and the replayer supplies its own — no corpus can ever contain one,
-  and a build refusing both replays everything clean while a live Vulkan client
-  segfaults on its first frame. `vkCmdCopyImageToBuffer` is merely absent from the
-  corpora we have. The three are what stands between this tree and the seated gate;
-  `synoik-vkcube` is the corpus that carries the third.
+  Booting found three commands replay does not reach. `vkExecuteCommandStreamsMESA`
+  carries an indirect command stream out of a resource; the recorder excludes it by
+  design, because its contents are already teed, so no corpus contains it.
+  `vkWaitRingSeqnoMESA` is recorded but skipped by the replayer, which has no ring
+  buffer to advance and would block forever. Neither is reachable by teaching the
+  replayer more, which is why the seated boot is a gate and not a formality — a build
+  refusing both scores every corpus clean while a live Vulkan client segfaults on its
+  first frame. `vkCmdCopyImageToBuffer` is the ordinary kind of gap, merely absent from
+  the corpora we had; `synoik-vkcube` is the corpus that carries it. The three are what
+  stands between this tree and the seated gate.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
