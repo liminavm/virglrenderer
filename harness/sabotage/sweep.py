@@ -72,8 +72,8 @@ SABOTAGES = [
 ]
 
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, cwd=RS, capture_output=True, text=True, **kw)
+def run(cmd, cwd=RS):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
 def main():
