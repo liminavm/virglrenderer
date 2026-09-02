@@ -8215,9 +8215,14 @@ static void vrend_pipe_resource_attach_iov(struct pipe_resource *pres,
    res->iov = iov;
    res->num_iovs = iov_count;
 
-   if (has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) {
+   /* Restore content the resource carried while it had no backing (see ->ptr_valid).
+    * A fresh resource has nothing to restore, and writing its zero-filled shadow here
+    * would race the guest, which may already have filled these pages: the kernel
+    * queues ATTACH_BACKING and returns to userspace without waiting for it. */
+   if (has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY) && res->ptr_valid) {
       vrend_write_to_iovec(res->iov, res->num_iovs, 0,
             res->ptr, res->base.width0);
+      res->ptr_valid = false;
    }
 }
 
@@ -8229,6 +8234,7 @@ static void vrend_pipe_resource_detach_iov(struct pipe_resource *pres,
    if (has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) {
       vrend_read_from_iovec(res->iov, res->num_iovs, 0,
             res->ptr, res->base.width0);
+      res->ptr_valid = true;
    }
 
    res->iov = NULL;
@@ -10590,6 +10596,7 @@ static int vrend_renderer_transfer_write_iov_inner(struct vrend_context *ctx,
       assert(!res->iov);
       vrend_read_from_iovec(iov, num_iovs, info->offset,
                             res->ptr + info->box->x, info->box->width);
+      res->ptr_valid = true;
       return 0;
    }
 

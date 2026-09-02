@@ -98,6 +98,12 @@ struct vrend_resource {
     * VREND_RESOURCE_STORAGE_GUEST_ELSE_SYSTEM buffer storage.
     */
    char *ptr;
+   /* True once ->ptr holds content the guest backing does not: a detach copied the
+    * backing into it, or a transfer wrote it while no backing was attached. Only then
+    * does an attach copy ->ptr back out. A fresh resource's zero-filled ->ptr must never
+    * be written over a backing the guest may already have filled: the guest does not
+    * wait for ATTACH_BACKING to be processed before writing its mapping. */
+   bool ptr_valid;
    /* IOV pointing to shared guest memory storage for this resource. */
    const struct iovec *iov;
    uint32_t num_iovs;
