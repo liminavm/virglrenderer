@@ -44,12 +44,32 @@ pub enum Error {
     NoAllocation,
     /// The allocation exists but the driver would not map it; see [`MemoryError::NotMappable`].
     NotMappable,
+    /// The allocation is already published as some other resource's blob. A memory backs one
+    /// blob: two resources over one storage is a state neither of them could detect.
+    AlreadyExported,
+    /// The host cannot address the allocation, so there is nothing to publish into the guest.
+    NotHostVisible,
+    /// The blob is larger than the allocation behind it. Mapping it would publish whatever
+    /// follows the allocation in this process.
+    BlobLargerThanAllocation,
     /// An import of zero bytes, which names no memory.
     ZeroSize,
     /// An shm descriptor the host could not map. A resource whose memory we cannot reach is one
     /// no ring can live in, so this fails at import rather than at the first command that needs
     /// it -- the guest gets the refusal while it is still holding the thing that caused it.
     Unmappable,
+}
+
+/// An export's refusals in the renderer's vocabulary, for the reason [`venus_error`] gives.
+fn export_error(e: venus::driver::ExportError) -> Error {
+    use venus::driver::ExportError as E;
+    match e {
+        E::NoSuchAllocation => Error::NoAllocation,
+        E::AlreadyExported => Error::AlreadyExported,
+        E::NotHostVisible => Error::NotHostVisible,
+        E::LargerThanAllocation => Error::BlobLargerThanAllocation,
+        E::NotMappable => Error::NotMappable,
+    }
 }
 
 /// venus's own refusals in the renderer's vocabulary. One function, because every venus entry
@@ -72,6 +92,9 @@ impl std::fmt::Display for Error {
             Error::Poisoned => "the context is poisoned",
             Error::NoAllocation => "no such allocation in that context",
             Error::NotMappable => "that allocation cannot be mapped for reading",
+            Error::AlreadyExported => "that allocation is already published as a blob",
+            Error::NotHostVisible => "that allocation is not addressable by the host",
+            Error::BlobLargerThanAllocation => "the blob is larger than the allocation behind it",
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
         };
@@ -97,6 +120,21 @@ pub struct ClassicDesc {
     pub flags: u32,
 }
 
+/// Where a blob's storage comes from.
+///
+/// The ABI discriminates on `blob_id == 0`, one magic number standing between two operations that
+/// have nothing in common: one asks this renderer to supply memory, the other names memory a venus
+/// context already holds and asks for it to be published. Naming them separates the two, and
+/// carries with the export the context whose table the id means something in -- without which the
+/// id names nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlobSource {
+    /// The guest asks the host for memory it does not yet have.
+    HostMinted,
+    /// A venus context publishes device memory it already holds.
+    Exported { ctx: CtxId, mem: BlobId },
+}
+
 /// Host memory the guest maps, or a handle a context exported.
 ///
 /// `blob_mem` and `blob_flags` stay bare integers until the blob path is served: naming their
@@ -106,7 +144,7 @@ pub struct ClassicDesc {
 pub struct BlobDesc {
     pub blob_mem: u32,
     pub blob_flags: u32,
-    pub blob_id: BlobId,
+    pub source: BlobSource,
     pub size: u64,
 }
 
@@ -153,11 +191,9 @@ pub struct Rejected {
 
 /// Memory this renderer minted for a blob, and the descriptor that names it.
 ///
-/// The guest asks for a blob two different ways through one entry point, and `blob_id` is what
-/// separates them: a non-zero id names something the renderer already has -- a `VkDeviceMemory` to
-/// export -- while a zero id asks the renderer to supply the memory itself. Only the second kind
-/// has a `HostShm`, and [`HostShm::for_blob`] is the single place that decides, so nothing else
-/// has to keep the id and the memory in step.
+/// Only a [`BlobSource::HostMinted`] blob has one; an export names memory that already exists, and
+/// minting for it would hand the guest fresh zeroed pages where it expected a `VkDeviceMemory`'s
+/// contents.
 ///
 /// The descriptor is kept rather than closed. The C hands it straight to the VMM in `out_blob` and
 /// keeps only the mapping; there is no `out_blob` here yet, and closing it now would make the
@@ -170,10 +206,12 @@ pub struct HostShm {
 impl HostShm {
     /// Mint memory for a blob, if this is the kind of blob that needs it.
     ///
-    /// Mirrors the C's `vkr_context_get_blob`: `blob_id == 0` reaches
-    /// `vkr_context_create_resource_from_shm`, everything else exports memory that already exists.
+    /// Mirrors the C's `vkr_context_get_blob`: a host-minted blob reaches
+    /// `vkr_context_create_resource_from_shm`, an export publishes memory that already exists.
     fn for_blob(handle: ResourceHandle, desc: &BlobDesc) -> Result<Option<HostShm>, Error> {
-        if desc.blob_mem != crate::abi::BLOB_MEM_HOST3D || desc.blob_id != BlobId(0) {
+        if desc.blob_mem != crate::abi::BLOB_MEM_HOST3D
+            || !matches!(desc.source, BlobSource::HostMinted)
+        {
             return Ok(None);
         }
         let len = usize::try_from(desc.size).map_err(|_| Error::Unmappable)?;
@@ -336,6 +374,13 @@ impl Renderer {
         Ok(())
     }
 
+    /// Create a resource backed by a blob: memory this renderer mints, or memory a venus context
+    /// already holds and is publishing.
+    ///
+    /// The export happens here, before the resource exists, because it is the half that can fail
+    /// on the guest's account -- naming memory it never allocated, exporting the same memory
+    /// twice, or asking for a blob bigger than what backs it. Failing before the insert is what
+    /// leaves nothing behind to clean up.
     pub fn resource_create_blob(
         &mut self,
         handle: ResourceHandle,
@@ -344,6 +389,9 @@ impl Renderer {
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
         let host = HostShm::for_blob(handle, &desc)?;
+        if let BlobSource::Exported { ctx, mem } = desc.source {
+            self.venus_memory_export(ctx, mem, desc.size)?;
+        }
         self.insert(handle, Backing::Blob { desc, host }, iov);
         Ok(())
     }
@@ -613,6 +661,30 @@ impl Renderer {
         self.venus_context(ctx_id, |ctx| ctx.driver().memory_census())
     }
 
+    /// Publish one venus allocation to the VMM, handing back the host address it lives at.
+    ///
+    /// The address is not kept here. A resource holding it would outlive the memory it points
+    /// into the first time a guest freed the memory while the resource stood -- so the resource
+    /// keeps the names, and [`Self::venus_memory_map_ptr`] resolves them again each time. Memory
+    /// that is gone then has no address to give, instead of having a stale one.
+    pub fn venus_memory_export(
+        &mut self,
+        ctx_id: CtxId,
+        mem: BlobId,
+        blob_size: u64,
+    ) -> Result<usize, Error> {
+        let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
+        v.with_context_mut(ctx_id, |ctx| ctx.memory_export(ObjectId(mem.0), blob_size))
+            .ok_or(Error::NoContext)?
+            .map_err(export_error)
+    }
+
+    /// Where an exported allocation is mapped, asked again rather than remembered.
+    pub fn venus_memory_map_ptr(&self, ctx_id: CtxId, mem: BlobId) -> Result<usize, Error> {
+        self.venus_context(ctx_id, |ctx| ctx.driver().memory_exported_at(ObjectId(mem.0)))?
+            .ok_or(Error::NoAllocation)
+    }
+
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
     pub fn venus_memory_read(
         &self,
@@ -670,12 +742,12 @@ mod tests {
         Renderer::new(Box::new(NoSink), config)
     }
 
-    /// The two questions `HostShm::for_blob` answers, and it answers them from `blob_id` alone.
+    /// The two questions `HostShm::for_blob` answers, and it answers them from the source alone.
     ///
-    /// One entry point serves two different guest requests: a zero id asks the renderer to supply
-    /// memory, any other id names memory it already has and asks for it to be exported. Minting
-    /// for the second kind would hand the guest fresh zeroed pages where it expected the contents
-    /// of a `VkDeviceMemory` -- a wrong answer that looks like a working one.
+    /// One entry point serves two different guest requests: one asks the renderer to supply
+    /// memory, the other names memory a context already has and asks for it to be published.
+    /// Minting for the second kind would hand the guest fresh zeroed pages where it expected the
+    /// contents of a `VkDeviceMemory` -- a wrong answer that looks like a working one.
     #[test]
     fn only_a_blob_that_asks_the_host_for_memory_is_given_any() {
         let mut r = renderer(Config::default());
@@ -683,7 +755,7 @@ mod tests {
         let minted = BlobDesc {
             blob_mem: crate::abi::BLOB_MEM_HOST3D,
             blob_flags: 1,
-            blob_id: BlobId(0),
+            source: BlobSource::HostMinted,
             // The size the venus corpus asks for a ring resource: not a whole number of pages.
             size: 0x24000 - 1,
         };
@@ -700,15 +772,21 @@ mod tests {
         assert_eq!(map.len() % page, 0, "the mapping is a whole number of pages");
         assert!(map.len() >= 0x24000 - 1, "and covers everything that was asked for");
 
-        // A blob naming memory that already exists gets none of its own.
-        let exported = BlobDesc { blob_id: BlobId(9), ..minted };
-        r.resource_create_blob(ResourceHandle::new(2).unwrap(), exported, Vec::new())
-            .expect("created");
+        // A blob naming memory that already exists gets none of its own. There is no venus in
+        // this build, so the export itself is refused -- what is being asked here is that the
+        // refusal came from the export path and not from minting something first.
+        let exported = BlobDesc {
+            source: BlobSource::Exported { ctx: CtxId::new(1).unwrap(), mem: BlobId(9) },
+            ..minted
+        };
+        assert_eq!(
+            r.resource_create_blob(ResourceHandle::new(2).unwrap(), exported, Vec::new()),
+            Err(Error::RendererAbsent),
+            "an export names memory a context holds; minting would answer with the wrong bytes"
+        );
         assert!(
-            r.with_resource(ResourceHandle::new(2).unwrap(), |res| res.shm().cloned())
-                .expect("there")
-                .is_none(),
-            "an export names memory the renderer already has; minting would answer with the wrong bytes"
+            r.with_resource(ResourceHandle::new(2).unwrap(), |res| res.shm().cloned()).is_none(),
+            "and a create that failed leaves no resource behind"
         );
 
         // And so does a blob in memory that is not the host's to mint.

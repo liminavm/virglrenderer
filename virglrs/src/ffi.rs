@@ -95,8 +95,18 @@ impl fence::FenceSink for VmmFences {
 fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
-        ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned | NoAllocation
-        | NotMappable | ZeroSize | Unmappable => EINVAL,
+        ResourceExists
+        | ContextExists
+        | NoContext
+        | RendererAbsent
+        | Poisoned
+        | NoAllocation
+        | NotMappable
+        | ZeroSize
+        | Unmappable
+        | AlreadyExported
+        | NotHostVisible
+        | BlobLargerThanAllocation => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
     }
 }
@@ -337,13 +347,28 @@ fn classic_desc(a: &ResourceCreateArgs) -> (Option<ResourceHandle>, renderer::Cl
 /// `ctx_id` is dropped: nothing reads it today, and when host3d blobs land its Rust shape is
 /// `Option<CtxId>` rather than a `u32`, because a guest-memory blob legitimately has no context
 /// and zero is how the ABI spells that.
-fn blob_desc(a: &CreateBlobArgs) -> renderer::BlobDesc {
-    renderer::BlobDesc {
+/// The C's flat argument struct as the two operations it actually encodes.
+///
+/// `blob_id` means something only for a blob whose storage is the host's: the C reads it solely on
+/// the `HOST3D` path and ignores it everywhere else, and a guest-storage blob carrying a non-zero
+/// id would otherwise arrive here as an export of memory no context was named for. Reconciled
+/// once, here, because this is the boundary that knows what the ABI meant.
+fn blob_desc(a: &CreateBlobArgs) -> Option<renderer::BlobDesc> {
+    let source = match (a.blob_mem, a.blob_id) {
+        // An export names memory in some context's table, so a request that names no context
+        // names no memory either. `None` here is the refusal -- the alternative, treating it as a
+        // mint, would answer with fresh zeroed pages for a guest that asked for its own bytes.
+        (crate::abi::BLOB_MEM_HOST3D, id) if id != 0 => {
+            renderer::BlobSource::Exported { ctx: CtxId::new(a.ctx_id)?, mem: BlobId(id) }
+        }
+        _ => renderer::BlobSource::HostMinted,
+    };
+    Some(renderer::BlobDesc {
         blob_mem: a.blob_mem,
         blob_flags: a.blob_flags,
-        blob_id: BlobId(a.blob_id),
+        source,
         size: a.size,
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -380,7 +405,9 @@ pub extern "C" fn virgl_renderer_resource_create_blob(args: *const CreateBlobArg
     let Some(handle) = ResourceHandle::new(a.res_handle) else {
         return EINVAL;
     };
-    let desc = blob_desc(a);
+    let Some(desc) = blob_desc(a) else {
+        return EINVAL;
+    };
     // SAFETY: the VMM's contract for create_blob is that `iovecs` points to `num_iovs` valid
     // entries for the duration of the call. Done here so the renderer never sees a raw pointer.
     let iov = unsafe { GuestIov::from_raw(a.iovecs, a.num_iovs) };
@@ -1278,14 +1305,18 @@ mod tests {
         assert_eq!(ResourceHandle::new(0), None);
     }
 
-    /// Likewise, and additionally that `ctx_id` does not silently become something else -- it is
-    /// the one field of the five that the renderer deliberately does not receive.
+    /// Likewise, and additionally which of the two operations the flat args encode.
+    ///
+    /// `blob_id` is meaningful only on the `HOST3D` path. Everywhere else the ABI carries whatever
+    /// the guest put there and the C ignores it, so reading it unconditionally would turn a
+    /// guest-storage blob into an export of memory nobody named a context for.
     #[test]
-    fn the_abi_blob_args_reach_the_renderer_without_the_context() {
+    fn the_abi_blob_args_say_which_of_the_two_blobs_was_asked_for() {
+        let host3d = crate::abi::BLOB_MEM_HOST3D;
         let a = CreateBlobArgs {
             res_handle: 1,
             ctx_id: 2,
-            blob_mem: 3,
+            blob_mem: host3d,
             blob_flags: 4,
             blob_id: 5,
             size: 6,
@@ -1294,8 +1325,36 @@ mod tests {
         };
         assert_eq!(
             blob_desc(&a),
-            renderer::BlobDesc { blob_mem: 3, blob_flags: 4, blob_id: BlobId(5), size: 6 }
+            Some(renderer::BlobDesc {
+                blob_mem: host3d,
+                blob_flags: 4,
+                source: renderer::BlobSource::Exported {
+                    ctx: CtxId::new(2).unwrap(),
+                    mem: BlobId(5),
+                },
+                size: 6,
+            }),
+            "a host3d blob naming an id exports that context's memory"
         );
+
+        // A zero id on the same path is the other operation entirely.
+        let minted = CreateBlobArgs { blob_id: 0, ..a };
+        assert_eq!(
+            blob_desc(&minted).expect("a mint needs no context").source,
+            renderer::BlobSource::HostMinted
+        );
+
+        // And an id set on a path that has no host storage is the guest's leftover, not a request.
+        let guest = CreateBlobArgs { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..a };
+        assert_eq!(
+            blob_desc(&guest).expect("guest storage needs no context").source,
+            renderer::BlobSource::HostMinted,
+            "the C reads blob_id only for host3d; reading it here would invent an export"
+        );
+
+        // An export naming no context names no memory: there is no table to resolve the id in.
+        let orphan = CreateBlobArgs { ctx_id: 0, ..a };
+        assert_eq!(blob_desc(&orphan), None, "an export with no context is refused, not minted");
     }
 
     /// The one thing lost when the Rust API stopped speaking errno: nothing else checks that a

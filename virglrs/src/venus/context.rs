@@ -19,7 +19,7 @@ use crate::ids::{CtxId, ResourceHandle, RingId};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
-use super::driver::{self, Driver, MemoryError, NoSyncFd};
+use super::driver::{self, Driver, ExportError, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
@@ -518,6 +518,23 @@ impl Context {
             .ok_or(MemoryError::NoSuchAllocation)?;
         let device = objects.device_of(id).ok_or(MemoryError::NoSuchAllocation)?;
         self.driver.memory_read(device, handle, id, buf)
+    }
+
+    /// Export one allocation as a blob, handing back the host address the VMM will publish.
+    ///
+    /// Here for the reason [`Self::memory_read`] gives: the table owns the handle and the device,
+    /// the driver owns the size and the mapping, and neither holds a copy of the other's answer.
+    pub fn memory_export(&mut self, id: ObjectId, blob_size: u64) -> Result<usize, ExportError> {
+        let (handle, device) = {
+            let objects = self.objects.borrow();
+            let handle = objects
+                .get(id)
+                .filter(|o| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY)
+                .map(|o| VkDeviceMemory::from_host(o.handle))
+                .ok_or(ExportError::NoSuchAllocation)?;
+            (handle, objects.device_of(id).ok_or(ExportError::NoSuchAllocation)?)
+        };
+        self.driver.memory_export(device, handle, id, blob_size)
     }
 }
 
