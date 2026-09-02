@@ -2372,8 +2372,10 @@ mod tests {
 
     /// A forwarded command whose device this context never created answers with an error.
     ///
-    /// These handlers cannot be witnessed against a real driver from here -- a unit test has no
-    /// Vulkan device -- so what is pinned is the half that matters most and does not need one.
+    /// The half of the group's contract that holds when there is no device to forward to. What
+    /// crosses to a device that *is* there is pinned separately, against a planted one -- see
+    /// [`a_forwarded_command_hands_the_driver_the_guests_own_arguments`].
+    ///
     /// Every command in this group answers with a `VkResult` the guest will act on, and for most
     /// of them zero is `VK_SUCCESS`; `vkGetEventStatus` and `vkGetFenceStatus` go further and
     /// report *state* in that same field, where zero means the event is set or the fence is
@@ -2515,6 +2517,226 @@ mod tests {
                 "{name} answered {ret} for a device this context never created"
             );
         }
+    }
+
+    /// Every argument the guest sent reaches the driver unchanged, and the driver's answer
+    /// reaches the guest.
+    ///
+    /// The shape helpers are thin, and thin is exactly where a swapped argument survives review:
+    /// `object_flags_op` and `bind_one` each take several values of interchangeable-looking type,
+    /// and passing the memory where the buffer goes compiles. Nothing outside this test can see
+    /// it -- replay reports a command as accounted for either way, and the reply oracle compares
+    /// encoders rather than arguments.
+    ///
+    /// Each stub returns `VK_NOT_READY`, which no path here fabricates: zero is the success these
+    /// wrappers must not invent and `VK_ERROR_INITIALIZATION_FAILED` is the answer for a device
+    /// that is missing, so a sentinel in `ret` can only have come back from the driver.
+    #[test]
+    fn a_forwarded_command_hands_the_driver_the_guests_own_arguments() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandPool, VkCommandPoolResetFlags, VkDeviceMemory, VkDeviceSize,
+            VkEvent, VkMappedMemoryRange,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const SENTINEL: VkResult = VkResult::VK_NOT_READY;
+
+        #[derive(Default)]
+        struct Saw {
+            waited: Vec<u64>,
+            events: Vec<(u64, u64)>,
+            pools: Vec<(u64, u32)>,
+            binds: Vec<(u64, u64, u64)>,
+            ranges: Vec<u32>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn wait_idle(device: VkDevice) -> VkResult {
+            SAW.with_borrow_mut(|s| s.waited.push(device.0));
+            SENTINEL
+        }
+        unsafe extern "C" fn set_event(device: VkDevice, event: VkEvent) -> VkResult {
+            SAW.with_borrow_mut(|s| s.events.push((device.0, event.0)));
+            SENTINEL
+        }
+        unsafe extern "C" fn reset_pool(
+            _device: VkDevice,
+            pool: VkCommandPool,
+            flags: VkCommandPoolResetFlags,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.pools.push((pool.0, flags.0)));
+            SENTINEL
+        }
+        unsafe extern "C" fn bind_buffer(
+            _device: VkDevice,
+            buffer: VkBuffer,
+            memory: VkDeviceMemory,
+            offset: VkDeviceSize,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|s| s.binds.push((buffer.0, memory.0, offset.0)));
+            SENTINEL
+        }
+        unsafe extern "C" fn flush(
+            _device: VkDevice,
+            count: u32,
+            p: *const VkMappedMemoryRange,
+        ) -> VkResult {
+            assert!(!p.is_null(), "a non-empty array arrives with its pointer");
+            SAW.with_borrow_mut(|s| s.ranges.push(count));
+            SENTINEL
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkSetEvent(set_event);
+        fns.plant_vkResetCommandPool(reset_pool);
+        fns.plant_vkBindBufferMemory(bind_buffer);
+        fns.plant_vkFlushMappedMemoryRanges(flush);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        let device = VkDevice(DEVICE);
+
+        let mut args = vn_command_vkDeviceWaitIdle { device, ..Default::default() };
+        h.vkDeviceWaitIdle(&mut args);
+        assert_eq!(args.ret, SENTINEL, "the driver's answer, not one of ours");
+        SAW.with_borrow(|s| assert_eq!(s.waited, [DEVICE]));
+
+        let mut args =
+            vn_command_vkSetEvent { device, event: VkEvent(0x111), ..Default::default() };
+        h.vkSetEvent(&mut args);
+        assert_eq!(args.ret, SENTINEL);
+        SAW.with_borrow(|s| assert_eq!(s.events, [(DEVICE, 0x111)], "the event the guest named"));
+
+        // A pool and a flags word: distinct values, because each is a bare integer to the compiler
+        // and a wrapper that swapped them would still build.
+        let mut args = vn_command_vkResetCommandPool {
+            device,
+            commandPool: VkCommandPool(0x222),
+            flags: VkFlags(0x4),
+            ..Default::default()
+        };
+        h.vkResetCommandPool(&mut args);
+        assert_eq!(args.ret, SENTINEL);
+        SAW.with_borrow(|s| assert_eq!(s.pools, [(0x222, 0x4)], "the pool, then its flags"));
+
+        // Three interchangeable-looking values in a row -- the shape most worth pinning.
+        let mut args = vn_command_vkBindBufferMemory {
+            device,
+            buffer: VkBuffer(0x333),
+            memory: VkDeviceMemory(0x444),
+            memoryOffset: VkDeviceSize(0x555),
+            ..Default::default()
+        };
+        h.vkBindBufferMemory(&mut args);
+        assert_eq!(args.ret, SENTINEL);
+        SAW.with_borrow(|s| assert_eq!(s.binds, [(0x333, 0x444, 0x555)], "buffer, memory, offset"));
+
+        // The count Vulkan is given is the slice's own length, and nothing else carries it.
+        let ranges = [VkMappedMemoryRange::default(); 3];
+        let mut args = vn_command_vkFlushMappedMemoryRanges::default();
+        args.device = device;
+        args.plant_pMemoryRanges(&ranges);
+        h.vkFlushMappedMemoryRanges(&mut args);
+        assert_eq!(args.ret, SENTINEL);
+        SAW.with_borrow(|s| assert_eq!(s.ranges, [3], "all three ranges, counted once"));
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
+    }
+
+    /// The driver's answer travels the whole way: through the handler, through the commit, into
+    /// the guest's window.
+    ///
+    /// [`a_forwarded_command_hands_the_driver_the_guests_own_arguments`] stops at `args.ret`, and
+    /// the reply witnesses stop at the encoder. This is the one that runs the full length --
+    /// wire, decode, handler, driver, commit -- so that a result which is right in the handler and
+    /// never reaches the guest cannot pass. `vkDeviceWaitIdle` drives it because it names no
+    /// object, so nothing here depends on the object table being set up first.
+    #[test]
+    fn the_drivers_answer_reaches_the_guests_window() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::VkAllocationCallbacks;
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const WINDOW: usize = 0x21000;
+        const SENTINEL: VkResult = VkResult::VK_NOT_READY;
+
+        /// The guest's name for the device, which is not the host's -- so a handler that reached
+        /// the driver with the id instead of the handle would be visible here.
+        const GUEST_ID: u64 = 0x5001;
+
+        thread_local! {
+            static CALLS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn wait_idle(device: VkDevice) -> VkResult {
+            CALLS.with_borrow_mut(|c| c.push(device.0));
+            SENTINEL
+        }
+        /// Teardown destroys what the context created, and the planted table owes it an entry.
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        ctx.driver.plant_device(DEVICE, fns);
+        ctx.objects
+            .borrow_mut()
+            .add(ObjectId(GUEST_ID), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE, None)
+            .expect("a fresh id");
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkDeviceWaitIdle_args,
+            ser::vn_encode_vkDeviceWaitIdle_args,
+            ty::vn_command_vkDeviceWaitIdle { device: VkDevice(GUEST_ID), ..Default::default() },
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served command does not poison");
+        CALLS.with_borrow(|c| {
+            assert_eq!(*c, [DEVICE], "the driver was called, with the host handle not the guest id")
+        });
+
+        let mut got = [0u8; 8];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(
+            u32::from_le_bytes([got[0], got[1], got[2], got[3]]),
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkDeviceWaitIdle_EXT.0 as u32,
+            "the reply names the command it answers"
+        );
+        assert_eq!(
+            i32::from_le_bytes([got[4], got[5], got[6], got[7]]),
+            SENTINEL.0,
+            "the driver's own result, carried all the way into the guest's memory"
+        );
     }
 
     /// Waiting on a queue this context never retrieved is refused, not answered.
