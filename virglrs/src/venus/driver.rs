@@ -18,13 +18,14 @@ use super::cs::{Handle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
-    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCommandBuffer,
-    VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool, VkCopyDescriptorSet,
-    VkDependencyFlags, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
-    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceSize, VkEvent, VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
-    VkFormat, VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout,
-    VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
+    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkClearAttachment, VkClearColorValue,
+    VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
+    VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorPool, VkDescriptorSet,
+    VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExtensionProperties,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer, VkImage,
+    VkImageBlit, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
+    VkImageSubresourceRange, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
     VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
     VkMemoryBarrier, VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
     VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
@@ -32,7 +33,8 @@ use super::proto::types::{
     VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
     VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion,
     VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule,
-    VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
+    VkShaderStageFlags, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
@@ -1775,6 +1777,111 @@ impl Driver {
                 layout,
                 regions.len() as u32,
                 regions.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    // Vulkan's own signature: the two images each carry a layout, and the filter is a
+    // parameter of the blit rather than of a region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cmd_blit_image(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkImage,
+        src_layout: VkImageLayout,
+        dst: VkImage,
+        dst_layout: VkImageLayout,
+        regions: &[VkImageBlit],
+        filter: VkFilter,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe {
+            (d.vkCmdBlitImage())(
+                cb,
+                src,
+                src_layout,
+                dst,
+                dst_layout,
+                regions.len() as u32,
+                regions.as_ptr(),
+                filter,
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_clear_color_image(
+        &self,
+        cb: VkCommandBuffer,
+        image: VkImage,
+        layout: VkImageLayout,
+        color: &VkClearColorValue,
+        ranges: &[VkImageSubresourceRange],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length, and the colour is a reference.
+        unsafe {
+            (d.vkCmdClearColorImage())(
+                cb,
+                image,
+                layout,
+                color,
+                ranges.len() as u32,
+                ranges.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// `vkCmdClearAttachments`, whose two arrays are counted separately and mean different things.
+    ///
+    /// Every attachment is cleared over every rect, so the two are a product, not a pair: neither
+    /// count governs the other and neither may be derived from the other.
+    pub fn cmd_clear_attachments(
+        &self,
+        cb: VkCommandBuffer,
+        attachments: &[VkClearAttachment],
+        rects: &[VkClearRect],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; each count is its own slice's length.
+        unsafe {
+            (d.vkCmdClearAttachments())(
+                cb,
+                attachments.len() as u32,
+                attachments.as_ptr(),
+                rects.len() as u32,
+                rects.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// `vkCmdPushConstants`, whose `size` is the length of the bytes and nothing else.
+    ///
+    /// The guest sends both, and the decoder has already lengthened the slice from the guest's
+    /// `size`. Taking the slice and re-deriving the count from it is what keeps a later edit from
+    /// reintroducing a size that disagrees with the buffer it measures.
+    pub fn cmd_push_constants(
+        &self,
+        cb: VkCommandBuffer,
+        layout: VkPipelineLayout,
+        stages: VkShaderStageFlags,
+        offset: u32,
+        values: &[u8],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the size is the slice's own length in bytes.
+        unsafe {
+            (d.vkCmdPushConstants())(
+                cb,
+                layout,
+                stages,
+                offset,
+                values.len() as u32,
+                values.as_ptr().cast(),
             )
         };
         Some(())
