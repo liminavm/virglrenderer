@@ -29,9 +29,10 @@ use super::proto::types::{
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
-    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
+    vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
+    vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer,
+    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor,
     vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
     vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
     vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
@@ -2593,6 +2594,62 @@ impl Commands for Handlers<'_> {
             args.dstImage,
             args.dstImageLayout,
             regions,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBlitImage(&mut self, args: &mut vn_command_vkCmdBlitImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_blit_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstImage,
+            args.dstImageLayout,
+            regions,
+            args.filter,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdClearColorImage(&mut self, args: &mut vn_command_vkCmdClearColorImage<'_>) {
+        // The colour is what the clear is for: without it there is no defensible value to write,
+        // and picking one would be inventing guest intent.
+        let Some(color) = self.names(args.pColor) else { return };
+        let ranges = args.pRanges();
+        let done = self.driver.cmd_clear_color_image(
+            args.commandBuffer,
+            args.image,
+            args.imageLayout,
+            color,
+            ranges,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdClearAttachments(&mut self, args: &mut vn_command_vkCmdClearAttachments<'_>) {
+        // Two counts over two arrays, cleared as a product. Either being empty clears nothing,
+        // which is legal and is the guest's business rather than a violation.
+        let attachments = args.pAttachments();
+        let rects = args.pRects();
+        let done = self.driver.cmd_clear_attachments(args.commandBuffer, attachments, rects);
+        self.recorded(done);
+    }
+
+    fn vkCmdPushConstants(&mut self, args: &mut vn_command_vkCmdPushConstants<'_>) {
+        // The bytes are the command. A null `pValues` with a non-zero `size` is the one shape the
+        // decoder cannot resolve into a slice, and pushing whatever the layout last held would
+        // hand the next draw constants the guest never sent.
+        let Some(values) = args.pValues() else {
+            self.reject = Some("pushed constants without saying what they are");
+            return;
+        };
+        let done = self.driver.cmd_push_constants(
+            args.commandBuffer,
+            args.layout,
+            args.stageFlags,
+            args.offset,
+            values,
         );
         self.recorded(done);
     }
@@ -7705,6 +7762,202 @@ mod tests {
         assert!(h.reject.is_some(), "there is no device to record into");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
+    }
+
+    /// The commands that put bytes into memory, and the two shapes the four of them add.
+    ///
+    /// Left unserved, these read as an accounting gap -- so many commands the build refused --
+    /// and the census reads as memory nothing wrote. That is the same evidence a renderer that
+    /// records them and gets them wrong produces, which is why what they were called with is
+    /// asserted here rather than inferred from a score.
+    ///
+    /// Two shapes beyond the recording four: two arrays under two independent counts, cleared as
+    /// a product rather than a pair; and a blob whose length is its own `size` member.
+    #[test]
+    fn the_commands_that_write_pixels_hand_the_driver_what_the_guest_sent() {
+        use super::super::proto::types::{
+            VkClearAttachment, VkClearColorValue, VkClearRect, VkCommandBuffer, VkCommandPool,
+            VkDevice, VkFilter, VkImage, VkImageBlit, VkImageLayout, VkImageSubresourceRange,
+            VkPipelineLayout, VkShaderStageFlags, vn_command_vkCmdBlitImage,
+            vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+            vn_command_vkCmdPushConstants,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        #[derive(Default)]
+        struct Saw {
+            blits: Vec<(u64, u64, u32, i32)>,
+            cleared_image: Vec<(u64, u32, u32)>,
+            cleared_attachments: Vec<(u32, u32)>,
+            pushed: Vec<(u64, u32, Vec<u8>)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn blit(
+            _cb: VkCommandBuffer,
+            src: VkImage,
+            _src_layout: VkImageLayout,
+            dst: VkImage,
+            _dst_layout: VkImageLayout,
+            count: u32,
+            _p: *const VkImageBlit,
+            filter: VkFilter,
+        ) {
+            SAW.with_borrow_mut(|s| s.blits.push((src.0, dst.0, count, filter.0)));
+        }
+
+        unsafe extern "C" fn clear_color(
+            _cb: VkCommandBuffer,
+            image: VkImage,
+            _layout: VkImageLayout,
+            color: *const VkClearColorValue,
+            count: u32,
+            p: *const VkImageSubresourceRange,
+        ) {
+            // SAFETY: the wrapper passes a reference for the colour and a slice's own pointer
+            // and length for the ranges.
+            let (c, ranges) = unsafe { (&*color, core::slice::from_raw_parts(p, count as usize)) };
+            let first = ranges.first().map(|r| r.baseMipLevel).unwrap_or(u32::MAX);
+            SAW.with_borrow_mut(|s| s.cleared_image.push((image.0, unsafe { c.uint32[0] }, first)));
+        }
+
+        unsafe extern "C" fn clear_attachments(
+            _cb: VkCommandBuffer,
+            attachments: u32,
+            _pa: *const VkClearAttachment,
+            rects: u32,
+            _pr: *const VkClearRect,
+        ) {
+            SAW.with_borrow_mut(|s| s.cleared_attachments.push((attachments, rects)));
+        }
+
+        unsafe extern "C" fn push(
+            _cb: VkCommandBuffer,
+            layout: VkPipelineLayout,
+            _stages: VkShaderStageFlags,
+            offset: u32,
+            size: u32,
+            values: *const core::ffi::c_void,
+        ) {
+            // SAFETY: the wrapper passes the slice's own pointer and its length in bytes.
+            let bytes = unsafe { core::slice::from_raw_parts(values.cast::<u8>(), size as usize) };
+            SAW.with_borrow_mut(|s| s.pushed.push((layout.0, offset, bytes.to_vec())));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdBlitImage(blit);
+        fns.plant_vkCmdClearColorImage(clear_color);
+        fns.plant_vkCmdClearAttachments(clear_attachments);
+        fns.plant_vkCmdPushConstants(push);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        let cb = VkCommandBuffer(CB.0);
+
+        // A counted array with a scalar behind it: the filter follows the pointer, so a wrapper
+        // that passes the count and pointer in the wrong order still compiles and lands here.
+        let regions = [VkImageBlit::default(); 2];
+        let mut args = vn_command_vkCmdBlitImage::default();
+        args.commandBuffer = cb;
+        args.srcImage = VkImage(0x11);
+        args.dstImage = VkImage(0x22);
+        args.filter = VkFilter::VK_FILTER_LINEAR;
+        args.plant_pRegions(&regions);
+        h.vkCmdBlitImage(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.blits,
+                [(0x11, 0x22, 2, VkFilter::VK_FILTER_LINEAR.0)],
+                "source, destination, both regions and the filter, none of them each other"
+            );
+        });
+
+        // A by-ref value beside a counted array. The colour is the whole point of the command,
+        // so it has to arrive as the guest set it and not as a default.
+        let color = VkClearColorValue { uint32: [0xabcd_ef01, 0, 0, 0] };
+        let ranges = [VkImageSubresourceRange { baseMipLevel: 4, ..Default::default() }];
+        let mut args = vn_command_vkCmdClearColorImage::default();
+        args.commandBuffer = cb;
+        args.image = VkImage(0x33);
+        args.pColor = Some(&color);
+        args.plant_pRanges(&ranges);
+        h.vkCmdClearColorImage(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(s.cleared_image, [(0x33, 0xabcd_ef01, 4)], "the guest's colour and range");
+        });
+
+        // Two arrays under two counts. Unequal on purpose: both counts are `u32` and the
+        // pointers differ only in type, so passing one where the other belongs compiles.
+        let attachments = [VkClearAttachment::default(); 2];
+        let rects = [VkClearRect::default(); 3];
+        let mut args = vn_command_vkCmdClearAttachments::default();
+        args.commandBuffer = cb;
+        args.plant_pAttachments(&attachments);
+        args.plant_pRects(&rects);
+        h.vkCmdClearAttachments(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(s.cleared_attachments, [(2, 3)], "each count with its own array");
+        });
+
+        // A blob measured by its own `size`, with a non-zero offset so a wrapper that passes the
+        // length where the offset goes cannot pass unnoticed.
+        let bytes = [0xde_u8, 0xad, 0xbe, 0xef, 0x11, 0x22];
+        let mut args = vn_command_vkCmdPushConstants::default();
+        args.commandBuffer = cb;
+        args.layout = VkPipelineLayout(0x44);
+        args.offset = 8;
+        args.plant_pValues(&bytes);
+        h.vkCmdPushConstants(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(s.pushed, [(0x44, 8, bytes.to_vec())], "the offset and every byte");
+        });
+
+        // A size with no bytes behind it. Pushing nothing would leave the layout holding whatever
+        // the last push left, and the next draw would read constants the guest never sent.
+        let mut args = vn_command_vkCmdPushConstants::default();
+        args.commandBuffer = cb;
+        args.size = 4;
+        h.vkCmdPushConstants(&mut args);
+        assert!(h.reject.is_some(), "a count with no blob behind it stops the ring");
+        SAW.with_borrow(|s| assert_eq!(s.pushed.len(), 1, "and pushes nothing"));
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
     }
 
