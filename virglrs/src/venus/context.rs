@@ -14,16 +14,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ids::{CtxId, RingId};
+use crate::ids::{CtxId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::ObjectId;
 use super::cs::{AllOfIt, Decoder, Encoder};
-use super::driver::{Driver, MemoryError, NoSyncFd};
+use super::driver::{self, Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags, VkObjectType, VkPhysicalDevice, VkResult,
+    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice, VkResult,
     vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
     vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
     vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
@@ -61,7 +62,7 @@ use super::proto::types::{
     vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements,
     vn_command_vkGetImageMemoryRequirements2, vn_command_vkGetImageSparseMemoryRequirements,
     vn_command_vkGetImageSparseMemoryRequirements2, vn_command_vkGetImageSubresourceLayout,
-    vn_command_vkGetImageSubresourceLayout2,
+    vn_command_vkGetImageSubresourceLayout2, vn_command_vkGetMemoryResourcePropertiesMESA,
     vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR,
     vn_command_vkGetPhysicalDeviceExternalBufferProperties,
     vn_command_vkGetPhysicalDeviceExternalFenceProperties,
@@ -1981,6 +1982,56 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    // ------------------------------------------------------ the MESA resource queries
+    //
+    // venus inventions rather than Vulkan, and the difference shows in what they name: a
+    // virtio-gpu resource id, not a Vulkan handle. The object table cannot resolve one -- it keys
+    // Vulkan objects -- so the id crosses into the resource table instead, and the two failures
+    // that live on the other side of that crossing are not the same failure.
+
+    fn vkGetMemoryResourcePropertiesMESA(
+        &mut self,
+        args: &mut vn_command_vkGetMemoryResourcePropertiesMESA<'_>,
+    ) {
+        let (device, resource) = (args.device, ResourceHandle(args.resourceId));
+        let Some(out) = self.fills(args.pMemoryResourceProperties_mut()) else { return };
+
+        // A resource id that names nothing is answered, never refused, and this is the one place
+        // in the query family where that is true. The C says why (vkr_device_memory.c:945): a
+        // dead id is a reachable runtime state -- a fire-and-forget CREATE_BLOB that failed --
+        // and it is the one thing here a guest can arrange from outside. Poisoning the ring for
+        // it aborts the whole guest process, because mesa's `vn_relax` aborts on the fatal bit.
+        //
+        // `shm` folds "no such resource" and "not host-addressable" into one answer, and folding
+        // them is right here: Vulkan has one error for both, and it is the same error.
+        let Some(map) = self.resources.shm(resource) else {
+            args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+        };
+
+        let bits = match self.driver.host_visible_memory_types(device) {
+            Ok(bits) => bits,
+            // A device this renderer has no table for is the other kind of failure: not the
+            // guest's state, ours. It goes back through the query family's refusal like every
+            // other query that could not be put at all.
+            Err(_) => {
+                self.reject = Some("asked a query this driver cannot answer");
+                return;
+            }
+        };
+
+        // The answer has to agree with what the allocation path will do with the same resource --
+        // see `Driver::host_visible_memory_types`. A guest reads this, intersects it with the
+        // image's own requirements, and hands the result straight back as a `memoryTypeIndex`.
+        out.memoryTypeBits = bits;
+        if let Some(size) =
+            driver::chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut out.pNext)
+        {
+            size.allocationSize = map.len() as u64;
+        }
+        args.ret = VkResult::VK_SUCCESS;
+    }
+
     // --------------------------------------------------------- the two-call enumerations
     //
     // Vulkan's count-then-fill idiom, eight commands of it. The guest calls once with a null
@@ -3891,6 +3942,207 @@ mod tests {
         let mut got = vec![0u8; want.len()];
         assert!(t.1.copy_out(WINDOW, &mut got));
         assert_eq!(got, want, "the driver's whole answer, in the guest's memory");
+    }
+
+    /// The one query that names a virtio-gpu resource rather than a Vulkan object, and the
+    /// promise it has to keep.
+    ///
+    /// The guest reads `memoryTypeBits`, intersects it with its image's own requirements, and
+    /// hands the result back as the `memoryTypeIndex` of a `vkAllocateMemory` that imports this
+    /// same resource. So this answer and that import are one statement made twice: report a type
+    /// the import will refuse and the guest binds nothing, report none and it binds nothing
+    /// either -- for a buffer that would have worked. Host-visible is what the import accepts,
+    /// so host-visible is what this says.
+    ///
+    /// Driven over the wire so the chained size struct is checked where it actually matters: the
+    /// reply encoder walks the guest's `pNext` for itself, so a handler that never found the
+    /// struct hands back a chain with a zero in it and no error anywhere.
+    #[test]
+    fn a_resource_the_guest_can_reach_reports_the_memory_it_can_bind() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkMemoryPropertyFlagBits, VkMemoryResourcePropertiesMESA,
+            VkStructureType,
+        };
+
+        const DEVICE: u64 = 3;
+        const GUEST_DEV: u64 = 0x5001;
+        const WINDOW: usize = 0x21000;
+        /// Host-visible on 1 and 3 and not on 0 and 2, so a handler that reports "all of them"
+        /// or reads the wrong bit cannot land on the same mask by accident.
+        const TYPES: [VkFlags; 4] = [
+            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32),
+            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32),
+            VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32),
+            VkFlags(
+                VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32
+                    | VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT.0 as u32,
+            ),
+        ];
+        const HOST_VISIBLE_MASK: u32 = 0b1010;
+
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+
+        let t = ring_table();
+        let mapped = t.1.len() as u64;
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkDeviceWaitIdle(idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        ctx.driver.plant_device(DEVICE, fns);
+        ctx.driver.plant_memory_types(DEVICE, &TYPES);
+        ctx.objects
+            .borrow_mut()
+            .add(ObjectId(GUEST_DEV), VkObjectType::VK_OBJECT_TYPE_DEVICE, DEVICE, None)
+            .expect("a fresh id");
+
+        /// The out-struct as the guest chains it: the base, and the size struct behind it.
+        fn asked() -> (VkMemoryResourcePropertiesMESA, VkMemoryResourceAllocationSizePropertiesMESA)
+        {
+            (
+                VkMemoryResourcePropertiesMESA {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+                    ..Default::default()
+                },
+                VkMemoryResourceAllocationSizePropertiesMESA {
+                    sType:
+                        VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA,
+                    ..Default::default()
+                },
+            )
+        }
+
+        let (mut props, mut size) = asked();
+        props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
+        let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
+        q.device = VkDevice(GUEST_DEV);
+        q.resourceId = RING_RES.0;
+        q.plant_pMemoryResourceProperties(&mut props);
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x200));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetMemoryResourcePropertiesMESA_args,
+            ser::vn_encode_vkGetMemoryResourcePropertiesMESA_args,
+            q,
+            GENERATE_REPLY
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a resource the guest owns is answered");
+
+        let (mut want_props, mut want_size) = asked();
+        want_props.memoryTypeBits = HOST_VISIBLE_MASK;
+        want_size.allocationSize = mapped;
+        want_props.pNext = (&mut want_size) as *mut _ as *mut core::ffi::c_void;
+        let mut expect = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
+        expect.ret = VkResult::VK_SUCCESS;
+        expect.plant_pMemoryResourceProperties(&mut want_props);
+        let want = reply!(
+            ser::vn_sizeof_vkGetMemoryResourcePropertiesMESA_reply,
+            ser::vn_encode_vkGetMemoryResourcePropertiesMESA_reply,
+            expect
+        );
+        let mut got = vec![0u8; want.len()];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, want, "the host-visible types, and the mapping's own size behind them");
+
+        // An id naming no resource is answered, not refused. The C is explicit about why
+        // (vkr_device_memory.c:945): a dead id is a reachable runtime state, and taking the ring
+        // down for it aborts the guest process.
+        let (mut props, mut size) = asked();
+        props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
+        let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
+        q.device = VkDevice(GUEST_DEV);
+        q.resourceId = RING_RES.0 + 1;
+        q.plant_pMemoryResourceProperties(&mut props);
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x200));
+        batch.extend_from_slice(&wire!(
+            ser::vn_sizeof_vkGetMemoryResourcePropertiesMESA_args,
+            ser::vn_encode_vkGetMemoryResourcePropertiesMESA_args,
+            q,
+            GENERATE_REPLY
+        ));
+        assert!(
+            ctx.submit(&batch, &mut todo, &g, &t),
+            "an id that names nothing keeps the ring alive"
+        );
+
+        let (mut want_props, mut want_size) = asked();
+        want_props.pNext = (&mut want_size) as *mut _ as *mut core::ffi::c_void;
+        let mut expect = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
+        expect.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        expect.plant_pMemoryResourceProperties(&mut want_props);
+        let want = reply!(
+            ser::vn_sizeof_vkGetMemoryResourcePropertiesMESA_reply,
+            ser::vn_encode_vkGetMemoryResourcePropertiesMESA_reply,
+            expect
+        );
+        let mut got = vec![0u8; want.len()];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, want, "the refusal, and nothing written into the struct behind it");
+    }
+
+    /// The other two ways this query can fail, and why only one of them is the guest's.
+    ///
+    /// No struct to answer into, and a device this renderer has no table for, are both *us*
+    /// unable to put the question -- the query family's refusal. An unknown resource id, tested
+    /// above, is the guest's own state and gets an answer. Keeping the two apart is the whole
+    /// point of the command being here rather than beside the ordinary queries.
+    #[test]
+    fn only_a_question_this_renderer_cannot_put_refuses() {
+        use super::super::proto::types::{
+            VkMemoryResourcePropertiesMESA, vn_command_vkGetMemoryResourcePropertiesMESA as Cmd,
+        };
+
+        const GUEST_DEV: u64 = 0x5001;
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let t = ring_table();
+
+        macro_rules! run {
+            ($args:expr) => {{
+                let mut rings = BTreeMap::new();
+                let mut ctx_reply = None;
+                let mut h = Handlers {
+                    objects: &objects,
+                    todo: &mut todo,
+                    driver: &mut driver,
+                    global: &global,
+                    reject: None,
+                    unserved: false,
+                    resources: &t,
+                    rings: &mut rings,
+                    replaying: false,
+                    current_ring: None,
+                    reply: &mut ctx_reply,
+                };
+                h.vkGetMemoryResourcePropertiesMESA($args);
+                h.reject
+            }};
+        }
+
+        let mut args = Cmd::default();
+        args.device = VkDevice(GUEST_DEV);
+        args.resourceId = RING_RES.0;
+        assert!(run!(&mut args).is_some(), "a query with nowhere to answer is refused");
+
+        // A live resource and nowhere to look up the device: the struct would go back untouched
+        // with VK_SUCCESS on it, which is the fiction this family exists to refuse.
+        let mut props = VkMemoryResourcePropertiesMESA::default();
+        let mut args = Cmd::default();
+        args.device = VkDevice(GUEST_DEV);
+        args.resourceId = RING_RES.0;
+        args.plant_pMemoryResourceProperties(&mut props);
+        assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
+        assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
     }
 
     /// The two-call idiom, in the half of it that has no way to say "there were more".

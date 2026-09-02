@@ -17,24 +17,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::cs::{Handle, ObjectId};
 use super::objects::Doomed;
 use super::proto::types::{
-    VkAllocationCallbacks, VkBaseInStructure, VkBool32, VkBuffer, VkBufferCopy, VkBufferImageCopy,
-    VkBufferMemoryBarrier, VkBufferView, VkCommandBuffer, VkCommandBufferBeginInfo,
-    VkCommandBufferResetFlags, VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags,
-    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
-    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
-    VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFlags, VkFormat,
-    VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout,
-    VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
-    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkObjectType,
-    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint,
-    VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D,
-    VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkShaderModule, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
-    VkWriteDescriptorSet,
+    VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
+    VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkCommandBuffer,
+    VkCommandBufferBeginInfo, VkCommandBufferResetFlags, VkCommandPool, VkCopyDescriptorSet,
+    VkDependencyFlags, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceSize, VkEvent, VkExtensionProperties, VkExternalSemaphoreHandleTypeFlagBits, VkFence,
+    VkFlags, VkFormat, VkFramebuffer, VkImage, VkImageCreateFlags, VkImageFormatProperties,
+    VkImageLayout, VkImageMemoryBarrier, VkImageTiling, VkImageType, VkImageUsageFlags,
+    VkImageView, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
+    VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion,
+    VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule,
+    VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport, VkWriteDescriptorSet,
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
+
+/// The one memory property this renderer decides anything by: whether the host can address it.
+const HOST_VISIBLE_BIT: u32 =
+    VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32;
 
 /// `VK_WHOLE_SIZE`: map an allocation from an offset to its end.
 const VK_WHOLE_SIZE: VkDeviceSize = VkDeviceSize(!0);
@@ -579,6 +583,29 @@ impl Driver {
     // commands this build advertises, where absence is our bug; a query is a path the guest
     // steers, and one guest asking for an extension this driver lacks must not take the worker
     // down with it.
+
+    /// The memory types a host pointer can be imported into, as Vulkan's own bitmask.
+    ///
+    /// Answered off the list taken once at [`Driver::create_device`] rather than by asking the
+    /// driver again: the properties cannot change under us, so a second reading would be a second
+    /// copy of one fact (CLAUDE.md), and a query that took an instance round trip per call would
+    /// pay it on a path a compositor walks every frame.
+    ///
+    /// This has to agree with what the allocation path actually does. A resource the guest can
+    /// reach through a host pointer is imported as `HOST_ALLOCATION_BIT_EXT`, which accepts the
+    /// host-visible types and no others -- so reporting anything wider hands the guest a memory
+    /// type the very next `vkAllocateMemory` will refuse, and anything narrower hands it zero
+    /// types for a buffer that binds perfectly well.
+    pub fn host_visible_memory_types(&self, device: VkDevice) -> Result<u32, VkResult> {
+        let d = self.devices.get(&device.0).ok_or(VkResult::VK_ERROR_DEVICE_LOST)?;
+        let mut bits = 0u32;
+        for (i, flags) in d.memory_types.iter().enumerate() {
+            if flags.0 & HOST_VISIBLE_BIT != 0 {
+                bits |= 1 << i;
+            }
+        }
+        Ok(bits)
+    }
 
     /// A physical-device query with nothing between the handle and the answer.
     pub fn pd_query<T, R>(
@@ -1351,6 +1378,14 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_device(&mut self, handle: u64, fns: DeviceFns) {
         self.devices.insert(handle, DeviceState { fns, memory_types: Vec::new() });
+    }
+
+    /// Give a planted device the memory types `vkCreateDevice` would have read off the driver.
+    /// Test scaffolding, separate from `plant_device` because most tests never look at them.
+    #[cfg(test)]
+    pub(super) fn plant_memory_types(&mut self, handle: u64, types: &[VkMemoryPropertyFlags]) {
+        let d = self.devices.get_mut(&handle).expect("a planted device");
+        d.memory_types = types.to_vec();
     }
 
     /// Record what a physical device supports, as `learn_extensions` would have off a real
@@ -2232,6 +2267,55 @@ fn pad_for_blob(size: u64, flags: Option<VkMemoryPropertyFlags>, imported: bool)
     size.checked_next_multiple_of(BLOB_ALIGN).unwrap_or(size)
 }
 
+/// A `pNext` struct nameable by its own `sType`.
+///
+/// The constant is on the type rather than beside it because the two must agree: a caller that
+/// passes the tag separately from the type it wants back is one typo away from reading a
+/// `VkMemoryResourceAllocationSizePropertiesMESA` out of whatever struct happened to carry a
+/// different tag. One value, on the type that is that value (CLAUDE.md).
+///
+/// # Safety
+///
+/// The implementor must be the exact struct venus-protocol decodes for `TYPE`, laid out as
+/// `repr(C)` with the `sType`/`pNext` header first -- that is what makes the cast in
+/// [`chained_mut`] sound.
+pub unsafe trait OutStruct {
+    const TYPE: VkStructureType;
+}
+
+/// The struct the guest chained onto an out-parameter, or `None` if it chained none.
+///
+/// A guest asking a query for more than the base struct says so by hanging a second struct off the
+/// answer's `pNext`, and this is how a handler reaches it: as a borrow, so `context.rs` stays free
+/// of unsafe. Safe to call for the reason stated at the top of this section -- every pointer these
+/// take is one the decoder allocated in the batch arena, which outlives the whole submission.
+///
+/// It takes the `pNext` field itself rather than the struct that holds it, which is what makes the
+/// borrow honest: the returned reference lives exactly as long as the exclusive borrow of the
+/// chain it was found in.
+pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&mut T> {
+    let mut node = (*head).cast::<VkBaseOutStructure>();
+    while !node.is_null() {
+        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
+        // of them begins with the `sType`/`pNext` header `VkBaseOutStructure` names.
+        let base = unsafe { &mut *node };
+        if base.sType == T::TYPE {
+            // SAFETY: the tag says this node is a `T`, and `OutStruct` is unsafe to implement
+            // precisely so that claim is the implementor's to uphold.
+            return Some(unsafe { &mut *node.cast::<T>() });
+        }
+        node = base.pNext;
+    }
+    None
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl OutStruct for VkMemoryResourceAllocationSizePropertiesMESA {
+    const TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA;
+}
+
 /// Whether an allocation's `pNext` chain imports another context's storage.
 ///
 /// Walked rather than asked of the guest, because the chain is where the guest put it.
@@ -2266,6 +2350,40 @@ fn read_names(names: &[*const std::ffi::c_char]) -> Vec<String> {
 mod tests {
     use super::super::proto::types::VkCommandPool;
     use super::*;
+
+    /// A guest chains what it wants onto an answer's `pNext`, in whatever order it likes, and
+    /// the struct a handler is after is rarely the first link. A walk that stops at the head
+    /// finds it exactly when the guest happened to put it there, which is not a contract.
+    #[test]
+    fn a_chained_struct_is_found_wherever_the_guest_hung_it() {
+        use super::super::proto::types::{VkBaseOutStructure, VkStructureType};
+
+        let mut want = VkMemoryResourceAllocationSizePropertiesMESA {
+            sType:
+                VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA,
+            ..Default::default()
+        };
+        // Two links the walk has to step over first, one of them carrying a tag that is not ours.
+        let mut second = VkBaseOutStructure {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+            pNext: (&mut want) as *mut _ as *mut VkBaseOutStructure,
+        };
+        let mut first = VkBaseOutStructure {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            pNext: (&mut second) as *mut _,
+        };
+        let mut head = (&mut first) as *mut _ as *mut core::ffi::c_void;
+
+        let found = chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head)
+            .expect("the third link is still on the chain");
+        found.allocationSize = 0x1234;
+        assert_eq!(want.allocationSize, 0x1234, "the borrow writes into the guest's own struct");
+
+        // And a chain without it says so, rather than handing back the nearest thing.
+        first.pNext = core::ptr::null_mut();
+        let mut head = (&mut first) as *mut _ as *mut core::ffi::c_void;
+        assert!(chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut head).is_none());
+    }
 
     const HOST_VISIBLE: VkMemoryPropertyFlags =
         VkFlags(VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32);
