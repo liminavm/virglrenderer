@@ -30,7 +30,7 @@
 #[path = "corpus.rs"]
 mod corpus;
 
-use std::cell::Cell;
+use std::sync::atomic::AtomicBool;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::process::ExitCode;
@@ -153,7 +153,7 @@ fn compare_within(wire: &[u8], slack: usize, tally: &mut Tally) -> bool {
     // Separate from the decoder's arena so a planted value can never be mistaken for one the
     // guest sent, in a debugger or in a leak.
     let fill_arena = Bump::new();
-    let hard = Cell::new(false);
+    let hard = AtomicBool::new(false);
     let mut dec = Decoder::new(wire, &temp, &IdentityObjects, &hard);
     let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
     let _flags = dec.decode_scalar::<VkFlags>();

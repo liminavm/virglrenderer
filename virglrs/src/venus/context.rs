@@ -10,8 +10,9 @@
 //! ends the loop.
 
 use bumpalo::Bump;
-use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::{CtxId, RingId};
 
@@ -71,7 +72,11 @@ pub struct Context {
     pub id: CtxId,
     /// The hard poison. It outlives any one command and any one submission: once the stream cannot
     /// be trusted, nothing later in it can be either.
-    fatal: Cell<bool>,
+    /// Shared rather than owned: a ring's thread poisons the context it belongs to when its
+    /// stream goes bad, and it must be able to do that without waiting for a lock -- the C's
+    /// `vkr_context_on_ring_fatal` is a plain `vkr_context_set_fatal` for the same reason. One
+    /// flag with many keys to it, never a copy per holder.
+    fatal: Arc<AtomicBool>,
     objects: Shared,
     /// The driver objects this context has stood up. Per context, because a context owns its
     /// instance tree and shares nothing with another guest.
@@ -110,7 +115,7 @@ impl Context {
     pub fn new(id: CtxId) -> Context {
         Context {
             id,
-            fatal: Cell::new(false),
+            fatal: Arc::new(AtomicBool::new(false)),
             objects: Shared::new(),
             driver: Driver::new(),
             replay: false,
@@ -122,7 +127,7 @@ impl Context {
     }
 
     pub fn fatal(&self) -> bool {
-        self.fatal.get()
+        self.fatal.load(Ordering::Acquire)
     }
 
     pub fn objects(&self) -> &Shared {
@@ -177,7 +182,7 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
-        if self.fatal.get() {
+        if self.fatal.load(Ordering::Acquire) {
             return false;
         }
 
@@ -246,7 +251,7 @@ impl Context {
                 poison(fatal, id, &dec, cmd, why);
             }
 
-            if fatal.get() {
+            if fatal.load(Ordering::Acquire) {
                 // The decoder poisoned itself inside the command: a malformed argument, or a
                 // shape the generator has no decoder for. Either way the command is what a
                 // reader needs, because without it a gap reaches a user as a hung guest.
@@ -258,7 +263,7 @@ impl Context {
         self.unhandled += unhandled;
         // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
         // success on the way out.
-        !self.fatal.get()
+        !self.fatal.load(Ordering::Acquire)
     }
 
     /// A submission that arrived on one ring's stream.
@@ -343,8 +348,8 @@ impl Drop for Context {
 ///
 /// Free-standing rather than a method because the dispatch loop has already lent the rest of the
 /// context to the handlers by the time it needs this.
-fn poison(fatal: &Cell<bool>, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
-    if !fatal.get() {
+fn poison(fatal: &AtomicBool, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
+    if !fatal.load(Ordering::Acquire) {
         let name = vn_command_name(cmd)
             .map(str::to_string)
             .unwrap_or_else(|| format!("command type {}", cmd.0));
@@ -3075,7 +3080,7 @@ mod tests {
 
         fn run(h: &mut Driver<'_>, objects: &Shared, wire: &[u8]) {
             let temp = Bump::new();
-            let hard = Cell::new(false);
+            let hard = AtomicBool::new(false);
             let mut dec = Decoder::new(wire, &temp, objects, &hard);
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let _flags = dec.decode_scalar::<VkFlags>();
@@ -3193,7 +3198,7 @@ mod tests {
         w.extend_from_slice(&DEVICE.to_le_bytes()); // the id the guest chose
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
@@ -3253,7 +3258,7 @@ mod tests {
         }
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
@@ -3321,7 +3326,7 @@ mod tests {
         w.extend_from_slice(&FENCE.to_le_bytes()); // the id the guest chose
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
@@ -3633,7 +3638,7 @@ mod tests {
 
         fn run(w: &[u8], objects: &Shared) -> (Option<usize>, bool) {
             let temp = Bump::new();
-            let hard = Cell::new(false);
+            let hard = AtomicBool::new(false);
             let mut dec = Decoder::new(w, &temp, objects, &hard);
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let _flags = dec.decode_scalar::<VkFlags>();
@@ -3846,7 +3851,7 @@ mod tests {
         w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
@@ -3987,7 +3992,7 @@ mod tests {
         w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
@@ -4060,7 +4065,7 @@ mod tests {
         w.extend_from_slice(&0u64.to_le_bytes()); // pAllocator: absent
 
         let temp = Bump::new();
-        let hard = Cell::new(false);
+        let hard = AtomicBool::new(false);
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();

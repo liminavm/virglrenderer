@@ -15,6 +15,7 @@
 //! stream rewrite the host's own progress counter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
@@ -236,6 +237,11 @@ pub struct Ring {
     /// Where answers to commands that arrived on *this* ring go. Per-ring and not per-context:
     /// see [`ReplyStream`].
     pub reply: Option<ReplyStream>,
+    /// How long the ring may go without work before it parks, as the guest asked at create time.
+    ///
+    /// The guest's number, kept because it is the guest's call: it knows its own cadence, and a
+    /// ring that parks too eagerly pays a doorbell round trip on the next submit.
+    pub idle_timeout: Duration,
 }
 
 impl Ring {
@@ -250,12 +256,22 @@ impl Ring {
         // would be checking the guest against itself.
         let map = resources.shm(handle).ok_or(RingError::NoResource(handle))?;
         let layout = RingLayout::parse(map.len(), info).map_err(RingError::Layout)?;
-        Ok(Ring { layout, map, reply: None })
+        Ok(Ring { layout, map, reply: None, idle_timeout: Duration::from_nanos(info.idleTimeout) })
     }
 
     /// How far the guest says it has written.
     pub fn tail(&self) -> u32 {
         self.map.load_u32(self.layout.tail.begin()).expect("a validated tail is inside the mapping")
+    }
+
+    /// The same, ordered against the status word the guest is reading.
+    ///
+    /// Only the park check may use this. See [`GuestMap::load_u32_seqcst`] for the race it closes;
+    /// everywhere else the acquire load is both correct and cheaper.
+    pub fn tail_seqcst(&self) -> u32 {
+        self.map
+            .load_u32_seqcst(self.layout.tail.begin())
+            .expect("a validated tail is inside the mapping")
     }
 
     /// How far the host has read. Written by us, read by the guest.
@@ -264,6 +280,51 @@ impl Ring {
             self.map.store_u32(self.layout.head.begin(), head),
             "a validated head is inside the mapping"
         );
+    }
+
+    /// Take back a status bit -- the ring is no longer idle.
+    pub fn unset_status_bits(&self, bits: u32) {
+        assert!(
+            self.map.fetch_and_u32(self.layout.status.begin(), !bits),
+            "a validated status word is inside the mapping"
+        );
+    }
+
+    /// Copy the `len` bytes at the free-running position `cur` into `out`.
+    ///
+    /// Returns whether `len` is a length this ring could hold. A `false` is the guest saying it
+    /// wrote more than fits in its own buffer, which means whatever is in there has already been
+    /// run over -- there is no batch to recover, only a ring to give up on.
+    ///
+    /// That bound lives here and nowhere else, and it is checked before `out` is grown: a length
+    /// arrives from the guest as a 32-bit count, so a caller that sized the buffer first would let
+    /// a guest ask the host for four gigabytes on the way to being told no.
+    ///
+    /// The buffer is a circle. `cur` counts commands forever and is masked to land inside it, so a
+    /// batch that runs off the end continues at the start; the size is a power of two -- the layout
+    /// refused anything else -- which is what makes the mask the whole of the arithmetic.
+    ///
+    /// Reading rather than advancing anything: the caller owns the position and moves it only once
+    /// the bytes have actually been dispatched. That is what lets a batch survive a dispatch that
+    /// could not get the lock it needed.
+    #[must_use]
+    pub fn read_batch(&self, cur: u32, len: u32, out: &mut Vec<u8>) -> bool {
+        let size = self.layout.buffer.size();
+        if len as usize > size {
+            return false;
+        }
+        out.clear();
+        out.resize(len as usize, 0);
+
+        let base = self.layout.buffer.begin();
+        let offset = (cur as usize) & (size - 1);
+        let to_end = size - offset;
+        if to_end < out.len() {
+            let (head, tail) = out.split_at_mut(to_end);
+            self.map.copy_out(base + offset, head) && self.map.copy_out(base, tail)
+        } else {
+            self.map.copy_out(base + offset, out)
+        }
     }
 
     /// Tell the guest something about the ring changed.
