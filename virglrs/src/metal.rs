@@ -317,6 +317,13 @@ mod tests {
         fn IOSurfaceLookup(id: u32) -> CfTypeRef;
     }
 
+    /// Held across every mint in this file. Ids recycle immediately -- the fact the module is
+    /// shaped around -- so a surface minted on another test thread can be handed the id the
+    /// lifetime test below has just dropped, and that test would then see its own dead id
+    /// resolve. The hazard is real and the serialization is the fix; a retry would only be
+    /// hiding it.
+    static MINT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Look a surface up the way another process would, and release what the lookup returns.
     ///
     /// Null is the answer for an id naming nothing -- which is the whole point of the test below.
@@ -341,6 +348,7 @@ mod tests {
     /// about what the *rest of the machine* can still reach.
     #[test]
     fn a_surface_is_reachable_by_id_only_while_it_is_alive() {
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
         let surface = Surface::scanout(64, 32, PixelFormat::Bgra, 64 * 4).expect("minted");
         let id = surface.id();
         assert!(id.0 != 0, "a global surface has an id");
@@ -361,6 +369,7 @@ mod tests {
         const HEIGHT: u32 = 64;
         const PITCH: u32 = 1968 * 4 + 256;
 
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
         let surface = Surface::scanout(WIDTH, HEIGHT, PixelFormat::Bgra, PITCH).expect("minted");
         assert_eq!(surface.bytes_per_row(), PITCH, "the rows are where the importer will look");
         assert!(
