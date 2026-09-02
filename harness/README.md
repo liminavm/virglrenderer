@@ -200,7 +200,13 @@ Before concluding anything from a hash, compute the all-zero FNV-1a for that rea
 and wrong are different findings and the score does not distinguish them: a refused command leaves
 memory no one wrote, and reads as a hash like any other. A scanout export that mints a surface
 nothing writes through scores exactly this way, and reports an empty surface as content — which is
-worse than reporting nothing.
+worse than reporting nothing. The lengths the corpora actually read:
+
+| bytes | all-zero FNV-1a | | bytes | all-zero FNV-1a |
+|---|---|---|---|---|
+| 65536 | `eb05052ea5b62325` | | 262144 | `9c735bed0a722325` |
+| 131072 | `c74b47c8c74a2325` | | 393216 | `156ad9514d9a2325` |
+| 196608 | `1a0564b2e8de2325` | | 1048576 | `a96777069d622325` |
 
 Two habits worth keeping. A count that reads zero is worth less than one that reads busy —
 `render_pass_starts=0` said neither replay rendered while the allocation-pool counters in the same
