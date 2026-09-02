@@ -27,8 +27,8 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use super::cs::{HostHandle, Lookup, ObjectId, Objects};
-use super::proto::types::VkObjectType;
+use super::cs::{Handle, HostHandle, Lookup, ObjectId, Objects};
+use super::proto::types::{VkDevice, VkObjectType};
 
 /// One live object: the host handle, and the Vulkan type the guest must name it by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,8 +143,10 @@ impl Arena {
         // the device, but a framebuffer three levels under an instance still needs the device
         // handle from further up. So the walk carries it down: passing a device sets it for
         // everything below, and everything else inherits what it was handed.
+        // The `ty` check is what makes the conversion honest: this is the one place that knows
+        // the handle is a device's, so it is the one place allowed to say so.
         let under = |o: &Object, inherited| match o.ty {
-            VkObjectType::VK_OBJECT_TYPE_DEVICE => Some(o.handle),
+            VkObjectType::VK_OBJECT_TYPE_DEVICE => Some(VkDevice::from_host(o.handle)),
             _ => inherited,
         };
         let mut taken =
@@ -233,7 +235,7 @@ pub struct Doomed {
     pub handle: HostHandle,
     /// `None` for the instance, its physical devices, and the devices themselves -- none of which
     /// is destroyed by a device's entry points.
-    pub device: Option<HostHandle>,
+    pub device: Option<VkDevice>,
 }
 
 #[derive(Default)]
@@ -332,12 +334,12 @@ impl Table {
     /// The same ancestry [`Arena::take_tree`] carries down as it destroys, asked without
     /// destroying anything -- so a caller that needs to know which device an object lives on has
     /// one answer to consult rather than a map of its own to keep in step.
-    pub fn device_of(&self, id: ObjectId) -> Option<HostHandle> {
+    pub fn device_of(&self, id: ObjectId) -> Option<VkDevice> {
         let mut at = self.slots.get(&id)?.key()?;
         loop {
             let o = self.arena.get(at)?;
             if o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE {
-                return Some(o.handle);
+                return Some(VkDevice::from_host(o.handle));
             }
             at = o.parent?;
         }
@@ -680,8 +682,8 @@ mod tests {
             [
                 (HostHandle(10), None),
                 (HostHandle(20), None),
-                (HostHandle(30), Some(HostHandle(20))),
-                (HostHandle(40), Some(HostHandle(20))),
+                (HostHandle(30), Some(VkDevice(20))),
+                (HostHandle(40), Some(VkDevice(20))),
             ]
         );
     }

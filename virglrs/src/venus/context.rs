@@ -23,13 +23,13 @@ use super::driver::{self, Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice, VkResult,
-    vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
-    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
-    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
+    VkCommandTypeEXT, VkDeviceMemory, VkFlags, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkObjectType, VkPhysicalDevice, VkResult, vn_command_vkAllocateCommandBuffers,
+    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
+    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
+    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
+    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
     vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
@@ -516,7 +516,7 @@ impl Context {
             .map(|o| VkDeviceMemory::from_host(o.handle))
             .ok_or(MemoryError::NoSuchAllocation)?;
         let device = objects.device_of(id).ok_or(MemoryError::NoSuchAllocation)?;
-        self.driver.memory_read(VkDevice::from_host(device), handle, id, buf)
+        self.driver.memory_read(device, handle, id, buf)
     }
 }
 
@@ -628,15 +628,15 @@ impl Handlers<'_> {
         what: &str,
         out: Option<&T>,
         shadow: Option<&mut T>,
-        host: Result<HostHandle, VkResult>,
+        host: Result<T, VkResult>,
     ) {
         let Some(id) = self.out_id(out) else {
             return;
         };
         match host {
-            Ok(h) if h.0 != 0 => {
+            Ok(h) if h.host().0 != 0 => {
                 if let Some(shadow) = shadow {
-                    *shadow = T::from_host(h);
+                    *shadow = h;
                 }
             }
             Err(r) => {
@@ -929,12 +929,7 @@ impl Commands for Handlers<'_> {
         let Some(info) = self.names(args.pCreateInfo) else { return };
         let host = self.driver.create_instance(self.global, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant(
-            "vkCreateInstance",
-            args.pInstance(),
-            args.handle_pInstance_mut(),
-            host.map(|h| h.host()),
-        );
+        self.plant("vkCreateInstance", args.pInstance(), args.handle_pInstance_mut(), host);
     }
 
     fn vkDestroyInstance(&mut self, args: &mut vn_command_vkDestroyInstance<'_>) {
@@ -994,12 +989,7 @@ impl Commands for Handlers<'_> {
         let Some(info) = self.names(args.pCreateInfo) else { return };
         let host = self.driver.create_device(args.physicalDevice, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant(
-            "vkCreateDevice",
-            args.pDevice(),
-            args.handle_pDevice_mut(),
-            host.map(|h| h.host()),
-        );
+        self.plant("vkCreateDevice", args.pDevice(), args.handle_pDevice_mut(), host);
     }
 
     fn vkDestroyDevice(&mut self, args: &mut vn_command_vkDestroyDevice<'_>) {
@@ -1025,12 +1015,7 @@ impl Commands for Handlers<'_> {
         let Some(info) = self.names(args.pAllocateInfo) else { return };
         let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator);
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
-        self.plant(
-            "vkAllocateMemory",
-            args.pMemory(),
-            args.handle_pMemory_mut(),
-            host.map(|m| m.host()),
-        );
+        self.plant("vkAllocateMemory", args.pMemory(), args.handle_pMemory_mut(), host);
     }
 
     fn vkFreeMemory(&mut self, args: &mut vn_command_vkFreeMemory<'_>) {
@@ -1198,7 +1183,7 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
         let Some(info) = self.names(args.pAllocateInfo) else { return };
-        let pool = info.commandPool.host();
+        let pool = info.commandPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.guest_id()).collect();
@@ -1233,7 +1218,7 @@ impl Commands for Handlers<'_> {
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
         let Some(info) = self.names(args.pAllocateInfo) else { return };
-        let pool = info.descriptorPool.host();
+        let pool = info.descriptorPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.guest_id()).collect();
@@ -1263,7 +1248,7 @@ impl Commands for Handlers<'_> {
             "vkGetDeviceQueue2",
             args.pQueue(),
             args.handle_pQueue_mut(),
-            host.map(|q| q.host()).ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
+            host.ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED),
         );
     }
 
@@ -2850,7 +2835,7 @@ mod tests {
     }
 
     use super::super::proto::types::{
-        VkImageAspectFlags, VkImageCreateFlags, VkImageUsageFlags, VkMemoryPropertyFlags,
+        VkDevice, VkImageAspectFlags, VkImageCreateFlags, VkImageUsageFlags, VkMemoryPropertyFlags,
         VkSemaphoreWaitFlags, VkToolPurposeFlags,
     };
     use super::*;
@@ -3363,7 +3348,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE), fns);
+        driver.plant_device(VkDevice(DEVICE), fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -3472,7 +3457,7 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(wait_idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(HostHandle(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice(DEVICE), fns);
         ctx.objects
             .borrow_mut()
             .add(ObjectId(GUEST_ID), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
@@ -3645,7 +3630,7 @@ mod tests {
         fns.plant_vkSignalSemaphore(signal);
         fns.plant_vkGetSemaphoreCounterValue(counter);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(HostHandle(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice(DEVICE), fns);
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -3920,7 +3905,7 @@ mod tests {
         fns.plant_vkGetImageSubresourceLayout2(layout);
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(HostHandle(DEVICE), fns);
+        ctx.driver.plant_device(VkDevice(DEVICE), fns);
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -4036,8 +4021,8 @@ mod tests {
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
         fns.plant_vkDestroyDevice(destroy_device);
-        ctx.driver.plant_device(HostHandle(DEVICE), fns);
-        ctx.driver.plant_memory_types(HostHandle(DEVICE), &TYPES);
+        ctx.driver.plant_device(VkDevice(DEVICE), fns);
+        ctx.driver.plant_memory_types(VkDevice(DEVICE), &TYPES);
         ctx.objects
             .borrow_mut()
             .add(ObjectId(GUEST_DEV), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
@@ -4816,7 +4801,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE), fns);
+        driver.plant_device(VkDevice(DEVICE), fns);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -6205,7 +6190,7 @@ mod tests {
 
         // A device whose table has no `VK_EXT_image_drm_format_modifier` in it.
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE.0), crate::vulkan::Device::default());
+        driver.plant_device(DEVICE, crate::vulkan::Device::default());
 
         let mut props = VkImageDrmFormatModifierPropertiesEXT::default();
         let mut args = vn_command_vkGetImageDrmFormatModifierPropertiesEXT::default();
@@ -7008,7 +6993,7 @@ mod tests {
     fn a_destroyed_pool_takes_its_command_buffers_out_of_the_object_table() {
         use super::super::cs::{Lookup, Objects};
         use super::super::proto::types::{
-            VkCommandPool, VkDevice, vn_command_vkDestroyCommandPool,
+            VkCommandBuffer, VkCommandPool, VkDevice, vn_command_vkDestroyCommandPool,
         };
 
         const DEVICE: u64 = 3;
@@ -7026,9 +7011,9 @@ mod tests {
             }
         }
         driver.plant_pool(
-            HostHandle(DEVICE),
-            HostHandle(POOL),
-            &BUFFERS.map(|(host, id)| (HostHandle(host), ObjectId(id))),
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &BUFFERS.map(|(host, id)| (VkCommandBuffer(host), ObjectId(id))),
         );
         assert_eq!(
             objects.lookup(ObjectId(BUFFERS[0].1), COMMAND_BUFFER.0),
@@ -7138,7 +7123,7 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE), fns);
+        driver.plant_device(VkDevice(DEVICE), fns);
         {
             let mut t = objects.borrow_mut();
             t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
@@ -7247,7 +7232,7 @@ mod tests {
         fns.plant_vkDestroyDevice(device);
 
         let mut ctx = Context::new(CtxId::new(7).expect("7 is not zero"));
-        ctx.driver_mut().plant_device(HostHandle(DEVICE), fns);
+        ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
         {
             let mut t = ctx.objects().borrow_mut();
             t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
@@ -7455,8 +7440,8 @@ mod tests {
     fn a_recording_handler_hands_the_driver_what_the_guest_sent() {
         use super::super::proto::types::{
             VkBuffer, VkBufferMemoryBarrier, VkCommandBuffer, VkCommandBufferBeginInfo,
-            VkDependencyFlags, VkDeviceSize, VkImageMemoryBarrier, VkMemoryBarrier,
-            VkPipelineStageFlags, VkViewport, vn_command_vkBeginCommandBuffer,
+            VkCommandPool, VkDependencyFlags, VkDevice, VkDeviceSize, VkImageMemoryBarrier,
+            VkMemoryBarrier, VkPipelineStageFlags, VkViewport, vn_command_vkBeginCommandBuffer,
             vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdPipelineBarrier,
             vn_command_vkCmdSetViewport,
         };
@@ -7544,11 +7529,11 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE), fns);
+        driver.plant_device(VkDevice(DEVICE), fns);
         driver.plant_pool(
-            HostHandle(DEVICE),
-            HostHandle(POOL),
-            &[(HostHandle(CB.0), ObjectId(CB.1))],
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
         );
 
         let mut todo = Unimplemented::default();
@@ -7726,8 +7711,8 @@ mod tests {
 
         let objects = Shared::new();
         let mut driver = Driver::new();
-        driver.plant_device(HostHandle(DEVICE), fns);
-        driver.plant_queue(HostHandle(DEVICE), HostHandle(QUEUE));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
 
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
@@ -7832,7 +7817,7 @@ mod tests {
         // commands a guest reaches an extension through, the predicate is what stands between a
         // driver we cannot serve on and a guest that can kill the process by asking.
         const BARE: u64 = 8;
-        h.driver.plant_device(HostHandle(BARE), crate::vulkan::Device::default());
+        h.driver.plant_device(VkDevice(BARE), crate::vulkan::Device::default());
         let info =
             VkImportSemaphoreResourceInfoMESA { semaphore: VkSemaphore(5), ..Default::default() };
         let mut args = vn_command_vkImportSemaphoreResourceMESA {
