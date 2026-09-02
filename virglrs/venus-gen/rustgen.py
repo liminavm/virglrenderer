@@ -1731,6 +1731,38 @@ class RustGen:
                 rows.append((f, rs.split(' ', 1)[1], shape[1], mutable))
         return rows
 
+    def infallible_arrays(self, ty):
+        """The array members whose accessor cannot hand back `None`, by field name.
+
+        An array vk.xml neither marks `optional` nor exempts from validation is decoded through
+        the checked `decode_array_size` on both branches, so a count the guest sent no array for
+        poisons the stream -- and the generated dispatch returns on `dec.fatal()` before the
+        handler is called. An empty array is not that case: `cs::wire_array` reconciles a null
+        pointer with a zero count into an empty slice. Between them there is no input that reaches
+        one of these accessors and yields `None`, so it does not offer one.
+
+        The two exceptions keep theirs, because for them `None` says something. An `optional`
+        array is one the guest may leave out on purpose -- the enumerations' "how many are
+        there?" -- and a `noautovalidity` array is deliberately not size-checked, so a genuinely
+        split pair can arrive and the handler has to rule on it.
+        """
+        out = set()
+        for var in ty.variables:
+            try:
+                shape = self._shape(ty, var)
+            except self.Unsupported:
+                continue
+            if shape[0] != 'dynamic' or var.is_optional() or not var.can_validate():
+                continue
+            out.add(self.field_name(var.name))
+        return out
+
+    #: What a validated array's accessor says when the state it cannot be in happens anyway.
+    #: Not a guest's doing -- the decoder refuses a split pair and dispatch stops on it, so
+    #: reaching here means a host invariant broke. See `infallible_arrays`.
+    EXPECT = ('\n            .expect("a split pair poisons the decode, and dispatch '
+              'refuses a poisoned command")')
+
     def _command_accessors(self, ty, gaps):
         """The arrays a command carries, as slices, on the struct that carries them.
 
@@ -1745,7 +1777,9 @@ class RustGen:
         a longer one than the arena has. The shadow arrays go the other way -- `&mut` borrowed
         from the struct -- so no two callers can hold one at once.
 
-        What `None` means is deliberately not decided here. See `cs::wire_array`.
+        Where `None` is still possible, what it means is deliberately not decided here -- see
+        `cs::wire_array`. Where it is not, the accessor does not offer one: see
+        `infallible_arrays`.
         """
         rows = self._array_rows(ty)
         scalars = self.scalar_rows(ty)
@@ -1754,11 +1788,19 @@ class RustGen:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
         out_handles = self.out_handle_fields(ty)
+        infallible = self.infallible_arrays(ty)
         for f, elem, count, mutable in rows:
             # As in `_scalar_accessor`: a create's out-array carries the guest's ids.
             read = 'cs::Guest<%s>' % elem if f in out_handles else elem
-            sig = ('pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem) if mutable
-                   else "pub fn %s(&self) -> Option<&'a [%s]>" % (f, read))
+            # Only the read side: a shadow is allocated from the same count, but it is the wire
+            # member the decoder validated and the two are separate members.
+            sure = not mutable and f in infallible
+            if mutable:
+                sig = 'pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem)
+            elif sure:
+                sig = "pub fn %s(&self) -> &'a [%s]" % (f, read)
+            else:
+                sig = "pub fn %s(&self) -> Option<&'a [%s]>" % (f, read)
             call = 'wire_array_mut' if mutable else 'wire_array'
             # The count expression is the decode's, which counts in `u64` because that is what the
             # wire holds. A slice is indexed in `usize`, and one cast says so once.
@@ -1781,7 +1823,8 @@ class RustGen:
                     '        // SAFETY: the decoder allocated this member from the batch arena,',
                     "        // sized to that count, and the arena outlives the struct's `'a`.",
                     '        unsafe { cs::%s((%s) as usize, val.%s as *%s _) }'
-                    % (call, n, f, 'mut' if mutable else 'const'),
+                    % (call, n, f, 'mut' if mutable else 'const')
+                    + ('' if not sure else self.EXPECT),
                     '    }',
                     '']
             out += self._planter(ty, f, elem, count, mutable)

@@ -734,7 +734,9 @@ impl Handlers<'_> {
     ///
     /// Exactly the arrays vk.xml marks `noautovalidity` -- `vkFreeCommandBuffers`,
     /// `vkFreeDescriptorSets` -- where the decoder deliberately does not check the size, so the
-    /// pair can genuinely arrive apart. Freeing "three, list not supplied" identifies nothing to
+    /// pair can genuinely arrive apart. Nothing else can be passed here: an array the decoder
+    /// does check hands back a slice rather than an `Option`, because a split one poisons the
+    /// stream and dispatch drops the command before a handler sees it. Freeing "three, list not supplied" identifies nothing to
     /// free, which is not the same as claiming work was done: there is no work to claim. Poisoning
     /// a ring over it would cost the guest everything to punish a request that asked for nothing.
     fn array_or_empty<'w, T>(&mut self, a: Option<&'w [T]>) -> &'w [T] {
@@ -1179,7 +1181,7 @@ impl Commands for Handlers<'_> {
     fn vkAllocateCommandBuffers(&mut self, args: &mut vn_command_vkAllocateCommandBuffers<'_>) {
         // The count inside the create-info is what sized both arrays, and the wire's own size
         // was checked against it -- which is the count both accessors below read.
-        let Some(ids) = self.array(args.pCommandBuffers()) else { return };
+        let ids = args.pCommandBuffers();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
         let Some(info) = self.names(args.pAllocateInfo) else { return };
@@ -1214,7 +1216,7 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
-        let Some(ids) = self.array(args.pDescriptorSets()) else { return };
+        let ids = args.pDescriptorSets();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let device = args.device;
         let Some(info) = self.names(args.pAllocateInfo) else { return };
@@ -2337,10 +2339,8 @@ impl Commands for Handlers<'_> {
     // is the all-or-nothing the guest sees.
 
     fn vkCreateGraphicsPipelines(&mut self, args: &mut vn_command_vkCreateGraphicsPipelines<'_>) {
-        let Some(infos) = self.array(args.pCreateInfos()) else { return };
-        let Some(ids) = self.array(args.pPipelines()) else {
-            return;
-        };
+        let infos = args.pCreateInfos();
+        let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
         let Some(out) = self.array(args.handle_pPipelines_mut()) else {
@@ -2374,12 +2374,12 @@ impl Commands for Handlers<'_> {
     // undefined behaviour at draw time, not errors the driver reports.
 
     fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2<'_>) {
-        let Some(infos) = self.array(args.pBindInfos()) else { return };
+        let infos = args.pBindInfos();
         args.ret = self.driver.counted_op(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
     fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2<'_>) {
-        let Some(infos) = self.array(args.pBindInfos()) else { return };
+        let infos = args.pBindInfos();
         args.ret = self.driver.counted_op(args.device, |d| d.vkBindImageMemory2(), infos);
     }
 
@@ -2409,7 +2409,7 @@ impl Commands for Handlers<'_> {
     /// guest is entitled to call them and a guest that does is not wrong. Serving them costs a
     /// forwarded call; refusing them would stop a ring over a command that has nothing to fail.
     fn vkFlushMappedMemoryRanges(&mut self, args: &mut vn_command_vkFlushMappedMemoryRanges<'_>) {
-        let Some(ranges) = self.array(args.pMemoryRanges()) else { return };
+        let ranges = args.pMemoryRanges();
         args.ret = self.driver.counted_op(args.device, |d| d.vkFlushMappedMemoryRanges(), ranges);
     }
 
@@ -2417,18 +2417,14 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkInvalidateMappedMemoryRanges<'_>,
     ) {
-        let Some(ranges) = self.array(args.pMemoryRanges()) else { return };
+        let ranges = args.pMemoryRanges();
         args.ret =
             self.driver.counted_op(args.device, |d| d.vkInvalidateMappedMemoryRanges(), ranges);
     }
 
     fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets<'_>) {
-        let Some(writes) = self.array(args.pDescriptorWrites()) else {
-            return;
-        };
-        let Some(copies) = self.array(args.pDescriptorCopies()) else {
-            return;
-        };
+        let writes = args.pDescriptorWrites();
+        let copies = args.pDescriptorCopies();
         self.driver.update_descriptor_sets(args.device, writes, copies);
     }
 
@@ -2468,9 +2464,9 @@ impl Commands for Handlers<'_> {
     fn vkCmdPipelineBarrier(&mut self, args: &mut vn_command_vkCmdPipelineBarrier<'_>) {
         // Three independent arrays, each optional: a barrier may name memory, buffers, images,
         // or any mix. An absent one is the guest barring nothing of that kind, not a violation.
-        let memory = self.array_or_empty(args.pMemoryBarriers());
-        let buffers = self.array_or_empty(args.pBufferMemoryBarriers());
-        let images = self.array_or_empty(args.pImageMemoryBarriers());
+        let memory = args.pMemoryBarriers();
+        let buffers = args.pBufferMemoryBarriers();
+        let images = args.pImageMemoryBarriers();
         let done = self.driver.cmd_pipeline_barrier(
             args.commandBuffer,
             args.srcStageMask,
@@ -2507,8 +2503,8 @@ impl Commands for Handlers<'_> {
         // The sets are what the command is for, so counting some and sending none is a violation.
         // The dynamic offsets are their own array with their own count, and a pipeline layout
         // with no dynamic descriptors legitimately binds none.
-        let Some(sets) = self.array(args.pDescriptorSets()) else { return };
-        let offsets = self.array_or_empty(args.pDynamicOffsets());
+        let sets = args.pDescriptorSets();
+        let offsets = args.pDynamicOffsets();
         let done = self.driver.cmd_bind_descriptor_sets(
             args.commandBuffer,
             args.pipelineBindPoint,
@@ -2532,13 +2528,13 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
-        let Some(viewports) = self.array(args.pViewports()) else { return };
+        let viewports = args.pViewports();
         let done = self.driver.cmd_set_viewport(args.commandBuffer, args.firstViewport, viewports);
         self.recorded(done);
     }
 
     fn vkCmdSetScissor(&mut self, args: &mut vn_command_vkCmdSetScissor<'_>) {
-        let Some(scissors) = self.array(args.pScissors()) else { return };
+        let scissors = args.pScissors();
         let done = self.driver.cmd_set_scissor(args.commandBuffer, args.firstScissor, scissors);
         self.recorded(done);
     }
@@ -2546,8 +2542,8 @@ impl Commands for Handlers<'_> {
     fn vkCmdBindVertexBuffers(&mut self, args: &mut vn_command_vkCmdBindVertexBuffers<'_>) {
         // One count, two arrays. Both accessors read that same count, so the two slices are the
         // same length by construction -- the driver asserts it rather than trusting the pair.
-        let Some(buffers) = self.array(args.pBuffers()) else { return };
-        let Some(offsets) = self.array(args.pOffsets()) else { return };
+        let buffers = args.pBuffers();
+        let offsets = args.pOffsets();
         let done = self.driver.cmd_bind_vertex_buffers(
             args.commandBuffer,
             args.firstBinding,
@@ -2569,7 +2565,7 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCmdCopyBuffer(&mut self, args: &mut vn_command_vkCmdCopyBuffer<'_>) {
-        let Some(regions) = self.array(args.pRegions()) else { return };
+        let regions = args.pRegions();
         let done = self.driver.cmd_copy_buffer(
             args.commandBuffer,
             args.srcBuffer,
@@ -2580,7 +2576,7 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkCmdCopyBufferToImage(&mut self, args: &mut vn_command_vkCmdCopyBufferToImage<'_>) {
-        let Some(regions) = self.array(args.pRegions()) else { return };
+        let regions = args.pRegions();
         let done = self.driver.cmd_copy_buffer_to_image(
             args.commandBuffer,
             args.srcBuffer,
@@ -2600,7 +2596,7 @@ impl Commands for Handlers<'_> {
     fn vkQueueSubmit(&mut self, args: &mut vn_command_vkQueueSubmit<'_>) {
         // Submitting nothing is legal -- it is how a guest signals a fence with no work -- so the
         // empty slice goes through rather than being turned away.
-        let submits = self.array_or_empty(args.pSubmits());
+        let submits = args.pSubmits();
         let Some(ret) = self.driver.queue_submit(args.queue, submits, args.fence) else {
             self.reject = Some("submitted to a queue with no device behind it");
             return;
@@ -2609,14 +2605,14 @@ impl Commands for Handlers<'_> {
     }
 
     fn vkResetFences(&mut self, args: &mut vn_command_vkResetFences<'_>) {
-        let Some(fences) = self.array(args.pFences()) else { return };
+        let fences = args.pFences();
         args.ret = self.driver.reset_fences(args.device, fences);
     }
 
     /// Blocks the caller for as long as the guest asked, up to forever. That is the guest's own
     /// thread being spent on the guest's own wait; answering early would be answering wrongly.
     fn vkWaitForFences(&mut self, args: &mut vn_command_vkWaitForFences<'_>) {
-        let Some(fences) = self.array(args.pFences()) else { return };
+        let fences = args.pFences();
         args.ret = self.driver.wait_for_fences(args.device, fences, args.waitAll, args.timeout);
     }
 
@@ -6703,7 +6699,7 @@ mod tests {
         });
         let mut args = vn_command_vkBindBufferMemory2::default();
         args.plant_pBindInfos(&infos);
-        let got = args.pBindInfos().expect("three counted, three sent");
+        let got = args.pBindInfos();
         assert_eq!(
             got.iter().map(|i| i.memoryOffset.0).collect::<Vec<_>>(),
             [100, 101, 102],
@@ -6714,55 +6710,95 @@ mod tests {
         // which is a legal thing to ask for and a different answer from a broken pair.
         let mut args = vn_command_vkBindBufferMemory2::default();
         args.plant_pBindInfos(&infos[..0]);
-        assert_eq!(args.pBindInfos().map(<[_]>::len), Some(0));
+        assert_eq!(args.pBindInfos().len(), 0);
     }
 
+    /// A count with no array behind it never reaches a handler.
+    ///
+    /// The pair is reconciled where the truth is: `decode_array_size` checks the wire's own size
+    /// against the count the command already gave, and the generated dispatch drops a command
+    /// whose decode poisoned. That is what lets a validated array's accessor hand back a slice
+    /// rather than an `Option` -- if this refusal ever stopped happening, the accessor would be
+    /// describing a state it can no longer rule out, and would panic instead of poisoning.
+    ///
+    /// `vkCmdSetViewport` stands in for the validated class, as `vkFreeCommandBuffers` does above
+    /// for the `noautovalidity` one whose absent-array size is deliberately left unchecked.
     #[test]
-    fn an_array_the_guest_counted_but_did_not_send_is_refused() {
-        use super::super::proto::types::{VkBindBufferMemoryInfo, vn_command_vkBindBufferMemory2};
+    fn an_array_the_guest_counted_but_did_not_send_never_reaches_a_handler() {
+        use super::super::proto::types::vn_command_vkCmdSetViewport;
+
+        const DEVICE: u64 = 9;
+        const BUFFER: u64 = 11;
+        /// Six `f32`, each a four-byte scalar on the wire.
+        const VIEWPORT: usize = 24;
+
+        #[derive(Default)]
+        struct Recorder {
+            saw: Option<usize>,
+        }
+        impl Commands for Recorder {
+            fn unsupported(&mut self, _cmd: VkCommandTypeEXT) {}
+
+            fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
+                self.saw = Some(args.pViewports().len());
+            }
+
+            fn object_created(
+                &mut self,
+                _ty: VkObjectType,
+                _id: ObjectId,
+                _host: HostHandle,
+                _owner: Option<ObjectId>,
+            ) {
+            }
+            fn object_destroyed(&mut self, _ty: VkObjectType, _id: ObjectId) {}
+        }
+
+        /// The wire for a command setting `sent` viewports that claims to be setting `counted`.
+        fn wire(counted: u32, sent: usize) -> Vec<u8> {
+            let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdSetViewport_EXT, 0);
+            w.extend_from_slice(&BUFFER.to_le_bytes());
+            w.extend_from_slice(&0u32.to_le_bytes()); // firstViewport
+            w.extend_from_slice(&counted.to_le_bytes());
+            w.extend_from_slice(&(sent as u64).to_le_bytes());
+            w.resize(w.len() + sent * VIEWPORT, 0);
+            w
+        }
+
+        fn run(w: &[u8], objects: &Shared) -> (Option<usize>, bool) {
+            let temp = Bump::new();
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(w, &temp, objects, &hard);
+            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+            let _flags = dec.decode_scalar::<VkFlags>();
+            let mut h = Recorder::default();
+            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+            (h.saw, dec.fatal())
+        }
 
         let objects = Shared::new();
-        let mut driver = Driver::new();
-        let mut todo = Unimplemented::default();
-        let global = crate::vulkan::global();
-        let mut rings = BTreeMap::new();
-        let mut ctx_reply = None;
-        let mut h = Handlers {
-            objects: &objects,
-            todo: &mut todo,
-            driver: &mut driver,
-            global: &global,
-            reject: None,
-            unserved: false,
-            resources: &NO_RESOURCES,
-            rings: &mut rings,
-            replaying: false,
-            current_ring: None,
-            reply: &mut ctx_reply,
-        };
+        {
+            let mut t = objects.borrow_mut();
+            t.add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(1), None)
+                .unwrap();
+            t.add(
+                ObjectId(BUFFER),
+                VkObjectType::VK_OBJECT_TYPE_COMMAND_BUFFER,
+                HostHandle(2),
+                Some(ObjectId(DEVICE)),
+            )
+            .unwrap();
+        }
 
-        // Counted without planting: the pointer stays null, which is the one shape the
-        // planter cannot build and the only one this handler is here to refuse.
-        let mut args = vn_command_vkBindBufferMemory2::default();
-        args.bindInfoCount = 3;
-        h.vkBindBufferMemory2(&mut args);
-        assert!(h.reject.is_some(), "three binds with no array behind them must not pass");
+        // Three counted, none sent: the one shape the accessor is no longer able to describe.
+        assert_eq!(run(&wire(3, 0), &objects), (None, true), "a split pair must not be dispatched");
 
-        // No array and nothing counted is the ordinary optional array, and binding nothing is a
-        // legal no-op -- a different answer from a protocol violation.
-        h.reject = None;
-        let mut args = vn_command_vkBindBufferMemory2::default();
-        h.vkBindBufferMemory2(&mut args);
-        assert!(h.reject.is_none(), "binding nothing is not a protocol violation");
+        // Nothing counted and nothing sent is legal, and must still reach the handler as an empty
+        // slice -- absence and emptiness are not the same answer.
+        assert_eq!(run(&wire(0, 0), &objects), (Some(0), false), "setting nothing is legal");
 
-        // An array that is there passes the guard; there is no device, so the driver refuses it,
-        // which is again not a protocol violation.
-        h.reject = None;
-        let info = VkBindBufferMemoryInfo::default();
-        let mut args = vn_command_vkBindBufferMemory2::default();
-        args.plant_pBindInfos(core::slice::from_ref(&info));
-        h.vkBindBufferMemory2(&mut args);
-        assert!(h.reject.is_none(), "an array the guest actually sent is not a violation");
+        // And a pair that agrees passes through with its length intact.
+        assert_eq!(run(&wire(2, 2), &objects), (Some(2), false), "an agreeing pair is dispatched");
     }
 
     /// A refused pipeline run ghosts every id in it, not just the first.
