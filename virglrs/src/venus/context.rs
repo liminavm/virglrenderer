@@ -19,7 +19,7 @@ use crate::ids::{CtxId, ResourceHandle, RingId};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
-use super::driver::{self, Driver, ExportError, MemoryError, NoSyncFd};
+use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
@@ -524,7 +524,7 @@ impl Context {
     ///
     /// Here for the reason [`Self::memory_read`] gives: the table owns the handle and the device,
     /// the driver owns the size and the mapping, and neither holds a copy of the other's answer.
-    pub fn memory_export(&mut self, id: ObjectId, blob_size: u64) -> Result<usize, ExportError> {
+    pub fn memory_export(&mut self, id: ObjectId, blob_size: u64) -> Result<Exported, ExportError> {
         let (handle, device) = {
             let objects = self.objects.borrow();
             let handle = objects

@@ -36,6 +36,12 @@ pub const BLOB_FD_TYPE_DMABUF: u32 = 0x0001;
 pub const BLOB_FD_TYPE_OPAQUE: u32 = 0x0002;
 pub const BLOB_FD_TYPE_SHM: u32 = 0x0003;
 
+/// `map_info` cache modes, from `virglrenderer.h`. `VIRGL_RENDERER_MAP_CACHE_NONE` is deliberately
+/// absent: it is the C's way of saying "there is nothing to map", which here is a refusal with a
+/// reason rather than a value the caller has to recognize.
+pub const MAP_CACHE_CACHED: u32 = 0x01;
+pub const MAP_CACHE_WC: u32 = 0x03;
+
 #[repr(C)]
 pub struct GlCtxParam {
     pub major_ver: c_int,

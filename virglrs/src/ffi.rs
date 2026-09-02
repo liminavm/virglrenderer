@@ -96,6 +96,7 @@ fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
         ResourceExists
+        | NoResource
         | ContextExists
         | NoContext
         | RendererAbsent
@@ -604,13 +605,35 @@ pub extern "C" fn virgl_renderer_resource_export_blob(
     todo_phase!("P2: blob export")
 }
 
+/// Where a blob resource lives, for the three ABI calls that each want part of the same answer.
+///
+/// One resolution, so a VMM that asks for the address, then the size, then the caching mode
+/// cannot be told about three different states of the same resource.
+fn host_mapping(res_handle: u32) -> Result<renderer::HostMapping, c_int> {
+    let handle = ResourceHandle::new(res_handle).ok_or(EINVAL)?;
+    with(Err(EINVAL), |r| r.resource_host_mapping(handle).map_err(errno))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_map(
-    _res_handle: u32,
-    _map: *mut *mut c_void,
-    _out_size: *mut u64,
+    res_handle: u32,
+    map: *mut *mut c_void,
+    out_size: *mut u64,
 ) -> c_int {
-    todo_phase!("P2: blob mapping")
+    if map.is_null() || out_size.is_null() {
+        return EINVAL;
+    }
+    let m = match host_mapping(res_handle) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    // SAFETY: both were checked non-null above, and the caller owns writable storage for each --
+    // this is the ABI's way of returning two values.
+    unsafe {
+        *map = m.addr as *mut c_void;
+        *out_size = m.size;
+    }
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -619,26 +642,52 @@ pub extern "C" fn virgl_renderer_resource_map_fixed(_res_handle: u32, _addr: *mu
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_resource_unmap(_res_handle: u32) -> c_int {
+pub extern "C" fn virgl_renderer_resource_unmap(res_handle: u32) -> c_int {
+    // Nothing to undo either way. A blob's mapping is owned by whatever minted it -- the shm the
+    // resource holds, or the `VkDeviceMemory` that was exported -- and is released when that is,
+    // so unmapping here would take the memory out from under a guest that still has the blob.
+    //
     // Called unconditionally at unref to balance an eager map, so "was never mapped" is the
     // ordinary case and must be a harmless error, never a failure the VMM reports.
-    EINVAL
+    match host_mapping(res_handle) {
+        Ok(_) => 0,
+        Err(_) => EINVAL,
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_get_map_info(
-    _res_handle: u32,
-    _map_info: *mut u32,
+    res_handle: u32,
+    map_info: *mut u32,
 ) -> c_int {
-    todo_phase!("P2: blob mapping")
+    if map_info.is_null() {
+        return EINVAL;
+    }
+    let m = match host_mapping(res_handle) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let info = match m.caching {
+        renderer::Caching::Cached => crate::abi::MAP_CACHE_CACHED,
+        renderer::Caching::WriteCombining => crate::abi::MAP_CACHE_WC,
+    };
+    // SAFETY: checked non-null above; the caller owns writable storage for one `u32`.
+    unsafe { *map_info = info };
+    0
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_resource_get_map_ptr(
-    _res_handle: u32,
-    _map_ptr: *mut u64,
-) -> c_int {
-    todo_phase!("P2: blob mapping")
+pub extern "C" fn virgl_renderer_resource_get_map_ptr(res_handle: u32, map_ptr: *mut u64) -> c_int {
+    if map_ptr.is_null() {
+        return EINVAL;
+    }
+    let m = match host_mapping(res_handle) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    // SAFETY: checked non-null above; the caller owns writable storage for one `u64`.
+    unsafe { *map_ptr = m.addr as u64 };
+    0
 }
 
 // ---------------------------------------------------------------- IOSurface

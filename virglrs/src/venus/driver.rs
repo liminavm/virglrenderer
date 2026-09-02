@@ -38,9 +38,14 @@ use super::proto::types::{
 };
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
-/// The one memory property this renderer decides anything by: whether the host can address it.
+/// The memory properties this renderer decides anything by: whether the host can address it at
+/// all, and whether its own caching of it is write-back -- which is what a guest needs to know to
+/// map it.
 const HOST_VISIBLE_BIT: u32 =
     VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT.0 as u32;
+const HOST_COHERENT_BIT: u32 =
+    VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT.0 as u32;
+const HOST_CACHED_BIT: u32 = VkMemoryPropertyFlagBits::VK_MEMORY_PROPERTY_HOST_CACHED_BIT.0 as u32;
 
 /// `VK_WHOLE_SIZE`: map an allocation from an offset to its end.
 const VK_WHOLE_SIZE: VkDeviceSize = VkDeviceSize(!0);
@@ -1442,18 +1447,27 @@ impl Driver {
         self.instance = Some(fns);
     }
 
-    /// Plant a live allocation. Host-visible, because every test that plants one either reads it
-    /// or exports it, and both need memory the host can address.
+    /// Plant a live allocation from a memory type with the given properties.
+    #[cfg(test)]
+    pub(super) fn plant_allocation_of(&mut self, id: ObjectId, size: u64, props: u32) {
+        self.memory.insert(
+            id,
+            Allocated { size, props: VkMemoryPropertyFlags(props as _), exported: None },
+        );
+    }
+
+    /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
+    /// host-visible types are, and what every test that reads or exports one needs.
     #[cfg(test)]
     pub(super) fn plant_allocation(&mut self, id: ObjectId, size: u64) {
-        self.memory.insert(id, Allocated { size, host_visible: true, exported: None });
+        self.plant_allocation_of(id, size, HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT);
     }
 
     /// The same, for memory the host cannot address -- the one case an export must refuse before
     /// it ever reaches the driver.
     #[cfg(test)]
     pub(super) fn plant_device_local_allocation(&mut self, id: ObjectId, size: u64) {
-        self.memory.insert(id, Allocated { size, host_visible: false, exported: None });
+        self.plant_allocation_of(id, size, 0);
     }
 
     /// Drop planted state without destroying it, for a test that stood a driver up by hand.
@@ -2268,9 +2282,12 @@ impl Driver {
         // A copy, not an edit in place: the decoder's struct is the guest's request, and the
         // round trip re-encodes it. The `pNext` chain is carried over untouched.
         let mut info = *info;
+        // Resolved once. The padding and the export both answer from the memory type's properties,
+        // and a second lookup is a second chance for them to disagree about what was allocated.
+        let props = d.memory_types.get(info.memoryTypeIndex as usize).copied();
         info.allocationSize = VkDeviceSize(pad_for_blob(
             info.allocationSize.0,
-            d.memory_types.get(info.memoryTypeIndex as usize).copied(),
+            props,
             imports_a_resource(info.pNext),
         ));
 
@@ -2282,12 +2299,11 @@ impl Driver {
             return Err(r);
         }
         assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
-        let host_visible = d
-            .memory_types
-            .get(info.memoryTypeIndex as usize)
-            .is_some_and(|f| f.0 & HOST_VISIBLE_BIT != 0);
-        self.memory
-            .insert(id, Allocated { size: info.allocationSize.0, host_visible, exported: None });
+        // A type index the device does not have is one `vkAllocateMemory` would have refused, so
+        // the fallback describes memory that cannot exist -- and describes it as addressable by
+        // nothing, which is the safe reading.
+        let props = props.unwrap_or(VkMemoryPropertyFlags(0));
+        self.memory.insert(id, Allocated { size: info.allocationSize.0, props, exported: None });
         Ok(out)
     }
 
@@ -2302,8 +2318,9 @@ impl Driver {
             return;
         };
         // An exported allocation is still mapped -- the export handed the VMM that address and
-        // left the mapping standing. Vulkan requires it be unmapped before the free, and the
-        // record that held it is already gone, so this is the last moment it can be done at all.
+        // left the mapping standing. `vkFreeMemory` would drop it implicitly, but the record that
+        // owns the mapping is being retired here, so releasing it here is what keeps the two the
+        // same act: nothing is left holding an address after the thing it named is gone.
         if was.is_some_and(|a| a.exported.is_some()) {
             // SAFETY: the mapping this driver made in `memory_export` and has not released, on the
             // device that owns it. The record is out of the map, so it cannot be unmapped twice.
@@ -2350,14 +2367,14 @@ impl Driver {
         handle: VkDeviceMemory,
         id: ObjectId,
         blob_size: u64,
-    ) -> Result<usize, ExportError> {
+    ) -> Result<Exported, ExportError> {
         let Some(record) = self.memory.get(&id) else {
             return Err(ExportError::NoSuchAllocation);
         };
         if record.exported.is_some() {
             return Err(ExportError::AlreadyExported);
         }
-        if !record.host_visible {
+        if !record.host_visible() {
             return Err(ExportError::NotHostVisible);
         }
         // The VMM publishes the *blob's* size from this address, not the allocation's, so a blob
@@ -2389,17 +2406,19 @@ impl Driver {
         let addr = ptr as usize;
         // Written back only now: until the map succeeds there is nothing to mark, and a mark
         // without an address is the disagreement `exported` exists to make impossible.
-        self.memory.get_mut(&id).expect("the record was here a moment ago").exported = Some(addr);
-        Ok(addr)
+        let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
+        record.exported = Some(addr);
+        Ok(Exported { addr, write_back: record.write_back() })
     }
 
-    /// The address an allocation was exported at, if it has been.
+    /// Where an allocation was exported to, if it has been.
     ///
     /// The VMM asks for this again after the create -- the C caches it on the resource, which is
     /// how a mapping outlives the memory it points into. Resolved through the live record instead,
     /// so memory the guest has freed has no address to give.
-    pub fn memory_exported_at(&self, id: ObjectId) -> Option<usize> {
-        self.memory.get(&id).and_then(|a| a.exported)
+    pub fn memory_exported_at(&self, id: ObjectId) -> Option<Exported> {
+        let a = self.memory.get(&id)?;
+        Some(Exported { addr: a.exported?, write_back: a.write_back() })
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -2455,12 +2474,12 @@ impl Driver {
 struct Allocated {
     /// Its size, padded to the blob the guest may map it as -- see [`pad_for_blob`].
     size: u64,
-    /// Whether the host can address it.
+    /// The properties of the memory type it was allocated from.
     ///
-    /// Recorded at the allocation, which is the only place the memory type is resolved. An export
-    /// has to refuse memory it cannot map, and refusing it with a reason of our own beats handing
-    /// back whatever the driver says when asked to map memory that was never mappable.
-    host_visible: bool,
+    /// The flags themselves rather than the questions asked of them: an export must refuse memory
+    /// the host cannot address, and the VMM must be told how the guest may cache it. Two answers
+    /// derived from one recorded fact cannot drift apart the way two recorded booleans can.
+    props: VkMemoryPropertyFlags,
     /// The host address `vkMapMemory` returned when this memory was exported as a blob.
     ///
     /// `Some` *is* the export mark: one value, not a flag beside an address that could disagree
@@ -2469,6 +2488,21 @@ struct Allocated {
     /// second place to remember to purge, and nothing can hand the VMM a pointer into memory the
     /// guest has freed.
     exported: Option<usize>,
+}
+
+impl Allocated {
+    /// Whether the host can address it -- what an export needs before it may map anything.
+    fn host_visible(&self) -> bool {
+        self.props.0 & HOST_VISIBLE_BIT != 0
+    }
+
+    /// Whether the host reads and writes it through a write-back cache that stays coherent
+    /// without explicit flushes. That is the one arrangement a guest may map cached; anything
+    /// else it must map write-combining, or see writes the host has not published.
+    fn write_back(&self) -> bool {
+        self.props.0 & (HOST_COHERENT_BIT | HOST_CACHED_BIT)
+            == (HOST_COHERENT_BIT | HOST_CACHED_BIT)
+    }
 }
 
 /// One live allocation, as the census reports it.
@@ -2493,6 +2527,20 @@ pub enum NoSyncFd {
     /// substitute: a semaphore whose payload cannot be moved is one the guest's next submit waits
     /// on forever, so saying so is better than pretending it worked.
     Unsupported,
+}
+
+/// An allocation the guest published as a blob, as the VMM has to see it: one address, and how
+/// the host's own caching of it constrains the guest's.
+///
+/// The two travel together because they are answered from the same record at the same moment. A
+/// VMM that fetched the address and then asked separately how to cache it could be told about a
+/// different allocation, or about one that had since been freed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Exported {
+    /// Where it lives in this process.
+    pub addr: usize,
+    /// See [`Allocated::write_back`].
+    pub write_back: bool,
 }
 
 /// Why an allocation could not be exported as a blob. Every one of these is the guest's doing.
@@ -2761,11 +2809,27 @@ mod tests {
         );
         MAPS.with_borrow(|n| assert_eq!(*n, 0, "not one of those reached the driver"));
 
-        // The export itself.
-        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok(ADDR));
+        // The export itself. Coherent and cached on the host, so the guest may map it cached.
+        let published = Exported { addr: ADDR, write_back: true };
+        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok(published));
         MAPS.with_borrow(|n| assert_eq!(*n, 1));
         UNMAPS.with_borrow(|n| assert_eq!(*n, 0, "the mapping is the VMM's now and stays up"));
-        assert_eq!(driver.memory_exported_at(MEM), Some(ADDR), "asked again, not remembered");
+        assert_eq!(driver.memory_exported_at(MEM), Some(published), "asked again, not remembered");
+
+        // Memory the host reaches through a cache it has to flush is memory the guest must not
+        // map cached, and the answer comes from the type it was allocated from -- not from a
+        // default that happens to be right for the driver we run on today.
+        const UNCACHED: ObjectId = ObjectId(14);
+        driver.plant_allocation_of(UNCACHED, SIZE, HOST_VISIBLE_BIT | HOST_COHERENT_BIT);
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, UNCACHED, SIZE),
+            Ok(Exported { addr: ADDR, write_back: false })
+        );
+        driver.free_memory(DEVICE, handle, UNCACHED);
+        MAPS.with_borrow(|n| assert_eq!(*n, 2));
+        UNMAPS.with_borrow(|n| assert_eq!(*n, 1));
+        MAPS.with_borrow_mut(|n| *n = 1);
+        UNMAPS.with_borrow_mut(|n| *n = 0);
 
         // The census stops reporting it: its bytes are the blob's, captured where they live.
         let census = driver.memory_census();

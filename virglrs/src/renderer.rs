@@ -14,7 +14,7 @@ use crate::guest_mem::GuestMap;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::venus;
 use crate::venus::cs::ObjectId;
-use crate::venus::driver::{Allocation, MemoryError};
+use crate::venus::driver::{Allocation, Exported, MemoryError};
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -30,6 +30,8 @@ use std::sync::{Arc, RwLock};
 pub enum Error {
     /// The guest reused a resource handle that is still live.
     ResourceExists,
+    /// No resource under that handle.
+    NoResource,
     /// The guest reused a context id that is still live.
     ContextExists,
     /// No context under that id.
@@ -85,6 +87,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Error::ResourceExists => "that resource handle is already live",
+            Error::NoResource => "no such resource",
             Error::ContextExists => "that context id is already live",
             Error::NoContext => "no such context",
             Error::RendererAbsent => "this build was not initialized to serve that capset",
@@ -223,6 +226,28 @@ impl HostShm {
             }
         }
     }
+}
+
+/// How a guest may cache memory the host published to it.
+///
+/// Decided by how the *host* reaches the same bytes: the guest's mapping has to be no weaker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Caching {
+    /// Write-back, coherent without explicit flushes.
+    Cached,
+    /// Write-combining: the guest must not read back through the cache.
+    WriteCombining,
+}
+
+/// A blob resource's home in this process, as a VMM needs it to publish the blob to its guest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostMapping {
+    /// Where it starts.
+    pub addr: usize,
+    /// How far it runs. Not the blob's requested size but the mapping's own extent, taken from
+    /// whatever owns the memory -- which is the only thing that knows how much of it there is.
+    pub size: u64,
+    pub caching: Caching,
 }
 
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
@@ -672,17 +697,60 @@ impl Renderer {
         ctx_id: CtxId,
         mem: BlobId,
         blob_size: u64,
-    ) -> Result<usize, Error> {
+    ) -> Result<Exported, Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
         v.with_context_mut(ctx_id, |ctx| ctx.memory_export(ObjectId(mem.0), blob_size))
             .ok_or(Error::NoContext)?
             .map_err(export_error)
     }
 
-    /// Where an exported allocation is mapped, asked again rather than remembered.
-    pub fn venus_memory_map_ptr(&self, ctx_id: CtxId, mem: BlobId) -> Result<usize, Error> {
-        self.venus_context(ctx_id, |ctx| ctx.driver().memory_exported_at(ObjectId(mem.0)))?
-            .ok_or(Error::NoAllocation)
+    /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
+    ///
+    /// The one question the mapping calls ask, in one answer: an address on its own is not enough
+    /// to publish memory, and a size or a caching mode fetched separately is a second lookup that
+    /// can land on a different resource -- or on one that has since been freed.
+    ///
+    /// Answered from the live state every time, never cached on the resource. That is the whole
+    /// reason the resource keeps `ctx` and `mem` rather than an address: an allocation the guest
+    /// has freed resolves to nothing here, where a remembered pointer would still resolve.
+    pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
+        // The source is copied out and the resource lock released before venus is asked anything.
+        // Holding a read lock across a call into a context is how a ring thread on the other side
+        // of it ends up waiting on us while we wait on it.
+        let source = self
+            .with_resource(handle, |r| match &r.backing {
+                // Host-minted memory this renderer already holds a mapping of; the blob *is* that
+                // mapping, so there is nothing further to resolve.
+                Backing::Blob { host: Some(h), .. } => {
+                    // The mapping answers for its own extent. `desc.size` is what was asked for;
+                    // this is what was mapped, and it is the one that bounds what may be read.
+                    // The host maps its own shm write-back and coherent, like any anonymous page.
+                    Some(Ok(HostMapping {
+                        addr: h.map.host_addr(),
+                        size: h.map.len() as u64,
+                        caching: Caching::Cached,
+                    }))
+                }
+                Backing::Blob { desc, host: None } => match desc.source {
+                    BlobSource::Exported { ctx, mem } => Some(Err((ctx, mem, desc.size))),
+                    BlobSource::HostMinted => None,
+                },
+                _ => None,
+            })
+            .ok_or(Error::NoResource)?
+            .ok_or(Error::NotMappable)?;
+        let (ctx, mem, size) = match source {
+            Ok(minted) => return Ok(minted),
+            Err(names) => names,
+        };
+        let e = self
+            .venus_context(ctx, |c| c.driver().memory_exported_at(ObjectId(mem.0)))?
+            .ok_or(Error::NoAllocation)?;
+        Ok(HostMapping {
+            addr: e.addr,
+            size,
+            caching: if e.write_back { Caching::Cached } else { Caching::WriteCombining },
+        })
     }
 
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
@@ -796,6 +864,47 @@ mod tests {
             r.with_resource(ResourceHandle::new(3).unwrap(), |res| res.shm().cloned())
                 .expect("there")
                 .is_none()
+        );
+    }
+
+    /// The VMM publishes a blob by asking where it lives, and it asks *after* the create --
+    /// three separate ABI calls, each of which has to be answered from the resource that is
+    /// standing now rather than from anything remembered at the create.
+    ///
+    /// The export half of this cannot be reached without a venus renderer, so what is pinned here
+    /// is the half that can: a minted blob answers from the mapping it owns, and everything that
+    /// is not a blob refuses instead of inventing an address.
+    #[test]
+    fn a_blob_says_where_it_lives_and_everything_else_refuses_to() {
+        let mut r = renderer(Config::default());
+
+        let minted = BlobDesc {
+            blob_mem: crate::abi::BLOB_MEM_HOST3D,
+            blob_flags: 1,
+            source: BlobSource::HostMinted,
+            size: 0x24000 - 1,
+        };
+        let blob = ResourceHandle::new(1).unwrap();
+        r.resource_create_blob(blob, minted, Vec::new()).expect("created");
+
+        let m = r.resource_host_mapping(blob).expect("a minted blob knows where it is");
+        let map = r.with_resource(blob, |res| res.shm().cloned()).expect("there").expect("memory");
+        assert_eq!(m.addr, map.host_addr(), "the address is the mapping's own");
+        assert_eq!(m.size, map.len() as u64, "and so is the extent, not what was asked for");
+        assert!(m.size > minted.size, "which here is the larger of the two");
+        assert_eq!(m.caching, Caching::Cached);
+
+        // Memory the host never mapped has no address to give, and saying so is the difference
+        // between a VMM reporting a failed guest mmap and one publishing a wild pointer.
+        let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
+        let elsewhere = ResourceHandle::new(2).unwrap();
+        r.resource_create_blob(elsewhere, vram, Vec::new()).expect("created");
+        assert_eq!(r.resource_host_mapping(elsewhere), Err(Error::NotMappable));
+
+        assert_eq!(
+            r.resource_host_mapping(ResourceHandle::new(77).unwrap()),
+            Err(Error::NoResource),
+            "a handle that names nothing is not the same as a resource that maps nothing"
         );
     }
 

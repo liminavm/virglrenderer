@@ -90,6 +90,14 @@ impl GuestMap {
         Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len })
     }
 
+    /// Where the mapping starts in this process.
+    ///
+    /// An address, not a pointer: this is for handing to a VMM that will publish it to a guest,
+    /// and nothing in this process may dereference it without going through the accessors above.
+    pub fn host_addr(&self) -> usize {
+        self.ptr.as_ptr() as usize
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
