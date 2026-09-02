@@ -44,6 +44,20 @@ pub const fn align4(size: usize) -> usize {
 #[repr(transparent)]
 pub struct ObjectId(pub u64);
 
+/// The handle the host driver gave the object, which is what a Vulkan call is made with.
+///
+/// The other half of the pair [`ObjectId`] names, and untyped until long after it. Both are one
+/// `u64` and they travel together everywhere -- the object table records the two side by side,
+/// and the decoder replaces one with the other in place -- so the two readings of the same word
+/// were told apart by nothing but the reader.
+///
+/// Zero is an ordinary value here, unlike a resource handle: Vulkan spells `VK_NULL_HANDLE` as
+/// zero, a great many members are optional, and a create the driver refused leaves one behind on
+/// purpose. So it is a plain `u64` and not a `NonZeroU64`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(transparent)]
+pub struct HostHandle(pub u64);
+
 /// Resolves guest object ids to host objects. The decoder holds one by reference; what sits behind
 /// it is vkr's object table in the renderer and an identity map in the round-trip test.
 /// A pointer stored in an arena array -- an array of strings is an array of these.
@@ -69,14 +83,25 @@ impl Default for Ptr {
 /// a typed shadow member, so the conversion is named here rather than done with a cast at every
 /// call site, and the generator implements it for every handle type.
 pub trait Handle: Copy {
-    fn raw(self) -> u64;
-    fn from_raw(raw: u64) -> Self;
+    /// The host handle in the slot, for a member the decoder has already resolved or the driver
+    /// has just written.
+    fn host(self) -> HostHandle;
+
+    /// The guest id in the slot, for the out-member of a create -- the one place the guest, not
+    /// the host, chooses what the word says.
+    fn guest_id(self) -> ObjectId;
+
+    /// Put a host handle in the slot.
+    fn from_host(host: HostHandle) -> Self;
+
+    /// `VK_NULL_HANDLE`, for an out-parameter before the driver has written it.
+    fn null() -> Self;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lookup {
     /// The host handle.
-    Found(u64),
+    Found(HostHandle),
     /// An id whose creation the host refused, and which the guest had already pipelined commands
     /// behind. Those commands are lost; the ring is not.
     Ghost,
@@ -98,7 +123,7 @@ pub struct IdentityObjects;
 
 impl Objects for IdentityObjects {
     fn lookup(&self, id: ObjectId, _ty: i32) -> Lookup {
-        Lookup::Found(id.0)
+        Lookup::Found(HostHandle(id.0))
     }
 }
 
@@ -250,22 +275,22 @@ impl<'a> Decoder<'a> {
     /// guest's later commands already in flight behind it -- it costs those commands and nothing
     /// more. Anything else is a guest naming an object it was never given, or naming one it has
     /// under the wrong type, and that is a stream we can no longer trust: the ring stops.
-    pub fn lookup_object(&self, id: ObjectId, ty: i32) -> u64 {
+    pub fn lookup_object(&self, id: ObjectId, ty: i32) -> HostHandle {
         // `VK_NULL_HANDLE`. Vulkan spells "no object" as zero and a great many members are
         // optional, so this is an ordinary value on the wire and not a miss at all -- an optional
         // `VkPipelineCache` left null is what found this.
         if id.0 == 0 {
-            return 0;
+            return HostHandle(0);
         }
         match self.objects.lookup(id, ty) {
             Lookup::Found(handle) => handle,
             Lookup::Ghost => {
                 self.set_soft_fatal();
-                0
+                HostHandle(0)
             }
             Lookup::Missing => {
                 self.set_fatal();
-                0
+                HostHandle(0)
             }
         }
     }
@@ -833,7 +858,7 @@ mod tests {
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &AllGhosts, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
         assert!(dec.fatal());
         assert!(!dec.hard_fatal());
         dec.clear_soft_fatal();
@@ -854,7 +879,7 @@ mod tests {
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(0), 0), 0);
+        assert_eq!(dec.lookup_object(ObjectId(0), 0), HostHandle(0));
         assert!(!dec.fatal());
     }
 
@@ -872,7 +897,7 @@ mod tests {
         let hard = AtomicBool::new(false);
         let buf = [0u8; 0];
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
-        assert_eq!(dec.lookup_object(ObjectId(42), 0), 0);
+        assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
         assert!(dec.hard_fatal());
         dec.clear_soft_fatal();
         assert!(dec.fatal(), "a hard poison does not clear with the command");

@@ -1859,11 +1859,17 @@ class RustGen:
             '}',
             '',
             'impl cs::Handle for %s {' % n,
-            '    fn raw(self) -> u64 {',
-            '        self.0',
+            '    fn host(self) -> cs::HostHandle {',
+            '        cs::HostHandle(self.0)',
             '    }',
-            '    fn from_raw(raw: u64) -> Self {',
-            '        %s(raw)' % n,
+            '    fn guest_id(self) -> ObjectId {',
+            '        ObjectId(self.0)',
+            '    }',
+            '    fn from_host(host: cs::HostHandle) -> Self {',
+            '        %s(host.0)' % n,
+            '    }',
+            '    fn null() -> Self {',
+            '        %s(0)' % n,
             '    }',
             '}',
             '',
@@ -1876,7 +1882,7 @@ class RustGen:
             '/// which guest object died. See the shadow members on `vn_command_*`.',
             'pub fn vn_decode_%s_lookup(dec: &mut Decoder<\'_>, val: &mut %s) -> ObjectId {' % (n, n),
             '    let id = ObjectId(dec.decode_scalar::<u64>());',
-            '    val.0 = dec.lookup_object(id, %s.0);' % objtype,
+            '    *val = <%s as cs::Handle>::from_host(dec.lookup_object(id, %s.0));' % (n, objtype),
             '    id',
             '}',
             '',
@@ -2140,7 +2146,7 @@ class RustGen:
                     'if !%s.is_null() && !%s.is_null() {' % (m, s),
                     '    // SAFETY: both are non-null and the decoder allocated them in the arena,',
                     '    // one element each.',
-                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), (*%s).0, %s) };'
+                    '    unsafe { h.object_created(%s, ObjectId((*%s).0), cs::HostHandle((*%s).0), %s) };'
                     % (objtype, m, s, owner),
                     '}']
             elif shape[0] == 'dynamic':
@@ -2149,7 +2155,7 @@ class RustGen:
                     '    for i in 0..(%s) as usize {' % shape[1],
                     '        // SAFETY: the decoder allocated both arrays with that many elements,',
                     '        // from the same count.',
-                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), (*%s.add(i)).0, %s) };'
+                    '        unsafe { h.object_created(%s, ObjectId((*%s.add(i)).0), cs::HostHandle((*%s.add(i)).0), %s) };'
                     % (objtype, m, s, owner),
                     '    }',
                     '}']
@@ -2215,7 +2221,7 @@ class RustGen:
                '        &mut self,',
                '        ty: VkObjectType,',
                '        id: ObjectId,',
-               '        host: u64,',
+               '        host: cs::HostHandle,',
                '        owner: Option<ObjectId>,',
                '    ) {',
                '        let _ = (ty, id, host, owner);',
