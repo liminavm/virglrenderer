@@ -7264,6 +7264,131 @@ mod tests {
         h.driver.abandon_planted();
     }
 
+    /// A pipeline run the driver only partly completes hands the guest nothing, and leaves
+    /// nothing behind on the host either.
+    ///
+    /// Vulkan is explicit that `vkCreateGraphicsPipelines` may fill some slots and fail: the
+    /// handles it did produce are real, they are the caller's to destroy, and the ones it did not
+    /// are `VK_NULL_HANDLE`. That makes the failure path the interesting one. The run is refused
+    /// as a whole -- so the survivors have to be destroyed here, because the guest never learns
+    /// their ids and nothing else will ever name them -- and the slots have to be cleared, or the
+    /// reply hands back a handle that was destroyed on the way out.
+    ///
+    /// Neither is visible from any corpus: a replay strips replies, and a leaked pipeline is a
+    /// host-side object no census reads.
+    #[test]
+    fn a_partly_failed_pipeline_run_destroys_what_it_made_and_keeps_none_of_it() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkGraphicsPipelineCreateInfo, VkPipeline,
+            VkPipelineCache, vn_command_vkCreateGraphicsPipelines,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const IDS: [u64; 3] = [61, 62, 63];
+        /// The driver compiles the first two and then gives up on the third.
+        const MADE: [u64; 2] = [0x7100, 0x7200];
+
+        thread_local! {
+            /// Every pipeline handed to `vkDestroyPipeline`, in order.
+            static DESTROYED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+            /// The create-info count the driver was told.
+            static ASKED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "C" fn create(
+            _device: VkDevice,
+            _cache: VkPipelineCache,
+            n: u32,
+            _infos: *const VkGraphicsPipelineCreateInfo,
+            _alloc: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            ASKED.with_borrow_mut(|a| a.push(n));
+            // SAFETY: the wrapper passes its slice's own pointer and length.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, n as usize) };
+            for (e, h) in out.iter_mut().zip(MADE) {
+                *e = VkPipeline(h);
+            }
+            VkResult::VK_ERROR_INVALID_SHADER_NV
+        }
+
+        unsafe extern "C" fn destroy(
+            _device: VkDevice,
+            pipeline: VkPipeline,
+            _alloc: *const VkAllocationCallbacks,
+        ) {
+            DESTROYED.with_borrow_mut(|d| d.push(pipeline.0));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateGraphicsPipelines(create);
+        fns.plant_vkDestroyPipeline(destroy);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(VkDevice(DEVICE), fns);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        let infos = [VkGraphicsPipelineCreateInfo::default(); 3];
+        let mut wire: [VkPipeline; 3] = core::array::from_fn(|i| VkPipeline(IDS[i]));
+        let mut shadow = [VkPipeline(0); 3];
+        let mut args = vn_command_vkCreateGraphicsPipelines::default();
+        args.device = VkDevice(DEVICE);
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+
+        h.vkCreateGraphicsPipelines(&mut args);
+        assert!(h.reject.is_none(), "a driver refusing to compile is an answer, not a bad command");
+        assert_eq!(args.ret, VkResult::VK_ERROR_INVALID_SHADER_NV);
+
+        ASKED.with_borrow(|a| {
+            assert_eq!(a.as_slice(), &[3], "one handle slot per create-info, and it says so");
+        });
+        DESTROYED.with_borrow(|d| {
+            assert_eq!(
+                d.as_slice(),
+                &MADE,
+                "the two the driver did make are destroyed: the guest never learns their ids, \
+                 so nothing else can ever name them"
+            );
+        });
+        assert_eq!(
+            shadow.map(|p| p.0),
+            [0, 0, 0],
+            "and no destroyed handle is left in the reply's shadow"
+        );
+
+        for id in IDS {
+            assert!(
+                objects.borrow().is_ghost(ObjectId(id)),
+                "id {id} was asked for and the run failed, so it names a ghost"
+            );
+        }
+
+        h.driver.abandon_planted();
+    }
+
     /// A create the macro serves, refused because the driver is not there.
     ///
     /// The whole point of routing every simple object through `Driver::create_object` is that the
