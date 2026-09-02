@@ -23,6 +23,7 @@
 #                 -- presented frames go to a PNG instead of a window. Omitting BOTH would attach
 #                 no GPU at all and record nothing, which is what --display-capture prevents.
 #   --seconds N   dump automatically N seconds after boot, then leave the VM running
+#   --renderer R  which rig bundle to boot: c (default) or rust
 #   --            everything after is passed to the limina binary
 #
 # Dump at any time with dump.sh. The recorders write only when asked: arming one costs the render
@@ -32,7 +33,7 @@ cd "$(dirname "$0")"
 RIG="$(pwd)"
 
 MODE="${1:-}"; shift || true
-MB=256; WINDOW=0; SECONDS_TO_DUMP=""; NAME=""
+MB=256; WINDOW=0; SECONDS_TO_DUMP=""; NAME=""; RENDERER=c
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,13 +41,19 @@ while [ $# -gt 0 ]; do
     --out) NAME="$2"; shift 2 ;;
     --window) WINDOW=1; shift ;;
     --seconds) SECONDS_TO_DUMP="$2"; shift 2 ;;
+    --renderer) RENDERER="$2"; shift 2 ;;
     --) shift; EXTRA+=("$@"); break ;;
     *) EXTRA+=("$1"); shift ;;
   esac
 done
 
-APP="$RIG/Limina.app/Contents/MacOS/limina"
-[ -x "$APP" ] || { echo "no rig — run make-rig.sh" >&2; exit 1; }
+case "$RENDERER" in
+  c)    BUNDLE="$RIG/Limina.app" ;;
+  rust) BUNDLE="$RIG/Limina-rust.app" ;;
+  *) echo "unknown renderer: $RENDERER (c|rust)" >&2; exit 2 ;;
+esac
+APP="$BUNDLE/Contents/MacOS/limina"
+[ -x "$APP" ] || { echo "no rig — run make-rig.sh --renderer $RENDERER" >&2; exit 1; }
 
 NAME="${NAME:-$MODE}"
 
@@ -82,7 +89,7 @@ else
   # /sys/class/drm, no venus context is ever created, and the recorder never even arms.
   ARGS+=(--display-capture "$RIG/captures/$MODE-frame.png"
          --display-size "${LIMINA_DISPLAY_SIZE:-1280x800}"
-         --firmware "$RIG/Limina.app/Contents/Resources/KRUN_EFI.gop.fd")
+         --firmware "$BUNDLE/Contents/Resources/KRUN_EFI.gop.fd")
 fi
 
 echo "==> $MODE capture, ${MB} MB -> $OUT"
