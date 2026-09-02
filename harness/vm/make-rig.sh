@@ -13,7 +13,11 @@
 # The disks are APFS clones (cp -c): they cost no space until the guest writes, and the originals
 # are never touched. Copying 15 GB per image the ordinary way would not fit on this host.
 #
-# Usage: make-rig.sh [--disks-only | --bundle-only]
+# Two renderers are under test in this tree, so the rig is two bundles. `--renderer` picks one,
+# and it picks the build and the bundle together: a bundle named for one tree holding the other
+# tree's dylib is a rig that lies about what it booted, and nothing downstream could tell.
+#
+# Usage: make-rig.sh [--disks-only | --bundle-only] [--renderer c|rust]
 set -euo pipefail
 cd "$(dirname "$0")"
 RIG="$(pwd)"
@@ -22,7 +26,6 @@ ROOT="$(pwd)"
 
 LIMINA="${LIMINA_ROOT:-$HOME/Projects/limina}"
 SRC_APP="$LIMINA/target/Limina.app"
-APP="$RIG/Limina.app"
 DISKS="$RIG/disks"
 
 # Three guests, because the corpus needs three different renderers exercised:
@@ -36,12 +39,20 @@ SRC_DISKS=(
   "$LIMINA/Fedora-Workstation-44.stock.test.raw"
 )
 
-want_bundle=1 want_disks=1
-case "${1:-}" in
-  --disks-only) want_bundle=0 ;;
-  --bundle-only) want_disks=0 ;;
-  "") ;;
-  *) echo "usage: make-rig.sh [--disks-only|--bundle-only]" >&2; exit 2 ;;
+want_bundle=1 want_disks=1 renderer=c
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --disks-only) want_bundle=0; shift ;;
+    --bundle-only) want_disks=0; shift ;;
+    --renderer) renderer="$2"; shift 2 ;;
+    *) echo "usage: make-rig.sh [--disks-only|--bundle-only] [--renderer c|rust]" >&2; exit 2 ;;
+  esac
+done
+
+case "$renderer" in
+  c)    PREFIX="$ROOT/harness/vm/prefix"; APP="$RIG/Limina.app" ;;
+  rust) PREFIX="$ROOT/virglrs/prefix";    APP="$RIG/Limina-rust.app" ;;
+  *) echo "unknown renderer: $renderer (c|rust)" >&2; exit 2 ;;
 esac
 
 if [ "$want_disks" = 1 ]; then
@@ -61,8 +72,14 @@ fi
 
 [ "$want_bundle" = 1 ] || exit 0
 
-DYLIB="$ROOT/harness/vm/prefix/lib/libvirglrenderer.1.dylib"
-[ -f "$DYLIB" ] || { echo "build the renderer first: harness/vm/build-renderer.sh" >&2; exit 1; }
+DYLIB="$PREFIX/lib/libvirglrenderer.1.dylib"
+[ -f "$DYLIB" ] || {
+  case "$renderer" in
+    c)    echo "build it first: harness/vm/build-renderer.sh" >&2 ;;
+    rust) echo "build it first: virglrs/install.sh" >&2 ;;
+  esac
+  exit 1
+}
 [ -d "$SRC_APP" ] || { echo "missing source bundle: $SRC_APP (cargo xtask app in limina)" >&2; exit 1; }
 
 echo "==> cloning $SRC_APP"
