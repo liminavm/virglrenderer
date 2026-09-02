@@ -17,6 +17,7 @@ pub mod fence;
 pub mod ffi;
 pub mod guest_mem;
 pub mod ids;
+pub mod metal;
 pub mod renderer;
 pub mod venus;
 pub mod vulkan;

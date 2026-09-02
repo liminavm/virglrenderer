@@ -55,6 +55,13 @@ id!(
     RingId(u64)
 );
 id!(
+    /// A global IOSurface id, which another process resolves to the surface itself.
+    ///
+    /// Live only as long as the surface, and recycled the instant it dies -- so this names a
+    /// surface only in the hand of something that is *also* holding one. See `crate::metal`.
+    SurfaceId(u32)
+);
+id!(
     /// Identifies the host-side object a blob resource exports. Meaningful only to the renderer
     /// that minted it.
     BlobId(u64)
