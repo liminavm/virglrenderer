@@ -155,6 +155,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
 
+**A corpus cannot reach the ring transport, so a seated boot is not a redundant gate.** The
+recorder writes the venus stream a ring carried; the commands that *drive* a ring --
+`vkExecuteCommandStreamsMESA`, `vkWaitRingSeqnoMESA` -- are the carrier, and replay supplies its
+own. So a build can replay every corpus perfectly and still refuse the first thing a live guest
+asks, which is exactly what a seated boot found. Replay stays the fine-grained oracle; booting is
+the only thing that scores the transport.
+
 Corpora come from vrend's in-memory tracer (`LIMINA_VREND_TRACE=<MB>`) for classic contexts, and
 from the venus recorder (`LIMINA_VKR_RECORD=<MB>`, `src/venus/vkr_record.[ch]`) for venus. Both
 dump on demand through a FIFO rather than on a timer, so asking for a capture costs the render
