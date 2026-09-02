@@ -58,11 +58,13 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
     vn_command_vkGetPhysicalDeviceProperties2,
     vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkImportSemaphoreResourceMESA,
-    vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer, vn_command_vkResetFences,
-    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkUpdateDescriptorSets,
-    vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
+    vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer,
+    vn_command_vkResetFences, vn_command_vkSetReplyCommandStreamMESA,
+    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
+    vn_command_vkWaitSemaphoreResourceMESA,
 };
 use super::ring::{ReplyStream, ReplyStreamError, Ring, RingError, ShmResources};
+use super::ring_thread::RingThread;
 use crate::vulkan::Global;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
@@ -92,7 +94,7 @@ pub struct Context {
     ///
     /// One map, so a ring has exactly one owner. Destroying the context drops it, which is what
     /// releases the share each ring holds of its resource's mapping.
-    rings: BTreeMap<RingId, Ring>,
+    rings: BTreeMap<RingId, RingSlot>,
     /// Where answers to commands that arrived on the context's own stream go. Each ring holds its
     /// own; this is the one for everything that did not come in on a ring.
     reply: Option<ReplyStream>,
@@ -110,6 +112,32 @@ const _: () = {
     const fn is_send<T: Send>() {}
     is_send::<Context>();
 };
+
+/// A ring, in whichever of its two states it is in.
+///
+/// The states differ by who owns the ring body, and that is the whole point of making them a type:
+/// while a ring is running there is no `Ring` here for anyone else to reach. It went into the
+/// thread and only comes back out of [`RingThread::stop`]. Nothing has to remember not to touch a
+/// running ring's buffer, because there is nothing to touch.
+enum RingSlot {
+    /// Created, not yet reading. Snapshot replay builds every ring this way and promotes them all
+    /// at `replay_end`; a live create is promoted at the end of the batch that made it.
+    Idle(Ring),
+    /// Reading on its own thread, which owns the body and lends the reply slot to each dispatch.
+    Running(RingThread),
+}
+
+#[cfg(test)]
+impl RingSlot {
+    /// The body of a ring that has not been started. Tests only, and deliberately panicking on a
+    /// running ring: there is no body here to look at once the thread owns it.
+    fn idle(&self) -> &Ring {
+        match self {
+            RingSlot::Idle(r) => r,
+            RingSlot::Running(_) => panic!("a running ring's body belongs to its thread"),
+        }
+    }
+}
 
 impl Context {
     pub fn new(id: CtxId) -> Context {
@@ -130,6 +158,15 @@ impl Context {
         self.fatal.load(Ordering::Acquire)
     }
 
+    /// A share of the poison flag, for a ring thread that must be able to set it.
+    ///
+    /// One flag with many keys, never a copy per holder: a ring that dies takes its whole context
+    /// with it, which is what the C's `vkr_context_on_ring_fatal` does. A thread can set it
+    /// without waiting for anything -- which it must, having no lock it is allowed to block on.
+    pub fn fatal_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.fatal)
+    }
+
     pub fn objects(&self) -> &Shared {
         &self.objects
     }
@@ -139,10 +176,18 @@ impl Context {
         self.replay = true;
     }
 
-    /// Leave replay mode. In the C this is also where deferred rings start; there are no rings to
-    /// start until a ring loop exists.
+    /// Leave replay mode. The rings the journal built are started by the caller straight after,
+    /// which is the C's loop at the end of `vkr_renderer_replay_end`.
     pub fn replay_end(&mut self) {
         self.replay = false;
+    }
+
+    /// Whether this context is being rebuilt from a journal rather than driven by a guest.
+    ///
+    /// Read by the promotion path: a replayed ring must not start reading while the journal is
+    /// still being fed to it. This is the C's `ctx->replaying`, consulted at the same decision.
+    pub fn replaying(&self) -> bool {
+        self.replay
     }
 
     /// Drain one submission, dispatching every command in it.
@@ -208,6 +253,7 @@ impl Context {
             rings: &mut self.rings,
             current_ring: on,
             reply,
+            replaying: replay,
         };
 
         while dec.has_command() {
@@ -280,21 +326,97 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
-        if !self.rings.contains_key(&ring) {
-            eprintln!(
-                "[virglrs] ctx {}: submission for {ring}, which is not a ring here",
-                self.id.get()
-            );
-            return false;
+        match self.rings.get(&ring) {
+            None => {
+                eprintln!(
+                    "[virglrs] ctx {}: submission for {ring}, which is not a ring here",
+                    self.id.get()
+                );
+                return false;
+            }
+            // The journal is replayed strictly before anything is promoted, so a running ring
+            // here would mean the caller fed a journal entry to a ring a guest is already
+            // driving. The C asserts the same thing at `vkr_renderer_replay_ring_cmd`.
+            Some(RingSlot::Running(_)) => {
+                panic!("ctx {}: {ring} was replayed into after it started running", self.id.get())
+            }
+            Some(RingSlot::Idle(_)) => {}
         }
         // The ring lends its slot for the batch, exactly as the context lends its own above.
-        // A running ring's thread will own the body and lend from there instead.
-        let mut reply = self.rings.get_mut(&ring).and_then(|r| r.reply.take());
+        // A running ring's thread owns the body and lends from there instead -- see `dispatch_ring`.
+        let mut reply = match self.rings.get_mut(&ring) {
+            Some(RingSlot::Idle(r)) => r.reply.take(),
+            _ => None,
+        };
         let ok = self.submit_on(Some(ring), &mut reply, buf, todo, global, resources);
-        if let Some(r) = self.rings.get_mut(&ring) {
+        if let Some(RingSlot::Idle(r)) = self.rings.get_mut(&ring) {
             r.reply = reply;
         }
         ok
+    }
+
+    /// Run a batch a ring's own thread read, answering into the slot that thread owns.
+    ///
+    /// The counterpart of [`Context::submit_ring`] for a running ring: same loop, same context,
+    /// but the reply stream is lent by the caller rather than found here -- because the caller is
+    /// the thread that owns the ring body, and no entry in `rings` holds it while it runs.
+    pub fn dispatch_ring(
+        &mut self,
+        ring: RingId,
+        reply: &mut Option<ReplyStream>,
+        buf: &[u8],
+        todo: &mut Unimplemented,
+        global: &Global,
+        resources: &dyn ShmResources,
+    ) -> bool {
+        self.submit_on(Some(ring), reply, buf, todo, global, resources)
+    }
+
+    /// Start every ring that is not running yet, and say how many that was.
+    ///
+    /// One promotion point for both paths the C has: a live create, promoted at the end of the
+    /// batch that made it, and a replayed one, promoted at `replay_end`. The C spells these as
+    /// `if (!ctx->replaying) vkr_ring_start(ring)` in the handler plus a loop in
+    /// `vkr_renderer_replay_end`; collapsing them into one function is what keeps the handler from
+    /// needing anything the renderer root owns.
+    ///
+    /// `spawn` is a closure because a ring thread needs a claim on this context, and a context
+    /// cannot hand out a claim on itself -- only the owner of the `Arc` can. See `Vkr::promote`.
+    pub fn start_idle_rings(&mut self, mut spawn: impl FnMut(RingId, Ring) -> RingThread) -> usize {
+        // The common case by far: every batch a guest sends comes through here, and almost none
+        // of them create a ring. Answering that without allocating keeps promotion off the
+        // submission path's conscience.
+        if !self.rings.values().any(|slot| matches!(slot, RingSlot::Idle(_))) {
+            return 0;
+        }
+        let idle: Vec<RingId> = self
+            .rings
+            .iter()
+            .filter(|(_, slot)| matches!(slot, RingSlot::Idle(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &idle {
+            let Some(RingSlot::Idle(ring)) = self.rings.remove(id) else {
+                unreachable!("just filtered for idle rings, and nothing else runs meanwhile")
+            };
+            self.rings.insert(*id, RingSlot::Running(spawn(*id, ring)));
+        }
+        idle.len()
+    }
+
+    /// Stop every running ring and join its thread.
+    ///
+    /// Called before a context is dropped, so that the drop always runs on the caller's thread.
+    /// A ring thread holds a weak claim on this context and upgrades it for the length of one
+    /// dispatch; if a thread were still running when the last strong reference went, that upgrade
+    /// could make the thread itself the last owner -- and the drop would join the thread it was
+    /// running on. Joining here, while no dispatch can be in flight afterwards, removes that.
+    pub fn stop_rings(&mut self) {
+        for (_, slot) in std::mem::take(&mut self.rings) {
+            if let RingSlot::Running(t) = slot {
+                drop(t.stop());
+            }
+        }
     }
 
     /// The driver state, for the teardown that has to destroy what it holds.
@@ -336,6 +458,10 @@ impl Context {
 /// is about to destroy the devices, and afterwards there is nothing left to destroy anything on.
 impl Drop for Context {
     fn drop(&mut self) {
+        // The rings go with it. An orderly teardown has already called `stop_rings`, so this is
+        // usually empty; anything still here is detached rather than joined, because a join in a
+        // drop can be a thread joining itself. See `impl Drop for RingThread`.
+        self.rings.clear();
         let doomed = self.objects.borrow_mut().take_all();
         self.driver.teardown(&doomed);
     }
@@ -396,7 +522,12 @@ pub struct Handlers<'a> {
     /// Where this batch's answers go, lent by whoever owns the stream it arrived on.
     reply: &'a mut Option<ReplyStream>,
     /// The rings this context has stood up. Held mutably because creating one is a command.
-    rings: &'a mut BTreeMap<RingId, Ring>,
+    rings: &'a mut BTreeMap<RingId, RingSlot>,
+    /// Whether this batch is a snapshot journal being replayed rather than a guest talking.
+    ///
+    /// A created ring reads it: replay restores head and status words the host would otherwise
+    /// insist on owning, and resumes the read cursor from them.
+    replaying: bool,
 }
 
 impl Handlers<'_> {
@@ -1184,7 +1315,7 @@ impl Commands for Handlers<'_> {
             return;
         }
 
-        let ring = match Ring::create(self.resources, info) {
+        let ring = match Ring::create(self.resources, info, self.replaying) {
             Ok(r) => r,
             Err(RingError::NoResource(h)) => {
                 eprintln!("[virglrs] vkCreateRingMESA: resource {h} is not a mapped shm resource");
@@ -1196,12 +1327,21 @@ impl Commands for Handlers<'_> {
                 self.reject = Some("created a ring with a layout we will not touch");
                 return;
             }
+
+            Err(RingError::NotOurs { head, status }) => {
+                eprintln!(
+                    "[virglrs] vkCreateRingMESA: ring {id}: head={head} status={status:#x} before \
+                     the host has written either"
+                );
+                self.reject = Some("created a ring another renderer is already driving");
+                return;
+            }
         };
 
-        // Registering is the whole of it. Nothing reads from a ring yet, so there is no thread to
-        // start and no `ctx->replaying` to check before starting it -- when there is, this is
-        // where the replay path and the live one diverge.
-        self.rings.insert(id, ring);
+        // Registered idle, never started here. Promotion happens at the end of the batch, which is
+        // where the caller knows whether it was replaying -- and doing it there rather than in the
+        // handler is why a handler never needs to reach the renderer's locks. See `Vkr::promote`.
+        self.rings.insert(id, RingSlot::Idle(ring));
     }
 
     fn vkDestroyRingMESA(&mut self, args: &mut vn_command_vkDestroyRingMESA<'_>) {
@@ -1211,9 +1351,32 @@ impl Commands for Handlers<'_> {
         }
         let id = RingId(args.ring);
         // Dropping the entry is the teardown: it releases this ring's share of the resource's
-        // mapping, and the mapping goes when the last share does.
-        if self.rings.remove(&id).is_none() {
-            self.reject = Some("destroyed a ring that was never created");
+        // mapping, and the mapping goes when the last share does. A running ring is stopped
+        // first, which joins its thread -- safe from here only because the refusal above means
+        // this is never a ring's own thread asking, and because that thread never blocks on the
+        // context lock this dispatch is holding.
+        match self.rings.remove(&id) {
+            None => self.reject = Some("destroyed a ring that was never created"),
+            Some(RingSlot::Idle(_)) => {}
+            Some(RingSlot::Running(t)) => drop(t.stop()),
+        }
+    }
+
+    /// The guest rang a ring's doorbell.
+    ///
+    /// An unknown ring poisons, matching the C: unlike a submission for a missing ring, which the
+    /// caller may simply have raced, a notify names a ring the guest believes it owns.
+    fn vkNotifyRingMESA(&mut self, args: &mut vn_command_vkNotifyRingMESA<'_>) {
+        if self.current_ring.is_some() {
+            self.reject = Some("rang a ring's doorbell from inside a ring's own stream");
+            return;
+        }
+        match self.rings.get(&RingId(args.ring)) {
+            None => self.reject = Some("rang the doorbell of a ring that was never created"),
+            // Not yet reading, so there is nothing to wake. Harmless to miss: promotion happens
+            // at the end of this batch, and a fresh thread reads the tail before it can park.
+            Some(RingSlot::Idle(_)) => {}
+            Some(RingSlot::Running(t)) => t.notify(),
         }
     }
 
@@ -1916,7 +2079,12 @@ mod tests {
         }
 
         let window = |ring: u64| {
-            ctx.rings[&RingId(ring)].reply.as_ref().expect("the ring was given a stream").window()
+            ctx.rings[&RingId(ring)]
+                .idle()
+                .reply
+                .as_ref()
+                .expect("the ring was given a stream")
+                .window()
         };
         assert_eq!(window(7).begin(), 0x21000, "ring 7 kept the window ring 7 set");
         assert_eq!(window(9).begin(), 0x22000, "ring 9 kept the window ring 9 set");
@@ -1946,7 +2114,10 @@ mod tests {
             ctx.reply.as_ref().expect("the context was given a stream").window().begin(),
             0x21000
         );
-        assert!(ctx.rings[&RingId(7)].reply.is_none(), "the ring was not the one that asked");
+        assert!(
+            ctx.rings[&RingId(7)].idle().reply.is_none(),
+            "the ring was not the one that asked"
+        );
     }
 
     /// Setting again is how the guest rewinds: it re-establishes the stream before each batch it
@@ -1972,6 +2143,7 @@ mod tests {
             reject: None,
             resources: &t,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2020,6 +2192,7 @@ mod tests {
                 reject: None,
                 resources: &t,
                 rings: &mut rings,
+                replaying: false,
                 current_ring: None,
                 reply: &mut ctx_reply,
             };
@@ -2057,6 +2230,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2090,6 +2264,7 @@ mod tests {
             reject: None,
             resources: &t,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2152,6 +2327,7 @@ mod tests {
             reject: None,
             resources: &t,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2189,6 +2365,7 @@ mod tests {
             reject: None,
             resources: &t,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2196,14 +2373,14 @@ mod tests {
         let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut first);
         assert_eq!(h.reject, None);
-        h.rings[&RingId(7)].set_head(0x1234);
+        h.rings[&RingId(7)].idle().set_head(0x1234);
 
         let mut again = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut again);
         assert!(h.reject.is_some(), "the second create under the same id is refused");
         assert_eq!(h.rings.len(), 1, "and did not add a second entry");
         assert_eq!(
-            h.rings[&RingId(7)].map.load_u32(0),
+            h.rings[&RingId(7)].idle().map.load_u32(0),
             Some(0x1234),
             "the ring that was already there is untouched"
         );
@@ -2243,6 +2420,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2273,6 +2451,7 @@ mod tests {
             reject: None,
             resources: &t,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2389,6 +2568,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2479,6 +2659,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2522,6 +2703,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2572,6 +2754,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2597,6 +2780,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2673,6 +2857,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2705,6 +2890,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2799,6 +2985,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2867,6 +3054,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2893,6 +3081,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2943,6 +3132,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -2983,6 +3173,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3007,6 +3198,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3174,6 +3366,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3244,6 +3437,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3309,6 +3503,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3366,6 +3561,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3448,6 +3644,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3504,6 +3701,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3554,6 +3752,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3731,6 +3930,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3843,6 +4043,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -3984,6 +4185,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -4053,6 +4255,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -4201,6 +4404,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
@@ -4375,6 +4579,7 @@ mod tests {
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
         };
