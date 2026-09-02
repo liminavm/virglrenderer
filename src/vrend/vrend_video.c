@@ -76,7 +76,7 @@
 #include "vrend_debug.h"
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
-#include "vrend_iov.h"
+#include "virgl_iov.h"
 #include "vrend_video.h"
 
 #ifdef __APPLE__
