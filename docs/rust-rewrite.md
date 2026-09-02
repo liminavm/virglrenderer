@@ -228,8 +228,15 @@ pixels against an llvmpipe/lavapipe reference — pixel-exact today. Alongside i
 These are implementation-agnostic already. Work here is corpus, not framework, and
 each corpus is owed by the phase it gates — not collected up front:
 
+- **P2** — a seated compositor driving Vulkan clients (mutter or synoik with real
+  clients), which is the only workload that produces scanout blobs in quantity. The
+  present venus corpora carry two, which is enough to *see* the IOSurface divergence
+  and not enough to pin it.
 - **P3** — classic-vrend capture on a **stock** guest (apitrace over virgl, not
-  zink→venus); today's Layer 1 corpus only exercises the venus path.
+  zink→venus); today's Layer 1 corpus only exercises the venus path. GL clients and
+  hardware video belong to this phase and not before it: the replayer skips classic
+  contexts wholesale, and `USE_VIDEO` is vrend's flag — venus carries no video
+  commands at all, so capturing either today grows a skip tally and nothing else.
 - **P4** — a video clip per codec × path (H.264, HEVC, VP9 hardware; AV1 software),
   each with a VPP conversion leg, since that is what `d1fdc034` shows is fragile.
 - **P5** — a suspend/resume cycle taken **mid-workload**, not from idle.
@@ -247,6 +254,14 @@ makes the rewrite testable at subagent speed instead of boot speed.
   is the working seed; port it to Rust and make it a library.
 - **Venus corpus**: the `limina_journal_export` → `replay_begin/submit/ring_cmd/end`
   path, which already solves handle remapping.
+- **The recorder's vocabulary bounds the corpus, and it is missing the mapping
+  calls.** `resource_map`, `get_map_ptr`, `get_map_info` and `unmap` are how a VMM
+  actually collects a blob, and no `Ctl` kind names any of them — so a replay cannot
+  call them however rich the guest workload is, and a stub behind them scores clean.
+  The hooks belong beside `vkr_record_create_blob` in `virglrenderer.c`. Golden the
+  return code and `map_info`, never the address: it is ASLR-fresh every run. New
+  record kinds need a format version bump or a replayer that skips what it does not
+  know, so the pinned corpora stay valid.
 - **Oracle**: plain-text scores, diffed against fixtures pinned from the C build.
   Classic scores a content hash and an ink count per offscreen via `transfer_read_iov`;
   venus scores renderer *state* — accept counts plus the contents of the device memory
