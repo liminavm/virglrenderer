@@ -7852,6 +7852,148 @@ mod tests {
         h.driver.abandon_planted();
     }
 
+    /// A pool allocation hands the driver one out-array of exactly the length the guest asked
+    /// for, and files both names of everything that comes back.
+    ///
+    /// The shape the generated accessor witnesses cannot reach: the count is
+    /// `pAllocateInfo->commandBufferCount`, inside a struct rather than beside the pointer, so a
+    /// planter cannot establish it from a slice and the round trip has nothing to plant.
+    ///
+    /// Three things travel together here and are separately wrong-able. The wire array carries
+    /// the *guest's* ids; the shadow beside it is where the driver writes *host* handles; and the
+    /// pool has to end up holding each pair. Hand the driver the shadow and the ids in different
+    /// orders, or one element short, and every id still resolves -- to the wrong object, for the
+    /// rest of the context's life.
+    #[test]
+    fn a_pool_allocation_hands_over_the_run_the_guest_asked_for() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandBufferAllocateInfo, VkCommandBufferLevel, VkCommandPool,
+            VkDevice, vn_command_vkAllocateCommandBuffers,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        /// The host handles the driver hands back, and the guest ids the wire named them by.
+        const HOST: [u64; 3] = [0x1100, 0x1200, 0x1300];
+        const IDS: [u64; 3] = [510, 520, 530];
+
+        thread_local! {
+            /// The room the driver was given, and what it was asked to fill it from.
+            static SAW: RefCell<Vec<(u32, usize)>> = const { RefCell::new(Vec::new()) };
+            /// What the next allocation answers with.
+            static ANSWER: RefCell<VkResult> = const {
+                RefCell::new(VkResult::VK_SUCCESS)
+            };
+        }
+
+        unsafe extern "C" fn allocate(
+            _device: VkDevice,
+            info: *const VkCommandBufferAllocateInfo,
+            out: *mut VkCommandBuffer,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes an arena allocation and an array it sized from the count
+            // inside it -- which is the pairing under test.
+            let info = unsafe { &*info };
+            let n = info.commandBufferCount as usize;
+            SAW.with_borrow_mut(|s| s.push((info.commandBufferCount, n)));
+            let r = ANSWER.with_borrow(|a| *a);
+            if r == VkResult::VK_SUCCESS {
+                // SAFETY: Vulkan fills the whole array on success, and the count it was given is
+                // the length of the array it was given.
+                let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
+                for (e, h) in out.iter_mut().zip(HOST) {
+                    *e = VkCommandBuffer(h);
+                }
+            }
+            r
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateCommandBuffers(allocate);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new();
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(VkDevice(DEVICE), VkCommandPool(POOL), &[]);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        // What the decoder would have built: the guest's ids on the wire, a shadow of the same
+        // length beside them, and the count inside the create-info that sized both.
+        let info = VkCommandBufferAllocateInfo {
+            commandPool: VkCommandPool(POOL),
+            level: VkCommandBufferLevel::VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            commandBufferCount: IDS.len() as u32,
+            ..Default::default()
+        };
+        let mut wire: [VkCommandBuffer; 3] = core::array::from_fn(|i| VkCommandBuffer(IDS[i]));
+        let mut shadow = [VkCommandBuffer(0); 3];
+        let mut args = vn_command_vkAllocateCommandBuffers::default();
+        args.device = VkDevice(DEVICE);
+        args.pAllocateInfo = Some(&info);
+        args.plant_pCommandBuffers(&mut wire);
+        args.plant_handle_pCommandBuffers(&mut shadow);
+
+        h.vkAllocateCommandBuffers(&mut args);
+        assert!(h.reject.is_none());
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|s| {
+            assert_eq!(s, &[(3, 3)], "the count it was told and the room it was given are one");
+        });
+        assert_eq!(shadow.map(|c| c.0), HOST, "the driver's handles land in the shadow");
+        assert_eq!(wire.map(|c| c.0), IDS, "and the guest's ids on the wire are left alone");
+
+        // Both names of every object, paired the way the guest sent them. A run recorded in the
+        // wrong order resolves every id to a live object -- someone else's.
+        for (host, id) in HOST.iter().zip(IDS) {
+            assert_eq!(
+                h.driver.pool_child_id(VkCommandPool(POOL), VkCommandBuffer(*host)),
+                Some(ObjectId(id)),
+                "the pool holds {host:#x} under the id the guest named it by"
+            );
+        }
+
+        // A refusal ghosts every id in the run. Left plain missing, each of the commands the
+        // guest already has in flight against them would poison the context instead of being
+        // absorbed -- and the guest asked for a whole run, so it is every id or none.
+        ANSWER.with_borrow_mut(|a| *a = VkResult::VK_ERROR_OUT_OF_POOL_MEMORY);
+        // A fresh set of ids, so a ghost found below is this run's and not the last one's.
+        let mut shadow = [VkCommandBuffer(0); 3];
+        let mut args = vn_command_vkAllocateCommandBuffers::default();
+        args.device = VkDevice(DEVICE);
+        args.pAllocateInfo = Some(&info);
+        args.plant_pCommandBuffers(&mut wire);
+        args.plant_handle_pCommandBuffers(&mut shadow);
+        h.vkAllocateCommandBuffers(&mut args);
+        assert_eq!(args.ret, VkResult::VK_ERROR_OUT_OF_POOL_MEMORY);
+        for id in IDS {
+            assert!(
+                objects.borrow().is_ghost(ObjectId(id)),
+                "id {id} was asked for and refused, so it names a ghost and not nothing"
+            );
+        }
+
+        h.driver.abandon_planted();
+    }
+
     /// The commands that put bytes into memory, and the two shapes the four of them add.
     ///
     /// Left unserved, these read as an accounting gap -- so many commands the build refused --
