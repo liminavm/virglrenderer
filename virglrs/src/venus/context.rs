@@ -6890,6 +6890,33 @@ mod tests {
             );
         });
 
+        // And the count the guest reads back, which the dispatch above cannot show: the storage
+        // for it belongs to the decoder's arena and is gone with the batch. So the handler is
+        // called once more against storage this test holds.
+        //
+        // It is the number the guest sizes its own array by, and reporting the length it asked
+        // for instead would have it walk two devices' worth of handles plus whatever the third
+        // slot was left holding -- while every other assertion above still passed.
+        let mut n = IDS.len() as u32;
+        let mut wire: [VkPhysicalDevice; 3] = core::array::from_fn(|i| VkPhysicalDevice(IDS[i]));
+        let mut shadow = [VkPhysicalDevice(0); 3];
+        let mut args = vn_command_vkEnumeratePhysicalDevices::default();
+        args.instance = VkInstance(INSTANCE);
+        args.plant_pPhysicalDeviceCount(&mut n);
+        args.plant_pPhysicalDevices(&mut wire);
+        args.plant_handle_pPhysicalDevices(&mut shadow);
+        h.vkEnumeratePhysicalDevices(&mut args);
+        assert_eq!(
+            n,
+            HOST.len() as u32,
+            "the guest is told how many it got, not how many it asked for"
+        );
+        assert_eq!(
+            shadow.map(|p| p.0),
+            [HOST[0], HOST[1], 0],
+            "and the slots past that answer are left as they were"
+        );
+
         h.driver.abandon_planted();
     }
 

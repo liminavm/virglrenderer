@@ -122,7 +122,7 @@ SABOTAGES = [
         "a bind sends the dynamic offsets' count with the descriptor sets",
         'virglrs/src/venus/context.rs',
         '            sets,\n            offsets,\n        );\n        self.recorded(done);',
-        '            &sets[..sets.len().min(offsets.len())],\n            offsets,\n        );\n        self.recorded(done);',
+        '            sets,\n            &offsets[..offsets.len().min(sets.len())],\n        );\n        self.recorded(done);',
         '',
     ),
     (
