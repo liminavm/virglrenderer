@@ -265,7 +265,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    const RES: ResourceHandle = ResourceHandle(449);
+    const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const BUF_AT: usize = 0xc0;
     const BUF_SIZE: usize = 0x20000;
     fn ctx_id() -> CtxId {
@@ -295,7 +295,7 @@ mod tests {
 
     fn ring_info() -> VkRingCreateInfoMESA {
         VkRingCreateInfoMESA {
-            resourceId: RES.0,
+            resourceId: RES.get(),
             offset: 0,
             size: 0x200c4,
             headOffset: 0,
@@ -339,7 +339,7 @@ mod tests {
 
         // A window in the same resource, clear of the ring's own regions.
         let stream =
-            VkCommandStreamDescriptionMESA { resourceId: RES.0, offset: 0x21000, size: 0x1000 };
+            VkCommandStreamDescriptionMESA { resourceId: RES.get(), offset: 0x21000, size: 0x1000 };
         let args = Args { pStream: Some(&stream), ..Default::default() };
         let proto = crate::venus::cs::AllOfIt;
         let mut buf = vec![0u8; vn_sizeof_vkSetReplyCommandStreamMESA_args(&proto, &args)];

@@ -28,8 +28,6 @@ use std::sync::{Arc, RwLock};
 /// "there is no renderer for that capset" without consulting a table of negative integers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
-    /// A handle of zero, which names nothing.
-    ZeroHandle,
     /// The guest reused a resource handle that is still live.
     ResourceExists,
     /// The guest reused a context id that is still live.
@@ -66,7 +64,6 @@ fn venus_error(e: venus::vkr::Error) -> Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Error::ZeroHandle => "handle zero names nothing",
             Error::ResourceExists => "that resource handle is already live",
             Error::ContextExists => "that context id is already live",
             Error::NoContext => "no such context",
@@ -400,10 +397,10 @@ impl Renderer {
     }
 
     /// Check a guest-chosen resource handle before anything is inserted under it.
+    ///
+    /// Zero is not among the answers: [`ResourceHandle`] cannot hold one, so the shim that parsed
+    /// the guest's integer has already refused it.
     fn free_handle(&self, handle: ResourceHandle) -> Result<(), Error> {
-        if handle.0 == 0 {
-            return Err(Error::ZeroHandle);
-        }
         if self.resources.read().expect("the resource lock is never poisoned").contains_key(&handle)
         {
             return Err(Error::ResourceExists);
@@ -673,9 +670,10 @@ mod tests {
             // The size the venus corpus asks for a ring resource: not a whole number of pages.
             size: 0x24000 - 1,
         };
-        r.resource_create_blob(ResourceHandle(1), minted, Vec::new()).expect("created");
+        r.resource_create_blob(ResourceHandle::new(1).unwrap(), minted, Vec::new())
+            .expect("created");
         let map = r
-            .with_resource(ResourceHandle(1), |res| res.shm().cloned())
+            .with_resource(ResourceHandle::new(1).unwrap(), |res| res.shm().cloned())
             .expect("there")
             .expect("has memory");
 
@@ -687,17 +685,22 @@ mod tests {
 
         // A blob naming memory that already exists gets none of its own.
         let exported = BlobDesc { blob_id: BlobId(9), ..minted };
-        r.resource_create_blob(ResourceHandle(2), exported, Vec::new()).expect("created");
+        r.resource_create_blob(ResourceHandle::new(2).unwrap(), exported, Vec::new())
+            .expect("created");
         assert!(
-            r.with_resource(ResourceHandle(2), |res| res.shm().cloned()).expect("there").is_none(),
+            r.with_resource(ResourceHandle::new(2).unwrap(), |res| res.shm().cloned())
+                .expect("there")
+                .is_none(),
             "an export names memory the renderer already has; minting would answer with the wrong bytes"
         );
 
         // And so does a blob in memory that is not the host's to mint.
         let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
-        r.resource_create_blob(ResourceHandle(3), vram, Vec::new()).expect("created");
+        r.resource_create_blob(ResourceHandle::new(3).unwrap(), vram, Vec::new()).expect("created");
         assert!(
-            r.with_resource(ResourceHandle(3), |res| res.shm().cloned()).expect("there").is_none()
+            r.with_resource(ResourceHandle::new(3).unwrap(), |res| res.shm().cloned())
+                .expect("there")
+                .is_none()
         );
     }
 
@@ -732,7 +735,7 @@ mod tests {
         let fd = a_descriptor();
         let raw = fd.as_raw_fd();
         let mut r = renderer(Config::default());
-        let h = ResourceHandle(1);
+        let h = ResourceHandle::new(1).unwrap();
         r.resource_import(h, import_desc(4096), fd).expect("a fresh handle and a real size");
         assert!(is_open(raw), "the resource holds the descriptor while it lives");
         r.resource_unref(h);
@@ -750,7 +753,7 @@ mod tests {
         let raw = fd.as_raw_fd();
         let mut r = renderer(Config::default());
         let rej = r
-            .resource_import(ResourceHandle(1), import_desc(0), fd)
+            .resource_import(ResourceHandle::new(1).unwrap(), import_desc(0), fd)
             .expect_err("zero bytes names no memory");
         assert_eq!(rej.error, Error::ZeroSize);
         assert_eq!(rej.fd.into_raw_fd(), raw, "the same descriptor, not another");

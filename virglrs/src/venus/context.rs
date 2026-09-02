@@ -2014,7 +2014,7 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetMemoryResourcePropertiesMESA<'_>,
     ) {
-        let (device, resource) = (args.device, ResourceHandle(args.resourceId));
+        let (device, named) = (args.device, args.resourceId);
         let Some(out) = self.fills(args.pMemoryResourceProperties_mut()) else { return };
 
         // A resource id that names nothing is answered, never refused, and this is the one place
@@ -2025,7 +2025,10 @@ impl Commands for Handlers<'_> {
         //
         // `shm` folds "no such resource" and "not host-addressable" into one answer, and folding
         // them is right here: Vulkan has one error for both, and it is the same error.
-        let Some(map) = self.resources.shm(resource) else {
+        //
+        // Zero is folded in with them: it cannot become a [`ResourceHandle`], and a guest that
+        // sends one has named a resource that is not there by the shortest route.
+        let Some(map) = ResourceHandle::new(named).and_then(|r| self.resources.shm(r)) else {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
@@ -2803,7 +2806,7 @@ mod tests {
         }
     }
 
-    const RING_RES: crate::ids::ResourceHandle = crate::ids::ResourceHandle(449);
+    const RING_RES: crate::ids::ResourceHandle = crate::ids::ResourceHandle::new(449).unwrap();
 
     /// A resource minted the way the renderer mints one for a ring, at the size the venus corpus
     /// actually asks for.
@@ -2818,7 +2821,7 @@ mod tests {
     /// power-of-two buffer and a small extra region.
     fn ring_info() -> crate::venus::proto::types::VkRingCreateInfoMESA {
         crate::venus::proto::types::VkRingCreateInfoMESA {
-            resourceId: RING_RES.0,
+            resourceId: RING_RES.get(),
             offset: 0,
             size: 0x200c4,
             headOffset: 0,
@@ -2894,7 +2897,7 @@ mod tests {
         size: usize,
     ) -> super::super::proto::types::VkCommandStreamDescriptionMESA {
         super::super::proto::types::VkCommandStreamDescriptionMESA {
-            resourceId: RING_RES.0,
+            resourceId: RING_RES.get(),
             offset,
             size,
         }
@@ -4036,7 +4039,7 @@ mod tests {
         props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
         let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
         q.device = VkDevice(GUEST_DEV);
-        q.resourceId = RING_RES.0;
+        q.resourceId = RING_RES.get();
         q.plant_pMemoryResourceProperties(&mut props);
 
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x200));
@@ -4071,7 +4074,7 @@ mod tests {
         props.pNext = (&mut size) as *mut _ as *mut core::ffi::c_void;
         let mut q = ty::vn_command_vkGetMemoryResourcePropertiesMESA::default();
         q.device = VkDevice(GUEST_DEV);
-        q.resourceId = RING_RES.0 + 1;
+        q.resourceId = RING_RES.get() + 1;
         q.plant_pMemoryResourceProperties(&mut props);
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x200));
         batch.extend_from_slice(&wire!(
@@ -4144,7 +4147,7 @@ mod tests {
 
         let mut args = Cmd::default();
         args.device = VkDevice(GUEST_DEV);
-        args.resourceId = RING_RES.0;
+        args.resourceId = RING_RES.get();
         assert!(run!(&mut args).is_some(), "a query with nowhere to answer is refused");
 
         // A live resource and nowhere to look up the device: the struct would go back untouched
@@ -4152,7 +4155,7 @@ mod tests {
         let mut props = VkMemoryResourcePropertiesMESA::default();
         let mut args = Cmd::default();
         args.device = VkDevice(GUEST_DEV);
-        args.resourceId = RING_RES.0;
+        args.resourceId = RING_RES.get();
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");

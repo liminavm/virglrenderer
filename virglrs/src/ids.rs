@@ -29,11 +29,6 @@ macro_rules! id {
 }
 
 id!(
-    /// A resource in the global resource table. Guest-chosen, and REUSED: a handle freed by one
-    /// unref names something else after the next create.
-    ResourceHandle(u32)
-);
-id!(
     /// A fence within a context's ring. Monotonic per (context, ring), never globally.
     FenceId(u64)
 );
@@ -90,6 +85,38 @@ impl CtxId {
 }
 
 impl std::fmt::Display for CtxId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A resource in the global resource table.
+///
+/// Guest-chosen and REUSED: a handle freed by one unref names something else after the next
+/// create. Never zero -- `NonZeroU32` rather than a checked constructor over a `u32`, for the
+/// reason [`CtxId`] gives, and because the alternative was a zero check at one call site with
+/// every other lookup left to miss quietly.
+///
+/// Like a context id it arrives as an untrusted integer, from the VMM at the C ABI or from a
+/// guest's own `vkCreateRingMESA`, and [`ResourceHandle::new`] is where that integer is parsed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(transparent)]
+pub struct ResourceHandle(NonZeroU32);
+
+impl ResourceHandle {
+    pub const fn new(raw: u32) -> Option<ResourceHandle> {
+        match NonZeroU32::new(raw) {
+            Some(n) => Some(ResourceHandle(n)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for ResourceHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }

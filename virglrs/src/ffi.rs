@@ -100,8 +100,8 @@ impl fence::FenceSink for VmmFences {
 fn errno(e: renderer::Error) -> c_int {
     use renderer::Error::*;
     match e {
-        ZeroHandle | ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned
-        | NoAllocation | NotMappable | ZeroSize | Unmappable => EINVAL,
+        ResourceExists | ContextExists | NoContext | RendererAbsent | Poisoned | NoAllocation
+        | NotMappable | ZeroSize | Unmappable => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
     }
 }
@@ -291,16 +291,22 @@ pub extern "C" fn virgl_renderer_context_destroy(handle: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_attach_resource(ctx_id: c_int, res_handle: c_int) {
     // Nothing is attached to the global: it holds no resource table of its own.
-    if let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) {
-        with((), |r| r.ctx_attach_resource(id, ResourceHandle(res_handle as u32)));
-    }
+    let (AbiCtx::Ctx(id), Some(handle)) =
+        (AbiCtx::new(ctx_id as u32), ResourceHandle::new(res_handle as u32))
+    else {
+        return;
+    };
+    with((), |r| r.ctx_attach_resource(id, handle));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: c_int) {
-    if let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) {
-        with((), |r| r.ctx_detach_resource(id, ResourceHandle(res_handle as u32)));
-    }
+    let (AbiCtx::Ctx(id), Some(handle)) =
+        (AbiCtx::new(ctx_id as u32), ResourceHandle::new(res_handle as u32))
+    else {
+        return;
+    };
+    with((), |r| r.ctx_detach_resource(id, handle));
 }
 
 #[unsafe(no_mangle)]
@@ -318,7 +324,7 @@ pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
 /// Field by field on purpose. A `From` impl would have to live beside one of the two types, which
 /// means either the C layout appearing in the renderer or the renderer's type appearing in the
 /// ABI module -- and the whole point of the split is that neither knows the other.
-fn classic_desc(a: &ResourceCreateArgs) -> (ResourceHandle, renderer::ClassicDesc) {
+fn classic_desc(a: &ResourceCreateArgs) -> (Option<ResourceHandle>, renderer::ClassicDesc) {
     let desc = renderer::ClassicDesc {
         target: a.target,
         format: a.format,
@@ -331,7 +337,7 @@ fn classic_desc(a: &ResourceCreateArgs) -> (ResourceHandle, renderer::ClassicDes
         nr_samples: a.nr_samples,
         flags: a.flags,
     };
-    (ResourceHandle(a.handle), desc)
+    (ResourceHandle::new(a.handle), desc)
 }
 
 /// The blob the ABI's create args describe.
@@ -360,6 +366,11 @@ pub extern "C" fn virgl_renderer_resource_create(
     // SAFETY: the VMM's contract is that `args` is valid for the call; the fields are copied out.
     let a = unsafe { &*args };
     let (handle, desc) = classic_desc(a);
+    // Zero was already `Error::ZeroHandle` here, answered with EINVAL. Now it is the parse that
+    // fails, and the answer is the same one.
+    let Some(handle) = handle else {
+        return EINVAL;
+    };
     let iov = read_iov(iov, num_iovs);
     with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
         Ok(()) => 0,
@@ -374,7 +385,9 @@ pub extern "C" fn virgl_renderer_resource_create_blob(args: *const CreateBlobArg
     }
     // SAFETY: valid for the duration of the call by the VMM's contract; copied out below.
     let a = unsafe { &*args };
-    let handle = ResourceHandle(a.res_handle);
+    let Some(handle) = ResourceHandle::new(a.res_handle) else {
+        return EINVAL;
+    };
     let desc = blob_desc(a);
     // SAFETY: the VMM's contract for create_blob is that `iovecs` points to `num_iovs` valid
     // entries for the duration of the call. Done here so the renderer never sees a raw pointer.
@@ -401,6 +414,9 @@ pub extern "C" fn virgl_renderer_resource_import_blob(args: *const ImportBlobArg
     if a.fd < 0 {
         return EINVAL;
     }
+    let Some(handle) = ResourceHandle::new(a.res_handle) else {
+        return EINVAL;
+    };
     let desc = ImportDesc { blob_mem, fd_type, size: a.size };
     // SAFETY: `a.fd` is non-negative and the ABI's contract is that a successful import takes it.
     // Both paths below account for it: the renderer files it under the resource, or hands it back
@@ -414,7 +430,7 @@ pub extern "C" fn virgl_renderer_resource_import_blob(args: *const ImportBlobArg
         return_fd(fd, a.fd);
         return EINVAL;
     };
-    match r.resource_import(ResourceHandle(a.res_handle), desc, fd) {
+    match r.resource_import(handle, desc, fd) {
         Ok(()) => 0,
         Err(rej) => {
             return_fd(rej.fd, a.fd);
@@ -457,21 +473,29 @@ pub extern "C" fn virgl_renderer_resource_import_eglimage(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_unref(res_handle: u32) {
-    with((), |r| r.resource_unref(ResourceHandle(res_handle)));
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return;
+    };
+    with((), |r| r.resource_unref(handle));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_set_priv(res_handle: u32, priv_: *mut c_void) {
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return;
+    };
     with((), |r| {
-        r.with_resource_mut(ResourceHandle(res_handle), |res| res.priv_ = VmmPtr(priv_));
+        r.with_resource_mut(handle, |res| res.priv_ = VmmPtr(priv_));
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_get_priv(res_handle: u32) -> *mut c_void {
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return std::ptr::null_mut();
+    };
     with(std::ptr::null_mut(), |r| {
-        r.with_resource(ResourceHandle(res_handle), |res| res.priv_.0)
-            .unwrap_or(std::ptr::null_mut())
+        r.with_resource(handle, |res| res.priv_.0).unwrap_or(std::ptr::null_mut())
     })
 }
 
@@ -484,9 +508,12 @@ pub extern "C" fn virgl_renderer_resource_attach_iov(
     if num_iovs < 0 {
         return EINVAL;
     }
+    let Some(handle) = ResourceHandle::new(res_handle as u32) else {
+        return EINVAL;
+    };
     let v = read_iov(iov, num_iovs as u32);
     with(EINVAL, |r| {
-        r.with_resource_mut(ResourceHandle(res_handle as u32), |res| {
+        r.with_resource_mut(handle, |res| {
             res.iov = v;
             0
         })
@@ -500,9 +527,12 @@ pub extern "C" fn virgl_renderer_resource_detach_iov(
     iov: *mut *mut libc::iovec,
     num_iovs: *mut c_int,
 ) {
+    let Some(handle) = ResourceHandle::new(res_handle as u32) else {
+        return;
+    };
     with((), |r| {
         let n = r
-            .with_resource_mut(ResourceHandle(res_handle as u32), |res| {
+            .with_resource_mut(handle, |res| {
                 let n = res.iov.len();
                 res.iov.clear();
                 n
@@ -529,11 +559,12 @@ pub extern "C" fn virgl_renderer_resource_get_info(
     if info.is_null() {
         return EINVAL;
     }
+    let Some(handle) = ResourceHandle::new(res_handle as u32) else {
+        return EINVAL;
+    };
     with(EINVAL, |r| {
-        r.with_resource(ResourceHandle(res_handle as u32), |_| {
-            todo_phase!("P3: resource info needs the pipe resource")
-        })
-        .unwrap_or(EINVAL)
+        r.with_resource(handle, |_| todo_phase!("P3: resource info needs the pipe resource"))
+            .unwrap_or(EINVAL)
     })
 }
 
@@ -604,8 +635,11 @@ pub extern "C" fn virgl_renderer_resource_get_iosurface_id(
     // Zero means "not IOSurface-backed", which is the truth for every resource here. It must also
     // become the answer the instant a backing is freed: ids are recycled immediately, and a stale
     // one names a stranger's surface.
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return EINVAL;
+    };
     with(EINVAL, |r| {
-        r.with_resource(ResourceHandle(res_handle), |_| {
+        r.with_resource(handle, |_| {
             // SAFETY: caller-provided out-pointer, checked non-null.
             unsafe { *iosurface_id = 0 };
             0
@@ -1208,7 +1242,7 @@ mod tests {
             flags: 11,
         };
         let (handle, d) = classic_desc(&a);
-        assert_eq!(handle, ResourceHandle(1));
+        assert_eq!(handle, ResourceHandle::new(1));
         assert_eq!(
             d,
             renderer::ClassicDesc {
@@ -1224,6 +1258,32 @@ mod tests {
                 flags: 11,
             }
         );
+    }
+
+    /// A handle of zero never becomes one.
+    ///
+    /// It used to travel as an ordinary `ResourceHandle` and be caught by a single check inside
+    /// `Renderer::free_handle`, which meant every lookup that did not go through that check --
+    /// unref, get_priv, attach_iov -- took zero as a name and merely failed to find it. The type
+    /// refuses it at the boundary now, and `Error::ZeroHandle` is gone with the check. What the
+    /// ABI answers is unchanged: `EINVAL`, which is what that error mapped to.
+    #[test]
+    fn a_resource_handle_of_zero_does_not_parse() {
+        let a = ResourceCreateArgs {
+            handle: 0,
+            target: 2,
+            format: 3,
+            bind: 4,
+            width: 5,
+            height: 6,
+            depth: 7,
+            array_size: 8,
+            last_level: 9,
+            nr_samples: 10,
+            flags: 11,
+        };
+        assert_eq!(classic_desc(&a).0, None);
+        assert_eq!(ResourceHandle::new(0), None);
     }
 
     /// Likewise, and additionally that `ctx_id` does not silently become something else -- it is
@@ -1254,7 +1314,6 @@ mod tests {
     fn every_cause_keeps_the_errno_the_abi_answered_with() {
         use renderer::Error::*;
         for e in [
-            ZeroHandle,
             ResourceExists,
             ContextExists,
             NoContext,
