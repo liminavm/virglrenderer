@@ -319,7 +319,7 @@ mod tests {
     use crate::venus::proto::types::VkRingCreateInfoMESA;
     use crate::venus::ring::ShmResources;
 
-    const RES: ResourceHandle = ResourceHandle(449);
+    const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const BUF_AT: usize = 0xc0;
     const BUF_SIZE: usize = 0x20000;
 
@@ -337,7 +337,7 @@ mod tests {
         drop(fd);
         let map = Arc::new(map);
         let info = VkRingCreateInfoMESA {
-            resourceId: RES.0,
+            resourceId: RES.get(),
             offset: 0,
             size: 0x200c4,
             idleTimeout: idle.as_nanos() as u64,

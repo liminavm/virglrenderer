@@ -206,7 +206,10 @@ impl RingLayout {
 /// inside it that we will not touch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RingError {
-    NoResource(ResourceHandle),
+    /// The id the guest named, which is zero or resolves to nothing. A bare `u32` rather than a
+    /// [`ResourceHandle`] because it is exactly the value that failed to become one: carrying it
+    /// as a handle would be claiming it parsed.
+    NoResource(u32),
     Layout(LayoutError),
     /// The head or status word was already non-zero on a ring the host is about to start managing.
     /// Those two words are the host's to write, so a guest presenting them dirty is describing a
@@ -272,11 +275,13 @@ impl Ring {
         info: &VkRingCreateInfoMESA,
         replaying: bool,
     ) -> Result<Ring, RingError> {
-        let handle = ResourceHandle(info.resourceId);
         // The resource is resolved before the layout is parsed, because the layout is checked
         // against the resource's real size -- checking it against the size the guest claimed
-        // would be checking the guest against itself.
-        let map = resources.shm(handle).ok_or(RingError::NoResource(handle))?;
+        // would be checking the guest against itself. Zero is refused here rather than looked up:
+        // it is not a handle, and every table below this line takes one.
+        let map = ResourceHandle::new(info.resourceId)
+            .and_then(|h| resources.shm(h))
+            .ok_or(RingError::NoResource(info.resourceId))?;
         let layout = RingLayout::parse(map.len(), info).map_err(RingError::Layout)?;
         let at = |r: &Region| {
             map.load_u32(r.begin()).expect("a validated control word is inside the mapping")
@@ -427,8 +432,9 @@ impl std::fmt::Display for ReplyOverflow {
 /// Why a guest's reply stream was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyStreamError {
-    /// No resource by that name, or one with no host mapping.
-    NoResource(ResourceHandle),
+    /// No resource by that name, or one with no host mapping. A bare `u32` for the reason
+    /// [`RingError::NoResource`] gives.
+    NoResource(u32),
     /// The window does not fit the memory behind the resource. Reported with the real size, not
     /// the one the guest claimed, because the guest's claim is what is in doubt.
     OutOfRange { offset: usize, size: usize, resource: usize },
@@ -443,8 +449,9 @@ impl ReplyStream {
         resources: &dyn ShmResources,
         stream: &VkCommandStreamDescriptionMESA,
     ) -> Result<ReplyStream, ReplyStreamError> {
-        let handle = ResourceHandle(stream.resourceId);
-        let map = resources.shm(handle).ok_or(ReplyStreamError::NoResource(handle))?;
+        let map = ResourceHandle::new(stream.resourceId)
+            .and_then(|h| resources.shm(h))
+            .ok_or(ReplyStreamError::NoResource(stream.resourceId))?;
         let out_of_range = ReplyStreamError::OutOfRange {
             offset: stream.offset,
             size: stream.size,
@@ -552,7 +559,7 @@ mod tests {
         OwnedFd::from(f)
     }
 
-    const HANDLE: ResourceHandle = ResourceHandle(7);
+    const HANDLE: ResourceHandle = ResourceHandle::new(7).unwrap();
 
     fn table(len: usize) -> OneResource {
         let fd = shm_fd(len);
@@ -568,7 +575,8 @@ mod tests {
     #[test]
     fn two_answers_land_one_after_the_other() {
         let t = table(0x4000);
-        let d = VkCommandStreamDescriptionMESA { resourceId: HANDLE.0, offset: 0x100, size: 0x40 };
+        let d =
+            VkCommandStreamDescriptionMESA { resourceId: HANDLE.get(), offset: 0x100, size: 0x40 };
         let mut s = ReplyStream::set(&t, &d).expect("a window inside the mapping");
 
         assert_eq!(s.pos(), 0);
@@ -753,7 +761,7 @@ mod tests {
     fn a_ring_outlives_the_resource_it_was_created_from() {
         let t = table(0x4000);
         let mut info = good();
-        info.resourceId = HANDLE.0;
+        info.resourceId = HANDLE.get();
         let ring = Ring::create(&t, &info, false).expect("created");
 
         ring.set_head(0x1234);
@@ -772,12 +780,28 @@ mod tests {
     fn a_resource_that_is_not_there_is_refused_by_name() {
         let t = table(0x4000);
         let mut info = good();
-        info.resourceId = HANDLE.0 + 1;
+        info.resourceId = HANDLE.get() + 1;
         assert_eq!(
             Ring::create(&t, &info, false).err(),
-            Some(RingError::NoResource(ResourceHandle(HANDLE.0 + 1))),
+            Some(RingError::NoResource(HANDLE.get() + 1)),
             "the refusal says which resource, because that is the bug"
         );
+    }
+
+    /// Zero is refused where every other unusable id is, and by the same answer.
+    ///
+    /// It never reaches the resource table: [`ResourceHandle`] cannot hold a zero, so the parse
+    /// is what fails. That is the point of the type -- before it, zero was an ordinary lookup
+    /// that happened to miss, and every table below here had to be trusted to keep missing it.
+    #[test]
+    fn a_resource_id_of_zero_is_refused_at_the_parse() {
+        let t = table(0x4000);
+        let mut info = good();
+        info.resourceId = 0;
+        assert_eq!(Ring::create(&t, &info, false).err(), Some(RingError::NoResource(0)));
+
+        let d = VkCommandStreamDescriptionMESA { resourceId: 0, offset: 0, size: 0x40 };
+        assert_eq!(ReplyStream::set(&t, &d).err(), Some(ReplyStreamError::NoResource(0)));
     }
 
     /// The layout is checked against the mapping's real size, not the size the guest claimed --
@@ -786,7 +810,7 @@ mod tests {
     fn the_layout_is_checked_against_the_resource_and_not_the_guest_s_word() {
         let t = table(0x2000);
         let mut info = good();
-        info.resourceId = HANDLE.0;
+        info.resourceId = HANDLE.get();
         info.offset = 0x1000;
         info.size = 0x2000; // would fit a 0x4000 resource; this one is 0x2000
         assert_eq!(
@@ -799,7 +823,7 @@ mod tests {
     fn the_head_and_tail_are_the_words_the_layout_named() {
         let t = table(0x4000);
         let mut info = good();
-        info.resourceId = HANDLE.0;
+        info.resourceId = HANDLE.get();
         let ring = Ring::create(&t, &info, false).expect("created");
 
         // The guest writes the tail; the host reads it.
@@ -832,7 +856,7 @@ mod tests {
         for (at, what) in [(0x1000usize, "head"), (0x1008usize, "status")] {
             let t = table(RES);
             let mut info = good();
-            info.resourceId = HANDLE.0;
+            info.resourceId = HANDLE.get();
             assert!(t.1.store_u32(at, 7), "the control word is inside the mapping");
 
             assert!(
@@ -849,7 +873,7 @@ mod tests {
     fn an_extra_write_cannot_reach_outside_the_extra_region() {
         let t = table(0x4000);
         let mut info = good();
-        info.resourceId = HANDLE.0;
+        info.resourceId = HANDLE.get();
         let ring = Ring::create(&t, &info, false).expect("created");
         assert_eq!(ring.layout.extra.size(), 0x40);
 
