@@ -1754,7 +1754,11 @@ class RustGen:
                 continue
             if shape[0] != 'dynamic' or var.is_optional() or not var.can_validate():
                 continue
-            out.add(self.field_name(var.name))
+            f = self.field_name(var.name)
+            # The shadow beside it is allocated from the same count, behind the same check: it
+            # exists only where the wire array does, and its own allocation poisons when it
+            # fails. So it inherits the member's class rather than being classified again.
+            out.update((f, 'handle_%s' % f))
         return out
 
     #: What a validated array's accessor says when the state it cannot be in happens anyway.
@@ -1792,10 +1796,10 @@ class RustGen:
         for f, elem, count, mutable in rows:
             # As in `_scalar_accessor`: a create's out-array carries the guest's ids.
             read = 'cs::Guest<%s>' % elem if f in out_handles else elem
-            # Only the read side: a shadow is allocated from the same count, but it is the wire
-            # member the decoder validated and the two are separate members.
-            sure = not mutable and f in infallible
-            if mutable:
+            sure = f in infallible
+            if mutable and sure:
+                sig = 'pub fn %s_mut(&mut self) -> &mut [%s]' % (f, elem)
+            elif mutable:
                 sig = 'pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem)
             elif sure:
                 sig = "pub fn %s(&self) -> &'a [%s]" % (f, read)
