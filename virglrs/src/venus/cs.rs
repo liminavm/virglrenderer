@@ -108,6 +108,37 @@ impl Default for Ptr {
 /// the whole point of the newtypes. A handler still has to move a raw handle from the driver into
 /// a typed shadow member, so the conversion is named here rather than done with a cast at every
 /// call site, and the generator implements it for every handle type.
+/// A handle slot holding the *guest's* id for an object, not a handle the host may be called with.
+///
+/// Every other handle slot in a decoded command holds the host handle: the decoder replaced the
+/// guest's id at lookup, which is what lets the argument struct be handed to the driver unchanged.
+/// A create's out-member is the exception -- the guest chooses the id there, the reply re-encodes
+/// it, and the driver's answer goes to a shadow member beside it. The two readings were one type
+/// and told apart by the reader.
+///
+/// So the accessor over an out-member hands back this, and it deliberately offers no way to reach
+/// a [`HostHandle`]: passing one to the driver would be calling Vulkan with a number the guest
+/// made up, and re-encoding a host handle in its place would hand the guest a live host pointer.
+/// [`Guest::id`] is the whole interface, because the id is the whole content.
+///
+/// `repr(transparent)` so the accessor is a cast and the wire layout is untouched.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(transparent)]
+pub struct Guest<T>(T);
+
+impl<T: Handle> Guest<T> {
+    /// The id the guest asked this object to be known by.
+    pub fn id(self) -> ObjectId {
+        self.0.guest_id()
+    }
+
+    /// Name an id the way the decoder would have, for a test that plants one.
+    #[cfg(test)]
+    pub fn new(handle: T) -> Guest<T> {
+        Guest(handle)
+    }
+}
+
 pub trait Handle: Copy {
     /// The `VkObjectType` discriminant of this handle's Vulkan type.
     ///

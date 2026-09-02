@@ -364,6 +364,16 @@ class RustGen:
                 continue
         return out
 
+    def out_handle_fields(self, ty):
+        """The visible members a create writes its *guest ids* into, by field name.
+
+        The one place in a command struct where a handle slot holds the guest's word rather than
+        the host's -- everywhere else the decoder has already replaced the id with the host handle
+        (see `vn_decode_*_lookup`). The reading is a fact about the member, not about the call, so
+        the accessor over one hands back `cs::Guest<T>` and the rest hand back the bare newtype.
+        """
+        return {self.field_name(var.name) for var, _ in self.out_handles(ty)}
+
     def shadows(self, ty):
         """The host-side members of a command's argument struct, as `(field, rust_type, shape)`.
 
@@ -1673,9 +1683,12 @@ class RustGen:
         if not rows and not scalars and not strings:
             return []
         out = ["impl<'a> vn_command_%s<'a> {" % ty.name]
+        out_handles = self.out_handle_fields(ty)
         for f, elem, count, mutable in rows:
+            # As in `_scalar_accessor`: a create's out-array carries the guest's ids.
+            read = 'cs::Guest<%s>' % elem if f in out_handles else elem
             sig = ('pub fn %s_mut(&mut self) -> Option<&mut [%s]>' % (f, elem) if mutable
-                   else "pub fn %s(&self) -> Option<&'a [%s]>" % (f, elem))
+                   else "pub fn %s(&self) -> Option<&'a [%s]>" % (f, read))
             call = 'wire_array_mut' if mutable else 'wire_array'
             # The count expression is the decode's, which counts in `u64` because that is what the
             # wire holds. A slice is indexed in `usize`, and one cast says so once.
@@ -1752,11 +1765,14 @@ class RustGen:
         named and writes the answer beside it in the same breath, and those two must be able to be
         held at once. Two writers must not, and are not.
         """
+        # A create's out-member is the guest's id, not a handle the driver may be called with,
+        # and `Guest` is transparent so the reference is the same reference.
+        read = 'cs::Guest<%s>' % elem if f in self.out_handle_fields(ty) else elem
         if mutable:
             sig = 'pub fn %s_mut(&mut self) -> Option<&mut %s>' % (f, elem)
             call, star = 'wire_out', 'mut'
         else:
-            sig = "pub fn %s(&self) -> Option<&'a %s>" % (f, elem)
+            sig = "pub fn %s(&self) -> Option<&'a %s>" % (f, read)
             call, star = 'wire_ref', 'const'
         # The door a test plants through follows the *field*, not the accessor. A wire out-handle
         # is a `*mut` the handler may only read, so the two disagree there, and it is the field

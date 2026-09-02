@@ -18,7 +18,7 @@ use crate::ids::{CtxId, ResourceHandle, RingId};
 
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Encoder};
-use super::cs::{HostHandle, ObjectId};
+use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -611,8 +611,8 @@ pub struct Handlers<'a> {
 
 impl Handlers<'_> {
     /// The guest id a single out-handle carries, or None when the guest asked for no object.
-    fn out_id<T: Handle>(&self, out: Option<&T>) -> Option<ObjectId> {
-        Some(out?.guest_id())
+    fn out_id<T: Handle>(&self, out: Option<&Guest<T>>) -> Option<ObjectId> {
+        Some(out?.id())
     }
 
     /// Write what the driver produced into the shadow the generated hook will read, or ghost the
@@ -626,7 +626,7 @@ impl Handlers<'_> {
     fn plant<T: Handle>(
         &mut self,
         what: &str,
-        out: Option<&T>,
+        out: Option<&Guest<T>>,
         shadow: Option<&mut T>,
         host: Result<T, VkResult>,
     ) {
@@ -797,9 +797,9 @@ impl Handlers<'_> {
         }
     }
 
-    fn ghost_ids<T: Handle>(&mut self, ids: &[T]) {
+    fn ghost_ids<T: Handle>(&mut self, ids: &[Guest<T>]) {
         for id in ids {
-            self.objects.borrow_mut().add_ghost(id.guest_id());
+            self.objects.borrow_mut().add_ghost(id.id());
         }
     }
 }
@@ -1186,7 +1186,7 @@ impl Commands for Handlers<'_> {
         let pool = info.commandPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
-        let named: Vec<ObjectId> = ids.iter().map(|h| h.guest_id()).collect();
+        let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
         let Some(out) = self.array(args.handle_pCommandBuffers_mut()) else { return };
         let host = self.driver.allocate_objects(
             device,
@@ -1221,7 +1221,7 @@ impl Commands for Handlers<'_> {
         let pool = info.descriptorPool;
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
-        let named: Vec<ObjectId> = ids.iter().map(|h| h.guest_id()).collect();
+        let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
         let Some(out) = self.array(args.handle_pDescriptorSets_mut()) else { return };
         let host = self.driver.allocate_objects(
             device,
