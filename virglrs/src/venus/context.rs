@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ids::{CtxId, RingId};
 
-use super::cs::Decoder;
 use super::cs::Handle;
 use super::cs::ObjectId;
+use super::cs::{AllOfIt, Decoder, Encoder};
 use super::driver::{Driver, MemoryError, NoSyncFd};
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -59,9 +59,9 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceProperties2,
     vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkImportSemaphoreResourceMESA,
     vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer,
-    vn_command_vkResetFences, vn_command_vkSetReplyCommandStreamMESA,
-    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
-    vn_command_vkWaitSemaphoreResourceMESA,
+    vn_command_vkResetFences, vn_command_vkSeekReplyCommandStreamMESA,
+    vn_command_vkSetReplyCommandStreamMESA, vn_command_vkUpdateDescriptorSets,
+    vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
 };
 use super::ring::{ReplyStream, ReplyStreamError, Ring, RingError, ShmResources};
 use super::ring_thread::RingThread;
@@ -242,6 +242,11 @@ impl Context {
         let (mut dispatched, mut unhandled) = (0u64, 0u64);
 
         let temp = Bump::new();
+        // One reply buffer for the batch, refilled per command. Host memory: an answer is built
+        // here in full and only then offered to the guest, so a reply that turns out not to fit
+        // never reaches it. See `ReplyStream::write`.
+        let mut scratch: Vec<u8> = Vec::new();
+        let proto = AllOfIt;
         let mut dec = Decoder::new(buf, &temp, &self.objects, fatal);
         let mut h = Handlers {
             objects: &self.objects,
@@ -272,23 +277,32 @@ impl Context {
                 break;
             }
 
-            // A command that wants an answer has nowhere to be answered into: the reply buffer is
-            // the ring's, and there is no ring loop yet. Poisoning is the honest response --
-            // dispatching and dropping the reply would leave the guest waiting on a reply that was
-            // never written, which is a hang rather than an error. Replay never takes this branch:
-            // the journal's entries have had their reply flag stripped already.
-            if flags.0 & GENERATE_REPLY != 0 && !replay {
+            // The guest is waiting for an answer to this one. Replay never is: the journal's
+            // entries have had their reply flag stripped already, which is why a replayed stream
+            // needs no reply buffer at all.
+            let wants_reply = flags.0 & GENERATE_REPLY != 0 && !replay;
+
+            // Asked before the command runs rather than after, which is where the C's
+            // `vkr_cs_encoder_acquire` asks it too. Running the handler first would let a command
+            // create an object and only then discover there is nowhere to report it -- state
+            // changed on a path that ends in a poisoned context either way.
+            if wants_reply && h.reply.is_none() {
                 unhandled += 1;
-                poison(fatal, id, &dec, cmd, "wants a reply, and there is no ring to answer into");
+                poison(fatal, id, &dec, cmd, "wants a reply, and no reply stream was ever set");
                 break;
             }
 
-            if vn_dispatch_command(&mut dec, None, cmd, &mut h).is_none() {
+            let mut enc = Encoder::growing(&mut scratch, &proto);
+            if vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut h).is_none()
+            {
                 // A command type this protocol does not define. We cannot even skip it: its length
                 // is only knowable by decoding it.
                 poison(fatal, id, &dec, cmd, "is not a command type this protocol defines");
                 break;
             }
+            // How much answer there is. Read here so the encoder's borrow of the scratch ends
+            // before the commit below reads it back.
+            let answer = enc.pos();
             dispatched += 1;
             // A handler that found the command itself unusable -- an id the guest cannot have, a
             // length that would send the driver off the end of what was decoded. The handler has
@@ -303,6 +317,18 @@ impl Context {
                 // reader needs, because without it a gap reaches a user as a hung guest.
                 poison(fatal, id, &dec, cmd, "did not decode");
                 break;
+            }
+
+            // The answer goes over only once the command is known to have worked. A poisoned
+            // context has nothing to say, and a rejected command's half-built reply would be an
+            // answer to a question we did not finish -- which the guest cannot tell apart from a
+            // real one.
+            if answer > 0 {
+                let stream = h.reply.as_mut().expect("a reply had a stream before the command ran");
+                if let Err(over) = stream.write(&scratch[..answer]) {
+                    poison(fatal, id, &dec, cmd, &format!("could not be answered: {over}"));
+                    break;
+                }
             }
         }
         self.dispatched += dispatched;
@@ -1419,6 +1445,31 @@ impl Commands for Handlers<'_> {
         *self.reply = Some(reply);
     }
 
+    /// Put the next answer somewhere other than after the last one.
+    ///
+    /// The guest does this when it knows where in its own window a reply belongs -- it has already
+    /// worked out the layout and is telling us, rather than asking us to append. A position past
+    /// the end of the window is refused instead of clamped: clamping would write the answer
+    /// somewhere the guest is not reading and report that as success, which is the shape of bug
+    /// this renderer exists to stop making.
+    fn vkSeekReplyCommandStreamMESA(
+        &mut self,
+        args: &mut vn_command_vkSeekReplyCommandStreamMESA<'_>,
+    ) {
+        let Some(reply) = self.reply.as_mut() else {
+            self.reject = Some("seeked a reply stream that was never set");
+            return;
+        };
+        if !reply.seek(args.position) {
+            eprintln!(
+                "[virglrs] vkSeekReplyCommandStreamMESA: {} is past a {}-byte window",
+                args.position,
+                reply.window().size()
+            );
+            self.reject = Some("seeked a reply stream past the end of its own window");
+        }
+    }
+
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
     // the honest channel and refusal is not: a driver without `VK_EXT_image_drm_format_modifier`
     // is an answer the guest asked for and can act on, not a reason to take its ring down. The
@@ -2027,6 +2078,149 @@ mod tests {
         let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
         vn_encode_vkSetReplyCommandStreamMESA_args(&mut enc, VkFlags(0), &args);
         buf
+    }
+
+    /// A seek command's bytes, with whatever header flags the caller wants.
+    ///
+    /// It is the cheapest command that both reaches a handler and produces a reply, which makes it
+    /// the one to drive the reply path with: no driver, no objects, no instance to have created.
+    fn wire_seek(position: usize, flags: u32) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkSeekReplyCommandStreamMESA_args,
+            vn_sizeof_vkSeekReplyCommandStreamMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkSeekReplyCommandStreamMESA as Args;
+
+        let args = Args { position, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkSeekReplyCommandStreamMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkSeekReplyCommandStreamMESA_args(&mut enc, VkFlags(flags), &args);
+        buf
+    }
+
+    /// What a reply to a seek looks like on the wire: the command type, and nothing else.
+    fn seek_reply_bytes() -> [u8; 4] {
+        (VkCommandTypeEXT::VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT.0 as u32).to_le_bytes()
+    }
+
+    /// The end-to-end claim of the whole reply path: a command that asks for an answer gets one,
+    /// in the guest's own memory, at the offset the guest chose.
+    ///
+    /// Driven over the wire rather than by calling the handler, because the thing being tested is
+    /// the dispatch loop's commit -- who writes, when, and to where -- and none of that is visible
+    /// from inside a handler.
+    #[test]
+    fn a_command_that_asks_for_an_answer_gets_one_in_the_guests_window() {
+        const WINDOW: usize = 0x21000;
+        const AT: usize = 8;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        // Set the window, then seek inside it and ask for a reply. The seek is what moves the
+        // answer off the top of the window, so finding it at `AT` proves the position was honoured
+        // rather than that everything happens to land at zero.
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_seek(AT, GENERATE_REPLY));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served batch does not poison");
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW + AT, &mut got));
+        assert_eq!(got, seek_reply_bytes(), "the answer is in the window, at the seeked offset");
+
+        // Nothing was written at the top of the window: the seek moved the write, it did not copy.
+        let mut top = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW, &mut top));
+        assert_eq!(top, [0; 4], "a seek leaves what it skipped alone");
+    }
+
+    /// A reply the guest left no room for kills the context, and leaves the window untouched.
+    ///
+    /// The second half is the part worth having. The C encoder writes members straight into guest
+    /// memory and finds out it has overrun partway through, so a guest that is polling its window
+    /// can see half an answer and act on it. Ours cannot write anything it has not first measured.
+    #[test]
+    fn a_reply_that_does_not_fit_writes_nothing_at_all() {
+        const WINDOW: usize = 0x21000;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        // Two bytes of room for a four-byte answer.
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 2));
+        batch.extend_from_slice(&wire_seek(0, GENERATE_REPLY));
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "an answer with nowhere to go poisons");
+        assert!(ctx.fatal());
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 4], "a refused reply is not a partial one");
+    }
+
+    /// A seek past the end of the window is refused rather than clamped, and a seek to exactly the
+    /// end is not: that is a stream with no room left, which is a state, not a mistake.
+    #[test]
+    fn a_seek_outside_the_window_is_refused() {
+        const WINDOW: usize = 0x21000;
+        const SIZE: usize = 0x100;
+
+        for (position, ok) in [(0usize, true), (SIZE, true), (SIZE + 1, false), (usize::MAX, false)]
+        {
+            let t = ring_table();
+            let g = crate::vulkan::global();
+            let mut todo = Unimplemented::default();
+            let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+            let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
+            batch.extend_from_slice(&wire_seek(position, 0));
+            assert_eq!(
+                ctx.submit(&batch, &mut todo, &g, &t),
+                ok,
+                "seeking to {position:#x} in a {SIZE:#x}-byte window"
+            );
+        }
+    }
+
+    /// A command that asked for an answer and then failed does not get to leave one behind.
+    ///
+    /// The encoder has already run by the time the handler's verdict lands, so the bytes exist --
+    /// what must not happen is their reaching a guest that would read them as a real answer to a
+    /// command that never worked. The commit is downstream of the verdict for exactly this.
+    #[test]
+    fn a_rejected_command_leaves_no_answer_behind() {
+        const WINDOW: usize = 0x21000;
+        const SIZE: usize = 0x100;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        // Out of range, and asking for a reply: the seek fails and the answer must not land.
+        let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
+        batch.extend_from_slice(&wire_seek(SIZE + 1, GENERATE_REPLY));
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "a rejected command poisons");
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 4], "a failed command's reply is not delivered");
+    }
+
+    /// Seeking a stream that was never set is the guest talking about something that is not there.
+    #[test]
+    fn a_seek_with_no_stream_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t), "there is nothing to seek");
+        assert!(ctx.fatal());
     }
 
     fn wire_create_ring(

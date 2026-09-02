@@ -408,6 +408,22 @@ pub struct ReplyStream {
     pos: usize,
 }
 
+/// A reply that did not fit the room the guest left for it.
+///
+/// Reported with both numbers because only the pair says anything: the guest chose the window and
+/// the command chose the answer, and which of the two is surprising is the reader's call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyOverflow {
+    pub wanted: usize,
+    pub remaining: usize,
+}
+
+impl std::fmt::Display for ReplyOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "a {}-byte reply into {} bytes of window", self.wanted, self.remaining)
+    }
+}
+
 /// Why a guest's reply stream was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyStreamError {
@@ -457,6 +473,48 @@ impl ReplyStream {
     pub fn pos(&self) -> usize {
         self.pos
     }
+
+    /// Room left for answers.
+    pub fn remaining(&self) -> usize {
+        self.window.size() - self.pos
+    }
+
+    /// Put one encoded answer in front of the guest.
+    ///
+    /// The bound is checked before anything is written, and the write is a single copy, so a reply
+    /// that does not fit leaves the window exactly as it was. The C cannot promise that: its
+    /// encoder writes members straight into guest memory and discovers the overflow partway
+    /// through, having already published half an answer to a guest that is waiting for one.
+    ///
+    /// Failing here is fatal to the stream's context, for the same reason a short ring read is: the
+    /// guest asked a question and reserved too little room to hear the answer, and there is no way
+    /// to tell it so -- the channel for saying anything is the one that just overflowed.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), ReplyOverflow> {
+        let remaining = self.remaining();
+        if bytes.len() > remaining {
+            return Err(ReplyOverflow { wanted: bytes.len(), remaining });
+        }
+        assert!(
+            self.map.copy_in(self.window.begin() + self.pos, bytes),
+            "a validated window is inside the mapping"
+        );
+        self.pos += bytes.len();
+        Ok(())
+    }
+
+    /// Move the write position, as `vkSeekReplyCommandStreamMESA` asks.
+    ///
+    /// The guest is placing its next answer, so the end of the window is a legal destination -- a
+    /// seek there is a stream with no room left, not a mistake. Past it is not, and says so rather
+    /// than clamping: a clamp would answer the next command somewhere the guest is not reading.
+    #[must_use]
+    pub fn seek(&mut self, pos: usize) -> bool {
+        if pos > self.window.size() {
+            return false;
+        }
+        self.pos = pos;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +557,32 @@ mod tests {
     fn table(len: usize) -> OneResource {
         let fd = shm_fd(len);
         OneResource(HANDLE, Arc::new(GuestMap::shm(fd.as_fd(), len).expect("mapped")))
+    }
+
+    /// Answers stack: each one starts where the last ended.
+    ///
+    /// A stream that wrote every reply at the top of its window would overwrite the previous answer
+    /// with the next, and the guest would read whichever it happened to look at first. The dispatch
+    /// loop's witnesses cannot see this -- every command they drive writes one reply -- so the rule
+    /// is pinned here, where the position lives.
+    #[test]
+    fn two_answers_land_one_after_the_other() {
+        let t = table(0x4000);
+        let d = VkCommandStreamDescriptionMESA { resourceId: HANDLE.0, offset: 0x100, size: 0x40 };
+        let mut s = ReplyStream::set(&t, &d).expect("a window inside the mapping");
+
+        assert_eq!(s.pos(), 0);
+        s.write(&[1, 2, 3, 4]).expect("room for the first");
+        assert_eq!(s.pos(), 4, "the position moved by what was written");
+        s.write(&[5, 6, 7, 8]).expect("room for the second");
+        assert_eq!(s.pos(), 8);
+
+        let mut got = [0u8; 8];
+        assert!(t.1.copy_out(0x100, &mut got));
+        assert_eq!(got, [1, 2, 3, 4, 5, 6, 7, 8], "the second answer did not land on the first");
+
+        // And the room left shrinks with them, which is what the overflow check is measured against.
+        assert_eq!(s.remaining(), 0x40 - 8);
     }
 
     /// A layout every case below starts from and breaks in exactly one way. The offsets are
