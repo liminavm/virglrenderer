@@ -112,9 +112,6 @@ invariants a port owes, none of which the C encodes as a type:
   unconditionally at unref and must return a harmless `-EINVAL` when nothing was mapped.
 - **Scanout stride must be GPU-row-aligned.** `IOSurfaceCreate` accepts a tight
   `width*4`, and CoreAnimation then composites blank.
-- **Charge the budget at the allocator, not the Vulkan entry point.** A scanout memory
-  that host-pointer-imports an IOSurface, or a cross-context import aliasing the
-  exporter's bytes, commits nothing new; billing it double is how the budget lies.
 
 ## Ranked by difficulty
 
@@ -318,6 +315,11 @@ buildable throughout as the A-side reference.
   an offset into a reply the renderer has not built yet, so the decoder and the reply encoder
   have to be designed against each other; they land with the first reply-bearing handler, and
   before the seated-GNOME gate. Neither corpus contains one, so nothing else will notice.
+  Two pieces of the budget land after the ledger itself: `VK_EXT_memory_budget`, which is the
+  only backpressure that reaches a guest at all and needs
+  `vkGetPhysicalDeviceMemoryProperties2` intercepted rather than forwarded; and the HostShm
+  blob carrier in `renderer.rs`, which is a second host allocator the C charges and this tree
+  does not yet.
   Midpoint gate, before any VM: both corpora replay to completion, their scores match
   the fixtures pinned from the C build, **and every handler whose contents matter
   carries its own witness**. Replay strips replies and needs no display, so score

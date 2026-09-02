@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::budget::{Account, Charge};
 use super::cs::{Handle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
@@ -194,9 +195,36 @@ impl Pools {
     }
 }
 
+/// Why no memory was allocated.
+///
+/// Two refusals that are not the same thing. A driver's is the guest's own affair -- it asked for
+/// memory the host does not have, and unwinding from that is something it does on hardware too. A
+/// budget refusal is this renderer declining to serve a request it could have served, which the
+/// guest is given no way to find out about (see [`crate::venus::budget`]) and so cannot recover
+/// from; the context stops instead, at the command that caused it rather than several later.
+#[derive(Debug)]
+pub enum NoMemory {
+    Driver(VkResult),
+    OverBudget { stop: bool },
+}
+
+impl NoMemory {
+    /// What the guest is told, on the chance that it is one of the rare configurations that reads
+    /// the answer back.
+    pub fn ret(&self) -> VkResult {
+        match self {
+            NoMemory::Driver(r) => *r,
+            NoMemory::OverBudget { .. } => VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        }
+    }
+}
+
 /// The driver objects one context has stood up.
-#[derive(Default)]
 pub struct Driver {
+    /// This context's key to the host memory ledger -- see [`crate::venus::budget`]. Held here
+    /// rather than passed to the calls that allocate, because the record of what was allocated
+    /// lives here too, and a charge is credited by that record going away.
+    account: Account,
     instance: Option<InstanceFns>,
     /// The instance's own handle, so a teardown with no command behind it can still destroy it.
     instance_handle: VkInstance,
@@ -358,8 +386,18 @@ fn fits(n: u32, room: Option<usize>) {
 }
 
 impl Driver {
-    pub fn new() -> Driver {
-        Driver::default()
+    pub fn new(account: Account) -> Driver {
+        Driver {
+            account,
+            instance: None,
+            instance_handle: VkInstance(0),
+            devices: BTreeMap::new(),
+            physical_device_exts: BTreeMap::new(),
+            memory: BTreeMap::new(),
+            images: BTreeMap::new(),
+            pools: Pools::default(),
+            queues: BTreeMap::new(),
+        }
     }
 
     /// The instance table, or None when this context has not created an instance.
@@ -1488,6 +1526,8 @@ impl Driver {
     /// Plant a live allocation from a memory type with the given properties.
     #[cfg(test)]
     pub(super) fn plant_allocation_of(&mut self, id: ObjectId, size: u64, props: u32) {
+        // Charged like a real one, so a test's ledger says what a guest's would.
+        let charge = self.account.try_charge("device memory", size).ok();
         self.memory.insert(
             id,
             Allocated {
@@ -1495,6 +1535,7 @@ impl Driver {
                 backing: Backing::Driver,
                 props: VkMemoryPropertyFlags(props as _),
                 exported: None,
+                charge,
             },
         );
     }
@@ -2349,9 +2390,9 @@ impl Driver {
         info: &VkMemoryAllocateInfo,
         alloc: Option<&VkAllocationCallbacks>,
         exported_allocation: &dyn Fn(ResourceHandle) -> Option<ObjectId>,
-    ) -> Result<VkDeviceMemory, VkResult> {
+    ) -> Result<VkDeviceMemory, NoMemory> {
         let Some(d) = self.devices.get(&device) else {
-            return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
+            return Err(NoMemory::Driver(VkResult::VK_ERROR_INITIALIZATION_FAILED));
         };
         // A copy, not an edit in place: the decoder's struct is the guest's request, and the
         // round trip re-encodes it. The `pNext` chain is carried over untouched.
@@ -2397,6 +2438,30 @@ impl Driver {
             info.allocationSize = VkDeviceSize(info.allocationSize.0.min(span.1));
         }
 
+        // What the bytes are decides both how they are freed and what they cost, so it is settled
+        // once, here, and read twice.
+        let backing = match (import, surface) {
+            (Some(_), _) => Backing::Imported,
+            (None, Some(s)) => Backing::Scanout(s),
+            (None, None) => Backing::Driver,
+        };
+        // Charged before the driver is asked, so a refusal costs no host memory -- and credited
+        // by `charge` going out of scope if the driver then refuses. A scanout is charged at the
+        // surface's own extent, because the surface is the commitment; the allocation importing
+        // its pages commits nothing further. An import commits nothing at all.
+        let charge = match &backing {
+            Backing::Driver => Some(self.account.try_charge("device memory", size)),
+            Backing::Scanout(s) => Some(self.account.try_charge("IOSurface", s.alloc_size())),
+            Backing::Imported => None,
+        };
+        let charge = match charge.transpose() {
+            Ok(c) => c,
+            Err(refused) => {
+                self.account.report_refusal(refused);
+                return Err(NoMemory::OverBudget { stop: self.account.kills_context() });
+            }
+        };
+
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
         let d = self.devices.get(&device).expect("the device was here a moment ago");
         let mut out = VkDeviceMemory(0);
@@ -2404,19 +2469,14 @@ impl Driver {
         // local that outlives this call, `alloc` is another arena allocation, and `out` is a local.
         let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
-            return Err(r);
+            return Err(NoMemory::Driver(r));
         }
         assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
         // A type index the device does not have is one `vkAllocateMemory` would have refused, so
         // the fallback describes memory that cannot exist -- and describes it as addressable by
         // nothing, which is the safe reading.
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
-        let backing = match (import, surface) {
-            (Some(_), _) => Backing::Imported,
-            (None, Some(s)) => Backing::Scanout(s),
-            (None, None) => Backing::Driver,
-        };
-        self.memory.insert(id, Allocated { size, backing, props, exported: None });
+        self.memory.insert(id, Allocated { size, backing, props, exported: None, charge });
         Ok(out)
     }
 
@@ -2743,6 +2803,19 @@ struct Allocated {
     /// the same act as making the address unreachable: there is no second place to purge, and
     /// nothing can hand the VMM a pointer into memory the guest has freed.
     exported: Option<usize>,
+    /// What this allocation cost the host, held so that retiring the record credits it back.
+    ///
+    /// Never read, and that is the design: the charge is a value whose only job is to be dropped,
+    /// so there is no release call for a future destroy path to forget.
+    ///
+    /// `None` for an import, which costs nothing: its bytes are the exporter's, charged where
+    /// they were made. The same rule as [`Allocated::censused`], for the same reason -- storage
+    /// is accounted once, at whoever owns it.
+    #[expect(
+        dead_code,
+        reason = "held for its Drop -- crediting the ledger is this field going away"
+    )]
+    charge: Option<Charge>,
 }
 
 /// What an allocation's bytes are, which decides how it is published, read and freed.
@@ -3123,7 +3196,7 @@ mod tests {
         const BORROWED: ObjectId = ObjectId(21);
         const SIZE: u64 = 4_096_000;
 
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_allocation(OWNED, SIZE);
         driver.plant_imported_allocation(BORROWED, SIZE);
 
@@ -3145,7 +3218,7 @@ mod tests {
     /// own to lend.
     #[test]
     fn an_import_resolves_to_storage_that_already_exists() {
-        let mut d = Driver::default();
+        let mut d = Driver::new(Account::for_test(None));
 
         let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
         let addr = surface.host_addr();
@@ -3214,6 +3287,280 @@ mod tests {
         assert_eq!(imported_resource((&raw const head).cast()), None);
     }
 
+    /// The budget's three answers, at the one call that asks it.
+    ///
+    /// A refusal must land *before* `vkAllocateMemory`, not after: refusing an allocation the host
+    /// has already made costs the memory it was meant to save, which is the whole point of the
+    /// cap. The counter is what proves it -- an implementation that allocated first and credited
+    /// back would pass every assertion about the ledger and none about this.
+    #[test]
+    fn an_allocation_over_the_budget_never_reaches_the_driver() {
+        use std::cell::Cell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const CAP: u64 = 1000;
+        const SIZE: u64 = 600;
+
+        thread_local! {
+            static ASKED: Cell<u32> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            ASKED.with(|n| n.set(n.get() + 1));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        let mut d = Driver::new(Account::for_test(Some(CAP)));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
+        d.plant_device(DEVICE, fns);
+        // Not host-visible, so nothing is padded and the ledger's numbers are the guest's own.
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+
+        let ask = |d: &mut Driver, id: u64| {
+            let info = VkMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: core::ptr::null(),
+                allocationSize: VkDeviceSize(SIZE),
+                memoryTypeIndex: 0,
+            };
+            d.allocate_memory(DEVICE, ObjectId(id), &info, None, &|_| None)
+        };
+
+        assert!(ask(&mut d, 1).is_ok(), "the first fits under the cap");
+        assert_eq!(d.account.live(), SIZE);
+        assert_eq!(ASKED.with(Cell::get), 1);
+
+        match ask(&mut d, 2) {
+            Err(NoMemory::OverBudget { stop: true }) => {}
+            other => {
+                panic!("the second is over the cap and stops the context, not {:?}", other.is_ok())
+            }
+        }
+        assert_eq!(ASKED.with(Cell::get), 1, "and the driver was never asked for it");
+        assert_eq!(d.account.live(), SIZE, "so the ledger is where it was");
+
+        // Freeing is the only thing that credits, and it does so by retiring the record -- there
+        // is no release call anywhere in `free_memory` for this to be testing instead.
+        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        assert_eq!(d.account.live(), 0, "the room comes back with the allocation");
+        assert!(ask(&mut d, 3).is_ok(), "and the next one fits again");
+        assert_eq!(ASKED.with(Cell::get), 2);
+
+        d.abandon_planted();
+    }
+
+    /// A driver refusal is not a budget refusal. The guest unwinds from the first the way it would
+    /// on hardware, and the charge taken before the call has to go back -- which it does by going
+    /// out of scope, so there is no error path that can forget it.
+    #[test]
+    fn a_driver_that_refuses_costs_the_budget_nothing() {
+        const DEVICE: VkDevice = VkDevice(3);
+
+        unsafe extern "C" fn refuse(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            _out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY
+        }
+
+        let mut d = Driver::new(Account::for_test(Some(1000)));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(refuse);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            allocationSize: VkDeviceSize(900),
+            memoryTypeIndex: 0,
+        };
+        match d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None) {
+            Err(NoMemory::Driver(r)) => {
+                assert_eq!(r, VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY, "the driver's own answer")
+            }
+            _ => panic!("the driver refused, so this is not the budget's refusal"),
+        }
+        assert_eq!(d.account.live(), 0, "and nothing is left charged for memory that never was");
+
+        d.abandon_planted();
+    }
+
+    /// A scanout is charged at the surface's own extent, not at the number in the request.
+    ///
+    /// The surface is the commitment: IOSurface rounds an allocation up to whole pages, and those
+    /// pages are the host memory that is actually gone. The `VkDeviceMemory` on top of it is a
+    /// host-pointer import of those same pages and commits nothing further -- so the guest's
+    /// figure is the wrong number to bill, and it is the smaller one, which is the direction that
+    /// lets a leak run past the cap.
+    #[test]
+    fn a_scanout_is_charged_for_the_pages_the_surface_took() {
+        use super::super::proto::types::{
+            VkExportMemoryAllocateInfo, VkExtent3D, VkExternalMemoryHandleTypeFlags, VkFormat,
+            VkImageCreateInfo, VkMemoryDedicatedAllocateInfo,
+        };
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const IMAGE: VkImage = VkImage(0x4100);
+        const W: u32 = 64;
+        const H: u32 = 8;
+        const PITCH: u64 = (W * 4) as u64;
+        /// What the guest asks for: the rows, and nothing for the page the surface rounds to.
+        const ASKED: u64 = PITCH * H as u64;
+
+        unsafe extern "C" fn layout(
+            _d: VkDevice,
+            _i: VkImage,
+            _s: *const VkImageSubresource,
+            out: *mut VkSubresourceLayout,
+        ) {
+            // SAFETY: the caller's local.
+            unsafe {
+                *out = VkSubresourceLayout {
+                    rowPitch: VkDeviceSize(PITCH),
+                    size: VkDeviceSize(PITCH * H as u64),
+                    ..Default::default()
+                }
+            };
+        }
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        // What the system will hand back for this geometry, minted here so the assertion is
+        // against the real rounding rather than a number this test made up.
+        let extent = Surface::scanout(W, H, PixelFormat::Bgra, PITCH as u32)
+            .expect("the system minted")
+            .alloc_size();
+        assert!(extent > ASKED, "the premise: IOSurface rounds up, so the two numbers differ");
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkFreeMemory(free);
+        fns.plant_vkGetImageSubresourceLayout(layout);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+        d.note_image(
+            IMAGE,
+            &VkImageCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+                extent: VkExtent3D { width: W, height: H, depth: 1 },
+                ..Default::default()
+            },
+        );
+
+        // The shape a window buffer has: exported to the outside world, and dedicated to one
+        // image. Nothing else in a venus stream looks like this.
+        let dedicated = VkMemoryDedicatedAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            image: IMAGE,
+            buffer: VkBuffer(0),
+        };
+        let export = VkExportMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const dedicated).cast(),
+            handleTypes: VkExternalMemoryHandleTypeFlags(0),
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const export).cast(),
+            allocationSize: VkDeviceSize(ASKED),
+            memoryTypeIndex: 0,
+        };
+        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
+        assert!(d.memory_surface_id(ObjectId(1)).is_some(), "the premise: this minted a surface");
+        assert_eq!(d.account.live(), extent, "charged for the pages, not for the rows");
+
+        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        assert_eq!(d.account.live(), 0, "and the surface's pages come back with it");
+
+        d.abandon_planted();
+    }
+
+    /// An import aliases bytes another allocation already paid for, so charging it would bill one
+    /// buffer twice and refuse work the host has room for. The same rule as the census, which is
+    /// why both read the one `Backing` rather than a flag each.
+    #[test]
+    fn an_import_is_not_charged_because_its_bytes_are_the_exporters() {
+        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
+
+        const DEVICE: VkDevice = VkDevice(3);
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut d = Driver::new(Account::for_test(Some(1000)));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(0)]);
+
+        // Nearly the whole cap is already spoken for, so an import that were charged at all
+        // would be refused -- and one charged at its own size would be refused loudly.
+        d.plant_allocation_of(ObjectId(1), 900, 0);
+        assert_eq!(d.account.live(), 900);
+
+        let import = VkImportMemoryResourceInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+            pNext: core::ptr::null(),
+            resourceId: 7,
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const import).cast(),
+            allocationSize: VkDeviceSize(400),
+            memoryTypeIndex: 0,
+        };
+        assert!(
+            d.allocate_memory(DEVICE, ObjectId(2), &info, None, &|_| None).is_ok(),
+            "an import is admitted with no room left, because it takes none"
+        );
+        assert_eq!(d.account.live(), 900, "and the ledger did not move");
+
+        d.abandon_planted();
+    }
+
     /// bigger than what backs it, or asking to map memory the host cannot address. The second of
     /// those is the one with teeth -- two resources over one storage is a state neither holder
     /// could detect afterwards.
@@ -3261,7 +3608,7 @@ mod tests {
         fns.plant_vkUnmapMemory(unmap);
         fns.plant_vkFreeMemory(free);
 
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(DEVICE, fns);
         driver.plant_allocation(MEM, SIZE);
         driver.plant_device_local_allocation(LOCAL, SIZE);
@@ -3375,7 +3722,7 @@ mod tests {
         fns.plant_vkFreeMemory(free);
         fns.plant_vkDestroyDevice(device);
 
-        let mut driver = Driver::new();
+        let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(DEVICE, fns);
         driver.plant_allocation(ObjectId(MEMORY.0), 4096);
         assert_eq!(driver.memory_census().len(), 1, "the allocation is live before the teardown");
@@ -3426,7 +3773,7 @@ mod tests {
     fn a_destroyed_pool_hands_back_the_ids_of_everything_in_it() {
         const DEVICE: VkDevice = VkDevice(3);
 
-        let mut d = Driver::default();
+        let mut d = Driver::new(Account::for_test(None));
         d.pools.open(DEVICE, VkCommandPool(7));
         d.pools.adopt(
             VkCommandPool(7),
@@ -3461,7 +3808,7 @@ mod tests {
 
         const SHARED: u64 = 7;
 
-        let mut d = Driver::default();
+        let mut d = Driver::new(Account::for_test(None));
         d.pools.open(VkDevice(3), VkCommandPool(SHARED));
         d.pools.adopt(VkCommandPool(SHARED), [(VkCommandBuffer(11), ObjectId(110))]);
         d.pools.open(VkDevice(3), VkDescriptorPool(SHARED));
@@ -3488,7 +3835,7 @@ mod tests {
     /// driver.
     #[test]
     fn a_device_takes_its_pools_and_their_ids_with_it() {
-        let mut d = Driver::default();
+        let mut d = Driver::new(Account::for_test(None));
         d.pools.open(VkDevice(3), VkCommandPool(7));
         d.pools.adopt(
             VkCommandPool(7),
