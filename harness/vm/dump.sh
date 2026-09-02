@@ -4,7 +4,7 @@
 #
 # Ask a running capture for its dump, then check what came back.
 #
-#   dump.sh venus | dump.sh vrend
+#   dump.sh venus | dump.sh vrend | dump.sh <name from capture.sh --out>
 #
 # The check is not a formality: a corpus is only worth pinning as a fixture if it is
 # structurally sound, and the failures worth catching (a lost head record, an orphan context, a
@@ -13,10 +13,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 RIG="$(pwd)"
 
+# Anything that is not the classic tracer is a venus capture, named by `capture.sh --out` --
+# so a corpus can have a name of its own rather than the mode's, and two captures of one workload
+# do not have to overwrite each other.
 case "${1:-}" in
-  synoik|venus) FIFO="$RIG/captures/$1.fifo"; OUT="$RIG/captures/$1.vkrc" ;;
+  '') echo "usage: dump.sh {synoik|venus|vrend|<name>}" >&2; exit 2 ;;
   vrend) FIFO="$RIG/captures/vrend.fifo"; OUT="$RIG/captures/vrend.bin" ;;
-  *) echo "usage: dump.sh {synoik|venus|vrend}" >&2; exit 2 ;;
+  *) FIFO="$RIG/captures/$1.fifo"; OUT="$RIG/captures/$1.vkrc" ;;
 esac
 
 [ -p "$FIFO" ] || { echo "no FIFO at $FIFO — is a capture running?" >&2; exit 1; }

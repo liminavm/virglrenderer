@@ -13,6 +13,11 @@
 #   --mb N        recorder capacity, MB (default 256). The venus recorder STOPS at the cap and
 #                 says so — a truncated corpus is a valid prefix, so a small cap costs coverage,
 #                 never validity.
+#   --out NAME    write captures/NAME.vkrc instead of captures/<mode>.vkrc, and dump it with
+#                 `dump.sh NAME`. A corpus is pinned by the score recorded from it, so a second
+#                 capture under the same name silently replaces what a fixture was measured
+#                 against — give a new capture its own name rather than the one already spoken
+#                 for. `synoik` and `synoik-lifecycle` are two such corpora of one workload.
 #   --window      show the guest in a window (default: headless, so a capture does not take over
 #                 the screen). Headless still attaches a virtio-gpu and drives the whole renderer
 #                 -- presented frames go to a PNG instead of a window. Omitting BOTH would attach
@@ -27,11 +32,12 @@ cd "$(dirname "$0")"
 RIG="$(pwd)"
 
 MODE="${1:-}"; shift || true
-MB=256; WINDOW=0; SECONDS_TO_DUMP=""
+MB=256; WINDOW=0; SECONDS_TO_DUMP=""; NAME=""
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --mb) MB="$2"; shift 2 ;;
+    --out) NAME="$2"; shift 2 ;;
     --window) WINDOW=1; shift ;;
     --seconds) SECONDS_TO_DUMP="$2"; shift 2 ;;
     --) shift; EXTRA+=("$@"); break ;;
@@ -42,14 +48,16 @@ done
 APP="$RIG/Limina.app/Contents/MacOS/limina"
 [ -x "$APP" ] || { echo "no rig — run make-rig.sh" >&2; exit 1; }
 
+NAME="${NAME:-$MODE}"
+
 case "$MODE" in
   synoik|venus)
     [ "$MODE" = synoik ] \
       && DISK="$RIG/disks/Fedora-Workstation-44.enhanced.synoik.raw" \
       || DISK="$RIG/disks/Fedora-Workstation-44.enhanced.test.raw"
     export LIMINA_VKR_RECORD="$MB"
-    export LIMINA_VKR_RECORD_OUT="$RIG/captures/$MODE.vkrc"
-    export LIMINA_VKR_RECORD_FIFO="$RIG/captures/$MODE.fifo"
+    export LIMINA_VKR_RECORD_OUT="$RIG/captures/$NAME.vkrc"
+    export LIMINA_VKR_RECORD_FIFO="$RIG/captures/$NAME.fifo"
     OUT="$LIMINA_VKR_RECORD_OUT" ;;
   vrend)
     DISK="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
@@ -57,7 +65,7 @@ case "$MODE" in
     export LIMINA_VREND_TRACE_OUT="$RIG/captures/vrend.bin"
     export LIMINA_VREND_TRACE_FIFO="$RIG/captures/vrend.fifo"
     OUT="$LIMINA_VREND_TRACE_OUT" ;;
-  *) echo "usage: capture.sh {synoik|venus|vrend} [--mb N] [--window] [--seconds N]" >&2
+  *) echo "usage: capture.sh {synoik|venus|vrend} [--mb N] [--out NAME] [--window] [--seconds N]" >&2
      exit 2 ;;
 esac
 
@@ -78,10 +86,10 @@ else
 fi
 
 echo "==> $MODE capture, ${MB} MB -> $OUT"
-echo "    dump with: $RIG/dump.sh $MODE"
+echo "    dump with: $RIG/dump.sh $NAME"
 
 if [ -n "$SECONDS_TO_DUMP" ]; then
-  ( sleep "$SECONDS_TO_DUMP"; "$RIG/dump.sh" "$MODE" ) &
+  ( sleep "$SECONDS_TO_DUMP"; "$RIG/dump.sh" "$NAME" ) &
 fi
 
 exec "$APP" "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}

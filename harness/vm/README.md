@@ -48,6 +48,43 @@ plus `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` for a windowed one. A **GL** client
 zink environment too, which an SSH shell does not inherit — without it the stack silently falls back
 to llvmpipe and the capture records nothing while looking healthy.
 
+## Two synoik corpora, and why one cannot do both jobs
+
+The synoik guest yields two corpora, and they measure different things because a capture cannot
+carry both properties at once:
+
+| | `synoik.vkrc` | `synoik-lifecycle.vkrc` |
+|---|---|---|
+| dumped | mid-workload, compositor still running | after the session is stopped |
+| teardown command kinds | 9 | 19 — `vkDestroyDevice`, `vkDestroyInstance`, `vkDestroyRingMESA`, the pipeline, render-pass, pool and layout destroys |
+| `vkFreeMemory` | 4 | 41 |
+| device allocations left to census | 22 | 0 |
+
+The census hashes device memory that is still live, so it can only score what the workload has
+not freed. A workload that exits cleanly frees everything — which is exactly what makes the
+lifecycle corpus prove teardown, and exactly why it has no content hashes to offer. Keep both:
+`synoik.score` is the content oracle, `synoik-lifecycle.score` is the teardown one, and a renderer
+that leaks a `VkDeviceMemory` fails the second while passing the first.
+
+### Capturing the lifecycle one
+
+synoik runs as the user unit `org.gnome.Shell@user.service`, which sets `RefuseManualStop=yes`, as
+do `gnome-session@gnome.target` and `gnome-session.target`. The one stoppable handle is
+`graphical-session.target`; synoik's SIGTERM handler quits its loop outright rather than waiting
+for clients, so stopping the target runs its drops and puts real `vkDestroy*` traffic on the wire
+instead of a bare fd close at exit.
+
+```sh
+./capture.sh synoik --mb 256 --out synoik-lifecycle    # boot; synoik starts itself
+# let it render for a couple of minutes, then, in the guest:
+#   ssh -p <port from the boot log> claude@127.0.0.1 \
+#     'XDG_RUNTIME_DIR=/run/user/1000 systemctl --user stop graphical-session.target'
+./dump.sh synoik-lifecycle
+```
+
+`--out` is what keeps the two apart. Without it every synoik capture writes `synoik.vkrc` and
+replaces the corpus a pinned score was recorded from.
+
 ## Capturing
 
 Both recorders are armed by capacity and write only when asked, through a FIFO — so arming one
