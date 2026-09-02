@@ -301,6 +301,16 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
     fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>> {
         self.get(&handle)?.shm().map(Arc::clone)
     }
+
+    fn exported_allocation(&self, ctx: CtxId, handle: ResourceHandle) -> Option<ObjectId> {
+        match self.get(&handle)?.backing {
+            Backing::Blob { ref desc, .. } => match desc.source {
+                BlobSource::Exported { ctx: owner, mem } if owner == ctx => Some(ObjectId(mem.0)),
+                BlobSource::Exported { .. } | BlobSource::HostMinted => None,
+            },
+            Backing::Classic(_) | Backing::Imported { .. } => None,
+        }
+    }
 }
 
 impl Resource {
@@ -864,6 +874,58 @@ mod tests {
             r.with_resource(ResourceHandle::new(3).unwrap(), |res| res.shm().cloned())
                 .expect("there")
                 .is_none()
+        );
+    }
+
+    /// A guest importing a resource into a second allocation is naming storage the *same* guest
+    /// exported, and the number it names is a guest id -- unique only inside one context.
+    ///
+    /// So the answer is scoped to the asker. Another context's export under the same id is a
+    /// different allocation entirely, and answering with it would alias one guest's window buffer
+    /// onto whatever the other happened to file under that number. No corpus can reach this: the
+    /// captures are one guest, and every id in them belongs to the context that asked.
+    #[test]
+    fn an_export_is_only_findable_by_the_context_that_made_it() {
+        use crate::venus::ring::ShmResources;
+
+        let one = CtxId::new(1).unwrap();
+        let two = CtxId::new(2).unwrap();
+        let blob = ResourceHandle::new(1).unwrap();
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            blob,
+            Resource {
+                handle: blob,
+                backing: Backing::Blob {
+                    desc: BlobDesc {
+                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                        blob_flags: 1,
+                        source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                        size: 4128768,
+                    },
+                    host: None,
+                },
+                iov: Vec::new(),
+                priv_: VmmPtr(core::ptr::null_mut()),
+                attached: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            table.exported_allocation(one, blob),
+            Some(ObjectId(66)),
+            "the context that exported it finds its own allocation"
+        );
+        assert_eq!(
+            table.exported_allocation(two, blob),
+            None,
+            "and another context finds nothing, rather than its own id 66"
+        );
+        assert_eq!(
+            table.exported_allocation(one, ResourceHandle::new(2).unwrap()),
+            None,
+            "a resource that is not here is not an export either"
         );
     }
 

@@ -17,9 +17,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::cs::ObjectId;
 use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
-use crate::ids::ResourceHandle;
+use crate::ids::{CtxId, ResourceHandle};
 
 /// The largest ring buffer we will accept, from the C's `VKR_RING_BUFFER_MAX_SIZE`.
 ///
@@ -220,7 +221,7 @@ pub enum RingError {
     },
 }
 
-/// The only thing venus needs from the renderer's resource table.
+/// What venus needs from the renderer's resource table.
 ///
 /// A trait rather than the table itself, so this module never learns what a `Resource` is: what a
 /// ring wants is a share of some host-addressable memory, and everything else about a resource --
@@ -231,6 +232,25 @@ pub trait ShmResources {
     /// exist or is not host-addressable. The two are deliberately one answer here: from the ring's
     /// side both mean "no memory", and the caller that can tell them apart says so in its log.
     fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>>;
+
+    /// The allocation this resource *is*, when the resource was published from `ctx`'s own
+    /// device memory.
+    ///
+    /// A guest that imports a resource into a second allocation is naming storage that already
+    /// exists, and this is the only way to find out which: the resource table is the renderer's
+    /// and the id it hands back is the guest's, so the driver can resolve it in the one map that
+    /// knows where those bytes are.
+    ///
+    /// `ctx` is not a formality. The id is a *guest* id, unique only within the context that
+    /// chose it, so an export belonging to another context would resolve here to whatever this
+    /// context happens to have filed under the same number. Answering only for the caller's own
+    /// exports is what makes the id mean something.
+    ///
+    /// The default is `None`: a table with no exports in it has no answer to give, and every
+    /// test stub is one of those.
+    fn exported_allocation(&self, _ctx: CtxId, _handle: ResourceHandle) -> Option<ObjectId> {
+        None
+    }
 }
 
 /// A ring the guest created and the host has agreed to read from.
