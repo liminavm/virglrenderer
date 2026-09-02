@@ -9535,13 +9535,27 @@ static bool vrend_iosurface_enabled(void)
 static void vrend_resource_init_planar_guest_layout(struct vrend_resource *gr,
                                                     enum virgl_formats format);
 
+/* The composite planar formats this host can back with one IOSurface. NV12 and NV21 only:
+ * the three-plane formats would work the same way but are not modelled, and P010 would
+ * not -- its planes are 16-bit, so a plane imported as R8/GR88 would address half a row.
+ *
+ * This is the whole contract behind VIDEO_PLANAR_TARGET, so it has to be the same set the
+ * capset advertises as samplable. The guest decides the shape of a decode target from the
+ * sampler bitmask BEFORE creating it, and it has no second chance: a create the host
+ * refuses is invisible to it (the kernel has already handed out the handle), so it goes on
+ * to attach backing and build views on a resource that does not exist, which puts the
+ * context in error for the rest of its life. gst-va provokes exactly that at registration,
+ * creating a 64x64 surface of every fourcc it knows. A format listed here that this
+ * function cannot back is therefore not a harmless surplus but a poisoned context. */
+static bool vrend_planar_target_backable(enum virgl_formats format)
+{
+   return format == VIRGL_FORMAT_NV12 || format == VIRGL_FORMAT_NV21;
+}
+
 static void vrend_resource_iosurface_init_planes(struct vrend_resource *gr,
                                                  enum virgl_formats format)
 {
-   /* NV12 and NV21 only. The three-plane formats would work the same way, but P010 would
-    * not: its planes are 16-bit, so a plane imported as R8/GR88 would address half a row.
-    * Refuse what is not modelled rather than mis-address it. */
-   if (format != VIRGL_FORMAT_NV12 && format != VIRGL_FORMAT_NV21)
+   if (!vrend_planar_target_backable(format))
       return;
    if (gr->base.target != PIPE_TEXTURE_2D || gr->base.last_level != 0 ||
        gr->base.nr_samples > 1 || gr->base.depth0 != 1)
@@ -9815,13 +9829,18 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
       vrend_resource_iosurface_init(gr, format);
 
       /* Refuse a composite target we could not back with a planar surface, rather than
-       * hand back a resource whose plane views cannot work.
+       * hand back a resource whose plane views cannot work: they would find no aux image
+       * and fall through to the texture-view branch, which is view_class_unsupported for
+       * a planar format and puts the context in error for its lifetime.
        *
-       * A guest only asks for this shape because we advertised VIDEO_PLANAR_TARGET, and
-       * it is built to fall back to per-plane buffers when the create is refused. Letting
-       * it succeed instead is worse than either: the plane views find no aux image and
-       * fall through to the texture-view branch, which is view_class_unsupported for a
-       * planar format and puts the context in error for its lifetime.
+       * The refusal is a last line, not a negotiation. The guest never sees it -- the
+       * kernel handed out the handle before we were asked -- so it will go on to use the
+       * resource and poison its context the same way. What keeps it from asking is the
+       * capset: the sampler bitmask lists only the planar formats
+       * vrend_planar_target_backable accepts, and the guest takes the composite shape
+       * only for those. This fires when that contract is broken (IOSurface disabled, an
+       * allocation failure, a format the two sides disagree on), and fails loudly
+       * instead of corrupting.
        *
        * Only our own capset-gated guest creates a classic planar resource on this host,
        * so nothing else can reach this. */
@@ -9830,8 +9849,9 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
       vrend_guest_plane_layout(format, gr->base.width0, gr->base.height0,
                                refuse_planes, &refuse_plane_count);
       if (refuse_plane_count > 1 && !gr->aux_plane_egl_image[0]) {
-         virgl_error("no planar surface for a %ux%u %s target; refusing the create so the "
-                     "guest falls back to per-plane buffers\n",
+         virgl_error("no planar surface for a %ux%u %s target; refusing the create (the "
+                     "guest cannot see this and will poison its context -- the capset "
+                     "should not have let it ask)\n",
                      gr->base.width0, gr->base.height0, util_format_name(format));
          return -EINVAL;
       }
@@ -13991,6 +14011,17 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
    /* All of the formats are common. */
    for (i = 0; i < VIRGL_FORMAT_MAX; i++) {
       enum virgl_formats fmt = (enum virgl_formats)i;
+      /* A planar YUV format is samplable only as a composite decode target, and only when
+       * this host can back it with a planar surface (vrend_planar_target_backable). The
+       * guest reads this bit as "I may create the composite shape", and cannot survive being
+       * told yes and then refused -- see the predicate. */
+      {
+         struct guest_plane planes[VIRGL_GBM_MAX_PLANES];
+         uint32_t plane_count = 0;
+         vrend_guest_plane_layout(fmt, 64, 64, planes, &plane_count);
+         if (plane_count > 1 && !vrend_planar_target_backable(fmt))
+            continue;
+      }
       if (tex_conv_table[i].internalformat != 0 || fmt == VIRGL_FORMAT_YV12 ||
           fmt == VIRGL_FORMAT_NV12) {
          if (vrend_format_can_sample(fmt)) {
