@@ -60,7 +60,7 @@ PRIMITIVE_ZERO = {
 class RustGen:
     """Renders vk.xml's types as Rust. Holds no state beyond the model and the API constants."""
 
-    def __init__(self, gen, constants, bitfields=None, member_order=None):
+    def __init__(self, gen, constants, bitfields=None, member_order=None, handle_parents=None):
         self.gen = gen
         # vk.xml's "API Constants" block, which the C generator never needs (it includes
         # vulkan.h) and which this one does: they are the static array dimensions.
@@ -71,6 +71,9 @@ class RustGen:
         # Each struct's members as the registry declares them. The model holds the order the wire
         # wants instead; `gen.member_order` is where the two part company.
         self.member_order = member_order or {}
+        # Each handle's owning handle. The model drops vk.xml's `parent`; `gen.handle_parents`
+        # says why, and `pool_children` is the only thing that reads it.
+        self.handle_parents = handle_parents or {}
 
     # --- names ---
 
@@ -373,6 +376,54 @@ class RustGen:
         the accessor over one hands back `cs::Guest<T>` and the rest hand back the bare newtype.
         """
         return {self.field_name(var.name) for var, _ in self.out_handles(ty)}
+
+    def pool_children(self):
+        """The pools, as `(pool, child)` pairs -- a handle allocated from another handle.
+
+        Derived from vk.xml, not listed. `parent` says which handle owns each, and the model says
+        whether that owner is dispatchable. **A pool is a non-dispatchable owner**, and that is the
+        whole rule: everything else a create hands back is parented on `VkDevice` or `VkInstance`,
+        `VkDeviceMemory` included -- so without the dispatchable test `vkAllocateMemory` would make
+        the device itself a pool, which compiles and is wrong. `VkQueryPool` is named a pool and is
+        not one: nothing is parented on it, so it never appears here.
+
+        The parentage is cross-checked against the command rather than trusted: the allocating
+        command has to *name* the pool, in its own parameters or one level into the struct it is
+        given, or the assert fires. vk.xml's ownership and the call the renderer actually serves
+        have to agree before either is emitted.
+        """
+        handles = {t.name: t for t in self.gen.supported_types[VkType.HANDLE]}
+        pools = {}
+        for ty in self.gen.supported_types[VkType.COMMAND]:
+            if not self.gen.is_serializable(ty):
+                continue
+            for var, _ in self.out_handles(ty):
+                child = var.ty.base
+                owner = handles.get(self.handle_parents.get(child.name))
+                if owner is None or owner.dispatchable:
+                    continue
+                assert self._names_handle(ty, owner.name), (
+                    '%s allocates %s from %s, which it never names'
+                    % (ty.name, child.name, owner.name))
+                seen = pools.setdefault(owner.name, child.name)
+                assert seen == child.name, (
+                    '%s allocates both %s and %s' % (owner.name, seen, child.name))
+        return sorted(pools.items())
+
+    def _names_handle(self, ty, name):
+        """Whether a command names a handle type, in its parameters or one struct deep.
+
+        One level is as deep as Vulkan puts it: an allocate takes its pool in the `*AllocateInfo`
+        it is handed, never further in.
+        """
+        for var in ty.variables:
+            base = var.ty.base
+            if base.name == name:
+                return True
+            if base.category == VkType.STRUCT and any(
+                    m.ty.base.name == name for m in base.variables):
+                return True
+        return False
 
     def shadows(self, ty):
         """The host-side members of a command's argument struct, as `(field, rust_type, shape)`.
@@ -1617,7 +1668,26 @@ class RustGen:
             out += self._command_fns(ty, gaps)
             out += self._command_accessors(ty, gaps)
         out += self._dispatch_fns(commands, gaps)
+        out += self._pool_impls()
         return '\n'.join(out)
+
+    def _pool_impls(self):
+        """Which pool holds which kind, for the driver's bookkeeping.
+
+        Emitted beside `impl cs::Handle` because it is the same kind of fact about the same types,
+        and derived by `pool_children` so a pool the renderer starts serving arrives here on its
+        own. The pairing is what stops a command buffer being filed under a descriptor pool: both
+        sides of that transposition are handles, and the bookkeeping cannot otherwise see it.
+        """
+        out = []
+        for pool, child in self.pool_children():
+            out += [
+                'impl cs::PoolOf for %s {' % pool,
+                '    type Child = %s;' % child,
+                '}',
+                '']
+        return out
+
 
     def _array_rows(self, ty):
         """Every array `ty` carries, as `(field, element type, count expression, mutable)`.

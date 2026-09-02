@@ -163,6 +163,21 @@ pub trait Handle: Copy {
     fn null() -> Self;
 }
 
+/// A pool handle, and the one kind of object allocated from it.
+///
+/// Vulkan's pools each hold exactly one kind: a command pool holds command buffers, a descriptor
+/// pool holds descriptor sets. Tying the two together in a type is what stops a command buffer
+/// being filed under a descriptor pool -- a transposition the pool bookkeeping cannot otherwise
+/// see, because both sides of it are handles.
+///
+/// The impls are generated from vk.xml's handle parentage, so a pool the renderer starts serving
+/// arrives with one and a handle that is merely *named* a pool never does. It lives here rather
+/// than beside the bookkeeping that uses it because the generated code can name this module and
+/// not the driver.
+pub trait PoolOf: Handle {
+    type Child: Handle;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lookup {
     /// The host handle.

@@ -86,6 +86,24 @@ def bitfield_types(vk_xml):
     return types
 
 
+def handle_parents(vk_xml):
+    """Each handle's owning handle, by name, as vk.xml's `parent` attribute gives it.
+
+    The model drops it: `vkxml.py`'s `_parse_type_handle` reads the element only to learn from the
+    `VK_DEFINE_HANDLE` macro whether a handle is dispatchable. Parentage is what separates a handle
+    allocated from another handle -- a command buffer from a command pool -- from one the device
+    hands out directly, and the renderer's pool bookkeeping is keyed on exactly that distinction.
+    """
+    parents = {}
+    for ty in ET.parse(vk_xml).getroot().iter('type'):
+        if ty.get('category') != 'handle' or ty.get('alias') or not ty.get('parent'):
+            continue
+        name = ty.find('name')
+        parents[name.text if name is not None else ty.get('name')] = ty.get('parent')
+    assert parents, 'no handle parents in %s' % vk_xml
+    return parents
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--outdir', required=True, help='Where to write the .rs files.')
@@ -109,7 +127,8 @@ def main():
     vk_xml = protocol / 'xmls' / 'vk.xml'
     rust = RustGen(gen, api_constants(vk_xml), bitfield_types(vk_xml),
                    member_order([vn_protocol.VN_PROTOCOL_VK_XML]
-                                + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)))
+                                + list(vn_protocol.VN_PROTOCOL_PRIVATE_XMLS)),
+                   handle_parents(vk_xml))
 
     lookup = TemplateLookup(str(HERE / 'templates'))
     outdir = Path(args.outdir)

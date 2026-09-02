@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::cs::{Handle, ObjectId, TypedHandle};
+use super::cs::{Handle, ObjectId, PoolOf, TypedHandle};
 use super::objects::Doomed;
 use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
@@ -94,28 +94,6 @@ struct Pools {
     open: BTreeMap<TypedHandle, Pool>,
     /// Every pool-allocated object, by host handle, pointing back at its pool.
     owner: BTreeMap<TypedHandle, TypedHandle>,
-}
-
-/// A pool handle, and the one kind of object allocated from it.
-///
-/// Vulkan's two pools each hold exactly one kind: a command pool holds command buffers, a
-/// descriptor pool holds descriptor sets. Tying the two together in a type is what stops a
-/// command buffer being recorded into a descriptor pool's contents -- a transposition the pool
-/// bookkeeping cannot otherwise see, because both sides of it are handles.
-///
-/// Written out rather than generated: the pinned `vkxml.py` does not parse vk.xml's `parent`
-/// attribute, so the generator has nothing to derive this from. Two impls, and a third pool kind
-/// would fail to compile at its call site rather than pass silently.
-pub trait PoolOf: Handle {
-    type Child: Handle;
-}
-
-impl PoolOf for VkCommandPool {
-    type Child = VkCommandBuffer;
-}
-
-impl PoolOf for VkDescriptorPool {
-    type Child = VkDescriptorSet;
 }
 
 /// One live pool: the device that owns it, and what has been allocated from it.
