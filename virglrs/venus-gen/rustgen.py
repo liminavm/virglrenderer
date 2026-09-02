@@ -81,6 +81,33 @@ class RustGen:
             return PRIMITIVES[base.name]
         return base.name
 
+    def bitmask_repr(self, ty):
+        """The scalar a bitmask newtype wraps.
+
+        vk.xml declares every bitmask as a typedef of `VkFlags` or `VkFlags64`, and those two are
+        the whole vocabulary -- a third would be a new width on the wire and is worth the
+        assertion rather than a silent 32.
+        """
+        if ty.typedef is None:
+            return 'u32'
+        assert ty.typedef.name in ('VkFlags', 'VkFlags64'), \
+            '%s is a bitmask over %s, which is a width the encoder does not know' \
+            % (ty.name, ty.typedef.name)
+        return 'u64' if ty.typedef.name == 'VkFlags64' else 'u32'
+
+    def bits_of(self, ty):
+        """The `FlagBits` enum whose values belong in this bitmask, if this build emits one.
+
+        vk.xml names it in `requires` or `bitvalues`. Some bitmasks have none -- reserved-for-
+        future-use words with no bits defined yet -- and some name an enum this build does not
+        emit, so the answer is optional and the `From` impl is emitted only when it exists.
+        """
+        bits = getattr(ty, 'requires', None)
+        if bits is None:
+            return None
+        emitted = {e.name for e in self.gen.supported_types[VkType.ENUM]}
+        return bits if bits.name in emitted else None
+
     def field_type(self, var):
         """The Rust type of a struct member or command argument, decoration included."""
         return self._decorate(var.ty)
@@ -138,9 +165,6 @@ class RustGen:
             return 'None'
         if base.category in (VkType.STRUCT, VkType.UNION):
             return '%s::default()' % base.name
-        if base.category == VkType.BITMASK:
-            # A bitmask is an alias for VkFlags or VkFlags64, so its zero is the alias target's.
-            return '%s(0)' % (base.typedef.name if base.typedef else 'VkFlags')
         # Newtypes: enums, handles, base types and bitmasks all wrap a scalar.
         return '%s(0)' % base.name
 
@@ -457,8 +481,6 @@ class RustGen:
         base = ty.base
         if base.category not in self.SCALAR_CATEGORIES:
             return None
-        if base.category == VkType.BITMASK:
-            return base.typedef.name if base.typedef else 'VkFlags'
         return self.base_name(base)
 
     def _substitute_constants(self, expr):
@@ -1098,8 +1120,6 @@ class RustGen:
             return '%s as _' % value
         if base.category == VkType.FUNCPOINTER:
             return 'None'
-        if base.category == VkType.BITMASK:
-            return '%s(%s as _)' % (base.typedef.name if base.typedef else 'VkFlags', value)
         return '%s(%s as _)' % (base.name, value)
 
     def _fill_one(self, ty, var, target, value):
