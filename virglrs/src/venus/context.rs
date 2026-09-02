@@ -1898,8 +1898,11 @@ impl Commands for Handlers<'_> {
     /// and zero is a null address the guest would hand to the GPU. See
     /// [`Driver::dev_ask_info`]: the only honest thing left is to stop the ring.
     fn vkGetBufferDeviceAddress(&mut self, args: &mut vn_command_vkGetBufferDeviceAddress<'_>) {
-        let (device, info) = (args.device, args.pInfo);
-        let r = self.driver.dev_ask_info(device, info, |d| d.try_vkGetBufferDeviceAddress());
+        let Some(info) = args.pInfo else {
+            self.reject = Some("asked for the address of no buffer at all");
+            return;
+        };
+        let r = self.driver.dev_ask_info(args.device, info, |d| d.try_vkGetBufferDeviceAddress());
         if let Some(ret) = self.asked(r) {
             args.ret = ret;
         }
@@ -1909,8 +1912,13 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetBufferOpaqueCaptureAddress<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
-        let r = self.driver.dev_ask_info(device, info, |d| d.try_vkGetBufferOpaqueCaptureAddress());
+        let Some(info) = args.pInfo else {
+            self.reject = Some("asked for the capture address of no buffer at all");
+            return;
+        };
+        let r = self
+            .driver
+            .dev_ask_info(args.device, info, |d| d.try_vkGetBufferOpaqueCaptureAddress());
         if let Some(ret) = self.asked(r) {
             args.ret = ret;
         }
@@ -1920,10 +1928,13 @@ impl Commands for Handlers<'_> {
         &mut self,
         args: &mut vn_command_vkGetDeviceMemoryOpaqueCaptureAddress<'_>,
     ) {
-        let (device, info) = (args.device, args.pInfo);
+        let Some(info) = args.pInfo else {
+            self.reject = Some("asked for the capture address of no memory at all");
+            return;
+        };
         let r = self
             .driver
-            .dev_ask_info(device, info, |d| d.try_vkGetDeviceMemoryOpaqueCaptureAddress());
+            .dev_ask_info(args.device, info, |d| d.try_vkGetDeviceMemoryOpaqueCaptureAddress());
         if let Some(ret) = self.asked(r) {
             args.ret = ret;
         }
@@ -3836,6 +3847,14 @@ mod tests {
         h.vkGetDeviceMemoryOpaqueCaptureAddress(&mut args);
         assert!(h.reject.take().is_some(), "an address this driver cannot be asked for");
         assert_eq!(args.ret, 0, "and nothing was invented to fill it");
+
+        // And an address query with no struct naming what to look up. The struct is required, so
+        // a guest omitting it is already fatal at the decode -- but the handler is what stands
+        // between a null and the driver, and it has to hold on its own.
+        let mut args = vn_command_vkGetBufferDeviceAddress { device, ..Default::default() };
+        h.vkGetBufferDeviceAddress(&mut args);
+        assert!(h.reject.take().is_some(), "an address query naming nothing");
+        assert_eq!(args.ret.0, 0, "and no address was invented for it");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         h.driver.abandon_planted();
