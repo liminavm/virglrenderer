@@ -404,6 +404,8 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         return -1;
     }
 
+    struct vrend_resource *composite = NULL;
+
     for (unsigned i = 0; i < dmabuf->num_planes && i < buf->num_planes; i++) {
         struct vrend_video_plane *plane = &buf->planes[i];
         struct vrend_resource *res;
@@ -417,6 +419,12 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         if (dmabuf->planes[i].fd < 0 && dmabuf->planes[i].map) {
             upload_mapped_plane(res, i, &dmabuf->planes[i]);
             writeback_plane_to_guest(res, i, &dmabuf->planes[i]);
+#ifdef __APPLE__
+            /* A composite target is one resource for every plane; tell it once, after
+             * all of its planes are in place, not per plane. */
+            if (res->iosurf_planes)
+                composite = res;
+#endif
             continue;
         }
 
@@ -459,6 +467,9 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (composite)
+        vrend_resource_planes_written(buf->ctx->ctx, composite);
 
     return 0;
 }

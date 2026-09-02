@@ -75,6 +75,9 @@ struct vrend_blitter_ctx {
 
    GLuint vbo_id;
    struct blit_coord vertices[4];
+
+   /* limina: NV12 -> RGBA (index 0) and NV21 -> RGBA (index 1) programs. */
+   GLuint yuv_prog[2];
 };
 
 static struct vrend_blitter_ctx vrend_blit_ctx;
@@ -906,6 +909,150 @@ void vrend_renderer_blit_gl(ASSERTED struct vrend_context *ctx,
    glBindTexture(src_res->target, 0);
 }
 
+/* limina: two-plane YUV -> RGBA, BT.601 limited range, the same matrix and range the
+ * CPU converter uses (guest_pixels_convert_yuv), so a composite target reads the same
+ * whichever path filled it. The guest's colour-space hint never reaches the host. */
+#define FS_YUV_BODY                                                          \
+   "uniform sampler2D luma;\n"                                                \
+   "uniform sampler2D chroma;\n"                                              \
+   "in vec4 tc;\n"                                                            \
+   "out vec4 FragColor;\n"                                                    \
+   "void main() {\n"                                                          \
+   "   float c = texture(luma, tc.xy).r - 16.0 / 255.0;\n"                    \
+   "   vec2 uv = texture(chroma, tc.xy).%s - vec2(0.5);\n"                    \
+   "   float d = uv.x;\n"                                                     \
+   "   float e = uv.y;\n"                                                     \
+   "   FragColor = vec4(clamp(1.1643 * c + 1.5977 * e, 0.0, 1.0),\n"          \
+   "                    clamp(1.1643 * c - 0.3906 * d - 0.8125 * e, 0.0, 1.0),\n" \
+   "                    clamp(1.1643 * c + 2.0156 * d, 0.0, 1.0),\n"          \
+   "                    1.0);\n"                                              \
+   "}\n"
+
+static GLuint blit_get_frag_yuv(struct vrend_blitter_ctx *blit_ctx, bool swapped)
+{
+   GLuint *slot = &blit_ctx->yuv_prog[swapped ? 1 : 0];
+   if (*slot)
+      return *slot;
+
+   char src[2048];
+   snprintf(src, sizeof(src), "%s" FS_YUV_BODY,
+            blit_ctx->use_gles ? HEADER_GLES : HEADER_GL, swapped ? "gr" : "rg");
+
+   GLint fs = blit_shader_build_and_check(GL_FRAGMENT_SHADER, src);
+   if (!fs)
+      return 0;
+
+   GLuint prog = glCreateProgram();
+   glAttachShader(prog, blit_ctx->vs);
+   glAttachShader(prog, fs);
+   bool linked = blit_shader_link_and_check(prog);
+   glDeleteShader(fs);
+   if (!linked)
+      return 0;
+
+   glUseProgram(prog);
+   glUniform1i(glGetUniformLocation(prog, "luma"), 0);
+   glUniform1i(glGetUniformLocation(prog, "chroma"), 1);
+   glUseProgram(0);
+   *slot = prog;
+   return prog;
+}
+
+bool vrend_renderer_convert_planes_gl(struct vrend_resource *res)
+{
+#ifdef __APPLE__
+   struct vrend_blitter_ctx *blit_ctx = &vrend_blit_ctx;
+   const bool swapped = res->base.format == VIRGL_FORMAT_NV21;
+
+   if (res->iosurf_planes < 2 || !res->aux_plane_egl_image[0] || !res->aux_plane_egl_image[1])
+      return false;
+   if (res->target != GL_TEXTURE_2D || !res->gl_id)
+      return false;
+   if (res->base.format != VIRGL_FORMAT_NV12 && !swapped)
+      return false;
+
+   vrend_renderer_init_blit_ctx(blit_ctx);
+
+   GLuint prog = blit_get_frag_yuv(blit_ctx, swapped);
+   if (!prog) {
+      virgl_error("composite fill: no YUV program; %ux%u %s stays unconverted\n",
+                  res->base.width0, res->base.height0, util_format_name(res->base.format));
+      return false;
+   }
+
+   /* The plane textures are made once per resource: each import adopts the IOSurface
+    * plane on the driver side, and a per-frame import would leak that as surely as the
+    * per-plane view did before its teardown was fixed. Deleted with the resource. */
+   for (unsigned i = 0; i < 2; i++) {
+      if (res->plane_tex[i])
+         continue;
+      glGenTextures(1, &res->plane_tex[i]);
+      glBindTexture(GL_TEXTURE_2D, res->plane_tex[i]);
+      glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)res->aux_plane_egl_image[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+      glBindTexture(GL_TEXTURE_2D, 0);
+   }
+
+   glUseProgram(prog);
+   glBindFramebuffer(GL_FRAMEBUFFER, blit_ctx->fb_id);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, res->gl_id, 0);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+   GLuint buffers = GL_COLOR_ATTACHMENT0;
+   glDrawBuffers(1, &buffers);
+
+   GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+   if (status != GL_FRAMEBUFFER_COMPLETE) {
+      virgl_error("composite fill: framebuffer over gl_id %u (%ux%u %s) incomplete, 0x%x\n",
+                  res->gl_id, res->base.width0, res->base.height0,
+                  util_format_name(res->base.format), status);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+      glUseProgram(0);
+      return false;
+   }
+
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, res->plane_tex[0]);
+   glActiveTexture(GL_TEXTURE1);
+   glBindTexture(GL_TEXTURE_2D, res->plane_tex[1]);
+
+   /* The blitter leaves depth testing on; nothing here has a depth buffer, but be
+    * explicit about every piece of state the draw depends on. */
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_STENCIL_TEST);
+   glDisable(GL_BLEND);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+   /* Identity: texture row 0 of the planes lands in row 0 of gl_id, which is how the
+    * guest's view addresses both. */
+   blit_ctx->dst_width = res->base.width0;
+   blit_ctx->dst_height = res->base.height0;
+   blitter_set_rectangle(blit_ctx, 0, 0, res->base.width0, res->base.height0);
+   blit_ctx->vertices[0].tex = (struct vec4){ 0.0f, 0.0f, 0.0f, 1.0f };
+   blit_ctx->vertices[1].tex = (struct vec4){ 1.0f, 0.0f, 0.0f, 1.0f };
+   blit_ctx->vertices[2].tex = (struct vec4){ 1.0f, 1.0f, 0.0f, 1.0f };
+   blit_ctx->vertices[3].tex = (struct vec4){ 0.0f, 1.0f, 0.0f, 1.0f };
+   vrend_set_vertex_param(prog);
+   glBufferData(GL_ARRAY_BUFFER, sizeof(blit_ctx->vertices), blit_ctx->vertices, GL_STATIC_DRAW);
+   glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glUseProgram(0);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+   return true;
+#else
+   (void)res;
+   return false;
+#endif
+}
+
 static void delete_program_cb(struct hash_entry *entry)
 {
    glDeleteProgram(pointer_to_uintptr(entry->data));
@@ -913,6 +1060,11 @@ static void delete_program_cb(struct hash_entry *entry)
 
 void vrend_blitter_fini(void)
 {
+   for (unsigned i = 0; i < ARRAY_SIZE(vrend_blit_ctx.yuv_prog); i++) {
+      if (vrend_blit_ctx.yuv_prog[i])
+         glDeleteProgram(vrend_blit_ctx.yuv_prog[i]);
+      vrend_blit_ctx.yuv_prog[i] = 0;
+   }
    vrend_blit_ctx.initialised = false;
    if (vrend_blit_ctx.blit_programs)
       _mesa_hash_table_u64_destroy(vrend_blit_ctx.blit_programs, delete_program_cb);
