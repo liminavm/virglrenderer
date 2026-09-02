@@ -1026,6 +1026,44 @@ vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf,
    return ok;
 }
 
+int
+vkr_mtl_iosurface_plane_copy(struct vkr_mtl_iosurface *dst,
+                             struct vkr_mtl_iosurface *src,
+                             uint32_t plane)
+{
+   if (!dst || !src || !dst->io_surface || !src->io_surface || dst == src)
+      return 0;
+   IOSurfaceRef d = (IOSurfaceRef)dst->io_surface;
+   IOSurfaceRef s = (IOSurfaceRef)src->io_surface;
+   if (plane >= IOSurfaceGetPlaneCount(d) || plane >= IOSurfaceGetPlaneCount(s))
+      return 0;
+
+   size_t rows = IOSurfaceGetHeightOfPlane(d, plane);
+   if (rows > IOSurfaceGetHeightOfPlane(s, plane))
+      rows = IOSurfaceGetHeightOfPlane(s, plane);
+   size_t row_bytes = IOSurfaceGetWidthOfPlane(d, plane) * IOSurfaceGetBytesPerElementOfPlane(d, plane);
+   const size_t src_row_bytes =
+      IOSurfaceGetWidthOfPlane(s, plane) * IOSurfaceGetBytesPerElementOfPlane(s, plane);
+   if (row_bytes > src_row_bytes)
+      row_bytes = src_row_bytes;
+   const size_t dst_stride = IOSurfaceGetBytesPerRowOfPlane(d, plane);
+   const size_t src_stride = IOSurfaceGetBytesPerRowOfPlane(s, plane);
+
+   IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+   IOSurfaceLock(d, 0, NULL);
+   uint8_t *dbase = (uint8_t *)IOSurfaceGetBaseAddressOfPlane(d, plane);
+   const uint8_t *sbase = (const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s, plane);
+   int ok = 0;
+   if (dbase && sbase && row_bytes <= dst_stride && row_bytes <= src_stride) {
+      for (size_t row = 0; row < rows; row++)
+         memcpy(dbase + row * dst_stride, sbase + row * src_stride, row_bytes);
+      ok = 1;
+   }
+   IOSurfaceUnlock(d, 0, NULL);
+   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+   return ok;
+}
+
 /* limina snapshot-replay P2: raw byte copy in/out of a scanout IOSurface — see the header. The
  * copy is flat, not row-by-row: capture and restore see the same geometry, so the surface's own
  * bytesPerRow is on both sides and translating strides would only invent a way to get it wrong.

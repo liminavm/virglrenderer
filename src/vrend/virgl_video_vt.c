@@ -131,6 +131,12 @@ struct virgl_video_codec {
      * per-codec parser can tell before end_frame. */
     bool frame_is_key;
     unsigned frames_dropped_awaiting_key;
+    /* While the gate is dropping frames, the picture the guest keeps seeing. A dropped
+     * frame's target holds whatever it held before, and a player presents its pool of such
+     * targets in pool order -- pictures from before the restore, back and forth. The first
+     * dropped frame's target is kept here and copied into every later one, so the guest
+     * presents one still picture until the keyframe. NULL when nothing is being dropped. */
+    struct virgl_video_buffer *freeze_source;
 
     /* Rebuilt whenever the stream's shape changes; see ensure_session(). */
     VTDecompressionSessionRef session;
@@ -229,19 +235,21 @@ struct virgl_video_buffer {
 static struct virgl_video_callbacks *video_cbs;
 static uint32_t next_buffer_id = 1;
 
-/* AV1 codecs currently alive. destroy_buffer is handed a buffer and nothing else, so
- * finding the codec that is holding a frame for it needs a way back. Only AV1 codecs are
- * registered, since only they hold frames. */
-#define MAX_LIVE_CODECS 16
+/* Codecs currently alive. destroy_buffer is handed a buffer and nothing else, so every
+ * codec that keeps a pointer to a buffer (an AV1 codec's held frame's target, any codec's
+ * freeze source) needs a way back to it. */
+#define MAX_LIVE_CODECS 256
 static struct virgl_video_codec *live_codecs[MAX_LIVE_CODECS];
 static unsigned num_live_codecs;
 
-static void codec_register(struct virgl_video_codec *codec)
+static bool codec_register(struct virgl_video_codec *codec)
 {
-    if (num_live_codecs < MAX_LIVE_CODECS)
+    if (num_live_codecs < MAX_LIVE_CODECS) {
         live_codecs[num_live_codecs++] = codec;
-    else
-        virgl_error("video: too many live codecs to track held frames\n");
+        return true;
+    }
+    virgl_error("video: too many live codecs to track their buffers\n");
+    return false;
 }
 
 static void codec_unregister(struct virgl_video_codec *codec)
@@ -251,6 +259,16 @@ static void codec_unregister(struct virgl_video_codec *codec)
             live_codecs[i] = live_codecs[--num_live_codecs];
             return;
         }
+}
+
+/* A codec the table could not take must never point at a buffer it will not be told
+ * about, so it forgoes the freeze and plainly drops. */
+static bool codec_registered(const struct virgl_video_codec *codec)
+{
+    for (unsigned i = 0; i < num_live_codecs; i++)
+        if (live_codecs[i] == codec)
+            return true;
+    return false;
 }
 
 /* LIMINA_VIDEO_TRACE=1 narrates the decode path to the worker log. virgl_error()
@@ -477,12 +495,12 @@ struct virgl_video_codec *virgl_video_create_codec(
     codec->height = args->height;
     codec->opaque = args->opaque;
     codec->await_keyframe = true;
+    codec_register(codec);
 
     if (args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
         codec->hw_av1 = vt_can_decode(kCMVideoCodecType_AV1);
         codec->av1_decode = codec->hw_av1 || virgl_dav1d_available();
         virgl_av1_obu_state_init(&codec->av1);
-        codec_register(codec);
     }
 
     VT_TRACE("create_codec: codec %p tid %llu profile %d %ux%u%s\n", (void *)codec,
@@ -571,12 +589,15 @@ void virgl_video_destroy_buffer(struct virgl_video_buffer *buffer)
      * leave a dangling pointer to write a picture into. The frame itself still has to be
      * decoded when its turn comes -- the decoder's reference list needs it -- so only the
      * destination is dropped. */
-    for (unsigned i = 0; i < num_live_codecs; i++)
+    for (unsigned i = 0; i < num_live_codecs; i++) {
         if (live_codecs[i]->held_target == buffer) {
             VT_TRACE("av1: the held frame's target was destroyed; it will decode "
                      "without being delivered\n");
             live_codecs[i]->held_target = NULL;
         }
+        if (live_codecs[i]->freeze_source == buffer)
+            live_codecs[i]->freeze_source = NULL;
+    }
 
     free(buffer);
 }
@@ -981,12 +1002,32 @@ static bool frame_passes_keyframe_gate(struct virgl_video_codec *codec, bool is_
                        "frames\n", (void *)codec, codec->frames_dropped_awaiting_key);
         codec->await_keyframe = false;
         codec->frames_dropped_awaiting_key = 0;
+        codec->freeze_source = NULL;
         return true;
     }
     if (!codec->frames_dropped_awaiting_key++)
         virgl_warn("video: codec %p has no reference pictures yet; dropping inter frames "
                    "until the stream's next keyframe\n", (void *)codec);
     return false;
+}
+
+/* A frame that produced no picture while the codec awaits a keyframe: make its target show
+ * the picture the guest last saw. The first such target is the picture; every later one
+ * gets a copy of it. See freeze_source. */
+static void freeze_dropped_target(struct virgl_video_codec *codec,
+                                  struct virgl_video_buffer *target)
+{
+    if (!codec->await_keyframe || !target)
+        return;
+    if (!codec->freeze_source) {
+        if (codec_registered(codec))
+            codec->freeze_source = target;
+        return;
+    }
+    if (target == codec->freeze_source || !video_cbs || !video_cbs->copy_picture)
+        return;
+    VT_TRACE("freeze: target %u <- %u\n", target->id, codec->freeze_source->id);
+    video_cbs->copy_picture(codec, codec->freeze_source, target);
 }
 
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
@@ -1803,6 +1844,8 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
         if (!codec->av1_decode || !codec->av1_desc_valid) {
             codec->bitstream_len = 0;
+            if (codec->av1_decode)  /* the frame a snapshot cut in half */
+                freeze_dropped_target(codec, target);
             return 0;   /* capture-only: nothing was accumulated to decode */
         }
 
@@ -1816,6 +1859,7 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
         if (!frame_passes_keyframe_gate(codec, starts_dpb)) {
             codec->bitstream_len = 0;
             codec->av1_desc_valid = false;
+            freeze_dropped_target(codec, target);
             return 0;
         }
 
@@ -1847,11 +1891,17 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     VT_TRACE("end_frame: %zu bytes\n", codec->bitstream_len);
 
-    if (!codec->bitstream_len)
+    /* No bitstream is the frame a snapshot cut in half: its slices reached the codec that
+     * was saved, its end_frame reaches the one that was restored. Nothing to decode, and the
+     * same stale target as a dropped frame's. */
+    if (!codec->bitstream_len) {
+        freeze_dropped_target(codec, target);
         return 0;
+    }
 
     if (!frame_passes_keyframe_gate(codec, codec->frame_is_key)) {
         codec->bitstream_len = 0;
+        freeze_dropped_target(codec, target);
         return 0;
     }
 

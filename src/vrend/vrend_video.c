@@ -88,6 +88,8 @@ struct vkr_mtl_iosurface;
 int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane,
                                   const void *src, uint32_t src_stride, uint32_t rows,
                                   uint32_t row_bytes);
+int vkr_mtl_iosurface_plane_copy(struct vkr_mtl_iosurface *dst, struct vkr_mtl_iosurface *src,
+                                 uint32_t plane);
 #endif
 
 struct vrend_context;
@@ -630,10 +632,144 @@ static void vrend_video_encode_completed(
     cdc->feed_res = NULL;
 }
 
+/* limina: where a plane of a target lives in guest memory, if it lives there at all. The
+ * same test writeback_plane_to_guest() applies: storage too small for the plane means the
+ * guest never asked for the frame there (the classic one-page shadow), and is silent. */
+static bool guest_plane_span(struct vrend_resource *res, unsigned plane_idx, size_t row,
+                             size_t height, size_t *offset, size_t *stride)
+{
+    size_t extent, storage;
+
+    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs))
+        return false;
+
+    *stride = res->guest_pixels_stride[plane_idx] ? res->guest_pixels_stride[plane_idx] : row;
+    *offset = res->guest_pixels_offset[plane_idx];
+    if (*stride < row)
+        return false;
+
+    extent = *offset + (height ? (height - 1) * *stride + row : 0);
+    storage = res->guest_pixels_map ? res->guest_pixels_map_size
+                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+    return extent <= storage;
+}
+
+/* limina: the guest-memory half of copying a picture: a guest that reads or exports the
+ * target's own storage (VIRGL_CAP_V2_VIDEO_GUEST_PLANES) must find the copy there too. */
+static void copy_guest_plane(struct vrend_resource *src, struct vrend_resource *dst,
+                             unsigned plane_idx)
+{
+    struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+    uint32_t plane_count = 0;
+    size_t row, height, soff, sstride, doff, dstride;
+    char *tmp;
+
+    vrend_guest_plane_layout(dst->base.format, dst->base.width0, dst->base.height0,
+                             geom, &plane_count);
+    if (plane_count < 2)
+        plane_idx = 0;
+    else if (plane_idx >= plane_count)
+        return;
+
+    row = (size_t)geom[plane_idx].width * geom[plane_idx].bpp;
+    height = geom[plane_idx].height;
+    if (!row || !height ||
+        !guest_plane_span(src, plane_idx, row, height, &soff, &sstride) ||
+        !guest_plane_span(dst, plane_idx, row, height, &doff, &dstride))
+        return;
+
+    tmp = malloc(row);
+    if (!tmp)
+        return;
+    for (size_t y = 0; y < height; y++) {
+        if (src->guest_pixels_map)
+            memcpy(tmp, (const char *)src->guest_pixels_map + soff + y * sstride, row);
+        else
+            vrend_read_from_iovec(src->iov, src->num_iovs, soff + y * sstride, tmp, row);
+        if (dst->guest_pixels_map)
+            memcpy((char *)dst->guest_pixels_map + doff + y * dstride, tmp, row);
+        else
+            vrend_write_to_iovec(dst->iov, dst->num_iovs, doff + y * dstride, tmp, row);
+    }
+    free(tmp);
+}
+
+/* limina: replicate the picture one target holds into another, everywhere a decoded
+ * picture would land -- the host texture or IOSurface plane a sampler reads, and the
+ * guest's own storage. Called by the backend for a frame it cannot decode (a codec with
+ * no reference pictures yet, after a snapshot restore), so the target the guest is about
+ * to present shows the same picture as the last one it presented. */
+static void vrend_video_copy_picture(struct virgl_video_codec *codec,
+                                     struct virgl_video_buffer *from,
+                                     struct virgl_video_buffer *to)
+{
+    struct vrend_video_buffer *src = vrend_video_buffer(from);
+    struct vrend_video_buffer *dst = vrend_video_buffer(to);
+    struct vrend_resource *composite = NULL;
+
+    (void)codec;
+
+    if (!src || !dst || src == dst || src->ctx != dst->ctx)
+        return;
+
+    for (unsigned i = 0; i < src->num_planes && i < dst->num_planes; i++) {
+        struct vrend_resource *sres, *dres;
+
+        sres = vrend_renderer_ctx_res_lookup(src->ctx->ctx, src->planes[i].res_handle);
+        dres = vrend_renderer_ctx_res_lookup(dst->ctx->ctx, dst->planes[i].res_handle);
+        if (!sres || !dres || sres == dres)
+            continue;
+        if (sres->base.format != dres->base.format ||
+            sres->base.width0 != dres->base.width0 ||
+            sres->base.height0 != dres->base.height0) {
+            /* Once: a pool of mixed shapes would otherwise say so at frame rate. */
+            static bool warned;
+            if (!warned)
+                virgl_error("%s: targets %u and %u differ in shape; not copying\n",
+                            __func__, src->handle, dst->handle);
+            warned = true;
+            return;
+        }
+
+#ifdef __APPLE__
+        /* A composite target is one resource for every plane; its pixels live in the
+         * IOSurface planes, and the composite is told once, after all of them. */
+        if (i < dres->iosurf_planes) {
+            if (i < sres->iosurf_planes)
+                vkr_mtl_iosurface_plane_copy(dres->iosurface, sres->iosurface, i);
+            composite = dres;
+            copy_guest_plane(sres, dres, i);
+            continue;
+        }
+#endif
+
+        /* src texture -> framebuffer -> dst texture, the way a decoded plane lands. */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, dst->planes[i].framebuffer);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, sres->gl_id, 0);
+        if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            virgl_error("%s: plane %u of target %u is not readable as a framebuffer\n",
+                        __func__, i, src->handle);
+            continue;
+        }
+        glBindTexture(GL_TEXTURE_2D, dres->gl_id);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                            dres->base.width0, dres->base.height0);
+        copy_guest_plane(sres, dres, i);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (composite)
+        vrend_resource_planes_written(dst->ctx->ctx, composite);
+}
+
 static struct virgl_video_callbacks video_callbacks = {
     .decode_completed           = vrend_video_decode_completed,
     .encode_upload_picture      = vrend_video_enocde_upload_picture,
     .encode_completed           = vrend_video_encode_completed,
+    .copy_picture               = vrend_video_copy_picture,
 };
 
 int vrend_video_init(int drm_fd)
