@@ -282,6 +282,7 @@ impl Context {
             todo,
             driver: &mut self.driver,
             global,
+            ctx: self.id,
             reject: None,
             unserved: false,
             resources,
@@ -611,8 +612,11 @@ pub struct Handlers<'a> {
     /// Read back and cleared every command, for the same reason as `reject`: the census is a
     /// tally, and the loop needs the per-command answer.
     unserved: bool,
-    /// The renderer's resource table, for the one command that needs guest memory by name.
+    /// The renderer's resource table, for the commands that name guest memory.
     resources: &'a dyn ShmResources,
+    /// Which context this is, for the resource questions whose answer is only meaningful within
+    /// one -- a guest id names an allocation, and every context numbers its own.
+    ctx: CtxId,
     /// The ring this batch arrived on, or `None` for the context's own stream. Several commands
     /// are legal on exactly one of the two, and a reply belongs to whichever it was.
     current_ring: Option<RingId>,
@@ -1045,7 +1049,12 @@ impl Commands for Handlers<'_> {
             return;
         };
         let Some(info) = self.names(args.pAllocateInfo) else { return };
-        let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator);
+        // Read out of `self` before the driver takes it mutably: both are plain copies of a
+        // shared reference and an id, so the resolver borrows nothing the driver also wants.
+        let (resources, ctx) = (self.resources, self.ctx);
+        let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator, &|handle| {
+            resources.exported_allocation(ctx, handle)
+        });
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkAllocateMemory", args.pMemory(), args.handle_pMemory_mut(), host);
     }
@@ -1094,8 +1103,29 @@ impl Commands for Handlers<'_> {
     );
     simple_destroy!(vkDestroyBuffer, vn_command_vkDestroyBuffer, buffer);
 
-    simple_create!(vkCreateImage, vn_command_vkCreateImage, pCreateInfo, pImage, handle_pImage_mut);
-    simple_destroy!(vkDestroyImage, vn_command_vkDestroyImage, image);
+    /// Not [`simple_create`]: an image's extent and format cannot be asked for afterwards, and a
+    /// scanout surface has to be minted at exactly them.
+    fn vkCreateImage(&mut self, args: &mut vn_command_vkCreateImage<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host =
+            self.driver.create_object(args.device, |d| d.vkCreateImage(), info, args.pAllocator);
+        if let Ok(image) = host {
+            self.driver.note_image(image, info);
+        }
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateImage", args.pImage(), args.handle_pImage_mut(), host);
+    }
+
+    /// Not [`simple_destroy`]: the record [`Self::vkCreateImage`] made goes with the image.
+    fn vkDestroyImage(&mut self, args: &mut vn_command_vkDestroyImage<'_>) {
+        self.driver.forget_image(args.image);
+        self.driver.destroy_object(
+            args.device,
+            |d| d.vkDestroyImage(),
+            args.image,
+            args.pAllocator,
+        );
+    }
 
     simple_create!(
         vkCreateImageView,
@@ -3438,6 +3468,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -4221,6 +4252,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
+                    ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
                     unserved: false,
                     resources: &t,
@@ -4284,6 +4316,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
+                    ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
                     unserved: false,
                     resources: &t,
@@ -4384,6 +4417,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
+                    ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
                     unserved: false,
                     resources: &t,
@@ -4477,6 +4511,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
+                    ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
                     unserved: false,
                     resources: &NO_RESOURCES,
@@ -4592,6 +4627,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
+                    ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
                     unserved: false,
                     resources: &NO_RESOURCES,
@@ -4891,6 +4927,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5003,6 +5040,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5276,6 +5314,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &t,
@@ -5326,6 +5365,7 @@ mod tests {
                 todo: &mut todo,
                 driver: &mut driver,
                 global: &global,
+                ctx: CtxId::new(1).expect("1 is not zero"),
                 reject: None,
                 unserved: false,
                 resources: &t,
@@ -5365,6 +5405,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5400,6 +5441,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &t,
@@ -5464,6 +5506,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &t,
@@ -5503,6 +5546,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &t,
@@ -5559,6 +5603,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5591,6 +5636,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &t,
@@ -5709,6 +5755,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5801,6 +5848,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5846,6 +5894,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5898,6 +5947,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -5925,6 +5975,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6008,6 +6059,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6042,6 +6094,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6180,6 +6233,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6250,6 +6304,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6278,6 +6333,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6330,6 +6386,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6372,6 +6429,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6398,6 +6456,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6567,6 +6626,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6644,6 +6704,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6711,6 +6772,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6770,6 +6832,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -6952,6 +7015,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7004,6 +7068,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7191,6 +7256,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7323,6 +7389,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7472,6 +7539,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7553,6 +7621,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7707,6 +7776,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -7893,6 +7963,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,
@@ -8081,6 +8152,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
             unserved: false,
             resources: &NO_RESOURCES,

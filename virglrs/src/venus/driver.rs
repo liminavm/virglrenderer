@@ -23,19 +23,23 @@ use super::proto::types::{
     VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorPool, VkDescriptorSet,
     VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
     VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExtensionProperties,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer, VkImage,
-    VkImageBlit, VkImageCreateFlags, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
-    VkImageSubresourceRange, VkImageTiling, VkImageType, VkImageUsageFlags, VkImageView,
-    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
-    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice,
-    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
-    VkPipelineLayout, VkPipelineStageFlags, VkQueryPool, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion,
-    VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule,
-    VkShaderStageFlags, VkStructureType, VkSubmitInfo, VkSubpassContents, VkViewport,
-    VkWriteDescriptorSet,
+    VkExternalMemoryHandleTypeFlagBits, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter,
+    VkFormat, VkFramebuffer, VkImage, VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit,
+    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
+    VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageType,
+    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
+    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
+    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
+    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueryPool,
+    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits,
+    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo,
+    VkSubpassContents, VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
 };
+use crate::ids::ResourceHandle;
+use crate::metal::{PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
 /// The memory properties this renderer decides anything by: whether the host can address it at
@@ -213,6 +217,20 @@ pub struct Driver {
     /// twice. The size is a fact nothing else has: the driver may round an allocation up, and the
     /// census reports the number the guest asked for, because that is what the guest reads back.
     memory: BTreeMap<ObjectId, Allocated>,
+    /// What each live image was created as, by host handle.
+    ///
+    /// Only the facts Vulkan will not give back: a scanout surface has to be minted at the
+    /// image's own width, height and format, and nothing can be asked for those after the create.
+    /// The row pitch is *not* here -- that is queried from the live image, because the driver
+    /// decides it and the driver is the only honest source.
+    ///
+    /// Keyed by host handle because that is what a dedicated allocation names, and the object
+    /// table has no handle-to-id direction to reach an id through. A handle Vulkan has recycled
+    /// could therefore find its predecessor's record; what stops that mattering is that the
+    /// record is only ever used beside a live layout query, and the two disagreeing is what
+    /// [`Driver::scanout_surface`] refuses on. A stale record cannot produce a wrong surface, only
+    /// no surface.
+    images: BTreeMap<VkImage, ImageFacts>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
     /// The device each queue belongs to, by host handle.
@@ -1188,6 +1206,17 @@ impl Driver {
         for o in mine().filter(|o| is_memory(o)) {
             Self::destroy_tracked(&d.fns, device, o);
         }
+        // The other place an image dies -- the guest left it live and the teardown took it. Its
+        // record goes with it, here rather than in `destroy_tracked`, which holds the device's
+        // entry points borrowed out of `self` and so cannot reach the map.
+        let images: Vec<VkImage> = doomed
+            .iter()
+            .filter(|o| o.device == Some(device) && o.ty == VkObjectType::VK_OBJECT_TYPE_IMAGE)
+            .map(|o| VkImage::from_host(o.handle))
+            .collect();
+        for image in images {
+            self.forget_image(image);
+        }
         // The census records the freed allocations by the guest's id, and they have just stopped
         // being live. Done after the borrow above rather than beside each free.
         let freed: Vec<ObjectId> = mine().filter(|o| is_memory(o)).map(|o| o.id).collect();
@@ -1454,8 +1483,8 @@ impl Driver {
             id,
             Allocated {
                 size,
+                backing: Backing::Driver,
                 props: VkMemoryPropertyFlags(props as _),
-                imported: false,
                 exported: None,
             },
         );
@@ -1466,7 +1495,17 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_imported_allocation(&mut self, id: ObjectId, size: u64) {
         self.plant_allocation(id, size);
-        self.memory.get_mut(&id).expect("just planted").imported = true;
+        self.memory.get_mut(&id).expect("just planted").backing = Backing::Imported;
+    }
+
+    /// Plant an allocation backed by a real IOSurface, which is the only way to get one: a
+    /// surface cannot be faked, and every claim about a scanout is a claim about what the system
+    /// did with it.
+    #[cfg(test)]
+    pub(super) fn plant_scanout_allocation(&mut self, id: ObjectId, surface: Surface) {
+        let size = surface.alloc_size();
+        self.plant_allocation(id, size);
+        self.memory.get_mut(&id).expect("just planted").backing = Backing::Scanout(surface);
     }
 
     /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
@@ -2288,6 +2327,7 @@ impl Driver {
         id: ObjectId,
         info: &VkMemoryAllocateInfo,
         alloc: Option<&VkAllocationCallbacks>,
+        exported_allocation: &dyn Fn(ResourceHandle) -> Option<ObjectId>,
     ) -> Result<VkDeviceMemory, VkResult> {
         let Some(d) = self.devices.get(&device) else {
             return Err(VkResult::VK_ERROR_INITIALIZATION_FAILED);
@@ -2299,12 +2339,48 @@ impl Driver {
         // the memory type's properties and from whether this aliases someone else's storage; a
         // second lookup is a second chance for two answers to disagree about one allocation.
         let props = d.memory_types.get(info.memoryTypeIndex as usize).copied();
-        let imported = imports_a_resource(info.pNext);
-        info.allocationSize = VkDeviceSize(pad_for_blob(info.allocationSize.0, props, imported));
+        let import = imported_resource(info.pNext);
+        info.allocationSize =
+            VkDeviceSize(pad_for_blob(info.allocationSize.0, props, import.is_some()));
 
+        // Whichever of the two this allocation is, it comes out as one host address the driver is
+        // handed instead of memory of its own. They are mutually exclusive by construction: an
+        // import names storage that exists, and a scanout is storage being made.
+        //
+        // An import that resolves to nothing falls through to an ordinary allocation, which is
+        // what this did before anything resolved at all: the guest gets memory, and the storage
+        // it meant to reach stays where it is. That is wrong for the guest -- it renders into a
+        // buffer nobody presents -- but it is the driver's own behaviour for a `pNext` link it
+        // does not recognise, and inventing a refusal here would fail allocations the C serves.
+        let alias = import.and_then(|r| self.aliased_span(exported_allocation(r)?));
+        let surface = if import.is_some() { None } else { self.scanout_surface(device, &info) };
+        let mut host_pointer = VkImportMemoryHostPointerInfoEXT {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+            pNext: info.pNext,
+            handleType: VkExternalMemoryHandleTypeFlagBits::
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+            pHostPointer: core::ptr::null_mut(),
+        };
+        // What the census reports and what the guest maps: the guest's own figure, padded. A
+        // surface's page-rounded extent is a fact about how IOSurface rounds, and telling the
+        // guest that number would be answering a question it did not ask.
+        let size = info.allocationSize.0;
+        // The pages back exactly this much, whoever owns them. The guest's figure is its own
+        // image's size, and a request larger than the backing would let the driver address past
+        // the end of it -- the one place a guest's arithmetic could reach outside the host's.
+        if let Some(span) = surface.as_ref().map(|s| (s.host_addr(), s.alloc_size())).or(alias) {
+            host_pointer.pHostPointer = span.0 as *mut core::ffi::c_void;
+            // Prepended, not spliced in: the guest's chain is the decoder's arena and the round
+            // trip re-encodes it, so it is read here and never rewritten.
+            info.pNext = (&raw const host_pointer).cast();
+            info.allocationSize = VkDeviceSize(info.allocationSize.0.min(span.1));
+        }
+
+        // `d` was borrowed before the surface was minted, which needed `&mut self`.
+        let d = self.devices.get(&device).expect("the device was here a moment ago");
         let mut out = VkDeviceMemory(0);
-        // SAFETY: `info` is a local whose chain the decoder owns for the batch, `alloc` is another
-        // of its arena allocations, and `out` is a local.
+        // SAFETY: `info` is a local whose chain the decoder owns for the batch, extended with a
+        // local that outlives this call, `alloc` is another arena allocation, and `out` is a local.
         let r = unsafe { (d.fns.vkAllocateMemory())(device, &info, ptr(alloc), &mut out) };
         if r != VkResult::VK_SUCCESS {
             return Err(r);
@@ -2314,9 +2390,113 @@ impl Driver {
         // the fallback describes memory that cannot exist -- and describes it as addressable by
         // nothing, which is the safe reading.
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
-        self.memory
-            .insert(id, Allocated { size: info.allocationSize.0, props, imported, exported: None });
+        let backing = match (import, surface) {
+            (Some(_), _) => Backing::Imported,
+            (None, Some(s)) => Backing::Scanout(s),
+            (None, None) => Backing::Driver,
+        };
+        self.memory.insert(id, Allocated { size, backing, props, exported: None });
         Ok(out)
+    }
+
+    /// Where an allocation this context already owns lives, for a second allocation that names
+    /// it: the host address and how far it runs.
+    ///
+    /// One value, because an address and the length it is good for are only meaningful together
+    /// -- the caller clamps the guest's figure to the second before handing the driver the first.
+    ///
+    /// `None` for storage there is no address for: an allocation the driver keeps to itself, or
+    /// one that is itself an alias. Only a scanout has an address before anyone asks; ordinary
+    /// memory has one once it has been published, and the guest publishes before it imports,
+    /// because the resource it names is the blob that publishing made.
+    fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
+        let record = self.memory.get(&id)?;
+        match &record.backing {
+            Backing::Scanout(s) => Some((s.host_addr(), s.alloc_size())),
+            Backing::Driver => Some((record.exported?, record.size)),
+            Backing::Imported => None,
+        }
+    }
+
+    /// Mint the IOSurface a scanout allocation lives in, if this allocation is one.
+    ///
+    /// A scanout is recognised by shape, not by a flag: the guest exports the memory to the
+    /// outside world (`VkExportMemoryAllocateInfo`) and dedicates it to one image
+    /// (`VkMemoryDedicatedAllocateInfo`). That is what a window buffer is, and nothing else in a
+    /// venus stream looks like it.
+    ///
+    /// `None` at every step that cannot be answered honestly -- a format no IOSurface has, a
+    /// driver that will not report a layout, a pitch the surface would not take. Every one of
+    /// those leaves an ordinary allocation, which renders correctly and merely cannot be
+    /// composited without a copy. A surface whose rows sit somewhere other than where the driver
+    /// will write them is worse than no surface: it displays, and it displays sheared.
+    fn scanout_surface(
+        &mut self,
+        device: VkDevice,
+        info: &VkMemoryAllocateInfo,
+    ) -> Option<Surface> {
+        if !exports_memory(info.pNext) {
+            return None;
+        }
+        let image = dedicated_image(info.pNext)?;
+        let facts = *self.images.get(&image)?;
+        let format = pixel_format(facts.format)?;
+
+        let d = self.devices.get(&device)?;
+        let layout = {
+            let query = d.fns.try_vkGetImageSubresourceLayout()?;
+            let subresource = VkImageSubresource {
+                aspectMask: VkImageAspectFlags(
+                    VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
+                ),
+                mipLevel: 0,
+                arrayLayer: 0,
+            };
+            let mut layout = VkSubresourceLayout::default();
+            // SAFETY: a device and an image this context created, and both structs are locals.
+            unsafe { query(device, image, &subresource, &mut layout) };
+            layout
+        };
+        let pitch = u32::try_from(layout.rowPitch.0).ok()?;
+        if pitch == 0 {
+            return None;
+        }
+        // The record says how wide the guest asked for; the live query says how the driver laid
+        // it out. A record left behind by an image whose handle has since been recycled will not
+        // describe this image, and this is where that shows: the rows would not add up.
+        if layout.size.0 != u64::from(pitch) * u64::from(facts.height) {
+            return None;
+        }
+
+        let surface = Surface::scanout(facts.width, facts.height, format, pitch).ok()?;
+        // IOSurface may lay the rows out its own way. The allocation is about to be a
+        // host-pointer import of these pages, so a pitch that is not the driver's is a surface
+        // whose every row is at the wrong offset.
+        if surface.bytes_per_row() != pitch {
+            return None;
+        }
+        Some(surface)
+    }
+
+    /// Record what an image was created as, for a scanout allocation that has to match it.
+    ///
+    /// Kept because Vulkan will not answer for an image's extent or format after the fact, and
+    /// forgotten in [`Self::forget_image`].
+    pub fn note_image(&mut self, image: VkImage, info: &VkImageCreateInfo) {
+        self.images.insert(
+            image,
+            ImageFacts {
+                width: info.extent.width,
+                height: info.extent.height,
+                format: info.format,
+            },
+        );
+    }
+
+    /// Drop an image's record. Called from the two places Vulkan destroys an image: the guest's
+    /// own `vkDestroyImage`, and the teardown that empties a device the guest left full.
+    pub fn forget_image(&mut self, image: VkImage) {
+        self.images.remove(&image);
     }
 
     /// Free device memory the guest named.
@@ -2333,7 +2513,14 @@ impl Driver {
         // left the mapping standing. `vkFreeMemory` would drop it implicitly, but the record that
         // owns the mapping is being retired here, so releasing it here is what keeps the two the
         // same act: nothing is left holding an address after the thing it named is gone.
-        if was.is_some_and(|a| a.exported.is_some()) {
+        //
+        // Only a driver mapping. A published scanout's address is its surface's, which the
+        // surface owns and this record's drop releases; unmapping it would be undoing something
+        // `vkMapMemory` never did.
+        if was
+            .as_ref()
+            .is_some_and(|a| a.exported.is_some() && matches!(a.backing, Backing::Driver))
+        {
             // SAFETY: the mapping this driver made in `memory_export` and has not released, on the
             // device that owns it. The record is out of the map, so it cannot be unmapped twice.
             unsafe { (d.fns.vkUnmapMemory())(device, memory) };
@@ -2354,7 +2541,7 @@ impl Driver {
     pub fn memory_census(&self) -> Vec<Allocation> {
         self.memory
             .iter()
-            .filter(|(_, a)| !a.imported && a.exported.is_none())
+            .filter(|(_, a)| a.censused())
             .map(|(id, a)| Allocation { id: *id, size: a.size })
             .collect()
     }
@@ -2386,6 +2573,19 @@ impl Driver {
         };
         if record.exported.is_some() {
             return Err(ExportError::AlreadyExported);
+        }
+        if let Some(surface) = record.surface() {
+            // A scanout is published as the surface it already is. There is nothing to map: the
+            // pages are the surface's, the driver imported them, and the address is the one the
+            // compositor will read the same bytes through.
+            if blob_size > surface.alloc_size() {
+                return Err(ExportError::LargerThanAllocation);
+            }
+            let addr = surface.host_addr();
+            let write_back = record.write_back();
+            self.memory.get_mut(&id).expect("the record was here a moment ago").exported =
+                Some(addr);
+            return Ok(Exported { addr, write_back });
         }
         if !record.host_visible() {
             return Err(ExportError::NotHostVisible);
@@ -2448,9 +2648,16 @@ impl Driver {
         id: ObjectId,
         buf: &mut [u8],
     ) -> Result<usize, MemoryError> {
-        let Some(size) = self.memory.get(&id).map(|a| a.size) else {
+        let Some(record) = self.memory.get(&id) else {
             return Err(MemoryError::NoSuchAllocation);
         };
+        // A scanout's bytes are the surface's, and only the surface can hand them over
+        // coherently -- `vkMapMemory` has nothing to map, because the driver imported these pages
+        // rather than allocating them.
+        if let Some(surface) = record.surface() {
+            return Ok(surface.read_into(buf));
+        }
+        let size = record.size;
         let Some(d) = self.devices.get(&device) else {
             return Err(MemoryError::NoSuchAllocation);
         };
@@ -2487,36 +2694,83 @@ impl Driver {
 struct Allocated {
     /// Its size, padded to the blob the guest may map it as -- see [`pad_for_blob`].
     size: u64,
+    /// What the bytes actually are. See [`Backing`].
+    backing: Backing,
     /// The properties of the memory type it was allocated from.
     ///
     /// The flags themselves rather than the questions asked of them: an export must refuse memory
     /// the host cannot address, and the VMM must be told how the guest may cache it. Two answers
     /// derived from one recorded fact cannot drift apart the way two recorded booleans can.
     props: VkMemoryPropertyFlags,
-    /// Whether it aliases storage another context owns, rather than storage of its own.
-    ///
-    /// A guest imports when one context has to reach a buffer another context rendered -- a
-    /// compositor sampling a client's window. The bytes are the exporter's, and this allocation
-    /// is a second Vulkan handle onto them, so the census must not read them here: it would
-    /// report one buffer twice, and report it through a mapping of memory this context does not
-    /// own. Recorded at the allocation because the `pNext` chain that says so is the guest's
-    /// request, and it is gone by the time anything asks.
-    ///
-    /// Orthogonal to `exported`, deliberately. Importing storage and republishing it is a chain
-    /// a guest is allowed to build, and nothing here has seen one; refusing it would be a
-    /// constraint invented rather than observed.
-    imported: bool,
-    /// The host address `vkMapMemory` returned when this memory was exported as a blob.
+    /// The host address this allocation was published to the VMM at, if it has been.
     ///
     /// `Some` *is* the export mark: one value, not a flag beside an address that could disagree
-    /// with it. The mapping belongs to this record, so retiring the record on
-    /// [`Driver::free_memory`] is the same act as making the address unreachable -- there is no
-    /// second place to remember to purge, and nothing can hand the VMM a pointer into memory the
-    /// guest has freed.
+    /// with it. Where the address came from is [`Backing`]'s to say, and that is what decides
+    /// whether freeing owes an unmap -- so nothing has to guess.
+    ///
+    /// The record owns whatever the address names, so retiring it on [`Driver::free_memory`] is
+    /// the same act as making the address unreachable: there is no second place to purge, and
+    /// nothing can hand the VMM a pointer into memory the guest has freed.
     exported: Option<usize>,
 }
 
+/// What an allocation's bytes are, which decides how it is published, read and freed.
+///
+/// One value rather than a bool per question. "Is it an import", "does it have a surface" and
+/// "does freeing owe an unmap" are three readings of one fact, and as three fields two of them
+/// could disagree about the same allocation.
+enum Backing {
+    /// Memory the driver allocated for this guest. Publishing it maps it, so freeing a published
+    /// one owes the unmap.
+    Driver,
+    /// An IOSurface this renderer minted: the allocation is a host-pointer import of the
+    /// surface's own pages, so the memory *is* the surface.
+    ///
+    /// Publishing hands out the surface's base address, which the surface owns -- there is
+    /// nothing to unmap, and dropping this record is what releases it. Reading goes through
+    /// [`crate::metal::Surface::read_into`], because a surface read without its lock sees
+    /// whatever the CPU's view last held rather than what the GPU wrote.
+    Scanout(Surface),
+    /// Storage another context owns, which this allocation only aliases.
+    ///
+    /// A guest imports when one context has to reach what another rendered -- a compositor
+    /// sampling a client's window. The census must not report it: one buffer under two ids, read
+    /// through a mapping this context has no claim to.
+    Imported,
+}
+
+/// What an image was created as, for a scanout surface that has to match it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ImageFacts {
+    width: u32,
+    height: u32,
+    format: VkFormat,
+}
+
 impl Allocated {
+    /// The surface behind it, for the one backing that has one.
+    fn surface(&self) -> Option<&Surface> {
+        match &self.backing {
+            Backing::Scanout(s) => Some(s),
+            Backing::Driver | Backing::Imported => None,
+        }
+    }
+
+    /// Whether the census reports it.
+    ///
+    /// Storage is reported once, at whoever owns it. An import owns none. A published ordinary
+    /// allocation is the VMM's to read through the blob it published as. A scanout is reported
+    /// even when published, because the address the VMM got is a surface, and a surface read
+    /// without its lock is not a read of what the GPU wrote -- this is the only place that can
+    /// take that lock.
+    fn censused(&self) -> bool {
+        match self.backing {
+            Backing::Driver => self.exported.is_none(),
+            Backing::Scanout(_) => true,
+            Backing::Imported => false,
+        }
+    }
+
     /// Whether the host can address it -- what an export needs before it may map anything.
     fn host_visible(&self) -> bool {
         self.props.0 & HOST_VISIBLE_BIT != 0
@@ -2676,20 +2930,76 @@ unsafe impl OutStruct for VkMemoryResourceAllocationSizePropertiesMESA {
         VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA;
 }
 
-/// Whether an allocation's `pNext` chain imports another context's storage.
+/// Whether an allocation's `pNext` chain says the memory is for the world outside this guest.
+fn exports_memory(node: *const core::ffi::c_void) -> bool {
+    chain_has(node, VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO)
+}
+
+/// The image an allocation is dedicated to, if it is dedicated to one.
 ///
-/// Walked rather than asked of the guest, because the chain is where the guest put it.
-fn imports_a_resource(mut node: *const core::ffi::c_void) -> bool {
+/// A dedicated allocation backs exactly one image, which is what makes it the image whose layout
+/// a scanout surface must match. `VK_NULL_HANDLE` is the legal way to say "a buffer, not an
+/// image", and reads as no image rather than as image zero.
+fn dedicated_image(mut node: *const core::ffi::c_void) -> Option<VkImage> {
     while !node.is_null() {
         // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
         // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
         let base = unsafe { &*node.cast::<VkBaseInStructure>() };
-        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA {
+        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO {
+            // SAFETY: the tag says this link is a `VkMemoryDedicatedAllocateInfo`.
+            let ded = unsafe { &*node.cast::<VkMemoryDedicatedAllocateInfo>() };
+            return (ded.image.0 != 0).then_some(ded.image);
+        }
+        node = base.pNext.cast();
+    }
+    None
+}
+
+/// The IOSurface format a Vulkan format is, for the formats a scanout can be.
+///
+/// `None` is not a failure: it is a format no IOSurface has, and an image in one is simply not a
+/// window buffer. Only the two BGRA spellings, because those are what a compositor presents and
+/// guessing at the rest would mint surfaces whose bytes mean something else.
+fn pixel_format(format: VkFormat) -> Option<PixelFormat> {
+    match format {
+        VkFormat::VK_FORMAT_B8G8R8A8_UNORM | VkFormat::VK_FORMAT_B8G8R8A8_SRGB => {
+            Some(PixelFormat::Bgra)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `pNext` chain carries a link of this type.
+fn chain_has(mut node: *const core::ffi::c_void, ty: VkStructureType) -> bool {
+    while !node.is_null() {
+        // SAFETY: as `imports_a_resource`.
+        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
+        if base.sType == ty {
             return true;
         }
         node = base.pNext.cast();
     }
     false
+}
+
+/// The resource an allocation's `pNext` chain names, when it is aliasing storage rather than
+/// asking for some.
+///
+/// Walked rather than asked of the guest, because the chain is where the guest put it. Resource
+/// zero is no resource, the same way a null handle is no image.
+fn imported_resource(mut node: *const core::ffi::c_void) -> Option<ResourceHandle> {
+    while !node.is_null() {
+        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
+        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
+        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA {
+            // SAFETY: the tag says this link is a `VkImportMemoryResourceInfoMESA`.
+            let import = unsafe { &*node.cast::<VkImportMemoryResourceInfoMESA>() };
+            return ResourceHandle::new(import.resourceId);
+        }
+        node = base.pNext.cast();
+    }
+    None
 }
 
 /// Read a Vulkan `const char *const *` array into owned strings.
@@ -2789,29 +3099,83 @@ mod tests {
         driver.abandon_planted();
     }
 
-    /// A `pNext` chain naming another context's resource is what makes an allocation an import,
-    /// and the guest may hang it anywhere in the chain. Reading only the head would find it
-    /// exactly when the guest happened to put it first, which is not a contract.
+    /// An import is the same storage under a second handle, so what it resolves to has to be an
+    /// address that already exists -- and the length it is good for, in the same answer. The two
+    /// are what the allocation is clamped against, and a length that could travel separately from
+    /// its address is the pair this tree spells as one value.
+    ///
+    /// Three backings, three answers: a scanout has an address from the moment it is minted, a
+    /// driver allocation has one only once it has been published, and an import has none of its
+    /// own to lend.
     #[test]
-    fn an_import_is_recognized_wherever_the_guest_hung_it() {
-        use super::super::proto::types::{VkBaseInStructure, VkStructureType};
+    fn an_import_resolves_to_storage_that_already_exists() {
+        let mut d = Driver::default();
 
-        let mut tail = VkBaseInStructure {
+        let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
+        let addr = surface.host_addr();
+        let extent = surface.alloc_size();
+        d.plant_scanout_allocation(ObjectId(66), surface);
+        assert_eq!(
+            d.aliased_span(ObjectId(66)),
+            Some((addr, extent)),
+            "a scanout lends the surface's own pages, and how far they run"
+        );
+
+        d.plant_allocation(ObjectId(70), 4096);
+        assert_eq!(
+            d.aliased_span(ObjectId(70)),
+            None,
+            "an allocation nobody has published has no address to lend"
+        );
+
+        d.plant_imported_allocation(ObjectId(71), 4096);
+        assert_eq!(
+            d.aliased_span(ObjectId(71)),
+            None,
+            "and an import lends nothing: the storage is not its to offer twice"
+        );
+
+        assert_eq!(d.aliased_span(ObjectId(999)), None, "nor does an id that names nothing");
+
+        d.abandon_planted();
+    }
+
+    /// A `pNext` chain naming another allocation's resource is what makes an allocation an
+    /// import, and the guest may hang it anywhere in the chain. Reading only the head would find
+    /// it exactly when the guest happened to put it first, which is not a contract.
+    ///
+    /// Which resource, not whether: the number is what the renderer resolves to the storage the
+    /// two allocations then share, so a walk that found the link and lost the id would leave the
+    /// import aliasing nothing.
+    #[test]
+    fn an_import_yields_the_resource_it_names_wherever_the_guest_hung_it() {
+        use super::super::proto::types::{
+            VkBaseInStructure, VkImportMemoryResourceInfoMESA, VkStructureType,
+        };
+
+        let mut tail = VkImportMemoryResourceInfoMESA {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
             pNext: core::ptr::null(),
+            resourceId: 7,
         };
         let mut head = VkBaseInStructure {
             sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            pNext: &raw const tail,
+            pNext: (&raw const tail).cast(),
         };
-        assert!(imports_a_resource((&raw const head).cast()), "found past the head");
+        assert_eq!(
+            imported_resource((&raw const head).cast()),
+            ResourceHandle::new(7),
+            "found past the head, with its resource"
+        );
 
         head.pNext = core::ptr::null();
-        assert!(!imports_a_resource((&raw const head).cast()), "and not claimed when absent");
+        assert_eq!(imported_resource((&raw const head).cast()), None, "and none when absent");
 
-        tail.sType = VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-        head.pNext = &raw const tail;
-        assert!(!imports_a_resource((&raw const head).cast()));
+        // Resource zero is how the wire spells "no resource" -- it must not resolve to a handle,
+        // because a handle is what the renderer would then go looking for.
+        tail.resourceId = 0;
+        head.pNext = (&raw const tail).cast();
+        assert_eq!(imported_resource((&raw const head).cast()), None);
     }
 
     /// bigger than what backs it, or asking to map memory the host cannot address. The second of
