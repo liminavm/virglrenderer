@@ -53,17 +53,21 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `cargo run --release --bin venus-roundtrip -- <corpus>`, which is a second and a half over the
   61 MB capture. Failure is per command: it names each command type, its outcome, and the first
   divergent offset, so one unimplemented shape cannot hide the thousand commands behind it. Both
-  corpora reproduce exactly. It does not cover reply encoding — no recording contains one — and
-  it tolerates the guest's padding bytes, which mesa leaves uninitialised and this renderer zeroes
-  on purpose; the encoder reports exactly which ranges those are, so the tolerance is a set of
-  offsets rather than a loose comparison.
-- `rs/` builds `venus-reply-oracle` for the half `venus-roundtrip` cannot reach. No recording holds
-  a reply — both replay entry points call `vkr_replay_strip_reply` — so the 326 per-command reply
-  wrappers have no witness in the corpus, and they are generated: one template mistake is 326
-  identical bugs, each reaching a guest as plausible garbage rather than as an error. The oracle
-  encodes every recorded command's reply twice, once with the generated Rust and once with
-  venus-protocol's own generated C renderer encoder, and compares the bytes. That C is ground truth
-  because it is what every venus guest in existence decodes. Both sides encode the *same*
+  corpora reproduce exactly. It does not cover reply encoding — a recording holds requests only,
+  never the bytes a renderer wrote back — and it tolerates the guest's padding bytes, which mesa
+  leaves uninitialised and this renderer zeroes on purpose; the encoder reports exactly which
+  ranges those are, so the tolerance is a set of offsets rather than a loose comparison.
+- `rs/` builds `venus-reply-oracle` for the half `venus-roundtrip` cannot reach. The corpus asks
+  for replies and holds none of them, and those are two separate facts. The requests keep their
+  `VN_CS_COMMAND_FLAG_GENERATE_REPLY` bit: 137 of venus's commands in 24 kinds and 64 of synoik's
+  in 25 kinds ask to be answered. What no recording holds is the *answer* — a recording is the
+  guest's side of the wire — and replay never produces one either, because both replay entry points
+  call `vkr_replay_strip_reply` to clear that bit before dispatch. So the 326 per-command reply
+  wrappers have no witness in the corpus and none from replay, and they are generated: one template
+  mistake is 326 identical bugs, each reaching a guest as plausible garbage rather than as an
+  error. The oracle encodes every recorded command's reply twice, once with the generated Rust and
+  once with venus-protocol's own generated C renderer encoder, and compares the bytes. That C is
+  ground truth because it is what every venus guest in existence decodes. Both sides encode the *same*
   `vn_command_*`: it is `#[repr(C)]`, so the C reads the memory the Rust decoder filled rather than
   a second construction of it, and nothing has to agree about filling. It needs the C toolchain, so
   it is behind a feature — `cargo run --release --features reply-oracle --bin venus-reply-oracle --
