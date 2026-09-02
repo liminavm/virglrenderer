@@ -1617,12 +1617,102 @@ impl Driver {
     // undefined behaviour just as surely as one naming a handle that does not exist. Serving
     // these is what makes a later `vkQueueSubmit` safe to pass through.
 
-    /// Bind memory to a run of buffers or images: `vkBindXMemory2`.
+    /// A device entry point that takes the device and nothing else: `vkDeviceWaitIdle`.
     ///
-    /// Both `vkBindBufferMemory2` and `vkBindImageMemory2` have exactly this shape, which is why
-    /// the entry point arrives as a closure -- the info type is the only thing that differs, and
-    /// it is a type parameter.
-    pub fn bind_memory<I>(
+    /// A device this table does not have answers with an error rather than a success. Every helper
+    /// in this group does the same, and it is the point of them: the alternative is reporting that
+    /// something happened to a device we never had, which the guest cannot tell from the truth.
+    pub fn device_op(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice) -> VkResult,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: `device` is a handle in this table. The same holds for every call below.
+        unsafe { proc(&d.fns)(device) }
+    }
+
+    /// A queue entry point that takes the queue and nothing else: `vkQueueWaitIdle`.
+    ///
+    /// `None` is a queue this context never retrieved, which the caller turns into a rejection --
+    /// the same answer `vkQueueSubmit` gives, and for the same reason. See [`Driver::submitter`].
+    pub fn queue_op(
+        &self,
+        queue: VkQueue,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkQueue) -> VkResult,
+    ) -> Option<VkResult> {
+        let d = self.submitter(queue)?;
+        // SAFETY: a queue this context retrieved, on the device that produced it.
+        Some(unsafe { proc(d)(queue) })
+    }
+
+    /// A device entry point that names one object and nothing else: the event and fence states.
+    pub fn object_op<T: Handle>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T) -> VkResult,
+        target: T,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: `device` is a handle in this table, and `target` is one the decoder resolved
+        // through the object table before this handler ran.
+        unsafe { proc(&d.fns)(device, target) }
+    }
+
+    /// A device entry point that names one object and a flags word: the pool resets.
+    pub fn object_flags_op<T: Handle, F: Copy>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, T, F) -> VkResult,
+        target: T,
+        flags: F,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: as above; `flags` is a plain scalar off the wire.
+        unsafe { proc(&d.fns)(device, target, flags) }
+    }
+
+    /// Bind memory to a single buffer or image: `vkBindBufferMemory`, `vkBindImageMemory`.
+    ///
+    /// The pre-1.1 spelling of what [`Driver::counted_op`] serves for the `2` forms. A guest that
+    /// has both still sends this one, so it is served rather than translated: rewriting it into
+    /// the `2` form would be this renderer inventing a `VkBindBufferMemoryInfo` the guest never
+    /// wrote, and any difference between the two would be ours and invisible.
+    pub fn bind_one<T: Handle>(
+        &self,
+        device: VkDevice,
+        proc: impl FnOnce(
+            &DeviceFns,
+        )
+            -> unsafe extern "C" fn(VkDevice, T, VkDeviceMemory, VkDeviceSize) -> VkResult,
+        target: T,
+        memory: VkDeviceMemory,
+        offset: VkDeviceSize,
+    ) -> VkResult {
+        let Some(d) = self.devices.get(&device.0) else {
+            return VkResult::VK_ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: as above; `memory` and `offset` are the guest's own, resolved and scalar.
+        unsafe { proc(&d.fns)(device, target, memory, offset) }
+    }
+
+    /// A device entry point whose arguments are one counted array and nothing else.
+    ///
+    /// `vkBindBufferMemory2`, `vkBindImageMemory2`, `vkFlushMappedMemoryRanges` and
+    /// `vkInvalidateMappedMemoryRanges` are all exactly this shape, which is why the entry point
+    /// arrives as a closure -- the element type is the only thing that differs, and it is a type
+    /// parameter. An empty array is legal for every one of them and the guest sends it.
+    ///
+    /// The count is never carried here: it is the slice's own length, rebuilt at the call. That is
+    /// the whole point of reconciling the wire's pair at the decoder -- see CLAUDE.md, "two values
+    /// that must agree are one value".
+    pub fn counted_op<I>(
         &self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, u32, *const I) -> VkResult,
@@ -1631,7 +1721,7 @@ impl Driver {
         let Some(d) = self.devices.get(&device.0) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
-        // Binding nothing is legal and the guest sends it.
+        // An empty array is legal and the guest sends it.
         if infos.is_empty() {
             return VkResult::VK_SUCCESS;
         }

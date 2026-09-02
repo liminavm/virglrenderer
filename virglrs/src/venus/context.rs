@@ -25,10 +25,10 @@ use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFlags, VkObjectType, VkPhysicalDevice, VkResult,
     vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
-    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory2,
-    vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
-    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
+    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
+    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
     vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdSetScissor,
     vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
@@ -45,11 +45,12 @@ use super::proto::types::{
     vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
     vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler, vn_command_vkDestroySemaphore,
-    vn_command_vkDestroyShaderModule, vn_command_vkEndCommandBuffer,
+    vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
     vn_command_vkEnumerateDeviceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
+    vn_command_vkFlushMappedMemoryRanges, vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
     vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetDeviceQueue2,
+    vn_command_vkGetEventStatus, vn_command_vkGetFenceStatus,
     vn_command_vkGetImageDrmFormatModifierPropertiesEXT, vn_command_vkGetImageMemoryRequirements2,
     vn_command_vkGetImageSubresourceLayout, vn_command_vkGetPhysicalDeviceExternalFenceProperties,
     vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties,
@@ -58,8 +59,10 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceMemoryProperties2, vn_command_vkGetPhysicalDeviceProperties,
     vn_command_vkGetPhysicalDeviceProperties2,
     vn_command_vkGetPhysicalDeviceQueueFamilyProperties2, vn_command_vkImportSemaphoreResourceMESA,
-    vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkResetCommandBuffer,
-    vn_command_vkResetFences, vn_command_vkSeekReplyCommandStreamMESA,
+    vn_command_vkInvalidateMappedMemoryRanges, vn_command_vkNotifyRingMESA,
+    vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer,
+    vn_command_vkResetCommandPool, vn_command_vkResetDescriptorPool, vn_command_vkResetEvent,
+    vn_command_vkResetFences, vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
     vn_command_vkSetReplyCommandStreamMESA, vn_command_vkUpdateDescriptorSets,
     vn_command_vkWaitForFences, vn_command_vkWaitSemaphoreResourceMESA,
 };
@@ -312,8 +315,9 @@ impl Context {
             // no handler ever filled in, and a zeroed reply is shaped exactly like a successful
             // one. There is no field in which to say "we did not do this", so the context dies
             // saying it rather than answering with a fiction the guest cannot tell from an answer.
+            // Not counted in `unhandled`: the census above already owns the tally of commands
+            // no handler served, and a second count of the same fact is one that can disagree.
             if core::mem::take(&mut h.unserved) && wants_reply {
-                unhandled += 1;
                 poison(
                     fatal,
                     id,
@@ -1709,12 +1713,51 @@ impl Commands for Handlers<'_> {
 
     fn vkBindBufferMemory2(&mut self, args: &mut vn_command_vkBindBufferMemory2<'_>) {
         let Some(infos) = self.array(args.pBindInfos()) else { return };
-        args.ret = self.driver.bind_memory(args.device, |d| d.vkBindBufferMemory2(), infos);
+        args.ret = self.driver.counted_op(args.device, |d| d.vkBindBufferMemory2(), infos);
     }
 
     fn vkBindImageMemory2(&mut self, args: &mut vn_command_vkBindImageMemory2<'_>) {
         let Some(infos) = self.array(args.pBindInfos()) else { return };
-        args.ret = self.driver.bind_memory(args.device, |d| d.vkBindImageMemory2(), infos);
+        args.ret = self.driver.counted_op(args.device, |d| d.vkBindImageMemory2(), infos);
+    }
+
+    fn vkBindBufferMemory(&mut self, args: &mut vn_command_vkBindBufferMemory<'_>) {
+        args.ret = self.driver.bind_one(
+            args.device,
+            |d| d.vkBindBufferMemory(),
+            args.buffer,
+            args.memory,
+            args.memoryOffset,
+        );
+    }
+
+    fn vkBindImageMemory(&mut self, args: &mut vn_command_vkBindImageMemory<'_>) {
+        args.ret = self.driver.bind_one(
+            args.device,
+            |d| d.vkBindImageMemory(),
+            args.image,
+            args.memory,
+            args.memoryOffset,
+        );
+    }
+
+    /// Publish host writes to a mapped range, and pick up the driver's.
+    ///
+    /// Both are no-ops on coherent memory, which is what this renderer hands out today -- but a
+    /// guest is entitled to call them and a guest that does is not wrong. Serving them costs a
+    /// forwarded call; refusing them would stop a ring over a command that has nothing to fail.
+    fn vkFlushMappedMemoryRanges(&mut self, args: &mut vn_command_vkFlushMappedMemoryRanges<'_>) {
+        let Some(ranges) = self.array(args.pMemoryRanges()) else { return };
+        args.ret = self.driver.counted_op(args.device, |d| d.vkFlushMappedMemoryRanges(), ranges);
+    }
+
+    fn vkInvalidateMappedMemoryRanges(
+        &mut self,
+        args: &mut vn_command_vkInvalidateMappedMemoryRanges<'_>,
+    ) {
+        let Some(ranges) = self.array(args.pMemoryRanges()) else { return };
+        args.ret =
+            self.driver.counted_op(args.device, |d| d.vkInvalidateMappedMemoryRanges(), ranges);
     }
 
     fn vkUpdateDescriptorSets(&mut self, args: &mut vn_command_vkUpdateDescriptorSets<'_>) {
@@ -1916,6 +1959,69 @@ impl Commands for Handlers<'_> {
     fn vkWaitForFences(&mut self, args: &mut vn_command_vkWaitForFences<'_>) {
         let Some(fences) = self.array(args.pFences()) else { return };
         args.ret = self.driver.wait_for_fences(args.device, fences, args.waitAll, args.timeout);
+    }
+
+    /// Wait for everything on a device, or on one queue, to finish.
+    ///
+    /// Blocking, like `vkWaitForFences` above: the guest's own thread is what is being spent, and
+    /// answering before the driver is idle would be answering wrongly.
+    fn vkDeviceWaitIdle(&mut self, args: &mut vn_command_vkDeviceWaitIdle<'_>) {
+        args.ret = self.driver.device_op(args.device, |d| d.vkDeviceWaitIdle());
+    }
+
+    fn vkQueueWaitIdle(&mut self, args: &mut vn_command_vkQueueWaitIdle<'_>) {
+        let Some(ret) = self.driver.queue_op(args.queue, |d| d.vkQueueWaitIdle()) else {
+            self.reject = Some("waited on a queue with no device behind it");
+            return;
+        };
+        args.ret = ret;
+    }
+
+    /// The event and fence states, and the two commands that set an event from the host side.
+    ///
+    /// `ret` here is the answer, not an error code: `VK_EVENT_SET`, `VK_EVENT_RESET`,
+    /// `VK_NOT_READY` and `VK_SUCCESS` are all ordinary outcomes the guest is asking about. What
+    /// makes forwarding them safe is that a device this renderer does not have answers
+    /// `VK_ERROR_INITIALIZATION_FAILED` rather than any of those -- an error the guest can act on
+    /// instead of a state it would believe.
+    fn vkGetEventStatus(&mut self, args: &mut vn_command_vkGetEventStatus<'_>) {
+        args.ret = self.driver.object_op(args.device, |d| d.vkGetEventStatus(), args.event);
+    }
+
+    fn vkSetEvent(&mut self, args: &mut vn_command_vkSetEvent<'_>) {
+        args.ret = self.driver.object_op(args.device, |d| d.vkSetEvent(), args.event);
+    }
+
+    fn vkResetEvent(&mut self, args: &mut vn_command_vkResetEvent<'_>) {
+        args.ret = self.driver.object_op(args.device, |d| d.vkResetEvent(), args.event);
+    }
+
+    fn vkGetFenceStatus(&mut self, args: &mut vn_command_vkGetFenceStatus<'_>) {
+        args.ret = self.driver.object_op(args.device, |d| d.vkGetFenceStatus(), args.fence);
+    }
+
+    /// Recycle everything a pool handed out, without destroying the pool or the objects.
+    ///
+    /// The object table is deliberately left alone. A reset does not free the command buffers or
+    /// descriptor sets -- their handles stay valid and the guest goes on naming them -- so
+    /// forgetting them here would poison the next command that did, over a reset that was legal.
+    /// This is the difference between a reset and the destroy that `pool_destroy!` serves.
+    fn vkResetCommandPool(&mut self, args: &mut vn_command_vkResetCommandPool<'_>) {
+        args.ret = self.driver.object_flags_op(
+            args.device,
+            |d| d.vkResetCommandPool(),
+            args.commandPool,
+            args.flags,
+        );
+    }
+
+    fn vkResetDescriptorPool(&mut self, args: &mut vn_command_vkResetDescriptorPool<'_>) {
+        args.ret = self.driver.object_flags_op(
+            args.device,
+            |d| d.vkResetDescriptorPool(),
+            args.descriptorPool,
+            args.flags,
+        );
     }
 
     fn vkWaitSemaphoreResourceMESA(
@@ -2248,24 +2354,218 @@ mod tests {
         assert!(ctx.fatal());
     }
 
+    /// One command's bytes, built by the generator's own encoder for it.
+    ///
+    /// The sizeof and encode functions come in as paths because a macro cannot paste a command
+    /// name into an identifier, and hand-rolling the layout instead would be a second
+    /// implementation of the wire -- the one that drifts silently.
+    macro_rules! wire {
+        ($size:path, $encode:path, $args:expr, $flags:expr) => {{
+            let args = $args;
+            let proto = crate::venus::cs::AllOfIt;
+            let mut buf = vec![0u8; $size(&proto, &args)];
+            let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+            $encode(&mut enc, VkFlags($flags), &args);
+            buf
+        }};
+    }
+
+    /// A forwarded command whose device this context never created answers with an error.
+    ///
+    /// These handlers cannot be witnessed against a real driver from here -- a unit test has no
+    /// Vulkan device -- so what is pinned is the half that matters most and does not need one.
+    /// Every command in this group answers with a `VkResult` the guest will act on, and for most
+    /// of them zero is `VK_SUCCESS`; `vkGetEventStatus` and `vkGetFenceStatus` go further and
+    /// report *state* in that same field, where zero means the event is set or the fence is
+    /// signalled. So the failure mode is not a missing answer, it is a confident wrong one: a
+    /// guest told its fence is ready waits for nothing and reads memory the GPU has not written.
+    ///
+    /// The driver's device table is what stands between those two outcomes. A device it does not
+    /// have must produce `VK_ERROR_INITIALIZATION_FAILED` and never a state, which is what this
+    /// checks -- once per command, because the guarantee belongs to each handler's own lookup and
+    /// a handler that forgot it would be invisible in any other's test.
+    #[test]
+    fn a_forwarded_command_on_an_unknown_device_answers_with_an_error() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+
+        const WINDOW: usize = 0x21000;
+        let batches: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "vkDeviceWaitIdle",
+                wire!(
+                    ser::vn_sizeof_vkDeviceWaitIdle_args,
+                    ser::vn_encode_vkDeviceWaitIdle_args,
+                    ty::vn_command_vkDeviceWaitIdle::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkGetEventStatus",
+                wire!(
+                    ser::vn_sizeof_vkGetEventStatus_args,
+                    ser::vn_encode_vkGetEventStatus_args,
+                    ty::vn_command_vkGetEventStatus::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkSetEvent",
+                wire!(
+                    ser::vn_sizeof_vkSetEvent_args,
+                    ser::vn_encode_vkSetEvent_args,
+                    ty::vn_command_vkSetEvent::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkResetEvent",
+                wire!(
+                    ser::vn_sizeof_vkResetEvent_args,
+                    ser::vn_encode_vkResetEvent_args,
+                    ty::vn_command_vkResetEvent::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkGetFenceStatus",
+                wire!(
+                    ser::vn_sizeof_vkGetFenceStatus_args,
+                    ser::vn_encode_vkGetFenceStatus_args,
+                    ty::vn_command_vkGetFenceStatus::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkResetCommandPool",
+                wire!(
+                    ser::vn_sizeof_vkResetCommandPool_args,
+                    ser::vn_encode_vkResetCommandPool_args,
+                    ty::vn_command_vkResetCommandPool::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkResetDescriptorPool",
+                wire!(
+                    ser::vn_sizeof_vkResetDescriptorPool_args,
+                    ser::vn_encode_vkResetDescriptorPool_args,
+                    ty::vn_command_vkResetDescriptorPool::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkBindBufferMemory",
+                wire!(
+                    ser::vn_sizeof_vkBindBufferMemory_args,
+                    ser::vn_encode_vkBindBufferMemory_args,
+                    ty::vn_command_vkBindBufferMemory::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkBindImageMemory",
+                wire!(
+                    ser::vn_sizeof_vkBindImageMemory_args,
+                    ser::vn_encode_vkBindImageMemory_args,
+                    ty::vn_command_vkBindImageMemory::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkFlushMappedMemoryRanges",
+                wire!(
+                    ser::vn_sizeof_vkFlushMappedMemoryRanges_args,
+                    ser::vn_encode_vkFlushMappedMemoryRanges_args,
+                    ty::vn_command_vkFlushMappedMemoryRanges::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkInvalidateMappedMemoryRanges",
+                wire!(
+                    ser::vn_sizeof_vkInvalidateMappedMemoryRanges_args,
+                    ser::vn_encode_vkInvalidateMappedMemoryRanges_args,
+                    ty::vn_command_vkInvalidateMappedMemoryRanges::default(),
+                    GENERATE_REPLY
+                ),
+            ),
+        ];
+
+        for (name, cmd) in batches {
+            let t = ring_table();
+            let g = crate::vulkan::global();
+            let mut todo = Unimplemented::default();
+            let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+            let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+            batch.extend_from_slice(&cmd);
+            assert!(
+                ctx.submit(&batch, &mut todo, &g, &t),
+                "{name} is served, so it does not poison"
+            );
+            assert!(todo.seen.is_empty(), "{name} reached a handler, so it is off the census");
+
+            let mut got = [0u8; 8];
+            assert!(t.1.copy_out(WINDOW, &mut got));
+            let ret = i32::from_le_bytes([got[4], got[5], got[6], got[7]]);
+            assert_eq!(
+                ret,
+                VkResult::VK_ERROR_INITIALIZATION_FAILED.0,
+                "{name} answered {ret} for a device this context never created"
+            );
+        }
+    }
+
+    /// Waiting on a queue this context never retrieved is refused, not answered.
+    ///
+    /// The odd one out of the group, and deliberately so: a queue carries no device of its own, so
+    /// there is no table to miss and no error that means "not yours". `vkQueueSubmit` already
+    /// rejects for exactly this reason and this follows it, because the two must not disagree
+    /// about what an unknown queue is.
+    #[test]
+    fn waiting_on_an_unknown_queue_is_refused() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap());
+
+        let cmd = wire!(
+            ser::vn_sizeof_vkQueueWaitIdle_args,
+            ser::vn_encode_vkQueueWaitIdle_args,
+            ty::vn_command_vkQueueWaitIdle::default(),
+            0
+        );
+        assert!(!ctx.submit(&cmd, &mut todo, &g, &t), "a queue with no device behind it");
+        assert!(ctx.fatal());
+    }
+
     /// A command with no handler at all, with whatever header flags the caller wants.
     ///
-    /// `vkDeviceWaitIdle` is the sharpest one to ask with: its whole reply is the command type and
-    /// a `VkResult`, and a `VkResult` of zero is `VK_SUCCESS`. A default-constructed answer to it
-    /// is therefore not obviously-wrong noise, it is the guest being told the host finished.
-    fn wire_device_wait_idle(flags: u32) -> Vec<u8> {
+    /// `vkGetDeferredOperationResultKHR` is the one to ask with on two counts. Its whole reply is
+    /// the command type and a `VkResult`, and a `VkResult` of zero is `VK_SUCCESS` -- so a
+    /// default-constructed answer to it is not obviously-wrong noise, it is the guest being told
+    /// the operation finished. And it belongs to `VK_KHR_deferred_host_operations`, which this
+    /// renderer cannot advertise, so it is one of the commands deliberately left unserved rather
+    /// than one merely waiting its turn. Serving it would break this test, which is the point:
+    /// whoever does has to come here and pick another still-unserved command.
+    fn wire_unserved(flags: u32) -> Vec<u8> {
         use super::super::proto::serialize::{
-            vn_encode_vkDeviceWaitIdle_args, vn_sizeof_vkDeviceWaitIdle_args,
+            vn_encode_vkGetDeferredOperationResultKHR_args,
+            vn_sizeof_vkGetDeferredOperationResultKHR_args,
         };
-        use super::super::proto::types::vn_command_vkDeviceWaitIdle as Args;
+        use super::super::proto::types::vn_command_vkGetDeferredOperationResultKHR as Args;
 
-        // A null device: `VK_NULL_HANDLE` is an ordinary value on the wire, so this decodes
-        // cleanly and reaches the trait default, which is the whole point of the command here.
+        // Null handles throughout: `VK_NULL_HANDLE` is an ordinary value on the wire, so this
+        // decodes cleanly and reaches the trait default, which is the whole point here.
         let args = Args::default();
         let proto = crate::venus::cs::AllOfIt;
-        let mut buf = vec![0u8; vn_sizeof_vkDeviceWaitIdle_args(&proto, &args)];
+        let mut buf = vec![0u8; vn_sizeof_vkGetDeferredOperationResultKHR_args(&proto, &args)];
         let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
-        vn_encode_vkDeviceWaitIdle_args(&mut enc, VkFlags(flags), &args);
+        vn_encode_vkGetDeferredOperationResultKHR_args(&mut enc, VkFlags(flags), &args);
         buf
     }
 
@@ -2288,21 +2588,18 @@ mod tests {
             let mut ctx = Context::new(CtxId::new(1).unwrap());
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
-            batch.extend_from_slice(&wire_device_wait_idle(if reply_wanted {
-                GENERATE_REPLY
-            } else {
-                0
-            }));
+            batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
 
             assert_eq!(
                 ctx.submit(&batch, &mut todo, &g, &t),
                 !reply_wanted,
-                "an unserved vkDeviceWaitIdle, reply wanted: {reply_wanted}"
+                "an unserved command, reply wanted: {reply_wanted}"
             );
 
             // Either way it is on the census: refusing to answer is not refusing to notice.
             assert_eq!(
-                todo.seen.get(&VkCommandTypeEXT::VK_COMMAND_TYPE_vkDeviceWaitIdle_EXT.0),
+                todo.seen
+                    .get(&VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetDeferredOperationResultKHR_EXT.0),
                 Some(&1),
                 "the command was counted"
             );
