@@ -179,6 +179,32 @@ every ring flow-control command, so nothing in the stream waits on the GPU: a ha
 instant `replay_end` returns can race queue work still executing and look nondeterministic when
 the renderer is perfectly deterministic.
 
+### Scoring the port against the C, and what still differs
+
+A fixture is recorded from the C, so the gate ladder compares Rust to Rust and a fixture mismatch
+means a regression. Reading a Rust score against the *C's* score is a different question, and on
+`synoik` it currently answers in three parts. Each is a live gap, not noise: both implementations
+are deterministic, and the C reproduces byte-identical across process restarts days apart.
+
+**The count.** Rust censuses 27 allocations to the C's 22. `vkr_device_memory_capturable()` skips
+exported map_ptr blobs and imports; the Rust blob path does not exist, so nothing marks them and
+all five are censused, reading zero.
+
+**Scanout memory reads the framebuffer in the C and zeros here.** The two `flags=0x7` blobs are
+host-pointer imports of their own dedicated image's IOSurface — the memory *is* the surface, so
+mapping it reads live pixels. Without the blob export path the Rust maps a plain allocation. This
+is the same gap as `iosurface backed=0`, counted twice.
+
+**Some memory the C's GPU work writes, ours never touches.** Whole allocations read zero here and
+carry content there. The unserved commands are the suspects — they either write pixels or change
+what a draw produces (`vkCmdClearAttachments`, `vkCmdClearColorImage`, `vkCmdBlitImage`,
+`vkCmdPushConstants`) — and a served command that got the write wrong would read *different*,
+not empty. Two allocations are non-zero on both sides and still disagree, which no gap above
+explains.
+
+Read a per-size all-zero FNV-1a before concluding anything from a hash: empty and wrong are
+different findings, and the score does not distinguish them for you.
+
 ### `--smoke`, the skeleton gate
 
 Both replayers take `--smoke`: apply the resource and context events, skip commands, transfers and
