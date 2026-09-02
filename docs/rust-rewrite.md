@@ -228,6 +228,14 @@ pixels against an llvmpipe/lavapipe reference — pixel-exact today. Alongside i
 These are implementation-agnostic already. Work here is corpus, not framework, and
 each corpus is owed by the phase it gates — not collected up front:
 
+- **P2** — `VkImportMemoryResourceInfoMESA` is not translated. A guest chains it to say "this
+  allocation is another context's resource"; the renderer owes the translation into whatever
+  the host's external memory actually is, and this one forwards the struct to a driver that has
+  never heard of it, which mints fresh memory instead. So a compositor importing a client's
+  window gets memory that is not the client's. The score cannot see it -- an import is not the
+  census's to report either way -- and the route is the same host-pointer import the scanout
+  export uses: resolve the resource to its published address or its surface base, and chain
+  `VkImportMemoryHostPointerInfoEXT` over it.
 - **P2** — a seated compositor driving Vulkan clients (mutter or synoik with real
   clients), which is the only workload that produces scanout blobs in quantity. The
   present venus corpora carry two, which is enough to *see* the IOSurface divergence
