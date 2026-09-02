@@ -463,16 +463,15 @@ pub extern "C" fn virgl_renderer_resource_unref(res_handle: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_set_priv(res_handle: u32, priv_: *mut c_void) {
     with((), |r| {
-        if let Some(res) = r.resource_mut(ResourceHandle(res_handle)) {
-            res.priv_ = VmmPtr(priv_);
-        }
+        r.with_resource_mut(ResourceHandle(res_handle), |res| res.priv_ = VmmPtr(priv_));
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_get_priv(res_handle: u32) -> *mut c_void {
     with(std::ptr::null_mut(), |r| {
-        r.resource(ResourceHandle(res_handle)).map_or(std::ptr::null_mut(), |res| res.priv_.0)
+        r.with_resource(ResourceHandle(res_handle), |res| res.priv_.0)
+            .unwrap_or(std::ptr::null_mut())
     })
 }
 
@@ -486,12 +485,12 @@ pub extern "C" fn virgl_renderer_resource_attach_iov(
         return EINVAL;
     }
     let v = read_iov(iov, num_iovs as u32);
-    with(EINVAL, |r| match r.resource_mut(ResourceHandle(res_handle as u32)) {
-        Some(res) => {
+    with(EINVAL, |r| {
+        r.with_resource_mut(ResourceHandle(res_handle as u32), |res| {
             res.iov = v;
             0
-        }
-        None => EINVAL,
+        })
+        .unwrap_or(EINVAL)
     })
 }
 
@@ -502,14 +501,13 @@ pub extern "C" fn virgl_renderer_resource_detach_iov(
     num_iovs: *mut c_int,
 ) {
     with((), |r| {
-        let n = match r.resource_mut(ResourceHandle(res_handle as u32)) {
-            Some(res) => {
+        let n = r
+            .with_resource_mut(ResourceHandle(res_handle as u32), |res| {
                 let n = res.iov.len();
                 res.iov.clear();
                 n
-            }
-            None => 0,
-        };
+            })
+            .unwrap_or(0);
         // The C hands back the array it was given. We copied it, so we own nothing the caller may
         // free -- report the count and a null array rather than inventing a pointer it would.
         if !iov.is_null() {
@@ -531,9 +529,11 @@ pub extern "C" fn virgl_renderer_resource_get_info(
     if info.is_null() {
         return EINVAL;
     }
-    with(EINVAL, |r| match r.resource(ResourceHandle(res_handle as u32)) {
-        Some(_) => todo_phase!("P3: resource info needs the pipe resource"),
-        None => EINVAL,
+    with(EINVAL, |r| {
+        r.with_resource(ResourceHandle(res_handle as u32), |_| {
+            todo_phase!("P3: resource info needs the pipe resource")
+        })
+        .unwrap_or(EINVAL)
     })
 }
 
@@ -604,13 +604,13 @@ pub extern "C" fn virgl_renderer_resource_get_iosurface_id(
     // Zero means "not IOSurface-backed", which is the truth for every resource here. It must also
     // become the answer the instant a backing is freed: ids are recycled immediately, and a stale
     // one names a stranger's surface.
-    with(EINVAL, |r| match r.resource(ResourceHandle(res_handle)) {
-        Some(_) => {
+    with(EINVAL, |r| {
+        r.with_resource(ResourceHandle(res_handle), |_| {
             // SAFETY: caller-provided out-pointer, checked non-null.
             unsafe { *iosurface_id = 0 };
             0
-        }
-        None => EINVAL,
+        })
+        .unwrap_or(EINVAL)
     })
 }
 

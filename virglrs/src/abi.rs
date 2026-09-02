@@ -138,9 +138,10 @@ pub type FreeDataCallback = Option<extern "C" fn(*mut c_void)>;
 
 /// A pointer the VMM owns and we only ever hand back to it.
 ///
-/// The renderer is reached from more than one thread through the ABI, so its state must be `Send`;
-/// a bare `*mut c_void` is not. Wrapping it here, in the module that IS the FFI boundary, keeps
-/// the `unsafe impl` where such a thing belongs instead of spreading it through the renderer.
+/// The renderer is reached from more than one thread through the ABI, so its state must be `Send`
+/// and -- once ring threads read the resource table alongside the caller -- `Sync`; a bare
+/// `*mut c_void` is neither. Wrapping it here, in the module that IS the FFI boundary, keeps the
+/// `unsafe impl` where such a thing belongs instead of spreading it through the renderer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
 pub struct VmmPtr(pub *mut c_void);
@@ -149,6 +150,12 @@ pub struct VmmPtr(pub *mut c_void);
 // back through `resource_get_priv`, and a guest iovec's base is read only by code that has the
 // VMM's guarantee the mapping is live. Moving the VALUE between threads dereferences nothing.
 unsafe impl Send for VmmPtr {}
+
+// SAFETY: the same invariant, and for the same reason. A shared reference to a VmmPtr grants only
+// the ability to copy the value out, which is exactly what `Send` already permits; there is no
+// interior mutability and no deref for two threads to race on. If anything here ever does
+// dereference one, both of these impls are wrong together.
+unsafe impl Sync for VmmPtr {}
 
 impl VmmPtr {
     pub const NULL: VmmPtr = VmmPtr(std::ptr::null_mut());
