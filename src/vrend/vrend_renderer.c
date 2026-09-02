@@ -9446,6 +9446,7 @@ int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane
 void vkr_mtl_iosurface_free(struct vkr_mtl_iosurface *surf);
 long vkr_mtl_iosurface_alloc_count(void);
 long vkr_mtl_iosurface_free_count(void);
+long vkr_mtl_iosurface_retain_count(const struct vkr_mtl_iosurface *surf);
 /* From vkr_budget: charge what follows to the shared classic-resource bucket rather than
  * to whichever venus context this thread served last. */
 void vkr_budget_set_vrend(void);
@@ -10125,13 +10126,41 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
  * EGLImage-backed resource (venus-blob imports, IOSurface scanouts) leaked
  * its EGLImage and pinned the VkImage/MTLTexture/IOSurface behind it. */
 #ifdef HAVE_EPOXY_EGL_H
-   if (res->egl_image) {
+   if (res->egl_image)
       virgl_egl_image_destroy(egl, res->egl_image);
+   /* Independently of the base image: a planar decode target has plane images and no
+    * base image (vrend_resource_iosurface_init_planes leaves the resource's own texture
+    * alone), and each plane image holds the IOSurface behind it. Tearing them down only
+    * when a base image existed left every decode target's surface alive after its
+    * resource was gone -- 63 allocated, 58 freed, 0 deallocated after five gst-va runs,
+    * and IOSurfaceCreate refusing at ~16.6k live surfaces after 170. */
+   {
+      /* LIMINA_SURF_REFTRACE: the surface's CF retain count around the plane-image
+       * teardown. Ours is one; anything left above that after the images are gone names
+       * a holder that is not the images. */
+      static int reftrace = -1;
+      if (reftrace < 0)
+         reftrace = getenv("LIMINA_SURF_REFTRACE") ? 1 : 0;
+      long before = -1;
+      if (reftrace && res->iosurface)
+         before = vkr_mtl_iosurface_retain_count(res->iosurface);
+      unsigned n_aux = 0;
+      long after_plane[VIRGL_GBM_MAX_PLANES] = { -1, -1, -1, -1 };
       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {
          if (res->aux_plane_egl_image[i]) {
             virgl_egl_image_destroy(egl, res->aux_plane_egl_image[i]);
+            res->aux_plane_egl_image[i] = NULL;
+            n_aux++;
+            if (reftrace && res->iosurface && i < VIRGL_GBM_MAX_PLANES)
+               after_plane[i] = vkr_mtl_iosurface_retain_count(res->iosurface);
          }
       }
+      if (reftrace && res->iosurface)
+         virgl_warn("[SURF-REF] destroy res %ux%u %s: retain %ld before, after plane0 image "
+                    "%ld, after plane1 image %ld (%u images, egl err 0x%x), base egl_image %d\n",
+                    res->base.width0, res->base.height0, util_format_name(res->base.format),
+                    before, after_plane[0], after_plane[1], n_aux,
+                    virgl_egl_error_code(egl), !!res->egl_image);
    }
 #endif
 #if defined(HAVE_EPOXY_EGL_H) && defined(ENABLE_GBM_ALLOCATION)

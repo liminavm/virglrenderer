@@ -167,6 +167,12 @@ vkr_mtl_iosurface_free_count(void)
    return (long)atomic_load(&g_limina_n_ios_free);
 }
 
+long
+vkr_mtl_iosurface_retain_count(const struct vkr_mtl_iosurface *surf)
+{
+   return (surf && surf->io_surface) ? (long)CFGetRetainCount(surf->io_surface) : -1;
+}
+
 void
 vkr_mtl_refcount_census(char *buf, unsigned long len)
 {
