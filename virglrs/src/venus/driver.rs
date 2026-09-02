@@ -207,7 +207,7 @@ pub struct Driver {
     /// -- which is why `vkFreeMemory` had to be skipped in the destroy cascade to avoid freeing
     /// twice. The size is a fact nothing else has: the driver may round an allocation up, and the
     /// census reports the number the guest asked for, because that is what the guest reads back.
-    memory: BTreeMap<ObjectId, u64>,
+    memory: BTreeMap<ObjectId, Allocated>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
     /// The device each queue belongs to, by host handle.
@@ -1442,9 +1442,18 @@ impl Driver {
         self.instance = Some(fns);
     }
 
+    /// Plant a live allocation. Host-visible, because every test that plants one either reads it
+    /// or exports it, and both need memory the host can address.
     #[cfg(test)]
     pub(super) fn plant_allocation(&mut self, id: ObjectId, size: u64) {
-        self.memory.insert(id, size);
+        self.memory.insert(id, Allocated { size, host_visible: true, exported: None });
+    }
+
+    /// The same, for memory the host cannot address -- the one case an export must refuse before
+    /// it ever reaches the driver.
+    #[cfg(test)]
+    pub(super) fn plant_device_local_allocation(&mut self, id: ObjectId, size: u64) {
+        self.memory.insert(id, Allocated { size, host_visible: false, exported: None });
     }
 
     /// Drop planted state without destroying it, for a test that stood a driver up by hand.
@@ -2273,7 +2282,12 @@ impl Driver {
             return Err(r);
         }
         assert!(out.0 != 0, "vkAllocateMemory succeeded and returned a null handle");
-        self.memory.insert(id, info.allocationSize.0);
+        let host_visible = d
+            .memory_types
+            .get(info.memoryTypeIndex as usize)
+            .is_some_and(|f| f.0 & HOST_VISIBLE_BIT != 0);
+        self.memory
+            .insert(id, Allocated { size: info.allocationSize.0, host_visible, exported: None });
         Ok(out)
     }
 
@@ -2283,24 +2297,109 @@ impl Driver {
     /// table like every other input handle -- not from a record of this driver's own. The id is
     /// only the census entry to retire.
     pub fn free_memory(&mut self, device: VkDevice, memory: VkDeviceMemory, id: ObjectId) {
-        self.memory.remove(&id);
+        let was = self.memory.remove(&id);
         let Some(d) = self.devices.get(&device) else {
             return;
         };
+        // An exported allocation is still mapped -- the export handed the VMM that address and
+        // left the mapping standing. Vulkan requires it be unmapped before the free, and the
+        // record that held it is already gone, so this is the last moment it can be done at all.
+        if was.is_some_and(|a| a.exported.is_some()) {
+            // SAFETY: the mapping this driver made in `memory_export` and has not released, on the
+            // device that owns it. The record is out of the map, so it cannot be unmapped twice.
+            unsafe { (d.fns.vkUnmapMemory())(device, memory) };
+        }
         // SAFETY: a device and an allocation this context made; the object table took the id out
         // before this call, so the same handle cannot arrive twice.
         unsafe { (d.fns.vkFreeMemory())(device, memory, core::ptr::null()) };
     }
 
-    /// Every live allocation, for the memory census.
+    /// Every live allocation the census is responsible for.
     ///
-    /// The C also skips memory it has exported as a blob and memory imported from another
-    /// context's storage -- in both cases the bytes are captured where they actually live, not
-    /// here. Neither flag can be set yet: both are decided by the blob path, which does not exist,
-    /// so nothing is skipped and the count reads high against the C by exactly the blobs a corpus
-    /// exported.
+    /// Exported memory is not: its bytes are the blob's, and the VMM captures them where they
+    /// live rather than reading them a second time through here. Memory *imported* from another
+    /// context's storage is skipped for the same reason and is not skipped yet -- the import side
+    /// of the blob path does not exist, so the count still reads high against the C by exactly the
+    /// surfaces a corpus imported.
     pub fn memory_census(&self) -> Vec<Allocation> {
-        self.memory.iter().map(|(id, size)| Allocation { id: *id, size: *size }).collect()
+        self.memory
+            .iter()
+            .filter(|(_, a)| a.exported.is_none())
+            .map(|(id, a)| Allocation { id: *id, size: a.size })
+            .collect()
+    }
+
+    /// Map an allocation for the VMM to publish into the guest, and mark it exported.
+    ///
+    /// The address outlives this call, which is the whole point: the VMM maps it into the guest
+    /// and reads and writes it for as long as the resource lives. It is *not* handed out again --
+    /// exporting twice would give two resources one storage, and the second holder would have no
+    /// way to know. The mapping is released when the allocation is freed, by the record that owns
+    /// it, so an address for freed memory cannot be produced.
+    ///
+    /// Every refusal here is the guest's error, not ours: it names memory it never allocated,
+    /// exports the same memory twice, asks for a blob larger than the allocation behind it, or
+    /// asks to map memory the host was never able to address. None of them may stop the worker.
+    ///
+    /// The device and the handle are the caller's to resolve through the object table, exactly as
+    /// [`Self::memory_read`] takes them, and for the same reason: this map does not keep a second
+    /// copy of what the table already knows.
+    pub fn memory_export(
+        &mut self,
+        device: VkDevice,
+        handle: VkDeviceMemory,
+        id: ObjectId,
+        blob_size: u64,
+    ) -> Result<usize, ExportError> {
+        let Some(record) = self.memory.get(&id) else {
+            return Err(ExportError::NoSuchAllocation);
+        };
+        if record.exported.is_some() {
+            return Err(ExportError::AlreadyExported);
+        }
+        if !record.host_visible {
+            return Err(ExportError::NotHostVisible);
+        }
+        // The VMM publishes the *blob's* size from this address, not the allocation's, so a blob
+        // larger than what was reserved would put host memory past the end of the allocation into
+        // the guest. `pad_for_blob` sizes an allocation up so this does not normally happen;
+        // refuse rather than over-map on the guest's say-so if it ever does.
+        if blob_size > record.size {
+            return Err(ExportError::LargerThanAllocation);
+        }
+        let Some(d) = self.devices.get(&device) else {
+            return Err(ExportError::NoSuchAllocation);
+        };
+        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a device and an allocation this context made, and `ptr` is a local. The mapping
+        // is deliberately left standing -- see this function's contract.
+        let r = unsafe {
+            (d.fns.vkMapMemory())(
+                device,
+                handle,
+                VkDeviceSize(0),
+                VK_WHOLE_SIZE,
+                VkMemoryMapFlags(0),
+                &mut ptr,
+            )
+        };
+        if r != VkResult::VK_SUCCESS || ptr.is_null() {
+            return Err(ExportError::NotMappable);
+        }
+        let addr = ptr as usize;
+        // Written back only now: until the map succeeds there is nothing to mark, and a mark
+        // without an address is the disagreement `exported` exists to make impossible.
+        self.memory.get_mut(&id).expect("the record was here a moment ago").exported = Some(addr);
+        Ok(addr)
+    }
+
+    /// The address an allocation was exported at, if it has been.
+    ///
+    /// The VMM asks for this again after the create -- the C caches it on the resource, which is
+    /// how a mapping outlives the memory it points into. Resolved through the live record instead,
+    /// so memory the guest has freed has no address to give.
+    pub fn memory_exported_at(&self, id: ObjectId) -> Option<usize> {
+        self.memory.get(&id).and_then(|a| a.exported)
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -2317,7 +2416,7 @@ impl Driver {
         id: ObjectId,
         buf: &mut [u8],
     ) -> Result<usize, MemoryError> {
-        let Some(size) = self.memory.get(&id).copied() else {
+        let Some(size) = self.memory.get(&id).map(|a| a.size) else {
             return Err(MemoryError::NoSuchAllocation);
         };
         let Some(d) = self.devices.get(&device) else {
@@ -2349,6 +2448,29 @@ impl Driver {
     }
 }
 
+/// One live allocation, as this driver holds it.
+///
+/// Not what the census reports -- see [`Allocation`]. This is the record the driver keeps for its
+/// own purposes, and it is where an export's mapping lives.
+struct Allocated {
+    /// Its size, padded to the blob the guest may map it as -- see [`pad_for_blob`].
+    size: u64,
+    /// Whether the host can address it.
+    ///
+    /// Recorded at the allocation, which is the only place the memory type is resolved. An export
+    /// has to refuse memory it cannot map, and refusing it with a reason of our own beats handing
+    /// back whatever the driver says when asked to map memory that was never mappable.
+    host_visible: bool,
+    /// The host address `vkMapMemory` returned when this memory was exported as a blob.
+    ///
+    /// `Some` *is* the export mark: one value, not a flag beside an address that could disagree
+    /// with it. The mapping belongs to this record, so retiring the record on
+    /// [`Driver::free_memory`] is the same act as making the address unreachable -- there is no
+    /// second place to remember to purge, and nothing can hand the VMM a pointer into memory the
+    /// guest has freed.
+    exported: Option<usize>,
+}
+
 /// One live allocation, as the census reports it.
 ///
 /// Two bare `u64`s side by side is how the ABI carries this, and exactly the confusion the
@@ -2371,6 +2493,23 @@ pub enum NoSyncFd {
     /// substitute: a semaphore whose payload cannot be moved is one the guest's next submit waits
     /// on forever, so saying so is better than pretending it worked.
     Unsupported,
+}
+
+/// Why an allocation could not be exported as a blob. Every one of these is the guest's doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExportError {
+    /// No allocation under that id in this context.
+    NoSuchAllocation,
+    /// Already exported. A memory backs one blob: two resources sharing one storage is a bug
+    /// neither of them could detect.
+    AlreadyExported,
+    /// The host cannot address this memory, so there is nothing to publish into the guest.
+    NotHostVisible,
+    /// The blob is bigger than the allocation behind it, and mapping it would publish whatever
+    /// follows the allocation in this process.
+    LargerThanAllocation,
+    /// The driver refused to map memory it said was host-visible.
+    NotMappable,
 }
 
 /// Why an allocation could not be read.
@@ -2546,6 +2685,113 @@ mod tests {
     /// Two facts about one allocation used to live in two places: the object table held its handle
     /// under the guest's id, and this driver held a second copy of that handle beside the size.
     /// The cascade had to skip `VK_OBJECT_TYPE_DEVICE_MEMORY` entirely to avoid freeing both, and
+    /// An export publishes memory to the VMM, and the mark it leaves is the mapping itself.
+    ///
+    /// Every refusal here is a guest's doing, so each has to be an answer rather than an abort:
+    /// naming memory that does not exist, exporting the same memory twice, asking for a blob
+    /// bigger than what backs it, or asking to map memory the host cannot address. The second of
+    /// those is the one with teeth -- two resources over one storage is a state neither holder
+    /// could detect afterwards.
+    #[test]
+    fn memory_is_published_once_and_leaves_the_census_when_it_is() {
+        use std::cell::RefCell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const MEM: ObjectId = ObjectId(12);
+        const LOCAL: ObjectId = ObjectId(13);
+        const SIZE: u64 = 128 * 1024;
+        /// Any address will do; nothing dereferences it. Page-aligned so it reads like one.
+        const ADDR: usize = 0x7000_0000;
+
+        thread_local! {
+            static MAPS: RefCell<u32> = const { RefCell::new(0) };
+            static UNMAPS: RefCell<u32> = const { RefCell::new(0) };
+        }
+
+        unsafe extern "C" fn map(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _f: VkMemoryMapFlags,
+            out: *mut *mut core::ffi::c_void,
+        ) -> VkResult {
+            MAPS.with_borrow_mut(|n| *n += 1);
+            // SAFETY: the caller passes a local of its own.
+            unsafe { *out = ADDR as *mut core::ffi::c_void };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn unmap(_d: VkDevice, _m: VkDeviceMemory) {
+            UNMAPS.with_borrow_mut(|n| *n += 1);
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkMapMemory(map);
+        fns.plant_vkUnmapMemory(unmap);
+        fns.plant_vkFreeMemory(free);
+
+        let mut driver = Driver::new();
+        driver.plant_device(DEVICE, fns);
+        driver.plant_allocation(MEM, SIZE);
+        driver.plant_device_local_allocation(LOCAL, SIZE);
+        let handle = VkDeviceMemory(0xd0);
+
+        assert_eq!(driver.memory_census().len(), 2, "both are live and unexported");
+
+        // Memory nobody allocated, refused before anything is mapped.
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, ObjectId(999), SIZE),
+            Err(ExportError::NoSuchAllocation)
+        );
+        // A blob bigger than the allocation would publish whatever follows it in this process.
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, MEM, SIZE + 1),
+            Err(ExportError::LargerThanAllocation)
+        );
+        // Memory the host cannot address has nothing to publish.
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, LOCAL, SIZE),
+            Err(ExportError::NotHostVisible)
+        );
+        MAPS.with_borrow(|n| assert_eq!(*n, 0, "not one of those reached the driver"));
+
+        // The export itself.
+        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok(ADDR));
+        MAPS.with_borrow(|n| assert_eq!(*n, 1));
+        UNMAPS.with_borrow(|n| assert_eq!(*n, 0, "the mapping is the VMM's now and stays up"));
+        assert_eq!(driver.memory_exported_at(MEM), Some(ADDR), "asked again, not remembered");
+
+        // The census stops reporting it: its bytes are the blob's, captured where they live.
+        let census = driver.memory_census();
+        assert_eq!(census.len(), 1, "the exported allocation is no longer the census's to read");
+        assert_eq!(census[0].id, LOCAL);
+
+        // And it cannot be published a second time.
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, MEM, SIZE),
+            Err(ExportError::AlreadyExported)
+        );
+        MAPS.with_borrow(|n| assert_eq!(*n, 1, "a refused export maps nothing"));
+
+        // Freeing it releases the mapping the export left standing -- the record that owned the
+        // address is gone, so this is the last moment it could be unmapped at all.
+        driver.free_memory(DEVICE, handle, MEM);
+        UNMAPS.with_borrow(|n| assert_eq!(*n, 1, "the export's mapping went with the allocation"));
+        assert_eq!(driver.memory_exported_at(MEM), None, "and there is no address left to give");
+
+        // The unexported one was never mapped, so freeing it must not unmap anything.
+        driver.free_memory(DEVICE, handle, LOCAL);
+        UNMAPS.with_borrow(|n| assert_eq!(*n, 1, "nothing unmaps memory that was never mapped"));
+
+        driver.abandon_planted();
+    }
+
     /// a skip arm that exists to work around a duplicated fact is the duplication still costing
     /// something. Now the handle comes from the table like every other, and the only thing left
     /// here is the size -- so the free happens in the cascade, and this is what pins its order.
