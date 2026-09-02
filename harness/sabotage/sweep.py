@@ -174,6 +174,16 @@ SABOTAGES = [
         'Backing::Scanout(_) => Some(self.account.try_charge("IOSurface", size)),',
         '',
     ),
+    (
+        'a budget refusal is reported to the guest and to nobody else',
+        'virglrs/src/venus/context.rs',
+        '''            if let driver::NoMemory::OverBudget { stop: true } = e {
+                self.reject = Some("the host memory budget refused this allocation");
+            }
+''',
+        '',
+        '',
+    ),
 ]
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
