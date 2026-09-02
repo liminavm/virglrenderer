@@ -177,6 +177,40 @@ class RustGen:
     def field_name(name):
         return 'r#' + name if name in KEYWORDS else name
 
+    # Structs the renderer builds but the wire never carries.
+    #
+    # venus decides what a *guest* can send, and that is what `supported_types` holds. A renderer
+    # also speaks to the driver in its own right -- to hand it an IOSurface's pages as the backing
+    # for a scanout allocation, say -- and the structs for that conversation are in the same
+    # vk.xml, just outside venus's set. They are emitted here rather than written by hand for the
+    # reason `vulkan.rs` gives for generating the proc tables: a hand-written Vulkan struct is a
+    # second source of truth for a layout the driver already fixed, and nothing would catch it
+    # drifting.
+    #
+    # Emitted as plain `#[repr(C)]` definitions with no serializer. Nothing decodes them: they are
+    # built by the renderer and read by the driver, and a guest that sent one would be sending a
+    # struct venus has no encoding for.
+    RENDERER_ONLY_STRUCTS = [
+        # Backs a VkDeviceMemory with pages the host already owns -- how a scanout allocation
+        # becomes the IOSurface a compositor will read.
+        'VkImportMemoryHostPointerInfoEXT',
+    ]
+
+    def renderer_only_structs(self):
+        """The types named in `RENDERER_ONLY_STRUCTS`, resolved against the registry.
+
+        Asserted present rather than skipped: a name that no longer resolves means vk.xml moved
+        under us, and emitting nothing would turn that into a compile error somewhere unrelated.
+        """
+        out = []
+        for name in self.RENDERER_ONLY_STRUCTS:
+            ty = self.gen.reg.type_table.get(name)
+            assert ty is not None, 'renderer-only struct %s is not in vk.xml' % name
+            assert not any(t.name == name for t in self.gen.supported_types[VkType.STRUCT]), (
+                '%s is in venus\'s own set; it does not belong here' % name)
+            out.append(ty)
+        return out
+
     def struct_fields(self, ty):
         """A struct's members as they are laid out, which is not the order they serialize in.
 

@@ -228,14 +228,22 @@ pixels against an llvmpipe/lavapipe reference — pixel-exact today. Alongside i
 These are implementation-agnostic already. Work here is corpus, not framework, and
 each corpus is owed by the phase it gates — not collected up front:
 
-- **P2** — `VkImportMemoryResourceInfoMESA` is not translated. A guest chains it to say "this
-  allocation is another context's resource"; the renderer owes the translation into whatever
-  the host's external memory actually is, and this one forwards the struct to a driver that has
-  never heard of it, which mints fresh memory instead. So a compositor importing a client's
-  window gets memory that is not the client's. The score cannot see it -- an import is not the
-  census's to report either way -- and the route is the same host-pointer import the scanout
-  export uses: resolve the resource to its published address or its surface base, and chain
-  `VkImportMemoryHostPointerInfoEXT` over it.
+- **P2** — **the scanout export and the resource import are one feature, not two.** Measured on
+  `synoik`: allocation 66 is exported as resource 7, and allocation 111 imports resource 7. They
+  are the same storage. The guest renders through the import and reads back through the export,
+  so a renderer that gives them separate memory leaves the exported half permanently blank --
+  which is what this one does, because `VkImportMemoryResourceInfoMESA` is forwarded to a driver
+  that has never heard of it and mints fresh memory instead.
+
+  Minting the export's IOSurface therefore closes nothing on its own. It is necessary --
+  something has to own the storage both halves name -- but until the import aliases it, backing
+  the export with a surface only means the census can report an empty surface instead of empty
+  memory, and reporting a buffer as empty is worse than not reporting it. Land the two together.
+
+  Both halves want the same mechanism: `VkImportMemoryHostPointerInfoEXT` over an address the
+  renderer already knows. What is missing for the import half is a way for the driver to resolve
+  a resource id to that address -- the resource table is the renderer's and the chain walk has to
+  stay in the driver, so this wants a lookup passed in, the way `ShmResources` is.
 - **P2** — a seated compositor driving Vulkan clients (mutter or synoik with real
   clients), which is the only workload that produces scanout blobs in quantity. The
   present venus corpora carry two, which is enough to *see* the IOSurface divergence
