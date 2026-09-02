@@ -1189,7 +1189,7 @@ impl Commands for Handlers<'_> {
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
-        let Some(out) = self.array(args.handle_pCommandBuffers_mut()) else { return };
+        let out = args.handle_pCommandBuffers_mut();
         let host = self.driver.allocate_objects(
             device,
             pool,
@@ -1224,7 +1224,7 @@ impl Commands for Handlers<'_> {
         // The pool records both names of every object it holds, so that destroying it can take
         // the guest's out of the object table. Built before the shadow is borrowed.
         let named: Vec<ObjectId> = ids.iter().map(|h| h.id()).collect();
-        let Some(out) = self.array(args.handle_pDescriptorSets_mut()) else { return };
+        let out = args.handle_pDescriptorSets_mut();
         let host = self.driver.allocate_objects(
             device,
             pool,
@@ -2343,9 +2343,7 @@ impl Commands for Handlers<'_> {
         let ids = args.pPipelines();
         // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
         let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
-        let Some(out) = self.array(args.handle_pPipelines_mut()) else {
-            return;
-        };
+        let out = args.handle_pPipelines_mut();
         let host = self.driver.create_pipelines(
             device,
             |d| d.vkCreateGraphicsPipelines(),
