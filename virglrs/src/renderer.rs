@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Why a call failed.
 ///
@@ -223,6 +223,14 @@ pub struct Resource {
     pub attached: Vec<CtxId>,
 }
 
+// The resource table is shared with every ring thread, so it must be safe to read from more than
+// one at a time. Checked by the compiler rather than asserted in prose: a raw pointer or a `Cell`
+// appearing anywhere under `Resource` names itself here instead of at the refactor that assumed it.
+const _: () = {
+    const fn is_send_sync<T: Send + Sync>() {}
+    is_send_sync::<BTreeMap<ResourceHandle, Resource>>();
+};
+
 /// The resource table answering the only question venus asks of it.
 ///
 /// On the table rather than on `Renderer`, because a venus submission needs the renderer's venus
@@ -263,7 +271,11 @@ pub struct Context {
 
 pub struct Renderer {
     pub config: Config,
-    resources: BTreeMap<ResourceHandle, Resource>,
+    /// Shared with every ring thread, which reads it to resolve a reply stream's resource while
+    /// the caller's thread may be creating another. A read-write lock rather than a mutex because
+    /// that is the actual access pattern: many readers looking up a handle, one writer when the
+    /// VMM creates or unrefs. See the lock order in `venus::vkr`.
+    resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>>,
     contexts: BTreeMap<CtxId, Context>,
     fences: Retirement,
     /// The venus renderer, present only when this build was initialized to serve it.
@@ -274,7 +286,7 @@ impl Renderer {
     pub fn new(fences: Box<dyn FenceSink>, config: Config) -> Renderer {
         Renderer {
             config,
-            resources: BTreeMap::new(),
+            resources: Arc::new(RwLock::new(BTreeMap::new())),
             contexts: BTreeMap::new(),
             fences: Retirement::start(fences),
             venus: config.venus.then(|| venus::vkr::Vkr::new(config)),
@@ -380,7 +392,7 @@ impl Renderer {
     /// File a resource under a handle `free_handle` has already cleared.
     fn insert(&mut self, handle: ResourceHandle, backing: Backing, iov: Vec<GuestIov>) {
         let r = Resource { handle, backing, iov, priv_: VmmPtr::NULL, attached: Vec::new() };
-        self.resources.insert(handle, r);
+        self.resources.write().expect("the resource lock is never poisoned").insert(handle, r);
     }
 
     /// Check a guest-chosen resource handle before anything is inserted under it.
@@ -388,27 +400,46 @@ impl Renderer {
         if handle.0 == 0 {
             return Err(Error::ZeroHandle);
         }
-        if self.resources.contains_key(&handle) {
+        if self.resources.read().expect("the resource lock is never poisoned").contains_key(&handle)
+        {
             return Err(Error::ResourceExists);
         }
         Ok(())
     }
 
-    pub fn resource(&self, handle: ResourceHandle) -> Option<&Resource> {
-        self.resources.get(&handle)
+    /// Look at one resource, for as long as the closure runs and no longer.
+    ///
+    /// The table is shared, so a `&Resource` cannot outlive the lock that made it safe to read;
+    /// scoping it to a closure is what says so in the type. `None` is a handle that names nothing,
+    /// which stays distinguishable from a closure that returned nothing.
+    pub fn with_resource<R>(
+        &self,
+        handle: ResourceHandle,
+        f: impl FnOnce(&Resource) -> R,
+    ) -> Option<R> {
+        self.resources.read().expect("the resource lock is never poisoned").get(&handle).map(f)
     }
 
-    pub fn resource_mut(&mut self, handle: ResourceHandle) -> Option<&mut Resource> {
-        self.resources.get_mut(&handle)
+    /// Change one resource, under the same scoping and for the same reason.
+    ///
+    /// `&self`, because the lock is what grants the mutation -- not an exclusive borrow of the
+    /// renderer, which the ring threads make impossible to hand out anyway.
+    pub fn with_resource_mut<R>(
+        &self,
+        handle: ResourceHandle,
+        f: impl FnOnce(&mut Resource) -> R,
+    ) -> Option<R> {
+        self.resources.write().expect("the resource lock is never poisoned").get_mut(&handle).map(f)
     }
 
     pub fn resource_unref(&mut self, handle: ResourceHandle) {
         // Detach from every context first. A context holding a dangling handle is how the C's
         // use-after-free reached the command stream.
-        if let Some(r) = self.resources.get_mut(&handle) {
+        let mut resources = self.resources.write().expect("the resource lock is never poisoned");
+        if let Some(r) = resources.get_mut(&handle) {
             r.attached.clear();
         }
-        self.resources.remove(&handle);
+        resources.remove(&handle);
     }
 
     // ---- contexts ----
@@ -444,7 +475,7 @@ impl Renderer {
         }
         // A destroyed context releases its claim on every resource; the resources themselves
         // survive, because the VMM unrefs them separately and may still be holding one.
-        for r in self.resources.values_mut() {
+        for r in self.resources.write().expect("the resource lock is never poisoned").values_mut() {
             r.attached.retain(|c| *c != id);
         }
     }
@@ -454,18 +485,18 @@ impl Renderer {
     }
 
     pub fn ctx_attach_resource(&mut self, ctx: CtxId, handle: ResourceHandle) {
-        let known = self.contexts.contains_key(&ctx);
-        if let (true, Some(r)) = (known, self.resources.get_mut(&handle))
-            && !r.attached.contains(&ctx)
-        {
-            r.attached.push(ctx);
+        if !self.contexts.contains_key(&ctx) {
+            return;
         }
+        self.with_resource_mut(handle, |r| {
+            if !r.attached.contains(&ctx) {
+                r.attached.push(ctx);
+            }
+        });
     }
 
     pub fn ctx_detach_resource(&mut self, ctx: CtxId, handle: ResourceHandle) {
-        if let Some(r) = self.resources.get_mut(&handle) {
-            r.attached.retain(|c| *c != ctx);
-        }
+        self.with_resource_mut(handle, |r| r.attached.retain(|c| *c != ctx));
     }
 
     // ---- fences ----
@@ -500,31 +531,31 @@ impl Renderer {
         };
         match c.capset {
             CapsetId::Venus => {
-                let (v, resources) = self.venus_and_resources();
-                let v = v.ok_or(Error::RendererAbsent)?;
-                v.submit(ctx, buf, resources).map_err(venus_error)
+                self.venus_submit(|v, resources| v.submit(ctx, buf, resources).map_err(venus_error))
             }
             // vrend arrives in P3.
             _ => Err(Error::RendererUnimplemented),
         }
     }
 
-    /// The venus renderer and the resource table, borrowed apart.
+    /// Run one venus entry point with the resource table readable underneath it.
     ///
-    /// Every venus entry point below goes through this: a submission may create a ring, which
-    /// needs a share of a resource's mapping while venus state is held mutably. Naming the two
-    /// fields is what makes that borrow legal, and doing it in one place is what stops each caller
-    /// from rediscovering it.
-    fn venus_and_resources(
+    /// Every venus submission goes through here, because any of them may set a reply stream or
+    /// create a ring and so needs to resolve a handle. Taking the read lock in one place is also
+    /// what fixes the lock order for the caller's thread -- resources before context -- so that
+    /// the ring threads, which try both and back off, have a single order to agree with.
+    fn venus_submit(
         &mut self,
-    ) -> (Option<&mut venus::vkr::Vkr>, &BTreeMap<ResourceHandle, Resource>) {
-        (self.venus.as_mut(), &self.resources)
+        f: impl FnOnce(&mut venus::vkr::Vkr, &dyn venus::ring::ShmResources) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let resources = self.resources.read().expect("the resource lock is never poisoned");
+        let v = self.venus.as_mut().ok_or(Error::RendererAbsent)?;
+        f(v, &*resources)
     }
 
     /// Feed one replay journal entry to a context's default stream.
     pub fn venus_replay_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
-        let (v, resources) = self.venus_and_resources();
-        v.ok_or(Error::RendererAbsent)?.submit(ctx, buf, resources).map_err(venus_error)
+        self.venus_submit(|v, resources| v.submit(ctx, buf, resources).map_err(venus_error))
     }
 
     /// Feed one replay journal entry to a named ring's stream.
@@ -534,8 +565,9 @@ impl Renderer {
         ring: RingId,
         buf: &[u8],
     ) -> Result<(), Error> {
-        let (v, resources) = self.venus_and_resources();
-        v.ok_or(Error::RendererAbsent)?.submit_ring(ctx, ring, buf, resources).map_err(venus_error)
+        self.venus_submit(|v, resources| {
+            v.submit_ring(ctx, ring, buf, resources).map_err(venus_error)
+        })
     }
 
     pub fn venus_replay_begin(&mut self, ctx: CtxId) -> Result<(), Error> {
@@ -547,7 +579,10 @@ impl Renderer {
     }
 
     pub fn counts(&self) -> (usize, usize) {
-        (self.resources.len(), self.contexts.len())
+        (
+            self.resources.read().expect("the resource lock is never poisoned").len(),
+            self.contexts.len(),
+        )
     }
 
     /// The venus commands a run asked for and this build did not serve, most-used first.
@@ -556,7 +591,10 @@ impl Renderer {
     /// intuition: the commands a real desktop leans on are not the ones a reading of the Vulkan
     /// spec would rank first.
     pub fn venus_todo(&self) -> Vec<(&'static str, u64)> {
-        self.venus.as_ref().map(|v| v.todo.by_frequency()).unwrap_or_default()
+        self.venus
+            .as_ref()
+            .map(|v| v.todo.lock().expect("the census lock is never poisoned").by_frequency())
+            .unwrap_or_default()
     }
 
     /// One venus context's live device memory.
@@ -564,7 +602,7 @@ impl Renderer {
     /// An empty census and a census that could not be taken are different answers, and the VMM
     /// decides whether to snapshot on the difference -- so the failure says which it was.
     pub fn venus_memory_census(&self, ctx_id: CtxId) -> Result<Vec<Allocation>, Error> {
-        Ok(self.venus_context(ctx_id)?.driver().memory_census())
+        self.venus_context(ctx_id, |ctx| ctx.driver().memory_census())
     }
 
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
@@ -574,17 +612,23 @@ impl Renderer {
         mem_id: u64,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        self.venus_context(ctx_id)?.memory_read(ObjectId(mem_id), buf).map_err(|e| match e {
-            MemoryError::NoSuchAllocation => Error::NoAllocation,
-            MemoryError::NotMappable => Error::NotMappable,
+        self.venus_context(ctx_id, |ctx| ctx.memory_read(ObjectId(mem_id), buf))?.map_err(|e| {
+            match e {
+                MemoryError::NoSuchAllocation => Error::NoAllocation,
+                MemoryError::NotMappable => Error::NotMappable,
+            }
         })
     }
 
     /// The venus context under an id, distinguishing "no venus in this build" from "no such
     /// context" -- which a caller asking for a snapshot needs to tell apart.
-    fn venus_context(&self, ctx_id: CtxId) -> Result<&venus::context::Context, Error> {
+    fn venus_context<R>(
+        &self,
+        ctx_id: CtxId,
+        f: impl FnOnce(&venus::context::Context) -> R,
+    ) -> Result<R, Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
-        v.context(ctx_id).ok_or(Error::NoContext)
+        v.with_context(ctx_id, f).ok_or(Error::NoContext)
     }
 }
 
@@ -636,7 +680,10 @@ mod tests {
             size: 0x24000 - 1,
         };
         r.resource_create_blob(ResourceHandle(1), minted, Vec::new()).expect("created");
-        let map = r.resource(ResourceHandle(1)).expect("there").shm().expect("has memory");
+        let map = r
+            .with_resource(ResourceHandle(1), |res| res.shm().cloned())
+            .expect("there")
+            .expect("has memory");
 
         // Page-rounded, because the VMM maps with MAP_FIXED and because the ring layout is
         // validated against this length -- un-rounded, a layout the C accepts would be refused.
@@ -648,14 +695,16 @@ mod tests {
         let exported = BlobDesc { blob_id: BlobId(9), ..minted };
         r.resource_create_blob(ResourceHandle(2), exported, Vec::new()).expect("created");
         assert!(
-            r.resource(ResourceHandle(2)).expect("there").shm().is_none(),
+            r.with_resource(ResourceHandle(2), |res| res.shm().cloned()).expect("there").is_none(),
             "an export names memory the renderer already has; minting would answer with the wrong bytes"
         );
 
         // And so does a blob in memory that is not the host's to mint.
         let vram = BlobDesc { blob_mem: crate::abi::BLOB_MEM_GUEST_VRAM, ..minted };
         r.resource_create_blob(ResourceHandle(3), vram, Vec::new()).expect("created");
-        assert!(r.resource(ResourceHandle(3)).expect("there").shm().is_none());
+        assert!(
+            r.with_resource(ResourceHandle(3), |res| res.shm().cloned()).expect("there").is_none()
+        );
     }
 
     /// A real descriptor to hand over. Any would do; a pipe's read end is the cheapest.
