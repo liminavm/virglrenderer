@@ -80,7 +80,13 @@ unsafe extern "C" {
     fn IOSurfaceGetBaseAddress(surface: CfTypeRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: CfTypeRef) -> usize;
     fn IOSurfaceGetBytesPerRow(surface: CfTypeRef) -> usize;
+    fn IOSurfaceLock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceUnlock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
 }
+
+/// `kIOSurfaceLockReadOnly`. Read-only is not an optimisation here: locking for write would
+/// invalidate the GPU's copy of pixels the guest is still rendering into.
+const LOCK_READ_ONLY: u32 = 1;
 
 // ------------------------------------------------------------------- pixels
 
@@ -243,6 +249,43 @@ impl Surface {
         unsafe { IOSurfaceGetBaseAddress(self.as_ref()) as usize }
     }
 
+    /// Copy the surface's bytes out, returning how many landed in `dst`.
+    ///
+    /// This is how a scanout allocation is read back at all: its storage *is* the surface, and
+    /// `vkMapMemory` refuses memory the host imported rather than allocated. A short buffer is
+    /// the caller's business and not an error -- the census caps what it reads -- so the count
+    /// comes back rather than being inferred from `dst`.
+    ///
+    /// Locked for the duration. The lock is what makes the GPU's writes visible to this process;
+    /// reading the base address without it returns whatever the CPU's view last held, which on a
+    /// surface being actively rendered into is neither the old frame nor the new one.
+    pub fn read_into(&self, dst: &mut [u8]) -> usize {
+        let n = dst.len().min(self.alloc_size() as usize);
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: `IOSurfaceLock` takes the surface we hold a reference to; a null seed is
+        // documented as "do not report the seed" rather than as an out parameter we must supply.
+        // A failed lock leaves nothing locked, so there is nothing to unlock and nothing to read.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) } != 0 {
+            return 0;
+        }
+        // SAFETY: the lock is held, so the base address addresses `alloc_size` readable bytes
+        // that no one else is writing through the CPU's view; `n` is bounded by that above and by
+        // `dst`'s own length. The regions cannot overlap -- `dst` is the caller's memory and this
+        // is the surface's.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                IOSurfaceGetBaseAddress(self.as_ref()).cast::<u8>(),
+                dst.as_mut_ptr(),
+                n,
+            );
+            // Balanced against the lock above, with the same options, as IOSurface requires.
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut());
+        }
+        n
+    }
+
     fn as_ref(&self) -> CfTypeRef {
         self.surface.as_ptr()
     }
@@ -377,6 +420,43 @@ mod tests {
             "and there is storage behind all of them"
         );
         assert!(surface.host_addr() != 0, "which is addressable");
+    }
+
+    /// A scanout's bytes are read back through the surface because they are not anywhere else:
+    /// once the allocation is a host-pointer import of these pages, `vkMapMemory` has nothing to
+    /// hand back. Written through the base address here because in the real path the writer is a
+    /// GPU this test does not have.
+    #[test]
+    fn a_surface_hands_back_the_bytes_it_holds() {
+        const PITCH: u32 = 256;
+        const HEIGHT: u32 = 4;
+
+        let _mint = MINT.lock().expect("the mint lock is never poisoned");
+        let surface = Surface::scanout(64, HEIGHT, PixelFormat::Bgra, PITCH).expect("minted");
+
+        // SAFETY: the surface is alive and this is its own storage, sized by `alloc_size`; the
+        // slice is dropped before anything else touches the surface.
+        let pixels = unsafe {
+            std::slice::from_raw_parts_mut(
+                surface.host_addr() as *mut u8,
+                surface.alloc_size() as usize,
+            )
+        };
+        pixels.fill(0);
+        pixels[0] = 0xf0;
+        pixels[(PITCH * (HEIGHT - 1)) as usize] = 0x0f;
+
+        let mut out = vec![0u8; surface.alloc_size() as usize];
+        assert_eq!(surface.read_into(&mut out), out.len(), "all of it");
+        assert_eq!(out[0], 0xf0, "the first row");
+        assert_eq!(out[(PITCH * (HEIGHT - 1)) as usize], 0x0f, "and the last");
+
+        // A short buffer takes a prefix rather than failing: the census caps every read.
+        let mut short = [0u8; 8];
+        assert_eq!(surface.read_into(&mut short), 8);
+        assert_eq!(short[0], 0xf0);
+
+        assert_eq!(surface.read_into(&mut []), 0, "and asking for nothing reads nothing");
     }
 
     /// Every refusal is a caller's mistake, and each says which -- a null with no reason is what
