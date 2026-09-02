@@ -66,6 +66,7 @@
  */
 
 
+#include <inttypes.h>
 #include <time.h>
 
 #include "util/u_format.h"
@@ -95,7 +96,23 @@ struct vrend_video_context {
     struct vrend_context *ctx;
     struct list_head codecs;
     struct list_head buffers;
+    /* Per-frame commands naming a codec or buffer this context does not have. */
+    uint64_t lookup_misses;
 };
+
+/* The per-frame commands report success to the guest whatever the lookup finds (the
+ * protocol has no way to say "your codec is gone"), so the only witness of a guest
+ * decoding into nothing is this log. Rate-limited: once, then every power of ten. */
+static void lookup_miss(struct vrend_video_context *ctx, const char *what,
+                        uint32_t cdc_handle, bool cdc, uint32_t tgt_handle, bool tgt)
+{
+    uint64_t n = ++ctx->lookup_misses;
+    if (n == 1 || n == 10 || n == 100 || n == 1000 || n % 10000 == 0)
+        virgl_error("video: %s names codec %u (%s) and buffer %u (%s) -- %" PRIu64
+                    " such command%s on this context so far, decoding into nothing\n",
+                    what, cdc_handle, cdc ? "found" : "MISSING", tgt_handle,
+                    tgt ? "found" : "MISSING", n, n == 1 ? "" : "s");
+}
 
 struct vrend_video_codec {
     struct virgl_video_codec *codec;
@@ -846,8 +863,10 @@ int vrend_video_begin_frame(struct vrend_video_context *ctx,
     struct vrend_video_codec *cdc = get_video_codec(ctx, cdc_handle);
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
 
-    if (!cdc || !tgt)
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "begin_frame", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
+    }
 
     return virgl_video_begin_frame(cdc->codec, tgt->buffer);
 }
@@ -1017,8 +1036,8 @@ int vrend_video_decode_bitstream(struct vrend_video_context *ctx,
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
     union virgl_picture_desc desc;
 
-    if (!cdc || !tgt){
-        virgl_error("video codec: %p, video buffer: %p, invalid.\n", (void *)cdc, (void *)tgt);
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "decode_bitstream", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
     }
 
@@ -1155,8 +1174,10 @@ int vrend_video_end_frame(struct vrend_video_context *ctx,
     struct vrend_video_codec *cdc = get_video_codec(ctx, cdc_handle);
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
 
-    if (!cdc || !tgt)
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "end_frame", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
+    }
 
     return virgl_video_end_frame(cdc->codec, tgt->buffer);
 }

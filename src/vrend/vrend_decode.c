@@ -1876,8 +1876,12 @@ static int vrend_decode_create_video_codec(struct vrend_context *ctx,
    if (length >= VIRGL_CREATE_VIDEO_CODEC_MAX_REF)
       max_ref = get_buf_entry(buf, VIRGL_CREATE_VIDEO_CODEC_MAX_REF);
 
-   vrend_video_create_codec(vctx, handle, profile, entrypoint,
-                            chroma_fmt, level, width, height, max_ref, 0);
+   /* A create that produced nothing must not report success: the journal retains
+    * only commands that dispatched, and a re-created codec that failed at replay would
+    * otherwise be recorded as live state. */
+   if (vrend_video_create_codec(vctx, handle, profile, entrypoint,
+                                chroma_fmt, level, width, height, max_ref, 0))
+      return EINVAL;
 
    return 0;
 }
@@ -1922,8 +1926,9 @@ static int vrend_decode_create_video_buffer(struct vrend_context *ctx,
        res_handles[i] = get_buf_entry(buf,
                                       VIRGL_CREATE_VIDEO_BUFFER_RES_BASE + i);
 
-   vrend_video_create_buffer(vctx, handle, format, width, height,
-                                      res_handles, num_res);
+   if (vrend_video_create_buffer(vctx, handle, format, width, height,
+                                 res_handles, num_res))
+      return EINVAL;
 
    return 0;
 }

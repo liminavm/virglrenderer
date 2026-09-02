@@ -120,6 +120,18 @@ struct virgl_video_codec {
     uint32_t height;
     void *opaque;
 
+    /* A codec starts with no reference pictures, so it can decode nothing before the
+     * first keyframe: inter frames handed to VideoToolbox against an empty DPB do not
+     * fail, they produce quietly wrong pixels. Set at creation, cleared by the first
+     * keyframe. The case that matters is a codec re-created by a snapshot restore in the
+     * middle of a stream: the guest keeps sending inter frames, and every one of them is
+     * dropped here until the stream's next keyframe re-seeds the references. */
+    bool await_keyframe;
+    /* Whether the frame being accumulated starts a new reference set, as far as the
+     * per-codec parser can tell before end_frame. */
+    bool frame_is_key;
+    unsigned frames_dropped_awaiting_key;
+
     /* Rebuilt whenever the stream's shape changes; see ensure_session(). */
     VTDecompressionSessionRef session;
     CMVideoFormatDescriptionRef format;
@@ -464,6 +476,7 @@ struct virgl_video_codec *virgl_video_create_codec(
     codec->width = args->width;
     codec->height = args->height;
     codec->opaque = args->opaque;
+    codec->await_keyframe = true;
 
     if (args->profile == PIPE_VIDEO_PROFILE_AV1_MAIN) {
         codec->hw_av1 = vt_can_decode(kCMVideoCodecType_AV1);
@@ -941,6 +954,41 @@ have_format:
     return 0;
 }
 
+/* Does any NAL in this Annex-B access unit have (header & mask) == type? Start codes
+ * are 00 00 01 or 00 00 00 01; the NAL header is the byte after. */
+static bool annexb_has_nal_type(const uint8_t *b, size_t len, uint8_t mask, uint8_t type)
+{
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+            if ((b[i + 3] & mask) == type)
+                return true;
+            i += 2;
+        }
+    }
+    return false;
+}
+
+/* The keyframe gate: false means "drop this frame, decode nothing". Called once per
+ * frame at end_frame, when the frame's key-ness is known. A dropped frame leaves its
+ * target untouched -- the guest sees stale content, never a decode of garbage. */
+static bool frame_passes_keyframe_gate(struct virgl_video_codec *codec, bool is_key)
+{
+    if (!codec->await_keyframe)
+        return true;
+    if (is_key) {
+        if (codec->frames_dropped_awaiting_key)
+            virgl_warn("video: codec %p re-seeded by a keyframe after dropping %u inter "
+                       "frames\n", (void *)codec, codec->frames_dropped_awaiting_key);
+        codec->await_keyframe = false;
+        codec->frames_dropped_awaiting_key = 0;
+        return true;
+    }
+    if (!codec->frames_dropped_awaiting_key++)
+        virgl_warn("video: codec %p has no reference pictures yet; dropping inter frames "
+                   "until the stream's next keyframe\n", (void *)codec);
+    return false;
+}
+
 int virgl_video_begin_frame(struct virgl_video_codec *codec,
                             struct virgl_video_buffer *target)
 {
@@ -948,6 +996,7 @@ int virgl_video_begin_frame(struct virgl_video_codec *codec,
         return -1;
 
     codec->bitstream_len = 0;
+    codec->frame_is_key = false;
     VT_TRACE("begin_frame: target %u\n", target->id);
 
     return 0;
@@ -1126,6 +1175,8 @@ static int h264_decode_bitstream(struct virgl_video_codec *codec,
         VT_TRACE("h264: no slice header yet, %zu bytes buffered\n", codec->bitstream_len);
         return 0;
     }
+    if (annexb_has_nal_type(codec->bitstream, codec->bitstream_len, 0x1f, 5))
+        codec->frame_is_key = true;
 
     if (virgl_h264_build_parameter_sets(&desc->h264, codec->width, codec->height,
                                         codec->profile, pps_id, &ps))
@@ -1197,6 +1248,9 @@ static int h265_decode_bitstream(struct virgl_video_codec *codec,
      * therefore emit empty. A stream that does is refused here rather than decoded into
      * quietly wrong pixels.
      */
+    if (desc->h265.IDRPicFlag || desc->h265.RAPPicFlag)
+        codec->frame_is_key = true;
+
     rc = virgl_h265_slice_inspect(codec->bitstream, codec->bitstream_len, &desc->h265,
                                   &pps_id);
     if (rc < 0)
@@ -1258,6 +1312,8 @@ int virgl_video_decode_bitstream(struct virgl_video_codec *codec,
         return -1;
 
     vp9 = &desc->vp9;
+    /* frame_type 0 is KEY_FRAME; an intra-only frame does not refresh every slot. */
+    codec->frame_is_key = vp9->picture_parameter.pic_fields.frame_type == 0;
     codec->frame_profile = vp9->picture_parameter.profile;
     codec->frame_bit_depth =
         vp9->picture_parameter.bit_depth ? vp9->picture_parameter.bit_depth : 8;
@@ -1757,6 +1813,12 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
             codec->av1_desc.picture_parameter.pic_info_fields.frame_type == 0 &&
             codec->av1_desc.picture_parameter.pic_info_fields.show_frame;
 
+        if (!frame_passes_keyframe_gate(codec, starts_dpb)) {
+            codec->bitstream_len = 0;
+            codec->av1_desc_valid = false;
+            return 0;
+        }
+
         if (!ensure_unit(codec, codec->bitstream_len + VIRGL_AV1_UNIT_OVERHEAD))
             return -1;
 
@@ -1787,6 +1849,11 @@ int virgl_video_end_frame(struct virgl_video_codec *codec,
 
     if (!codec->bitstream_len)
         return 0;
+
+    if (!frame_passes_keyframe_gate(codec, codec->frame_is_key)) {
+        codec->bitstream_len = 0;
+        return 0;
+    }
 
     /*
      * H.264 and HEVC arrive Annex-B (mesa prepends a start code per slice) and VideoToolbox
