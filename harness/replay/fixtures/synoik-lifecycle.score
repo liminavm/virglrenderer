@@ -1,0 +1,11 @@
+prologue 0 / 0
+cmds 5283 / 5283
+ctl 324 / 324
+skipped flow-control 102
+skipped classic [3, 4, 2, 6, 7]
+unreplayable imports []
+parked 0
+census ctx=2 allocations=0
+iosurface ctx=2 backed=2
+census ctx=8 allocations=0
+iosurface ctx=8 backed=0

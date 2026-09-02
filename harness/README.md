@@ -71,7 +71,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `vn_command_*`: it is `#[repr(C)]`, so the C reads the memory the Rust decoder filled rather than
   a second construction of it, and nothing has to agree about filling. It needs the C toolchain, so
   it is behind a feature — `cargo run --release --features reply-oracle --bin venus-reply-oracle --
-  <corpus>`. Both corpora match on every command. A recorded command carries the guest's
+  <corpus>`. Every corpus matches on every command. A recorded command carries the guest's
   *request*, so its outputs arrive zeroed — and zero is the value that hides a content mistake,
   since two encoders reading different members of the same zeroed struct write the same bytes. The
   outputs are therefore planted with distinct values before encoding. Measured: a corruption that
@@ -81,8 +81,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh` with
   `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
   feed, the decode loop, the object table — and every command is accounted for rather than merely
-  parsed, which is what separates it from `venus-roundtrip`. Both corpora reach `cmds N/N` with no
-  `FAIL` line. What it catches is the layer between the bytes and Vulkan, and it caught two things
+  parsed, which is what separates it from `venus-roundtrip`. Every corpus reaches `cmds N/N` with
+  no `FAIL` line. What it catches is the layer between the bytes and Vulkan, and it caught two things
   already — a `VK_NULL_HANDLE` treated as a missing object, and every command after the first that
   named one.
 
@@ -120,8 +120,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   1280x800 scanout IOSurfaces go from distinct fully-inked hashes to one shared all-zero hash. An
   empty diff would mean the oracle measures nothing. `synoik.score` is the venus content fixture:
   its capture was taken mid-workload, so 22 device allocations are still live and half of them
-  carry GPU-written bytes. `venus.score` is the lifecycle fixture: vkmark runs to completion, and
-  every context censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there.
+  carry GPU-written bytes. `venus.score` and `synoik-lifecycle.score` are the lifecycle fixtures:
+  vkmark runs to completion and the synoik session is stopped before its dump, so every context
+  censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there. The two synoik
+  fixtures are one workload measured twice on purpose, and neither one can be the other: the
+  census scores memory that is still live, so the corpus that proves teardown has nothing left to
+  hash (`vm/README.md`).
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
