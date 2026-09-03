@@ -505,8 +505,12 @@ SABOTAGES = [
     (
         'saving the pipeline cache is refused again, and every GTK client dies after its first pipeline',
         'virglrs/src/venus/context.rs',
-        """    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {""",
-        """    fn unused_vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {""",
+        """    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {
+        let device = args.device;""",
+        """    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {
+        self.unsupported(VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT);
+        if true { return; }
+        let device = args.device;""",
         '',
     ),
     (
@@ -525,8 +529,12 @@ SABOTAGES = [
     (
         'merging pipeline caches is refused again',
         'virglrs/src/venus/context.rs',
-        """    fn vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {""",
-        """    fn unused_vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {""",
+        """    fn vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {
+        let srcs = args.pSrcCaches();""",
+        """    fn vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {
+        self.unsupported(VkCommandTypeEXT::VK_COMMAND_TYPE_vkMergePipelineCaches_EXT);
+        if true { return; }
+        let srcs = args.pSrcCaches();""",
         '',
     ),
     (
