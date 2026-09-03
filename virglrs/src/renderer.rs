@@ -881,7 +881,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
-        Some(self.resource_storage(handle)?.read_rows(dst, stride, height))
+        self.resource_storage(handle)?.read_rows(dst, stride, height)
     }
 
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
@@ -1192,6 +1192,40 @@ mod tests {
             table.bytes(three, blob).is_none(),
             "a context the guest never attached it to still reaches nothing"
         );
+
+        // The other shape of share -- pages minted for exportable memory -- resolves by the same
+        // rule. The gate is about the share, not about what the share is of.
+        let pages = Storage::pages_for_test(4096, &account);
+        let linear = ResourceHandle::new(2).unwrap();
+        table.insert(
+            linear,
+            Resource {
+                handle: linear,
+                backing: Backing::Blob {
+                    desc: BlobDesc {
+                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                        blob_flags: 1,
+                        source: BlobSource::Exported { ctx: one, mem: BlobId(67) },
+                        size: 4096,
+                    },
+                    host: None,
+                    storage: Some(pages.clone()),
+                },
+                iov: Vec::new(),
+                priv_: VmmPtr(core::ptr::null_mut()),
+                attached: vec![two],
+            },
+        );
+        assert_eq!(
+            match table.bytes(two, linear) {
+                Some(ResourceBytes::Shared(s)) => Some(s),
+                _ => None,
+            }
+            .as_ref(),
+            Some(&pages),
+            "pages resolve for the context attached to them, exporter or not"
+        );
+        assert!(table.bytes(one, linear).is_none(), "and not for the exporter once detached");
     }
 
     /// The VMM publishes a blob by asking where it lives, and it asks *after* the create --

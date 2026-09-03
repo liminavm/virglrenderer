@@ -44,6 +44,7 @@ use super::proto::types::{
 use std::sync::Arc;
 
 use super::ring::ResourceBytes;
+use crate::guest_mem::GuestMap;
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
 use crate::metal::{PixelFormat, Surface};
@@ -2499,6 +2500,31 @@ impl Driver {
         // does not recognise, and inventing a refusal here would fail allocations the C serves.
         let alias = import.and_then(|r| self.span(&resource_bytes(r)?));
         let surface = if import.is_some() { None } else { self.scanout_surface(device, &info) };
+        // The third shape: memory the guest asked to be able to export, that is not a window
+        // buffer. The driver would allocate it and later lend a mapping -- a pointer with the
+        // device's lifetime, which no other context could be handed. So the pages are minted here
+        // and the driver imports them, and the pages are what a resource can hold a share of.
+        // Only for memory the host can address: exporting a type it cannot is refused later,
+        // and minting pages for it would be storage nobody reaches. Plain host-visible memory
+        // the guest never asked to export keeps the driver's own allocation, unchanged.
+        let pages = if import.is_none()
+            && surface.is_none()
+            && exports_memory(info.pNext)
+            && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)
+        {
+            match GuestMap::anonymous(size_for_pages(info.allocationSize.0)?) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    eprintln!(
+                        "[virglrs] cannot mint {} bytes to export: {e}",
+                        info.allocationSize.0
+                    );
+                    return Err(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY));
+                }
+            }
+        } else {
+            None
+        };
         let mut host_pointer = VkImportMemoryHostPointerInfoEXT {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
             pNext: info.pNext,
@@ -2513,7 +2539,11 @@ impl Driver {
         // The pages back exactly this much, whoever owns them. The guest's figure is its own
         // image's size, and a request larger than the backing would let the driver address past
         // the end of it -- the one place a guest's arithmetic could reach outside the host's.
-        if let Some(span) = surface.as_ref().map(|s| (s.host_addr(), s.alloc_size())).or(alias) {
+        let owned = surface
+            .as_ref()
+            .map(|s| (s.host_addr(), s.alloc_size()))
+            .or(pages.as_ref().map(|p| (p.host_addr(), p.len() as u64)));
+        if let Some(span) = owned.or(alias) {
             host_pointer.pHostPointer = span.0 as *mut core::ffi::c_void;
             // Prepended, not spliced in: the guest's chain is the decoder's arena and the round
             // trip re-encodes it, so it is read here and never rewritten.
@@ -2528,13 +2558,17 @@ impl Driver {
         // charge goes into the surface rather than beside it: the surface may outlive this
         // allocation and this context, and the bytes are the host's for as long as it does. An
         // import commits nothing at all.
-        let (backing, charge) = match (import, surface) {
-            (Some(_), _) => (Backing::Imported, None),
-            (None, Some(surface)) => {
+        let (backing, charge) = match (import, surface, pages) {
+            (Some(_), _, _) => (Backing::Imported, None),
+            (None, Some(surface), _) => {
                 let charge = self.admit("IOSurface", surface.alloc_size())?;
                 (Backing::Scanout(Arc::new(Minted { surface, charge })), None)
             }
-            (None, None) => (Backing::Driver, Some(self.admit("device memory", size)?)),
+            (None, None, Some(map)) => {
+                let charge = self.admit("exported pages", map.len() as u64)?;
+                (Backing::Pages(Arc::new(Pages { map, charge })), None)
+            }
+            (None, None, None) => (Backing::Driver, Some(self.admit("device memory", size)?)),
         };
 
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
@@ -2618,9 +2652,12 @@ impl Driver {
     /// because the resource it names is the blob that publishing made.
     fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
         let record = self.memory.get(&id)?;
+        if let Some(span) = record.owned_span() {
+            return Some(span);
+        }
         match &record.backing {
-            Backing::Scanout(m) => Some((m.surface.host_addr(), m.surface.alloc_size())),
             Backing::Driver => Some((record.exported?, record.size)),
+            Backing::Scanout(_) | Backing::Pages(_) => unreachable!("owned storage answered above"),
             Backing::Imported => None,
         }
     }
@@ -2794,14 +2831,13 @@ impl Driver {
         if record.exported.is_some() {
             return Err(ExportError::AlreadyExported);
         }
-        if let Some(surface) = record.surface() {
-            // A scanout is published as the surface it already is. There is nothing to map: the
-            // pages are the surface's, the driver imported them, and the address is the one the
-            // compositor will read the same bytes through.
-            if blob_size > surface.alloc_size() {
+        if let Some((addr, len)) = record.owned_span() {
+            // Storage this renderer minted -- a surface or pages -- is published as what it
+            // already is. There is nothing to map: the driver imported these pages, and the
+            // address is the one every other holder of the share reads the same bytes through.
+            if blob_size > len {
                 return Err(ExportError::LargerThanAllocation);
             }
-            let addr = surface.host_addr();
             let write_back = record.write_back();
             let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
             record.exported = Some(addr);
@@ -2879,6 +2915,13 @@ impl Driver {
             return Ok(surface.read_into(buf));
         }
         let size = record.size;
+        // Minted pages are host memory this renderer owns, coherent like any anonymous page, and
+        // there is nothing for `vkMapMemory` to map -- the driver imported them.
+        if let Backing::Pages(p) = &record.backing {
+            let n = buf.len().min(size as usize);
+            assert!(p.map.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
+            return Ok(n);
+        }
         let Some(d) = self.devices.get(&device) else {
             return Err(MemoryError::NoSuchAllocation);
         };
@@ -2968,6 +3011,14 @@ enum Backing {
     /// [`crate::metal::Surface::read_into`], because a surface read without its lock sees
     /// whatever the CPU's view last held rather than what the GPU wrote.
     Scanout(Arc<Minted>),
+    /// Pages this renderer minted because the guest asked for memory it could export: the
+    /// allocation is a host-pointer import of them, so the memory *is* the pages, and the pages
+    /// are what a resource holds a share of.
+    ///
+    /// Publishing hands out the pages' address, which they own -- nothing to unmap, and dropping
+    /// the last share is what releases them. Only for memory the host can address: an export of
+    /// a type it cannot would be storage nobody could reach.
+    Pages(Arc<Pages>),
     /// Storage another context owns, which this allocation only aliases.
     ///
     /// A guest imports when one context has to reach what another rendered -- a compositor
@@ -2991,6 +3042,17 @@ impl Allocated {
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
             Backing::Scanout(m) => Some(&m.surface),
+            Backing::Driver | Backing::Pages(_) | Backing::Imported => None,
+        }
+    }
+
+    /// Where storage this record *owns* lives, before anyone has asked to publish it: a surface's
+    /// pages or minted pages. Driver memory has no address until it is mapped, and an import's
+    /// address is someone else's.
+    fn owned_span(&self) -> Option<(usize, u64)> {
+        match &self.backing {
+            Backing::Scanout(m) => Some((m.surface.host_addr(), m.surface.alloc_size())),
+            Backing::Pages(p) => Some(p.span()),
             Backing::Driver | Backing::Imported => None,
         }
     }
@@ -2998,17 +3060,23 @@ impl Allocated {
     /// A share of the storage behind it, for a resource that must go on naming these bytes after
     /// the context that allocated them is gone.
     ///
-    /// Only a surface can be shared today. Ordinary device memory is published as a borrowed
-    /// `vkMapMemory` pointer whose lifetime is the device's, and handing that to another context
-    /// would be exactly the dangling the resource's share exists to prevent -- so it answers
-    /// `None`, and the caller refuses rather than sharing something it cannot keep alive.
+    /// Storage this renderer minted can be shared: a surface, or pages. Driver memory cannot --
+    /// it is published as a borrowed `vkMapMemory` pointer whose lifetime is the device's, and
+    /// handing that to another context would be exactly the dangling the share exists to prevent
+    /// -- so it answers `None`, and the caller refuses rather than sharing what it cannot keep
+    /// alive. That is only ever memory the guest exported without having asked, at allocation,
+    /// for memory it could export.
     fn shared(&self) -> Option<Storage> {
+        // From here the storage may outlive this context, so its charge stops being this
+        // context's alone. See [`Charge::share`].
         match &self.backing {
             Backing::Scanout(m) => {
-                // From here the surface may outlive this context, so its charge stops being
-                // this context's alone. See [`Charge::share`].
                 m.charge.share();
                 Some(Storage::Texture(Arc::clone(m)))
+            }
+            Backing::Pages(p) => {
+                p.charge.share();
+                Some(Storage::Linear(Arc::clone(p)))
             }
             Backing::Driver | Backing::Imported => None,
         }
@@ -3023,7 +3091,7 @@ impl Allocated {
     /// take that lock.
     fn censused(&self) -> bool {
         match self.backing {
-            Backing::Driver => self.exported.is_none(),
+            Backing::Driver | Backing::Pages(_) => self.exported.is_none(),
             Backing::Scanout(_) => true,
             Backing::Imported => false,
         }
@@ -3083,6 +3151,24 @@ pub enum Storage {
     /// every Vulkan object that ever imported them -- it depends on no device, no instance and no
     /// object table, so nothing cascades from holding one.
     Texture(Arc<Minted>),
+    /// Pages this renderer minted for an allocation the guest meant to share, and handed the
+    /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
+    /// fences are the only barrier over them, as they are for any host-visible allocation.
+    Linear(Arc<Pages>),
+}
+
+/// Pages this renderer minted for a shareable allocation, and what they cost -- one value, for
+/// the same reason as [`Minted`]: a resource holding a share keeps them alive past the
+/// allocation and the context, and they are the host's to count for as long as it does.
+pub struct Pages {
+    map: GuestMap,
+    charge: Charge,
+}
+
+impl Pages {
+    fn span(&self) -> (usize, u64) {
+        (self.map.host_addr(), self.map.len() as u64)
+    }
 }
 
 /// A surface this renderer minted, and what it cost -- one value, because they have one lifetime.
@@ -3103,6 +3189,14 @@ impl Storage {
         let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
         Storage::Texture(Arc::new(Minted { surface, charge }))
     }
+
+    /// A share over pages this renderer minted, charged to `account`, for the same tests.
+    #[cfg(test)]
+    pub(crate) fn pages_for_test(len: usize, account: &Account) -> Storage {
+        let map = GuestMap::anonymous(len).expect("the host has pages");
+        let charge = account.try_charge("exported pages", map.len() as u64).expect("no cap");
+        Storage::Linear(Arc::new(Pages { map, charge }))
+    }
 }
 
 /// Two shares are the same share when they name the same storage -- not when they describe
@@ -3111,6 +3205,9 @@ impl PartialEq for Storage {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Storage::Texture(a), Storage::Texture(b)) => Arc::ptr_eq(a, b),
+            (Storage::Linear(a), Storage::Linear(b)) => Arc::ptr_eq(a, b),
+            (Storage::Texture(_), Storage::Linear(_))
+            | (Storage::Linear(_), Storage::Texture(_)) => false,
         }
     }
 }
@@ -3123,6 +3220,7 @@ impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface.id()).finish(),
+            Storage::Linear(p) => f.debug_tuple("Linear").field(&p.map.len()).finish(),
         }
     }
 }
@@ -3132,20 +3230,27 @@ impl Storage {
     pub fn span(&self) -> (usize, u64) {
         match self {
             Storage::Texture(m) => (m.surface.host_addr(), m.surface.alloc_size()),
+            Storage::Linear(p) => p.span(),
         }
     }
 
-    /// The surface's id, for the presentation path that publishes one.
+    /// The surface's id, for the presentation path that publishes one. Pages have none: a
+    /// buffer presented from them is read back rather than adopted.
     pub fn surface_id(&self) -> Option<SurfaceId> {
         match self {
             Storage::Texture(m) => Some(m.surface.id()),
+            Storage::Linear(_) => None,
         }
     }
 
     /// Copy the presented pixels out, `stride` bytes per row, under the surface's own lock.
-    pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> u32 {
+    ///
+    /// `None` for storage that is not a surface -- there is nothing to read *presented* pixels
+    /// from, which is a different answer from a surface that read nothing.
+    pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> Option<u32> {
         match self {
-            Storage::Texture(m) => m.surface.read_rows(dst, stride, height),
+            Storage::Texture(m) => Some(m.surface.read_rows(dst, stride, height)),
+            Storage::Linear(_) => None,
         }
     }
 }
@@ -3201,6 +3306,18 @@ pub enum MemoryError {
 ///
 /// Only host-visible memory, because only host-visible memory is ever mapped; and never an import,
 /// which aliases bytes that already exist at a size the exporter fixed.
+/// How many bytes to mint for an allocation of `size`, as the host counts them.
+///
+/// `None` is a size this host cannot hold: the guest's own number, unbounded, and the driver
+/// would have refused it too. It is answered with the driver's refusal rather than a mint that
+/// wraps.
+fn size_for_pages(size: u64) -> Result<usize, NoMemory> {
+    usize::try_from(size)
+        .ok()
+        .and_then(crate::guest_mem::page_round)
+        .ok_or(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY))
+}
+
 fn pad_for_blob(size: u64, flags: Option<VkMemoryPropertyFlags>, imported: bool) -> u64 {
     /// Blobs are counted in 64 KiB units.
     const BLOB_ALIGN: u64 = 64 * 1024;
@@ -3885,6 +4002,149 @@ mod tests {
                 (&raw const external).cast(),
             ),
         );
+    }
+
+    /// Memory the guest asks to be able to export is backed by pages this renderer minted, handed
+    /// to the driver by host-pointer import -- so that the pages, and not a mapping the driver
+    /// lends, are what a resource can hold a share of.
+    ///
+    /// Three things have to be true of it at once. The driver was handed our pages and nothing
+    /// else. Publishing it maps nothing: the address is the pages', so `vkMapMemory` is never
+    /// asked. And the share carries the charge, so the pages stay counted for as long as any
+    /// holder has them, whatever happened to the allocation.
+    #[test]
+    fn exportable_memory_is_backed_by_pages_this_renderer_minted() {
+        use super::super::budget::Budget;
+        use super::super::proto::types::{
+            VkExportMemoryAllocateInfo, VkExternalMemoryHandleTypeFlags,
+        };
+        use std::cell::Cell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const ASKED: u64 = 100_000;
+
+        thread_local! {
+            /// What the driver was handed: the imported pointer, and the size it was told.
+            static GIVEN: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+            static MAPPED: Cell<bool> = const { Cell::new(false) };
+        }
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's locals, and a chain the caller built for this call.
+            unsafe {
+                let info = &*info;
+                let mut node = info.pNext;
+                let mut ptr = 0usize;
+                while !node.is_null() {
+                    let base = &*node.cast::<VkBaseInStructure>();
+                    if base.sType
+                        == VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT
+                    {
+                        ptr = (*node.cast::<VkImportMemoryHostPointerInfoEXT>()).pHostPointer
+                            as usize;
+                    }
+                    node = base.pNext.cast();
+                }
+                GIVEN.with(|g| g.set((ptr, info.allocationSize.0)));
+                *out = VkDeviceMemory(0x9000);
+            }
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn map(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _f: VkMemoryMapFlags,
+            _out: *mut *mut core::ffi::c_void,
+        ) -> VkResult {
+            MAPPED.with(|m| m.set(true));
+            VkResult::VK_ERROR_MEMORY_MAP_FAILED
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        let budget = Budget::with_cap(None, false);
+        let one = crate::ids::CtxId::new(1).expect("not zero");
+        let mut d = Driver::new(Account::open(&budget, one));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        fns.plant_vkMapMemory(map);
+        fns.plant_vkFreeMemory(free);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(
+            DEVICE,
+            &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT)],
+        );
+
+        let export = VkExportMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            pNext: core::ptr::null(),
+            handleTypes: VkExternalMemoryHandleTypeFlags(1),
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const export).cast(),
+            allocationSize: VkDeviceSize(ASKED),
+            memoryTypeIndex: 0,
+        };
+        d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
+
+        let (ptr, told) = GIVEN.with(Cell::get);
+        let page = crate::guest_mem::page_size();
+        assert_ne!(ptr, 0, "the driver was handed pages rather than asked for memory");
+        assert_eq!(ptr % page, 0, "pages start on a page, which every import alignment divides");
+        let padded = pad_for_blob(ASKED, Some(VkMemoryPropertyFlags(HOST_VISIBLE_BIT)), false);
+        assert_eq!(told, padded, "and told the guest's padded figure, which the pages cover");
+        let span = d.aliased_span(ObjectId(1)).expect("minted pages have an address");
+        assert_eq!(span.0, ptr, "the address a later import aliases is the one the driver got");
+        assert!(span.1 >= padded, "the pages cover everything the driver was told it has");
+        assert_eq!(budget.live(), span.1, "charged for the pages, as 'exported pages'");
+
+        // Publishing is a matter of saying where the pages are. Nothing is mapped.
+        let (published, share) =
+            d.memory_export(DEVICE, VkDeviceMemory(0x9000), ObjectId(1), ASKED).expect("exports");
+        assert_eq!(published.addr, ptr);
+        assert!(published.write_back, "coherent and cached, as the type says");
+        assert!(!MAPPED.with(Cell::get), "the driver was never asked to map what it imported");
+        let share = share.expect("pages lend a share");
+        assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
+        assert_eq!(share.span(), span, "resolving to exactly what the driver was handed");
+        assert_eq!(budget.live_for(one), 0, "shared, so no longer this context's alone");
+
+        // The census reads the pages themselves -- coherent host memory -- not a driver mapping.
+        let mut buf = vec![0u8; 16];
+        assert_eq!(d.memory_read(DEVICE, VkDeviceMemory(0x9000), ObjectId(1), &mut buf), Ok(16));
+        assert!(!MAPPED.with(Cell::get), "still never mapped");
+
+        // The allocation goes; the share keeps the pages, and the ledger keeps counting them.
+        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
+        assert_eq!(budget.live(), span.1, "the share is what keeps the pages counted now");
+        drop(share);
+        assert_eq!(budget.live(), 0, "and the last share going is what credits them");
+
+        // Plain host-visible memory the guest never asked to export is the driver's own, as it
+        // always was: the two paths are not unified, because their coherency has not been measured
+        // to be the same.
+        let plain = VkMemoryAllocateInfo { pNext: core::ptr::null(), ..info };
+        GIVEN.with(|g| g.set((0, 0)));
+        d.allocate_memory(DEVICE, ObjectId(2), &plain, None, &|_| None).expect("no cap");
+        assert_eq!(GIVEN.with(Cell::get).0, 0, "no pages were handed over for it");
+        assert!(
+            d.memory.get(&ObjectId(2)).expect("here").shared().is_none(),
+            "and it lends no share"
+        );
+        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
+
+        d.abandon_planted();
     }
 
     /// A scanout is charged at the surface's own extent, not at the number in the request.

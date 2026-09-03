@@ -90,6 +90,44 @@ impl GuestMap {
         Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len })
     }
 
+    /// Map `len` bytes of fresh anonymous memory, rounded up to whole pages.
+    ///
+    /// This is the host minting storage for a Vulkan allocation the guest means to share: the
+    /// driver is handed these pages by host-pointer import instead of memory of its own, so that
+    /// the pages -- and not a mapping the driver lends -- are what a resource can hold a share of.
+    /// No descriptor, because nothing needs one: the share travels inside this process as an
+    /// `Arc`, and on this platform nothing re-imports a buffer by descriptor across contexts.
+    ///
+    /// Page-rounded because a host-pointer import requires both the pointer and the size to be
+    /// multiples of the driver's import alignment, and a whole number of pages satisfies every
+    /// alignment a driver reports.
+    pub fn anonymous(len: usize) -> io::Result<GuestMap> {
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot map zero bytes"));
+        }
+        let len = page_round(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "size overflows when paged")
+        })?;
+        // SAFETY: a null hint lets the kernel choose the address; `len` is non-zero and
+        // page-rounded; an anonymous private mapping names no descriptor.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: mmap returned something other than MAP_FAILED, so it is a valid mapping of
+        // `len` bytes and is never null.
+        Ok(GuestMap { ptr: unsafe { NonNull::new_unchecked(ptr.cast::<u8>()) }, len })
+    }
+
     /// Where the mapping starts in this process.
     ///
     /// An address, not a pointer: this is for handing to a VMM that will publish it to a guest,
