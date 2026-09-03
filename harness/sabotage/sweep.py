@@ -184,6 +184,33 @@ SABOTAGES = [
         '',
         '',
     ),
+    (
+        'an image-to-buffer copy hands the driver no regions',
+        'virglrs/src/venus/driver.rs',
+        '''            (d.vkCmdCopyImageToBuffer())(
+                cb,
+                src,
+                layout,
+                dst,
+                regions.len() as u32,
+                regions.as_ptr(),
+            )''',
+        '''            (d.vkCmdCopyImageToBuffer())(cb, src, layout, dst, 0, regions.as_ptr())''',
+        '',
+    ),
+    (
+        'an image-to-buffer copy never reaches the driver at all',
+        'virglrs/src/venus/context.rs',
+        '''        let done = self.driver.cmd_copy_image_to_buffer(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstBuffer,
+            regions,
+        );''',
+        '''        let done = Some(());''',
+        '',
+    ),
 ]
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
