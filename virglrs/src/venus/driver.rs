@@ -158,6 +158,16 @@ impl Pools {
         }
     }
 
+    /// Whether every one of `children` was allocated from `pool`, and is still held by it.
+    ///
+    /// The one question a free has to ask before the driver is: Vulkan's free takes the pool and
+    /// the objects as separate arguments, and a guest that pairs them wrongly is asking for
+    /// undefined behaviour on the host. The table already knows the answer, per child.
+    fn all_from<P: PoolOf>(&self, pool: P, children: &[P::Child]) -> bool {
+        let pool = TypedHandle::of(pool);
+        children.iter().all(|c| self.owner.get(&TypedHandle::of(*c)) == Some(&pool))
+    }
+
     /// Forget objects freed back to their pool. The pool each belongs to is looked up rather than
     /// passed in, so a caller cannot name the wrong one.
     fn release<T: Handle>(&mut self, children: impl IntoIterator<Item = T>) {
@@ -199,6 +209,15 @@ impl Pools {
             })
             .collect()
     }
+}
+
+/// Why a run of pool objects was not freed. Neither reached the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreeRefused {
+    /// The device named has no table here.
+    NoDevice,
+    /// At least one object in the run is not the pool's -- another pool's, or already freed.
+    NotFromThisPool,
 }
 
 /// Why no memory was allocated.
@@ -1544,31 +1563,36 @@ impl Driver {
         Err(r)
     }
 
-    /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
-    ///
-    /// Free a run of objects back to the pool they came from.
-    /// Free a run of pool children, handing back whatever the driver's free returns.
+    /// Free a run of pool children back to the pool that allocated them, handing back whatever
+    /// the driver's free returns.
     ///
     /// `R` is `()` for `vkFreeCommandBuffers` and `VkResult` for `vkFreeDescriptorSets` -- the
-    /// one free in Vulkan with a return, which the spec says is always `VK_SUCCESS`. `None` is
-    /// nothing to free: an empty run, a pool that is not open, a device this driver has no table
-    /// for. None of those is an error, and none reached the driver.
+    /// one free in Vulkan with a return, which the spec says is always `VK_SUCCESS`. An empty run
+    /// is the caller's to short-circuit: there is nothing here to check for it.
+    ///
+    /// Every object has to be `pool`'s, and that is checked before the driver is called rather
+    /// than trusted: a guest pairing a pool with another pool's objects is asking for undefined
+    /// behaviour on the host while the pool is open, and while it is closed would have the
+    /// objects forgotten from the guest's table and not from the pool that still holds them --
+    /// which hands them back at that pool's destroy, to remove whatever the guest has since
+    /// named by the same ids.
     pub fn free_objects<P: PoolOf, R>(
         &mut self,
         device: VkDevice,
         proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const P::Child) -> R,
         pool: P,
         objects: &[P::Child],
-    ) -> Option<R> {
-        let d = self.devices.get(&device)?;
-        if objects.is_empty() || !self.pools.is_open(pool) {
-            return None;
+    ) -> Result<R, FreeRefused> {
+        let d = self.devices.get(&device).ok_or(FreeRefused::NoDevice)?;
+        if !self.pools.all_from(pool, objects) {
+            return Err(FreeRefused::NotFromThisPool);
         }
-        // SAFETY: handles this context allocated, and the count Vulkan is given is the slice's own
-        // length. The generated lifecycle hook removes the ids from the object table exactly once.
+        // SAFETY: handles this context allocated from this pool -- just checked -- and the count
+        // Vulkan is given is the slice's own length. The generated lifecycle hook removes the
+        // ids from the object table exactly once.
         let r = unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
         self.pools.release(objects.iter().copied());
-        Some(r)
+        Ok(r)
     }
 
     /// Register a device with a hand-built proc table, as `create_device` would have.

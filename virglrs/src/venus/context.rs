@@ -1105,6 +1105,23 @@ impl Handlers<'_> {
         a.unwrap_or_default()
     }
 
+    /// The verdict on a free, for both frees. A run that was not the pool's is the guest naming
+    /// objects it does not hold under that pool, and the command is refused for it; a device
+    /// with no table here is the same. Neither reached the driver.
+    fn freed<R>(&mut self, r: Result<R, driver::FreeRefused>) -> Option<R> {
+        match r {
+            Ok(r) => Some(r),
+            Err(driver::FreeRefused::NotFromThisPool) => {
+                self.reject = Some("frees objects the pool it names did not allocate");
+                None
+            }
+            Err(driver::FreeRefused::NoDevice) => {
+                self.reject = Some("frees from a pool on a device with no table here");
+                None
+            }
+        }
+    }
+
     /// Refuse every id in a run the guest sent.
     ///
     /// The generated lifecycle hook walks the whole array whatever the handler did with it, so
@@ -1676,24 +1693,34 @@ impl Commands for Handlers<'_> {
 
     fn vkFreeCommandBuffers(&mut self, args: &mut vn_command_vkFreeCommandBuffers<'_>) {
         let buffers = self.array_or_empty(args.pCommandBuffers());
-        self.driver.free_objects(
+        if buffers.is_empty() {
+            return;
+        }
+        let r = self.driver.free_objects(
             args.device,
             |d| d.vkFreeCommandBuffers(),
             args.commandPool,
             buffers,
         );
+        self.freed(r);
     }
 
     fn vkFreeDescriptorSets(&mut self, args: &mut vn_command_vkFreeDescriptorSets<'_>) {
         let sets = self.array_or_empty(args.pDescriptorSets());
+        // The spec's answer is always success, and freeing nothing is not a failure either.
+        args.ret = VkResult::VK_SUCCESS;
+        if sets.is_empty() {
+            return;
+        }
         let r = self.driver.free_objects(
             args.device,
             |d| d.vkFreeDescriptorSets(),
             args.descriptorPool,
             sets,
         );
-        // The spec's answer is always success, and freeing nothing is not a failure either.
-        args.ret = r.unwrap_or(VkResult::VK_SUCCESS);
+        if let Some(ret) = self.freed(r) {
+            args.ret = ret;
+        }
     }
 
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
@@ -8840,6 +8867,34 @@ mod tests {
         h.vkFreeDescriptorSets(&mut args);
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w.len(), 1, "an empty run is answered without a call"));
+
+        // A set under a pool that did not allocate it is refused before the driver sees the
+        // pair: the driver would free it from the wrong pool, and the pool that holds it would
+        // go on holding a handle the driver has reused.
+        const OTHER: u64 = 8;
+        h.driver.plant_pool(VkDevice(DEVICE), VkDescriptorPool(OTHER), &[]);
+        let two = [VkDescriptorSet(SETS[1].0)];
+        let mut args = vn_command_vkFreeDescriptorSets::default();
+        args.device = VkDevice(DEVICE);
+        args.descriptorPool = VkDescriptorPool(OTHER);
+        args.plant_pDescriptorSets(&two);
+        h.vkFreeDescriptorSets(&mut args);
+        assert!(h.reject.take().is_some(), "a run that is not the pool's is refused");
+        SAW.with_borrow(|w| assert_eq!(w.len(), 1, "and never reached the driver"));
+        assert_eq!(
+            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[1].0)),
+            Some(ObjectId(SETS[1].1)),
+            "its own pool still holds it"
+        );
+
+        // So is a set freed twice: the second time it is nobody's.
+        let mut args = vn_command_vkFreeDescriptorSets::default();
+        args.device = VkDevice(DEVICE);
+        args.descriptorPool = VkDescriptorPool(POOL);
+        args.plant_pDescriptorSets(&one);
+        h.vkFreeDescriptorSets(&mut args);
+        assert!(h.reject.take().is_some(), "a set already freed is not the pool's to free again");
+        SAW.with_borrow(|w| assert_eq!(w.len(), 1));
 
         h.driver.abandon_planted();
     }

@@ -549,6 +549,17 @@ SABOTAGES = [
         '',
     ),
     (
+        'a free is handed to the driver under whatever pool the guest named',
+        'virglrs/src/venus/driver.rs',
+        """        if !self.pools.all_from(pool, objects) {
+            return Err(FreeRefused::NotFromThisPool);
+        }""",
+        """        if !self.pools.is_open(pool) {
+            return Err(FreeRefused::NotFromThisPool);
+        }""",
+        'freeing_descriptor_sets_releases_them_from_their_pool',
+    ),
+    (
         'saving the pipeline cache is refused again, and every GTK client dies after its first pipeline',
         'virglrs/src/venus/context.rs',
         """    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {
