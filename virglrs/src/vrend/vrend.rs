@@ -13,8 +13,9 @@
 //! `vrend_hw_switch_context` does: every entry point names the context it needs, and the switch
 //! is one place rather than a habit.
 
+use super::context::{Context, Current, Fault, Guest, Host, Todo};
 use super::egl::{self, EglError, Flavour, Version, Winsys};
-use super::features::Features;
+use super::features::{Feature, Features};
 use super::formats::Table;
 use super::gl::Gl;
 use super::gl::gles::GL_VERSION;
@@ -48,18 +49,6 @@ impl From<EglError> for InitError {
     }
 }
 
-/// A guest context's host side.
-pub struct Context {
-    gl_ctx: egl::Context,
-}
-
-/// Which GL context is current on the calling thread.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Current {
-    Ctx0,
-    Ctx(CtxId),
-}
-
 pub struct Vrend {
     winsys: Winsys,
     gl: Gl,
@@ -67,9 +56,12 @@ pub struct Vrend {
     pub formats: Table,
     pub limits: Limits,
     ctx0: egl::Context,
+    /// The version guest contexts are made with: the newest the driver gave ctx0.
+    version: Version,
     current: Current,
     resources: BTreeMap<ResourceHandle, Resource>,
     contexts: BTreeMap<CtxId, Context>,
+    pub todo: Todo,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -86,20 +78,23 @@ impl Vrend {
         let mut ctx0 = None;
         for v in VERSIONS {
             if let Ok(c) = winsys.create_context(v, None) {
-                ctx0 = Some(c);
+                ctx0 = Some((c, v));
                 break;
             }
         }
-        let ctx0 = ctx0.ok_or(InitError::NoContext)?;
+        let (ctx0, version) = ctx0.ok_or(InitError::NoContext)?;
         winsys.make_current(&ctx0)?;
         let gl = Gl::new(winsys.gles());
-        let version = gl.get_string(GL_VERSION);
-        let gles_version = parse_gles_version(&version);
-        let features = Features::probe(gles_version, gl.extensions());
-        let limits = Limits::query(&gl);
+        let version_string = gl.get_string(GL_VERSION);
+        let gles_version = parse_gles_version(&version_string);
+        let mut features = Features::probe(gles_version, gl.extensions());
+        if !winsys.has_extension("EGL_KHR_gl_colorspace") {
+            features.clear(Feature::srgb_write_control);
+        }
+        let limits = Limits::query(&gl, &features);
         let formats = Table::probe(&gl, &features);
         eprintln!(
-            "[virglrs] vrend: {version} (gles {gles_version}), {} formats, {} features",
+            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features",
             formats.entries().count(),
             features.present().count(),
         );
@@ -110,9 +105,11 @@ impl Vrend {
             formats,
             limits,
             ctx0,
+            version,
             current: Current::Ctx0,
             resources: BTreeMap::new(),
             contexts: BTreeMap::new(),
+            todo: Todo::default(),
         })
     }
 
@@ -128,42 +125,73 @@ impl Vrend {
         }
     }
 
-    /// Make a guest context current. `false` if there is no such context.
-    fn switch_to(&mut self, id: CtxId) -> bool {
-        let Some(c) = self.contexts.get(&id) else {
-            return false;
+    /// The host a context's commands run against, and the contexts beside it: two disjoint
+    /// borrows of this renderer, so a context can run against the rest of it.
+    fn split<'a>(
+        &'a mut self,
+        ctx: CtxId,
+        guest: &'a dyn Guest,
+    ) -> (Host<'a>, &'a mut BTreeMap<CtxId, Context>) {
+        let Vrend {
+            winsys,
+            gl,
+            features,
+            formats,
+            limits,
+            ctx0,
+            version,
+            current,
+            resources,
+            contexts,
+            todo,
+        } = self;
+        let host = Host {
+            gl,
+            winsys,
+            version: *version,
+            share: ctx0,
+            features,
+            formats,
+            limits,
+            resources,
+            guest,
+            ctx,
+            current,
+            todo,
         };
-        if self.current != Current::Ctx(id) {
-            self.winsys
-                .make_current(&c.gl_ctx)
-                .expect("a guest context that exists can be made current");
-            self.current = Current::Ctx(id);
-        }
-        true
+        (host, contexts)
     }
 
     // ---- contexts ----
 
-    pub fn context_create(&mut self, id: CtxId) -> Result<(), EglError> {
-        let version = VERSIONS
-            .iter()
-            .copied()
-            .find(|v| self.features.gles_version >= v.major * 10 + v.minor)
-            .unwrap_or(VERSIONS[2]);
-        let gl_ctx = self.winsys.create_context(version, Some(&self.ctx0))?;
-        self.contexts.insert(id, Context { gl_ctx });
+    pub fn context_create(&mut self, id: CtxId, guest: &dyn Guest) -> Result<(), EglError> {
+        let (mut host, contexts) = self.split(id, guest);
+        let c = Context::new(&mut host)?;
+        contexts.insert(id, c);
         Ok(())
     }
 
-    pub fn context_destroy(&mut self, id: CtxId) {
-        if self.current == Current::Ctx(id) {
-            self.switch_ctx0();
+    pub fn context_destroy(&mut self, id: CtxId, guest: &dyn Guest) {
+        let (mut host, contexts) = self.split(id, guest);
+        if let Some(c) = contexts.remove(&id) {
+            c.destroy(&mut host);
         }
-        self.contexts.remove(&id);
+        self.switch_ctx0();
     }
 
     pub fn has_context(&self, id: CtxId) -> bool {
         self.contexts.contains_key(&id)
+    }
+
+    /// Run a batch on a context. `None` for a context this renderer does not have.
+    pub fn submit(
+        &mut self,
+        id: CtxId,
+        words: &[u32],
+        guest: &dyn Guest,
+    ) -> Option<Result<(), Fault>> {
+        let (mut host, contexts) = self.split(id, guest);
+        contexts.get_mut(&id).map(|c| c.submit(&mut host, words))
     }
 
     // ---- resources ----
@@ -234,9 +262,12 @@ impl Vrend {
     ) -> Result<(), transfer::Error> {
         match ctx {
             Some(id) => {
-                if !self.switch_to(id) {
+                if !self.contexts.contains_key(&id) {
                     return Err(transfer::Error::NoPages);
                 }
+                // The context's current sub-context owns the GL context to run on.
+                let (mut host, contexts) = self.split(id, &NoGuest);
+                contexts[&id].make_current(&mut host);
             }
             None => self.switch_ctx0(),
         }
@@ -249,6 +280,19 @@ impl Vrend {
         } else {
             transfer::read(&self.gl, &self.formats, res, own, pages, info)
         }
+    }
+}
+
+/// A guest that answers nothing: for a switch of GL context, which asks nothing of the guest.
+struct NoGuest;
+
+impl Guest for NoGuest {
+    fn attached(&self, _: CtxId, _: ResourceHandle) -> bool {
+        false
+    }
+
+    fn pages(&self, _: CtxId, _: ResourceHandle) -> Option<Iov<'_>> {
+        None
     }
 }
 
@@ -271,6 +315,8 @@ mod tests {
     #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn the_host_table_for_the_corpus_formats() {
         let v = Vrend::new().expect("vrend comes up");
+        let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
+        eprintln!("features: {}", present.join(" "));
         for raw in [1, 2, 20, 48, 49, 64, 65, 67, 131, 134, 177, 227] {
             let f = super::super::proto::Format::from_wire(raw).unwrap();
             eprintln!("{raw:>4} {:<24} {:?}", f.name(), v.formats.get(f));

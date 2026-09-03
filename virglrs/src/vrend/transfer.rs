@@ -16,7 +16,7 @@
 
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
-use super::gl::{GLenum, GLint, GLsizei, Gl, pixel_bytes};
+use super::gl::{GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
 use super::proto::Box3;
 use super::resource::{Resource, Storage};
 use crate::guest_mem::Iov;
@@ -138,7 +138,7 @@ impl Layout {
 }
 
 /// `resource_contains_box`.
-fn contains_box(res: &Resource, b: &Box3, level: u32) -> bool {
+pub fn contains_box(res: &Resource, b: &Box3, level: u32) -> bool {
     if level > res.args.last_level {
         return false;
     }
@@ -241,7 +241,7 @@ fn flip_rows(data: &mut [u8], l: &Layout) {
 }
 
 /// `vrend_format_is_bgra`: the formats GLES stores as RGBA and swaps on the way through.
-fn is_bgra(name: &str) -> bool {
+pub fn is_bgra(name: &str) -> bool {
     matches!(name, "B8G8R8X8_UNORM" | "B8G8R8A8_UNORM" | "B8G8R8X8_SRGB" | "B8G8R8A8_SRGB")
 }
 
@@ -316,7 +316,7 @@ pub fn write(
             }
             Ok(())
         }
-        Storage::Buffer { name, target } => {
+        Storage::Buffer { name, target, .. } => {
             let (name, target) = (*name, *target);
             let (x, w) = (b.x as usize, b.width as usize);
             let mut flags = GL_MAP_INVALIDATE_RANGE_BIT;
@@ -460,27 +460,61 @@ pub fn attachment_for(res: &Resource, formats: &Table) -> GLenum {
     }
 }
 
-/// Attach `level`/`layer` of a texture to the bound framebuffer at `attachment`.
-pub fn attach(gl: &Gl, res: &Resource, attachment: GLenum, level: GLint, layer: GLint) -> bool {
+/// Attach `level` of a texture to the bound framebuffer at `attachment`: one `layer` of it, or
+/// every layer when `None` (`vrend_fb_bind_texture_id` with a layer of -1). `false` when the
+/// resource is not a texture or the driver lacks the entry point the shape needs.
+pub fn attach(
+    gl: &Gl,
+    res: &Resource,
+    attachment: GLenum,
+    level: GLint,
+    layer: Option<GLint>,
+) -> bool {
     let Storage::Texture { name, target, .. } = &res.storage else {
         return false;
     };
-    match *target {
-        GL_TEXTURE_2D_ARRAY | GL_TEXTURE_2D_MULTISAMPLE_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY => {
-            gl.framebuffer_texture_layer(attachment, Some(*name), level, layer)
+    attach_texture(gl, *target, *name, attachment, level, layer)
+}
+
+/// [`attach`] for a texture named directly -- a resource's own, or a view of it.
+pub fn attach_texture(
+    gl: &Gl,
+    target: GLenum,
+    name: TextureName,
+    attachment: GLenum,
+    level: GLint,
+    layer: Option<GLint>,
+) -> bool {
+    let name = &name;
+    match (target, layer) {
+        (
+            GL_TEXTURE_2D_ARRAY
+            | GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+            | GL_TEXTURE_CUBE_MAP_ARRAY
+            | GL_TEXTURE_3D
+            | GL_TEXTURE_CUBE_MAP,
+            None,
+        ) => {
+            if !gl.framebuffer_texture(attachment, Some(*name), level) {
+                return false;
+            }
         }
-        GL_TEXTURE_3D => {
+        (
+            GL_TEXTURE_2D_ARRAY | GL_TEXTURE_2D_MULTISAMPLE_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY,
+            Some(layer),
+        ) => gl.framebuffer_texture_layer(attachment, Some(*name), level, layer),
+        (GL_TEXTURE_3D, Some(layer)) => {
             if !gl.framebuffer_texture_3d(attachment, Some(*name), level, layer) {
                 return false;
             }
         }
-        GL_TEXTURE_CUBE_MAP => gl.framebuffer_texture_2d(
+        (GL_TEXTURE_CUBE_MAP, Some(layer)) => gl.framebuffer_texture_2d(
             attachment,
             GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer as GLenum,
             Some(*name),
             level,
         ),
-        t => gl.framebuffer_texture_2d(attachment, t, Some(*name), level),
+        (t, _) => gl.framebuffer_texture_2d(attachment, t, Some(*name), level),
     }
     if attachment == GL_DEPTH_ATTACHMENT {
         gl.framebuffer_texture_2d(GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
@@ -506,7 +540,7 @@ fn read_layer(
     let fb = gl.gen_framebuffer();
     gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
     let attachment = attachment_for(res, formats);
-    let attached = attach(gl, res, attachment, level as GLint, layer);
+    let attached = attach(gl, res, attachment, level as GLint, Some(layer));
     gl.drain_errors();
     let read = attached && gl.read_pixels(x, y, w, h, entry.gl.glformat, entry.gl.gltype, dst);
     let err = gl.drain_errors();
@@ -555,7 +589,7 @@ pub fn read(
             }
             Ok(())
         }
-        Storage::Buffer { name, target } => {
+        Storage::Buffer { name, target, .. } => {
             let (x, w) = (b.x as usize, b.width as usize);
             gl.bind_buffer(*target, Some(*name));
             gl.drain_errors();

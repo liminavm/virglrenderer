@@ -183,15 +183,29 @@ pub struct Limits {
     pub max_texture_2d_size: u32,
     pub max_texture_3d_size: u32,
     pub max_texture_cube_size: u32,
+    /// Capped at 8, as the C caps `max_draw_buffers`.
+    pub max_draw_buffers: u32,
+    pub max_vertex_attributes: u32,
+    pub max_texture_units: u32,
+    /// Zero when the host has no texture buffers.
+    pub max_texture_buffer_size: u32,
 }
 
 impl Limits {
-    pub fn query(gl: &Gl) -> Limits {
+    pub fn query(gl: &Gl, features: &Features) -> Limits {
         let get = |name| gl.get_integer(name).max(1) as u32;
         Limits {
             max_texture_2d_size: get(GL_MAX_TEXTURE_SIZE),
             max_texture_3d_size: get(GL_MAX_3D_TEXTURE_SIZE),
             max_texture_cube_size: get(GL_MAX_CUBE_MAP_TEXTURE_SIZE),
+            max_draw_buffers: get(GL_MAX_DRAW_BUFFERS).min(8),
+            max_vertex_attributes: get(GL_MAX_VERTEX_ATTRIBS),
+            max_texture_units: get(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS),
+            max_texture_buffer_size: if features.has(Feature::arb_or_gles_ext_texture_buffer) {
+                get(GL_MAX_TEXTURE_BUFFER_SIZE)
+            } else {
+                0
+            },
         }
     }
 }
@@ -206,6 +220,9 @@ pub enum Storage {
         name: BufferName,
         /// The binding target the buffer is created and mapped through, from its bind.
         target: GLenum,
+        /// The buffer texture a sampler view of this buffer samples through, made at the first
+        /// such view (`tbo_tex_id`).
+        tbo: Option<TextureName>,
     },
     Texture {
         name: TextureName,
@@ -280,7 +297,12 @@ impl Resource {
     pub fn destroy(self, gl: &Gl) {
         match self.storage {
             Storage::Guest | Storage::Host(_) => {}
-            Storage::Buffer { name, .. } => gl.delete_buffer(name),
+            Storage::Buffer { name, tbo, .. } => {
+                if let Some(t) = tbo {
+                    gl.delete_texture(t);
+                }
+                gl.delete_buffer(name)
+            }
             Storage::Texture { name, .. } => gl.delete_texture(name),
         }
     }
@@ -484,7 +506,7 @@ fn alloc_buffer(gl: &Gl, features: &Features, a: &Args) -> Result<Storage, Refus
         gl.delete_buffer(name);
         return Err(Refusal::GlError(err));
     }
-    Ok(Storage::Buffer { name, target })
+    Ok(Storage::Buffer { name, target, tbo: None })
 }
 
 /// `tgsitargettogltarget`, with the GLES rewrites `vrend_resource_alloc_texture` applies after
@@ -640,7 +662,15 @@ mod tests {
     }
 
     fn limits() -> Limits {
-        Limits { max_texture_2d_size: 4096, max_texture_3d_size: 256, max_texture_cube_size: 4096 }
+        Limits {
+            max_texture_2d_size: 4096,
+            max_texture_3d_size: 256,
+            max_texture_cube_size: 4096,
+            max_draw_buffers: 8,
+            max_vertex_attributes: 16,
+            max_texture_units: 32,
+            max_texture_buffer_size: 65536,
+        }
     }
 
     fn texture() -> Args {

@@ -51,6 +51,18 @@ pub struct FramebufferName(GLuint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RenderbufferName(GLuint);
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VertexArrayName(GLuint);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SamplerName(GLuint);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TransformFeedbackName(GLuint);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct QueryName(GLuint);
+
 impl TextureName {
     pub fn raw(self) -> GLuint {
         self.0
@@ -710,11 +722,599 @@ impl Gl {
         unsafe { self.t.glReadBuffer()(src) };
     }
 
+    /// `glFramebufferTexture`: every layer of a layered texture. `false` if the driver has none
+    /// of the three spellings.
+    pub fn framebuffer_texture(
+        &self,
+        attachment: GLenum,
+        tex: Option<TextureName>,
+        level: GLint,
+    ) -> bool {
+        let f = self
+            .t
+            .try_glFramebufferTexture()
+            .or_else(|| self.t.try_glFramebufferTextureEXT())
+            .or_else(|| self.t.try_glFramebufferTextureOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(GL_FRAMEBUFFER, attachment, tex.map_or(0, |t| t.0), level) };
+        true
+    }
+
+    /// `glTextureView` in whichever spelling the driver exports: `view` becomes a view of
+    /// `levels` levels from `first_level` and `layers` layers from `first_layer` of `tex`.
+    /// `false` if the driver has none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn texture_view(
+        &self,
+        view: TextureName,
+        target: GLenum,
+        tex: TextureName,
+        internalformat: GLenum,
+        first_level: GLuint,
+        levels: GLuint,
+        first_layer: GLuint,
+        layers: GLuint,
+    ) -> bool {
+        let f = self.t.try_glTextureViewOES().or_else(|| self.t.try_glTextureViewEXT());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe {
+            f(view.0, target, tex.0, internalformat, first_level, levels, first_layer, layers)
+        };
+        true
+    }
+
+    pub fn framebuffer_parameter_i(&self, name: GLenum, value: GLint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glFramebufferParameteri()(GL_FRAMEBUFFER, name, value) };
+    }
+
+    /// `glBlitFramebuffer` from the read framebuffer's rectangle to the draw framebuffer's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_framebuffer(
+        &self,
+        src: [GLint; 4],
+        dst: [GLint; 4],
+        mask: GLbitfield,
+        filter: GLenum,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe {
+            self.t.glBlitFramebuffer()(
+                src[0], src[1], src[2], src[3], dst[0], dst[1], dst[2], dst[3], mask, filter,
+            )
+        };
+    }
+
+    /// `glCopyImageSubData`, in whichever spelling the driver exports. `false` if none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_image_sub_data(
+        &self,
+        src: TextureName,
+        src_target: GLenum,
+        src_level: GLint,
+        src_origin: [GLint; 3],
+        dst: TextureName,
+        dst_target: GLenum,
+        dst_level: GLint,
+        dst_origin: [GLint; 3],
+        extent: [GLsizei; 3],
+    ) -> bool {
+        let f = self
+            .t
+            .try_glCopyImageSubData()
+            .or_else(|| self.t.try_glCopyImageSubDataEXT())
+            .or_else(|| self.t.try_glCopyImageSubDataOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe {
+            f(
+                src.0,
+                src_target,
+                src_level,
+                src_origin[0],
+                src_origin[1],
+                src_origin[2],
+                dst.0,
+                dst_target,
+                dst_level,
+                dst_origin[0],
+                dst_origin[1],
+                dst_origin[2],
+                extent[0],
+                extent[1],
+                extent[2],
+            )
+        };
+        true
+    }
+
+    pub fn copy_buffer_sub_data(
+        &self,
+        read_offset: usize,
+        write_offset: usize,
+        size: usize,
+    ) -> bool {
+        let (Ok(r), Ok(w), Ok(s)) = (
+            GLintptr::try_from(read_offset),
+            GLintptr::try_from(write_offset),
+            GLsizeiptr::try_from(size),
+        ) else {
+            return false;
+        };
+        // SAFETY: plain scalars; the copy is between the two bound copy buffers.
+        unsafe { self.t.glCopyBufferSubData()(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, r, w, s) };
+        true
+    }
+
+    /// `glTexBufferRange` on the bound `GL_TEXTURE_BUFFER`, or `glTexBuffer` when `range` is
+    /// `None`. `false` if the driver has neither spelling of the one asked for.
+    pub fn tex_buffer(
+        &self,
+        internalformat: GLenum,
+        buf: BufferName,
+        range: Option<(usize, usize)>,
+    ) -> bool {
+        match range {
+            Some((offset, size)) => {
+                let f = self
+                    .t
+                    .try_glTexBufferRange()
+                    .or_else(|| self.t.try_glTexBufferRangeEXT())
+                    .or_else(|| self.t.try_glTexBufferRangeOES());
+                let (Some(f), Ok(offset), Ok(size)) =
+                    (f, GLintptr::try_from(offset), GLsizeiptr::try_from(size))
+                else {
+                    return false;
+                };
+                // SAFETY: plain scalars.
+                unsafe { f(GL_TEXTURE_BUFFER, internalformat, buf.0, offset, size) };
+            }
+            None => {
+                let f = self
+                    .t
+                    .try_glTexBuffer()
+                    .or_else(|| self.t.try_glTexBufferEXT())
+                    .or_else(|| self.t.try_glTexBufferOES());
+                let Some(f) = f else {
+                    return false;
+                };
+                // SAFETY: plain scalars.
+                unsafe { f(GL_TEXTURE_BUFFER, internalformat, buf.0) };
+            }
+        }
+        true
+    }
+
+    /// `glClearTexSubImageEXT` with one pixel of `format`/`ty` as the value. Refuses a value
+    /// shorter than the pixel or a pair this crate cannot size, and a driver without the
+    /// extension.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clear_tex_sub_image(
+        &self,
+        tex: TextureName,
+        level: GLint,
+        origin: [GLint; 3],
+        extent: [GLsizei; 3],
+        format: GLenum,
+        ty: GLenum,
+        value: &[u8],
+    ) -> bool {
+        let (Some(f), Some(need)) = (self.t.try_glClearTexSubImageEXT(), pixel_bytes(format, ty))
+        else {
+            return false;
+        };
+        if value.len() < need {
+            return false;
+        }
+        // SAFETY: the driver reads one pixel -- `need` bytes -- from `value`, which holds them.
+        unsafe {
+            f(
+                tex.0,
+                level,
+                origin[0],
+                origin[1],
+                origin[2],
+                extent[0],
+                extent[1],
+                extent[2],
+                format,
+                ty,
+                value.as_ptr().cast(),
+            )
+        };
+        true
+    }
+
+    // ---- fixed-function state ----
+
+    pub fn enable(&self, cap: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glEnable()(cap) };
+    }
+
+    pub fn disable(&self, cap: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDisable()(cap) };
+    }
+
+    pub fn set_enabled(&self, cap: GLenum, on: bool) {
+        if on {
+            self.enable(cap);
+        } else {
+            self.disable(cap);
+        }
+    }
+
+    pub fn depth_func(&self, func: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDepthFunc()(func) };
+    }
+
+    pub fn depth_mask(&self, on: bool) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDepthMask()(on as GLboolean) };
+    }
+
+    pub fn stencil_op(&self, fail: GLenum, zfail: GLenum, zpass: GLenum) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glStencilOp()(fail, zfail, zpass) };
+    }
+
+    pub fn stencil_op_separate(&self, face: GLenum, fail: GLenum, zfail: GLenum, zpass: GLenum) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glStencilOpSeparate()(face, fail, zfail, zpass) };
+    }
+
+    pub fn stencil_func(&self, func: GLenum, reference: GLint, mask: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glStencilFunc()(func, reference, mask) };
+    }
+
+    pub fn stencil_func_separate(
+        &self,
+        face: GLenum,
+        func: GLenum,
+        reference: GLint,
+        mask: GLuint,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glStencilFuncSeparate()(face, func, reference, mask) };
+    }
+
+    pub fn stencil_mask(&self, mask: GLuint) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glStencilMask()(mask) };
+    }
+
+    pub fn stencil_mask_separate(&self, face: GLenum, mask: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glStencilMaskSeparate()(face, mask) };
+    }
+
+    pub fn color_mask(&self, rgba: [bool; 4]) {
+        // SAFETY: plain scalars.
+        unsafe {
+            self.t.glColorMask()(
+                rgba[0] as GLboolean,
+                rgba[1] as GLboolean,
+                rgba[2] as GLboolean,
+                rgba[3] as GLboolean,
+            )
+        };
+    }
+
+    /// `glColorMaski` in whichever spelling the driver exports. `false` if none.
+    pub fn color_mask_i(&self, index: GLuint, rgba: [bool; 4]) -> bool {
+        let f = self
+            .t
+            .try_glColorMaski()
+            .or_else(|| self.t.try_glColorMaskiEXT())
+            .or_else(|| self.t.try_glColorMaskiOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe {
+            f(
+                index,
+                rgba[0] as GLboolean,
+                rgba[1] as GLboolean,
+                rgba[2] as GLboolean,
+                rgba[3] as GLboolean,
+            )
+        };
+        true
+    }
+
+    pub fn clear_color(&self, rgba: [f32; 4]) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glClearColor()(rgba[0], rgba[1], rgba[2], rgba[3]) };
+    }
+
+    pub fn clear_depth_f(&self, depth: f32) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glClearDepthf()(depth) };
+    }
+
+    pub fn clear_stencil(&self, stencil: GLint) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glClearStencil()(stencil) };
+    }
+
+    pub fn clear(&self, mask: GLbitfield) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glClear()(mask) };
+    }
+
+    pub fn clear_buffer_fv(&self, buffer: GLenum, drawbuffer: GLint, value: &[f32; 4]) {
+        // SAFETY: the driver reads four floats for `GL_COLOR`, one for `GL_DEPTH`; `value` holds
+        // four.
+        unsafe { self.t.glClearBufferfv()(buffer, drawbuffer, value.as_ptr()) };
+    }
+
+    pub fn blend_color(&self, rgba: [f32; 4]) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBlendColor()(rgba[0], rgba[1], rgba[2], rgba[3]) };
+    }
+
+    pub fn line_width(&self, width: f32) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glLineWidth()(width) };
+    }
+
+    pub fn polygon_offset(&self, factor: f32, units: f32) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glPolygonOffset()(factor, units) };
+    }
+
+    pub fn cull_face(&self, mode: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glCullFace()(mode) };
+    }
+
+    pub fn front_face(&self, mode: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glFrontFace()(mode) };
+    }
+
+    pub fn sample_mask_i(&self, index: GLuint, mask: GLbitfield) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glSampleMaski()(index, mask) };
+    }
+
+    /// `glMinSampleShading`. `false` if the driver has neither spelling.
+    pub fn min_sample_shading(&self, value: f32) -> bool {
+        let f = self.t.try_glMinSampleShading().or_else(|| self.t.try_glMinSampleShadingOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalar.
+        unsafe { f(value) };
+        true
+    }
+
+    pub fn viewport(&self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glViewport()(x, y, w, h) };
+    }
+
+    pub fn scissor(&self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glScissor()(x, y, w, h) };
+    }
+
+    pub fn depth_range_f(&self, near: f32, far: f32) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glDepthRangef()(near, far) };
+    }
+
+    /// `glClipControlEXT`. `false` if the driver lacks it.
+    pub fn clip_control(&self, origin: GLenum, depth: GLenum) -> bool {
+        let Some(f) = self.t.try_glClipControlEXT() else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(origin, depth) };
+        true
+    }
+
+    pub fn memory_barrier(&self, barriers: GLbitfield) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glMemoryBarrier()(barriers) };
+    }
+
+    // ---- vertex arrays ----
+
+    pub fn gen_vertex_array(&self) -> VertexArrayName {
+        let mut id: GLuint = 0;
+        // SAFETY: room for the one name asked for.
+        unsafe { self.t.glGenVertexArrays()(1, &mut id) };
+        VertexArrayName(id)
+    }
+
+    pub fn delete_vertex_array(&self, vao: VertexArrayName) {
+        // SAFETY: one name, read from a live local.
+        unsafe { self.t.glDeleteVertexArrays()(1, &vao.0) };
+    }
+
+    pub fn bind_vertex_array(&self, vao: Option<VertexArrayName>) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glBindVertexArray()(vao.map_or(0, |v| v.0)) };
+    }
+
+    pub fn vertex_attrib_format(
+        &self,
+        index: GLuint,
+        size: GLint,
+        ty: GLenum,
+        normalized: bool,
+        offset: GLuint,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glVertexAttribFormat()(index, size, ty, normalized as GLboolean, offset) };
+    }
+
+    pub fn vertex_attrib_i_format(&self, index: GLuint, size: GLint, ty: GLenum, offset: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glVertexAttribIFormat()(index, size, ty, offset) };
+    }
+
+    pub fn vertex_attrib_binding(&self, index: GLuint, binding: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glVertexAttribBinding()(index, binding) };
+    }
+
+    pub fn vertex_binding_divisor(&self, binding: GLuint, divisor: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glVertexBindingDivisor()(binding, divisor) };
+    }
+
+    pub fn enable_vertex_attrib_array(&self, index: GLuint) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glEnableVertexAttribArray()(index) };
+    }
+
+    // ---- samplers ----
+
+    pub fn gen_sampler(&self) -> SamplerName {
+        let mut id: GLuint = 0;
+        // SAFETY: room for the one name asked for.
+        unsafe { self.t.glGenSamplers()(1, &mut id) };
+        SamplerName(id)
+    }
+
+    pub fn delete_sampler(&self, s: SamplerName) {
+        // SAFETY: one name, read from a live local.
+        unsafe { self.t.glDeleteSamplers()(1, &s.0) };
+    }
+
+    pub fn sampler_parameter_i(&self, s: SamplerName, name: GLenum, value: GLint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glSamplerParameteri()(s.0, name, value) };
+    }
+
+    pub fn sampler_parameter_f(&self, s: SamplerName, name: GLenum, value: f32) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glSamplerParameterf()(s.0, name, value) };
+    }
+
+    /// `glSamplerParameterIuiv` for the border colour. `false` if the driver has no spelling.
+    pub fn sampler_border_color(&self, s: SamplerName, color: &[GLuint; 4]) -> bool {
+        let f = self
+            .t
+            .try_glSamplerParameterIuiv()
+            .or_else(|| self.t.try_glSamplerParameterIuivEXT())
+            .or_else(|| self.t.try_glSamplerParameterIuivOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: the driver reads four values for `GL_TEXTURE_BORDER_COLOR`; `color` holds four.
+        unsafe { f(s.0, GL_TEXTURE_BORDER_COLOR, color.as_ptr()) };
+        true
+    }
+
+    // ---- transform feedback ----
+
+    pub fn gen_transform_feedback(&self) -> TransformFeedbackName {
+        let mut id: GLuint = 0;
+        // SAFETY: room for the one name asked for.
+        unsafe { self.t.glGenTransformFeedbacks()(1, &mut id) };
+        TransformFeedbackName(id)
+    }
+
+    pub fn delete_transform_feedback(&self, tf: TransformFeedbackName) {
+        // SAFETY: one name, read from a live local.
+        unsafe { self.t.glDeleteTransformFeedbacks()(1, &tf.0) };
+    }
+
+    pub fn bind_transform_feedback(&self, tf: Option<TransformFeedbackName>) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glBindTransformFeedback()(GL_TRANSFORM_FEEDBACK, tf.map_or(0, |t| t.0)) };
+    }
+
+    pub fn end_transform_feedback(&self) {
+        // SAFETY: takes nothing.
+        unsafe { self.t.glEndTransformFeedback()() };
+    }
+
+    pub fn bind_buffer_base(&self, target: GLenum, index: GLuint, buf: Option<BufferName>) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBindBufferBase()(target, index, buf.map_or(0, |b| b.0)) };
+    }
+
+    pub fn bind_buffer_range(
+        &self,
+        target: GLenum,
+        index: GLuint,
+        buf: BufferName,
+        offset: usize,
+        size: usize,
+    ) -> bool {
+        let (Ok(offset), Ok(size)) = (GLintptr::try_from(offset), GLsizeiptr::try_from(size))
+        else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBindBufferRange()(target, index, buf.0, offset, size) };
+        true
+    }
+
+    // ---- queries ----
+
+    pub fn gen_query(&self) -> QueryName {
+        let mut id: GLuint = 0;
+        // SAFETY: room for the one name asked for.
+        unsafe { self.t.glGenQueries()(1, &mut id) };
+        QueryName(id)
+    }
+
+    pub fn delete_query(&self, q: QueryName) {
+        // SAFETY: one name, read from a live local.
+        unsafe { self.t.glDeleteQueries()(1, &q.0) };
+    }
+
+    pub fn begin_query(&self, target: GLenum, q: QueryName) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBeginQuery()(target, q.0) };
+    }
+
+    pub fn end_query(&self, target: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glEndQuery()(target) };
+    }
+
+    pub fn get_query_object_uiv(&self, q: QueryName, name: GLenum) -> GLuint {
+        let mut v: GLuint = 0;
+        // SAFETY: every name asked for writes exactly one integer.
+        unsafe { self.t.glGetQueryObjectuiv()(q.0, name, &mut v) };
+        v
+    }
+
     // ---- misc ----
 
     pub fn use_program_none(&self) {
         // SAFETY: zero is "no program".
         unsafe { self.t.glUseProgram()(0) };
+    }
+
+    /// `glBindProgramPipeline(0)`. `false` if the driver has no spelling.
+    pub fn bind_program_pipeline_none(&self) -> bool {
+        let f =
+            self.t.try_glBindProgramPipeline().or_else(|| self.t.try_glBindProgramPipelineEXT());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: zero is "no pipeline".
+        unsafe { f(0) };
+        true
     }
 
     pub fn finish(&self) {
