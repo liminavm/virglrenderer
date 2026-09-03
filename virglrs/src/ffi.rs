@@ -32,6 +32,10 @@ use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 use crate::venus::context::{Submitted, Wait};
+use crate::vrend::pipe::TextureTarget;
+use crate::vrend::proto::{self, Format};
+use crate::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
+use crate::vrend::transfer;
 
 /// Decode a capset id the guest chose.
 ///
@@ -109,8 +113,13 @@ fn errno(e: renderer::Error) -> c_int {
         | Unmappable
         | AlreadyExported
         | NotHostVisible
-        | BlobLargerThanAllocation => EINVAL,
+        | BlobLargerThanAllocation
+        | ClassicRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
+        // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
+        // from an errno.
+        Transfer(transfer::Error::NotReadable) => -1,
+        Transfer(_) => EINVAL,
     }
 }
 
@@ -194,8 +203,16 @@ pub extern "C" fn virgl_renderer_init(
             write_context_fence: (&raw const (*cb).write_context_fence).read(),
         }
     };
-    *g = Some(Renderer::new(Box::new(sink), config_of(flags)));
-    0
+    match Renderer::new(Box::new(sink), config_of(flags)) {
+        Ok(r) => {
+            *g = Some(r);
+            0
+        }
+        Err(e) => {
+            eprintln!("[virglrs] init: {e}");
+            EINVAL
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -393,7 +410,8 @@ pub extern "C" fn virgl_renderer_context_create(
     nlen: u32,
     name: *const c_char,
 ) -> c_int {
-    virgl_renderer_context_create_with_flags(handle, 0, nlen, name)
+    // The flagless form is the classic one: the C spells it as a VIRGL2 context.
+    virgl_renderer_context_create_with_flags(handle, abi::CAPSET_VIRGL2, nlen, name)
 }
 
 #[unsafe(no_mangle)]
@@ -458,20 +476,22 @@ pub extern "C" fn virgl_renderer_context_get_poll_fd(_ctx_id: u32) -> c_int {
 /// Field by field on purpose. A `From` impl would have to live beside one of the two types, which
 /// means either the C layout appearing in the renderer or the renderer's type appearing in the
 /// ABI module -- and the whole point of the split is that neither knows the other.
-fn classic_desc(a: &ResourceCreateArgs) -> (Option<ResourceHandle>, renderer::ClassicDesc) {
-    let desc = renderer::ClassicDesc {
-        target: a.target,
-        format: a.format,
-        bind: a.bind,
+/// The classic resource the ABI's create args describe, or `None` for a handle, target or format
+/// the wire has no name for.
+fn classic_desc(a: &ResourceCreateArgs) -> Option<(ResourceHandle, ClassicArgs)> {
+    let desc = ClassicArgs {
+        target: TextureTarget::from_wire(a.target)?,
+        format: Format::from_wire(a.format)?,
+        bind: Bind(a.bind),
         width: a.width,
         height: a.height,
         depth: a.depth,
         array_size: a.array_size,
         last_level: a.last_level,
         nr_samples: a.nr_samples,
-        flags: a.flags,
+        flags: ResourceFlags(a.flags),
     };
-    (ResourceHandle::new(a.handle), desc)
+    Some((ResourceHandle::new(a.handle)?, desc))
 }
 
 /// The blob the ABI's create args describe.
@@ -514,16 +534,18 @@ pub extern "C" fn virgl_renderer_resource_create(
     }
     // SAFETY: the VMM's contract is that `args` is valid for the call; the fields are copied out.
     let a = unsafe { &*args };
-    let (handle, desc) = classic_desc(a);
-    // Zero was already `Error::ZeroHandle` here, answered with EINVAL. Now it is the parse that
-    // fails, and the answer is the same one.
-    let Some(handle) = handle else {
+    // A handle of zero, a target or a format the wire has no name for: each is the parse
+    // failing, and each is EINVAL, as in the C.
+    let Some((handle, desc)) = classic_desc(a) else {
         return EINVAL;
     };
     let iov = read_iov(iov, num_iovs);
     with(EINVAL, |r| match r.resource_create(handle, desc, iov) {
         Ok(()) => 0,
-        Err(e) => errno(e),
+        Err(e) => {
+            eprintln!("[virglrs] resource {}: {e}", handle.get());
+            errno(e)
+        }
     })
 }
 
@@ -663,12 +685,9 @@ pub extern "C" fn virgl_renderer_resource_attach_iov(
         return EINVAL;
     };
     let v = read_iov(iov, num_iovs as u32);
-    with(EINVAL, |r| {
-        r.with_resource_mut(handle, |res| {
-            res.iov = v;
-            0
-        })
-        .unwrap_or(EINVAL)
+    with(EINVAL, |r| match r.resource_attach_iov(handle, v) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
     })
 }
 
@@ -682,13 +701,7 @@ pub extern "C" fn virgl_renderer_resource_detach_iov(
         return;
     };
     with((), |r| {
-        let n = r
-            .with_resource_mut(handle, |res| {
-                let n = res.iov.len();
-                res.iov.clear();
-                n
-            })
-            .unwrap_or(0);
+        let n = r.resource_detach_iov(handle);
         // The C hands back the array it was given. We copied it, so we own nothing the caller may
         // free -- report the count and a null array rather than inventing a pointer it would.
         if !iov.is_null() {
@@ -714,8 +727,35 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         return EINVAL;
     };
     with(EINVAL, |r| {
-        r.with_resource(handle, |_| todo_phase!("P3: resource info needs the pipe resource"))
-            .unwrap_or(EINVAL)
+        // The C fills what it knows and reports success for any resource it holds; the shim
+        // reads the classic half, which is the only kind with a format and a size.
+        let filled = r.with_resource(handle, |res| match &res.backing {
+            renderer::Backing::Classic(a) => {
+                let desc = a.format.describe();
+                let stride = desc.map_or(0, |d| d.stride(a.width));
+                Some((a.format.wire(), a.width, a.height, a.depth, a.flags.0, stride))
+            }
+            _ => None,
+        });
+        match filled {
+            None => EINVAL,
+            Some(None) => 0,
+            Some(Some((format, width, height, depth, flags, stride))) => {
+                // SAFETY: caller-provided out-pointer, checked non-null; only the C's first
+                // eight fields are written, which every version of the struct has.
+                unsafe {
+                    (*info).handle = res_handle as u32;
+                    (*info).virgl_format = format;
+                    (*info).width = width;
+                    (*info).height = height;
+                    (*info).depth = depth;
+                    (*info).flags = flags & ResourceFlags::Y_0_TOP.0;
+                    (*info).tex_id = 0;
+                    (*info).stride = stride;
+                }
+                0
+            }
+        }
     })
 }
 
@@ -933,33 +973,89 @@ pub extern "C" fn virgl_renderer_republish_iosurface(_iosurface_id: u32) -> c_in
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn virgl_renderer_transfer_read_iov(
-    _handle: u32,
-    _ctx_id: u32,
-    _level: u32,
-    _stride: u32,
-    _layer_stride: u32,
-    _box_: *mut Box3,
-    _offset: u64,
-    _iov: *mut libc::iovec,
-    _iovec_cnt: c_int,
+    handle: u32,
+    ctx_id: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+    box_: *mut Box3,
+    offset: u64,
+    iov: *mut libc::iovec,
+    iovec_cnt: c_int,
 ) -> c_int {
-    todo_phase!("P3: vrend transfers")
+    let Ok(n) = u32::try_from(iovec_cnt) else {
+        return EINVAL;
+    };
+    transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iov, n, false)
 }
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn virgl_renderer_transfer_write_iov(
-    _handle: u32,
-    _ctx_id: u32,
-    _level: c_int,
-    _stride: u32,
-    _layer_stride: u32,
-    _box_: *mut Box3,
-    _offset: u64,
-    _iovec: *mut libc::iovec,
-    _iovec_cnt: c_uint,
+    handle: u32,
+    ctx_id: u32,
+    level: c_int,
+    stride: u32,
+    layer_stride: u32,
+    box_: *mut Box3,
+    offset: u64,
+    iovec: *mut libc::iovec,
+    iovec_cnt: c_uint,
 ) -> c_int {
-    todo_phase!("P3: vrend transfers")
+    let Ok(level) = u32::try_from(level) else {
+        return EINVAL;
+    };
+    transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iovec, iovec_cnt, true)
+}
+
+/// Both transfer entry points, which differ only in direction and in the signedness of two
+/// arguments the header spells differently.
+#[allow(clippy::too_many_arguments)]
+fn transfer_iov(
+    handle: u32,
+    ctx_id: u32,
+    level: u32,
+    stride: u32,
+    layer_stride: u32,
+    box_: *mut Box3,
+    offset: u64,
+    iov: *mut libc::iovec,
+    iovec_cnt: u32,
+    to_host: bool,
+) -> c_int {
+    let (Some(handle), false) = (ResourceHandle::new(handle), box_.is_null()) else {
+        return EINVAL;
+    };
+    // SAFETY: the VMM's contract is that `box_` is valid for the call; it is copied out.
+    let b = unsafe { &*box_ };
+    // The ABI's box is unsigned; the wire's is signed, and the renderer checks it as such. An
+    // extent past `i32::MAX` is outside any resource, so refusing it here changes nothing.
+    let region = match (
+        i32::try_from(b.x),
+        i32::try_from(b.y),
+        i32::try_from(b.z),
+        i32::try_from(b.w),
+        i32::try_from(b.h),
+        i32::try_from(b.d),
+    ) {
+        (Ok(x), Ok(y), Ok(z), Ok(width), Ok(height), Ok(depth)) => {
+            proto::Box3 { x, y, z, width, height, depth }
+        }
+        _ => return EINVAL,
+    };
+    let info = transfer::Info { level, stride, layer_stride, offset, region, synchronized: false };
+    let ctx = match AbiCtx::new(ctx_id) {
+        AbiCtx::Global => None,
+        AbiCtx::Ctx(id) => Some(id),
+    };
+    let iov = read_iov(iov, iovec_cnt);
+    with(EINVAL, |r| match r.transfer(handle, ctx, to_host, &info, iov) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[virglrs] transfer on resource {}: {e}", handle.get());
+            errno(e)
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1694,23 +1790,26 @@ mod tests {
             nr_samples: 10,
             flags: 11,
         };
-        let (handle, d) = classic_desc(&a);
-        assert_eq!(handle, ResourceHandle::new(1));
+        let (handle, d) = classic_desc(&a).expect("every field parses");
+        assert_eq!(Some(handle), ResourceHandle::new(1));
         assert_eq!(
             d,
-            renderer::ClassicDesc {
-                target: 2,
-                format: 3,
-                bind: 4,
+            ClassicArgs {
+                target: TextureTarget::Texture2d,
+                format: Format::from_wire(3).unwrap(),
+                bind: Bind(4),
                 width: 5,
                 height: 6,
                 depth: 7,
                 array_size: 8,
                 last_level: 9,
                 nr_samples: 10,
-                flags: 11,
+                flags: ResourceFlags(11),
             }
         );
+        // A target or a format the wire has no name for is the parse failing, not a resource.
+        assert!(classic_desc(&ResourceCreateArgs { target: 9, ..a }).is_none());
+        assert!(classic_desc(&ResourceCreateArgs { format: 482, ..a }).is_none());
     }
 
     /// A handle of zero never becomes one.
@@ -1735,7 +1834,7 @@ mod tests {
             nr_samples: 10,
             flags: 11,
         };
-        assert_eq!(classic_desc(&a).0, None);
+        assert!(classic_desc(&a).is_none());
         assert_eq!(ResourceHandle::new(0), None);
     }
 

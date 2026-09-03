@@ -19,7 +19,7 @@
 use core::ffi::CStr;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) use super::gl::types;
 use super::gl::{Gles, ProcAddr};
@@ -106,13 +106,22 @@ pub struct Version {
 }
 
 /// The display and everything a context needs to reach it. Shared by every [`Context`] and
-/// [`Winsys`] so that a context cannot outlive the display it was created on. An `Rc`, not an
-/// `Arc`: a GL context is current on one thread, and this winsys lives on that thread with it.
+/// [`Winsys`] so that a context cannot outlive the display it was created on.
 struct Shared {
     egl: Egl,
     display: EGLDisplay,
     config: EGLConfig,
 }
+
+// SAFETY: an `EGLDisplay`, `EGLConfig` or `EGLContext` is a token the library hands out, not
+// memory this crate reads: every use goes back through an EGL call, and EGL is specified to be
+// callable from any thread, serialising its own state. Which thread a context is *current* on is
+// EGL's own bookkeeping (`eglMakeCurrent` binds the calling thread), not a property of the handle,
+// so moving the handle between threads asserts nothing. These impls are what lets the renderer
+// root, which is `Send`, own the winsys; the make-current discipline is `Vrend`'s.
+unsafe impl Send for Shared {}
+// SAFETY: as above -- a shared reference grants only the ability to pass the tokens to EGL.
+unsafe impl Sync for Shared {}
 
 impl Shared {
     fn error(&self, call: &'static str) -> EglError {
@@ -131,7 +140,7 @@ impl Drop for Shared {
 
 /// The surfaceless EGL display, initialised, with the client API bound and a config chosen.
 pub struct Winsys {
-    shared: Rc<Shared>,
+    shared: Arc<Shared>,
     flavour: Flavour,
     version: Version,
     extensions: BTreeSet<String>,
@@ -139,9 +148,13 @@ pub struct Winsys {
 
 /// An EGL context on the winsys's display. Destroyed with it; cannot outlive the display.
 pub struct Context {
-    shared: Rc<Shared>,
+    shared: Arc<Shared>,
     ctx: EGLContext,
 }
+
+// SAFETY: `ctx` is an EGL token, for the reason `Shared`'s impl gives; which thread it is current
+// on is EGL's bookkeeping, not the handle's.
+unsafe impl Send for Context {}
 
 impl Drop for Context {
     fn drop(&mut self) {
@@ -207,7 +220,7 @@ impl Winsys {
             return Err(EglError { call: "eglInitialize", code });
         }
         // From here the display is owned, and `Shared`'s drop terminates it on any failure.
-        let shared = Rc::new(Shared { egl, display, config: core::ptr::null_mut() });
+        let shared = Arc::new(Shared { egl, display, config: core::ptr::null_mut() });
         let egl = &shared.egl;
 
         let extensions: BTreeSet<String> = {
@@ -248,10 +261,10 @@ impl Winsys {
         if ok == proc::EGL_FALSE || count != 1 {
             return Err(shared.error("eglChooseConfig"));
         }
-        // The config is the one field not known at construction; `Rc::get_mut` holds because
+        // The config is the one field not known at construction; `Arc::get_mut` holds because
         // nothing else has cloned the `Arc` yet.
         let mut shared = shared;
-        Rc::get_mut(&mut shared).expect("no context exists yet").config = config;
+        Arc::get_mut(&mut shared).expect("no context exists yet").config = config;
 
         Ok(Winsys {
             shared,
@@ -294,7 +307,7 @@ impl Winsys {
             proc::EGL_NONE as EGLint,
         ];
         let share = shared.map_or(proc::EGL_NO_CONTEXT, |c| {
-            assert!(Rc::ptr_eq(&c.shared, &self.shared), "a share context from another display");
+            assert!(Arc::ptr_eq(&c.shared, &self.shared), "a share context from another display");
             c.ctx
         });
         let egl = &self.shared.egl;
@@ -306,12 +319,12 @@ impl Winsys {
         if ctx == proc::EGL_NO_CONTEXT {
             return Err(self.shared.error("eglCreateContext"));
         }
-        Ok(Context { shared: Rc::clone(&self.shared), ctx })
+        Ok(Context { shared: Arc::clone(&self.shared), ctx })
     }
 
     /// Make `ctx` current on this thread, with no surface.
     pub fn make_current(&self, ctx: &Context) -> Result<(), EglError> {
-        assert!(Rc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
+        assert!(Arc::ptr_eq(&ctx.shared, &self.shared), "a context from another display");
         let egl = &self.shared.egl;
         // SAFETY: the display is initialised, the context alive on it, and surfaceless contexts
         // are made current with `EGL_NO_SURFACE` twice.

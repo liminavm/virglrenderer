@@ -10,7 +10,7 @@
 use crate::abi::{GuestIov, VmmPtr};
 use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
-use crate::guest_mem::GuestMap;
+use crate::guest_mem::{GuestMap, Iov};
 use crate::ids::{
     BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
 };
@@ -20,6 +20,9 @@ use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
 use crate::venus::objects::ObjectKey;
 use crate::venus::ring::{Published, ResourceBytes};
+use crate::vrend;
+use crate::vrend::resource::{Args as ClassicArgs, Refusal};
+use crate::vrend::transfer;
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -67,6 +70,10 @@ pub enum Error {
     /// no ring can live in, so this fails at import rather than at the first command that needs
     /// it -- the guest gets the refusal while it is still holding the thing that caused it.
     Unmappable,
+    /// vrend refused to create a classic resource, for the reason given.
+    ClassicRefused(Refusal),
+    /// A classic transfer did not happen, for the reason given.
+    Transfer(transfer::Error),
 }
 
 /// An export's refusals in the renderer's vocabulary, for the reason [`venus_error`] gives.
@@ -109,28 +116,14 @@ impl std::fmt::Display for Error {
             Error::BlobLargerThanAllocation => "the blob is larger than the allocation behind it",
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
+            Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
+            Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
         };
         f.write_str(s)
     }
 }
 
 impl std::error::Error for Error {}
-
-/// A classic texture or buffer, as the guest described it -- everything about the resource except
-/// the handle it is filed under, which is the caller's to name.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ClassicDesc {
-    pub target: u32,
-    pub format: u32,
-    pub bind: u32,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub array_size: u32,
-    pub last_level: u32,
-    pub nr_samples: u32,
-    pub flags: u32,
-}
 
 /// Where a blob's storage comes from.
 ///
@@ -283,8 +276,9 @@ pub struct HostMapping {
 /// What a resource is backed by. A resource is exactly one of these for its whole life; the C
 /// keeps overlapping fields and a set of flags saying which are meaningful.
 pub enum Backing {
-    /// Created from `virgl_renderer_resource_create` -- a classic texture or buffer.
-    Classic(ClassicDesc),
+    /// Created from `virgl_renderer_resource_create` -- a classic texture or buffer. Its host
+    /// side, when this build serves vrend, is vrend's under the same handle.
+    Classic(ClassicArgs),
     /// Created from `virgl_renderer_resource_create_blob`. `desc` is what the guest asked for;
     /// `storage` is what it got, settled once at the create -- see [`BlobStorage`].
     Blob { desc: BlobDesc, storage: BlobStorage },
@@ -434,21 +428,31 @@ pub struct Renderer {
     fences: Retirement,
     /// The venus renderer, present only when this build was initialized to serve it.
     venus: Option<venus::vkr::Vkr>,
+    /// The classic renderer, likewise.
+    vrend: Option<vrend::vrend::Vrend>,
 }
 
 impl Renderer {
-    pub fn new(fences: Box<dyn FenceSink>, config: Config) -> Renderer {
+    /// Bring up the renderers the config asks for. vrend needs a GL context on the calling
+    /// thread, and a host that cannot give it one is a host this renderer cannot serve the
+    /// classic protocol on -- so that is a failure to initialise, as it is in the C.
+    pub fn new(
+        fences: Box<dyn FenceSink>,
+        config: Config,
+    ) -> Result<Renderer, vrend::vrend::InitError> {
         // Built here and shared into venus, rather than reached through the renderer: a ring
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
         let resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>> = Arc::default();
-        Renderer {
+        let vrend = if config.vrend { Some(vrend::vrend::Vrend::new()?) } else { None };
+        Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
             contexts: BTreeMap::new(),
             fences: Retirement::start(fences),
             venus: config.venus.then(|| venus::vkr::Vkr::new(config, resources.clone())),
-        }
+            vrend,
+        })
     }
 
     /// What this build advertises for a capset, or `None` for one it does not serve.
@@ -483,13 +487,18 @@ impl Renderer {
     pub fn resource_create(
         &mut self,
         handle: ResourceHandle,
-        desc: ClassicDesc,
+        args: ClassicArgs,
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
         // A guest-chosen handle that is already live is the guest's error, not ours: reject it
         // rather than replacing an entry something else still holds.
         self.free_handle(handle)?;
-        self.insert(handle, Backing::Classic(desc), iov);
+        // vrend's half first, because it is the half that can refuse; without vrend the resource
+        // is a table entry and nothing more, which is all a venus-only build owes it.
+        if let Some(v) = self.vrend.as_mut() {
+            v.resource_create(handle, args).map_err(Error::ClassicRefused)?;
+        }
+        self.insert(handle, Backing::Classic(args), iov);
         Ok(())
     }
 
@@ -648,6 +657,9 @@ impl Renderer {
     }
 
     pub fn resource_unref(&mut self, handle: ResourceHandle) {
+        if let Some(v) = self.vrend.as_mut() {
+            v.resource_destroy(handle);
+        }
         // Detach from every context first. A context holding a dangling handle is how the C's
         // use-after-free reached the command stream.
         let mut resources = self.resources.write().expect("the resource lock is never poisoned");
@@ -655,6 +667,67 @@ impl Renderer {
             r.attached.clear();
         }
         resources.remove(&handle);
+    }
+
+    /// The VMM attached guest pages to a resource. `Err` if it has none, or already has some:
+    /// the C refuses a second attach, and a VMM that attaches twice has lost track of what it
+    /// gave.
+    pub fn resource_attach_iov(
+        &mut self,
+        handle: ResourceHandle,
+        iov: Vec<GuestIov>,
+    ) -> Result<(), Error> {
+        let already = self.with_resource(handle, |r| !r.iov.is_empty()).ok_or(Error::NoResource)?;
+        if already {
+            return Err(Error::ResourceExists);
+        }
+        if let Some(v) = self.vrend.as_mut() {
+            v.resource_attached(handle, &Iov::new(&iov));
+        }
+        self.with_resource_mut(handle, |r| r.iov = iov);
+        Ok(())
+    }
+
+    /// The VMM is taking a resource's pages back; how many entries it had.
+    pub fn resource_detach_iov(&mut self, handle: ResourceHandle) -> usize {
+        let iov =
+            self.with_resource_mut(handle, |r| std::mem::take(&mut r.iov)).unwrap_or_default();
+        if let Some(v) = self.vrend.as_mut() {
+            v.resource_detaching(handle, &Iov::new(&iov));
+        }
+        iov.len()
+    }
+
+    /// A classic transfer between a resource and guest pages, on the API path: the resource's
+    /// own pages when `iov` is empty.
+    ///
+    /// `ctx` names the context the transfer runs on, or the VMM's own (ctx 0) when `None`. A
+    /// named context must exist and must have the resource attached, as in the C's per-context
+    /// lookup.
+    pub fn transfer(
+        &mut self,
+        handle: ResourceHandle,
+        ctx: Option<CtxId>,
+        to_host: bool,
+        info: &transfer::Info,
+        iov: Vec<GuestIov>,
+    ) -> Result<(), Error> {
+        let (own, attached) = self
+            .with_resource(handle, |r| (r.iov.clone(), r.attached.clone()))
+            .ok_or(Error::NoResource)?;
+        if let Some(c) = ctx {
+            if !self.contexts.contains_key(&c) {
+                return Err(Error::NoContext);
+            }
+            if !attached.contains(&c) {
+                return Err(Error::NoResource);
+            }
+        }
+        let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
+        let own = Iov::new(&own);
+        let given = Iov::new(&iov);
+        let pages = if iov.is_empty() { &own } else { &given };
+        v.transfer(ctx, handle, to_host, Some(&own), pages, info).map_err(Error::Transfer)
     }
 
     // ---- contexts ----
@@ -671,12 +744,24 @@ impl Renderer {
             return Err(Error::ContextExists);
         }
         self.contexts.insert(id, Context { id, capset, name, last_fence: BTreeMap::new() });
-        // A venus context gets venus state; anything else gets a context and nothing behind it,
-        // and finds out when it submits.
-        if capset == CapsetId::Venus
-            && let Some(v) = self.venus.as_mut()
-        {
-            v.context_create(id);
+        // A venus context gets venus state, a classic one vrend's; anything else gets a context
+        // and nothing behind it, and finds out when it submits.
+        match capset {
+            CapsetId::Venus => {
+                if let Some(v) = self.venus.as_mut() {
+                    v.context_create(id);
+                }
+            }
+            CapsetId::Virgl | CapsetId::Virgl2 => {
+                if let Some(v) = self.vrend.as_mut()
+                    && let Err(e) = v.context_create(id)
+                {
+                    eprintln!("[virglrs] ctx {}: no GL context: {e}", id.get());
+                    self.contexts.remove(&id);
+                    return Err(Error::RendererAbsent);
+                }
+            }
+            CapsetId::Unknown(_) => {}
         }
         Ok(())
     }
@@ -686,6 +771,9 @@ impl Renderer {
             return;
         }
         if let Some(v) = self.venus.as_mut() {
+            v.context_destroy(id);
+        }
+        if let Some(v) = self.vrend.as_mut() {
             v.context_destroy(id);
         }
         // A destroyed context releases its claim on every resource; the resources themselves
@@ -1016,9 +1104,11 @@ impl Renderer {
 /// a log line that explains a failure and one that misleads about it.
 pub fn unsupported_renderers(config: Config) -> &'static str {
     match (config.venus, config.vrend) {
-        (true, true) => "venus serves only part of the protocol; no vrend",
+        (true, true) => {
+            "venus serves only part of the protocol; vrend serves resources and transfers"
+        }
         (true, false) => "venus serves only part of the protocol",
-        (false, true) => "no vrend",
+        (false, true) => "vrend serves resources and transfers",
         (false, false) => "no renderer asked for",
     }
 }
@@ -1035,7 +1125,7 @@ mod tests {
     }
 
     fn renderer(config: Config) -> Renderer {
-        Renderer::new(Box::new(NoSink), config)
+        Renderer::new(Box::new(NoSink), config).expect("no vrend is asked for")
     }
 
     /// The two questions `HostShm::for_blob` answers, and it answers them from the source alone.

@@ -27,6 +27,8 @@ pub const USE_GUEST_VRAM: c_int = 1 << 14;
 
 /// A context's capset is the low byte of the flags it was created with.
 pub const CAPSET_MASK: u32 = 0xff;
+/// `VIRTGPU_DRM_CAPSET_VIRGL2`, the capset the flagless `virgl_renderer_context_create` binds.
+pub const CAPSET_VIRGL2: u32 = 2;
 
 /// `blob_mem` and `fd_type` values, from `virglrenderer.h`. Only the ones the import path accepts
 /// are named; the rest are refused by not being here.

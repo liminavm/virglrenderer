@@ -262,6 +262,92 @@ impl GuestMap {
     }
 }
 
+/// A classic resource's guest pages: the scatter list the VMM attached, as one byte-addressed
+/// span.
+///
+/// The VMM owns the pages and the list describes them; this type holds neither. What it adds is
+/// the walk -- an offset into the concatenation resolved to a page and a position -- and the
+/// bounds check, so that no offset a guest names reaches outside the pages the VMM described.
+/// The C's walker asserts on an offset past the end (`iov.c`), a host abort reachable from a
+/// guest value; here it is a `false`.
+///
+/// Copies only, for the reason [`GuestMap`] gives: the guest writes these pages whenever it
+/// likes, so a reference into them cannot be sound.
+pub struct Iov<'a>(&'a [crate::abi::GuestIov]);
+
+impl<'a> Iov<'a> {
+    pub fn new(entries: &'a [crate::abi::GuestIov]) -> Iov<'a> {
+        Iov(entries)
+    }
+
+    /// The total bytes the list describes.
+    pub fn len(&self) -> u64 {
+        self.0.iter().map(|e| e.len as u64).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|e| e.len == 0)
+    }
+
+    /// Whether the entries are the same pages, in the same order, as `other`'s.
+    pub fn same_pages(&self, other: &Iov<'_>) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(other.0).all(|(a, b)| a.base == b.base && a.len == b.len)
+    }
+
+    /// Walk `len` bytes from `at`, handing each contiguous piece to `f` as a host pointer and a
+    /// length. `false`, with nothing visited, if the range is not wholly inside the list.
+    fn walk(&self, at: u64, len: usize, mut f: impl FnMut(*mut u8, usize, usize)) -> bool {
+        let Some(end) = at.checked_add(len as u64) else {
+            return false;
+        };
+        if end > self.len() {
+            return false;
+        }
+        let mut skip = at;
+        let mut done = 0usize;
+        for e in self.0 {
+            if done == len {
+                break;
+            }
+            let elen = e.len as u64;
+            if skip >= elen {
+                skip -= elen;
+                continue;
+            }
+            let start = skip as usize;
+            let take = (e.len - start).min(len - done);
+            // The entry's base is the VMM's host address for the page; `start` is inside it.
+            f(e.base.0.cast::<u8>().wrapping_add(start), done, take);
+            done += take;
+            skip = 0;
+        }
+        done == len
+    }
+
+    /// Copy bytes out of the guest pages into `dst`. Returns whether the range was inside them.
+    #[must_use]
+    pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
+        self.walk(at, dst.len(), |src, into, n| {
+            // SAFETY: the VMM's contract for an attached iov is that every entry addresses `len`
+            // bytes of live guest memory until it detaches the list, and this renderer holds no
+            // list past a detach. `walk` proved the piece is inside its entry; `dst` is a host
+            // slice the caller owns, so the two cannot overlap.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(into), n) };
+        })
+    }
+
+    /// Copy `src` into the guest pages at `at`. Returns whether the range was inside them.
+    #[must_use]
+    pub fn copy_in(&self, at: u64, src: &[u8]) -> bool {
+        self.walk(at, src.len(), |dst, from, n| {
+            // SAFETY: as `copy_out`, with the direction reversed; the VMM maps the pages writable
+            // because a transfer from the host is what they are for.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().add(from), dst, n) };
+        })
+    }
+}
+
 /// The host's page size, which is what a mapping's length has to be a multiple of.
 pub fn page_size() -> usize {
     // SAFETY: a plain sysconf query with no pointers involved.
