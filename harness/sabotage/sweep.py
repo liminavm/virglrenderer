@@ -46,6 +46,16 @@ SABOTAGES = [
         'witness',
     ),
     (
+        'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
+        'virglrs/src/venus/context.rs',
+        """        if wants_reply && answer == 0 {
+            poison(id, &dec, cmd, "wanted a reply, and names an object the host refused");
+            break;
+        }""",
+        '',
+        'a_ghost_absorbs_a_command',
+    ),
+    (
         'a reply is committed before the command that produced it is judged',
         'virglrs/src/venus/ring.rs',
         '        self.pos += bytes.len();\n        Ok(())',

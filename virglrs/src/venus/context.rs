@@ -699,7 +699,7 @@ fn run_batch(
         // changed on a path that ends in a poisoned context either way.
         if wants_reply && h.reply.is_none() {
             counts.unhandled += 1;
-            poison(fatal, id, &dec, cmd, "wants a reply, and no reply stream was ever set");
+            poison(id, &dec, cmd, "wants a reply, and no reply stream was ever set");
             break;
         }
 
@@ -707,7 +707,7 @@ fn run_batch(
         if vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut *h).is_none() {
             // A command type this protocol does not define. We cannot even skip it: its length
             // is only knowable by decoding it.
-            poison(fatal, id, &dec, cmd, "is not a command type this protocol defines");
+            poison(id, &dec, cmd, "is not a command type this protocol defines");
             break;
         }
         // How much answer there is. Read here so the encoder's borrow of the scratch ends
@@ -727,21 +727,32 @@ fn run_batch(
         // Not counted in `unhandled`: the census above already owns the tally of commands
         // no handler served, and a second count of the same fact is one that can disagree.
         if core::mem::take(&mut h.unserved) {
-            poison(fatal, id, &dec, cmd, "is not a command this build serves");
+            poison(id, &dec, cmd, "is not a command this build serves");
             break;
         }
         // A handler that found the command itself unusable -- an id the guest cannot have, a
         // length that would send the driver off the end of what was decoded. The handler has
         // no decoder to say so with; this is where its verdict lands.
         if let Some(why) = h.reject.take() {
-            poison(fatal, id, &dec, cmd, why);
+            poison(id, &dec, cmd, why);
+            break;
         }
 
         if fatal.load(Ordering::Acquire) {
             // The decoder poisoned itself inside the command: a malformed argument, or a
             // shape the generator has no decoder for. Either way the command is what a
             // reader needs, because without it a gap reaches a user as a hung guest.
-            poison(fatal, id, &dec, cmd, "did not decode");
+            poison(id, &dec, cmd, "did not decode");
+            break;
+        }
+
+        // The command named a ghost, so the wrapper skipped it as containment asks -- and
+        // containment is for commands the guest is not waiting on. This one it is, and a reply
+        // the host never wrote is whatever the slot held before, shaped exactly like success.
+        // Every reply-carrying command has, by here, been answered or has stopped the batch:
+        // this is the one path that is neither, and it becomes the latter.
+        if wants_reply && answer == 0 {
+            poison(id, &dec, cmd, "wanted a reply, and names an object the host refused");
             break;
         }
 
@@ -759,7 +770,6 @@ fn run_batch(
             // transport waits, which is why nothing real is expected to reach this line.
             if depth > 0 {
                 poison(
-                    fatal,
                     id,
                     &dec,
                     cmd,
@@ -776,7 +786,6 @@ fn run_batch(
         if let Some(exec) = h.execute.take() {
             if depth > 0 {
                 poison(
-                    fatal,
                     id,
                     &dec,
                     cmd,
@@ -797,7 +806,7 @@ fn run_batch(
         if answer > 0 {
             let stream = h.reply.as_mut().expect("a reply had a stream before the command ran");
             if let Err(over) = stream.write(&scratch[..answer]) {
-                poison(fatal, id, &dec, cmd, &format!("could not be answered: {over}"));
+                poison(id, &dec, cmd, &format!("could not be answered: {over}"));
                 break;
             }
         }
@@ -884,13 +893,14 @@ fn run_streams(
     }
 }
 
-fn poison(fatal: &AtomicBool, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
-    if !fatal.load(Ordering::Acquire) {
-        let name = vn_command_name(cmd)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("command type {}", cmd.0));
-        eprintln!("[virglrs] ctx {id}: {name} {why}, {} bytes in", dec.pos());
-    }
+/// Poison the context, saying which command and why. Every caller leaves the loop right after,
+/// so this prints unconditionally: the flag may already be set -- the decoder sets the same one
+/// when a command does not decode -- and that is the case whose reason is most worth reading.
+fn poison(id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
+    let name = vn_command_name(cmd)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("command type {}", cmd.0));
+    eprintln!("[virglrs] ctx {id}: {name} {why}, {} bytes in", dec.pos());
     dec.set_fatal();
 }
 
@@ -3576,9 +3586,10 @@ mod tests {
         w
     }
 
-    /// A shape the generator has no decoder for poisons the ring, and the log line that says so
-    /// has to be able to name the command. Without the name a gap reaches a user as a hung guest
-    /// with nothing to report; `vn_command_name` returning `None` here would be that silently.
+    /// A command that does not decode -- here, one cut off after its header -- poisons the ring,
+    /// and the log line that says so has to be able to name the command. Without the name a gap
+    /// reaches a user as a hung guest with nothing to report; `vn_command_name` returning `None`
+    /// here would be that silently.
     #[test]
     fn an_undecodable_command_poisons_the_context_by_name() {
         let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT;
@@ -3590,7 +3601,7 @@ mod tests {
         let mut todo = Unimplemented::default();
         assert!(
             !ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES).ran(),
-            "a stubbed decoder must poison"
+            "a command with no body must poison"
         );
         assert!(ctx.fatal());
 
@@ -3737,6 +3748,57 @@ mod tests {
 
         assert!(t.1.copy_out(WINDOW + 0x30, &mut got));
         assert_eq!(got, seek_reply_bytes(), "the command after the execute ran too");
+    }
+
+    /// A pipeline-cache count call naming `device`, with whatever header flags the caller wants.
+    fn wire_cache_data(device: u64, flags: u32) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkGetPipelineCacheData_args, vn_sizeof_vkGetPipelineCacheData_args,
+        };
+        use super::super::proto::types::vn_command_vkGetPipelineCacheData as Args;
+
+        let mut size = 0usize;
+        let mut args = Args::default();
+        args.device = VkDevice(device);
+        args.plant_pDataSize(&mut size);
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkGetPipelineCacheData_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkGetPipelineCacheData_args(&mut enc, VkFlags(flags), &args);
+        buf
+    }
+
+    /// A ghost absorbs the commands pipelined behind a refused create -- but only the ones the
+    /// guest is not waiting on. One it is waiting on cannot be absorbed: skipping it leaves the
+    /// reply slot holding whatever was there before, which the guest reads as an answer, so the
+    /// context has to stop instead.
+    #[test]
+    fn a_ghost_absorbs_a_command_unless_the_guest_is_waiting_on_it() {
+        const WINDOW: usize = 0x21000;
+        const GHOST: u64 = 7;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        // Not waiting: the command is lost, the context lives.
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_cache_data(GHOST, 0));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "absorbed, not poisoned");
+        assert!(!ctx.fatal());
+
+        // Waiting: nothing the host could write is an honest answer, so it writes none and stops.
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_cache_data(GHOST, GENERATE_REPLY));
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "a reply it cannot give poisons");
+        assert!(ctx.fatal());
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 4], "and no reply was written for it");
     }
 
     /// A command that replies without moving the reply position, for the tests about where a
