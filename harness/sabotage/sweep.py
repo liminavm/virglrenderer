@@ -211,6 +211,42 @@ SABOTAGES = [
         '''        let done = Some(());''',
         '',
     ),
+    (
+        'a monitored ring is registered but never stamped',
+        'virglrs/src/venus/monitor.rs',
+        '''                Some(status) => {
+                    status.set_bits(STATUS_ALIVE);
+                    true
+                }''',
+        '''                Some(_) => true,''',
+        '',
+    ),
+    (
+        'a ring asking to be monitored is quietly not monitored',
+        'virglrs/src/venus/context.rs',
+        '''        if let Some(want) = monitor_period(info) {''',
+        '''        if let Some(want) = None::<Option<u32>> {''',
+        '',
+    ),
+    (
+        'a reporting period of zero is given a default instead of being refused',
+        'virglrs/src/venus/context.rs',
+        '''    Some(Some(m.maxReportingPeriodMicroseconds).filter(|&us| us != 0))''',
+        '''    Some(Some(m.maxReportingPeriodMicroseconds).filter(|&us| us != 0).or(Some(3_000_000)))''',
+        '',
+    ),
+    (
+        'a shortened reporting period does not wake the sleeping monitor',
+        'virglrs/src/venus/monitor.rs',
+        '''            self.shared.wake.notify_one();
+        }
+    }
+}''',
+        '''        }
+    }
+}''',
+        '',
+    ),
 ]
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to

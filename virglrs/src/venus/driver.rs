@@ -34,10 +34,11 @@ use super::proto::types::{
     VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
     VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline,
     VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlags, VkQueryPool,
-    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkResult, VkSampleCountFlagBits,
-    VkSampler, VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo,
-    VkSubpassContents, VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
+    VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkResult, VkRingMonitorInfoMESA,
+    VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits, VkShaderModule, VkShaderStageFlags,
+    VkStructureType, VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkViewport,
+    VkWriteDescriptorSet,
 };
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
@@ -3036,6 +3037,46 @@ pub unsafe trait OutStruct {
 /// It takes the `pNext` field itself rather than the struct that holds it, which is what makes the
 /// borrow honest: the returned reference lives exactly as long as the exclusive borrow of the
 /// chain it was found in.
+/// The same claim for a struct the guest chained onto an *in*-parameter.
+///
+/// Separate from [`OutStruct`] because the two are read through different pointers and a type is
+/// rarely both -- an in-struct is a request the guest wrote, an out-struct is an answer we fill.
+///
+/// # Safety
+///
+/// As [`OutStruct`]: implementing this asserts the tag names exactly this `repr(C)` type.
+pub unsafe trait InStruct {
+    const TYPE: VkStructureType;
+}
+
+/// The struct the guest chained onto a request, or `None` if it chained none.
+///
+/// The read-only mirror of [`chained_mut`], and it exists for the same reason: a handler that
+/// wants what the guest hung off a `pNext` gets a borrow, so `context.rs` stays free of unsafe.
+/// It takes the `pNext` field itself rather than the struct holding it, so the returned reference
+/// lives exactly as long as the borrow of the chain it was found in.
+pub fn chained<T: InStruct>(head: &*const core::ffi::c_void) -> Option<&T> {
+    let mut node = (*head).cast::<VkBaseInStructure>();
+    while !node.is_null() {
+        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
+        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+        let base = unsafe { &*node };
+        if base.sType == T::TYPE {
+            // SAFETY: the tag says this node is a `T`, and `InStruct` is unsafe to implement
+            // precisely so that claim is the implementor's to uphold.
+            return Some(unsafe { &*node.cast::<T>() });
+        }
+        node = base.pNext;
+    }
+    None
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkRingMonitorInfoMESA {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA;
+}
+
 pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&mut T> {
     let mut node = (*head).cast::<VkBaseOutStructure>();
     while !node.is_null() {
