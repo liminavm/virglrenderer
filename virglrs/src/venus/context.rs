@@ -25,18 +25,19 @@ use super::monitor::Monitor;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandTypeEXT, VkDeviceMemory, VkFlags, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkObjectType, VkPhysicalDevice, VkResult, VkRingCreateInfoMESA, VkRingMonitorInfoMESA,
-    vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
-    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
-    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage,
-    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
-    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw,
-    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
-    vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport,
-    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeviceMemory, VkFlags,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice, VkResult,
+    VkRingCreateInfoMESA, VkRingMonitorInfoMESA, vn_command_vkAllocateCommandBuffers,
+    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
+    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
+    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
+    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
+    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
+    vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
+    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
@@ -53,11 +54,12 @@ use super::proto::types::{
     vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
-    vn_command_vkFlushMappedMemoryRanges, vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory,
-    vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
-    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
-    vn_command_vkGetDescriptorSetLayoutSupport, vn_command_vkGetDeviceBufferMemoryRequirements,
-    vn_command_vkGetDeviceGroupPeerMemoryFeatures, vn_command_vkGetDeviceImageMemoryRequirements,
+    vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory, vn_command_vkGetBufferDeviceAddress,
+    vn_command_vkGetBufferMemoryRequirements, vn_command_vkGetBufferMemoryRequirements2,
+    vn_command_vkGetBufferOpaqueCaptureAddress, vn_command_vkGetDescriptorSetLayoutSupport,
+    vn_command_vkGetDeviceBufferMemoryRequirements, vn_command_vkGetDeviceGroupPeerMemoryFeatures,
+    vn_command_vkGetDeviceImageMemoryRequirements,
     vn_command_vkGetDeviceImageSparseMemoryRequirements,
     vn_command_vkGetDeviceImageSubresourceLayout, vn_command_vkGetDeviceMemoryCommitment,
     vn_command_vkGetDeviceMemoryOpaqueCaptureAddress, vn_command_vkGetDeviceQueue2,
@@ -361,143 +363,34 @@ impl Context {
             return Submitted::Poisoned;
         }
 
-        // One arena for the batch. Every temporary a command decodes into lives until the batch
-        // ends, which is the same bargain the C makes with its temp pool -- and the decoder's own
-        // cap, not this arena, is what stops a guest from asking for all of memory.
         // Read out what the poison path needs before the handlers borrow the rest of the
         // context: they hold the driver mutably for as long as the loop runs.
         let id = self.id;
         let replay = self.replay;
         let fatal = &self.fatal;
-        let (mut dispatched, mut unhandled) = (0u64, 0u64);
-
-        let temp = Bump::new();
-        // One reply buffer for the batch, refilled per command. Host memory: an answer is built
-        // here in full and only then offered to the guest, so a reply that turns out not to fit
-        // never reaches it. See `ReplyStream::write`.
-        let mut scratch: Vec<u8> = Vec::new();
-        let proto = AllOfIt;
-        let mut dec = Decoder::new(buf, &temp, &self.objects, fatal);
+        let mut counts = Counts::default();
         let mut h = Handlers {
             objects: &self.objects,
             todo,
             driver: &mut self.driver,
             global,
-            ctx: self.id,
+            ctx: id,
             reject: None,
             unserved: false,
             resources,
             rings: &mut self.rings,
             monitor: &mut self.monitor,
             wait: None,
+            execute: None,
             current_ring: on,
             reply,
             replaying: replay,
         };
 
-        // Where this batch stopped, when it stopped at a wait. The position *before* the command
-        // that asked, so the resume re-decodes it -- see `Submitted::Waiting`.
-        let mut suspended = None;
+        let suspended = run_batch(&mut h, buf, fatal, &mut counts, 0);
 
-        while dec.has_command() {
-            dec.clear_soft_fatal();
-
-            let at = dec.pos();
-            let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
-            let flags = dec.decode_scalar::<VkFlags>();
-            if dec.hard_fatal() {
-                // The header itself was short: there is no command here to lose.
-                eprintln!(
-                    "[virglrs] ctx {}: submission ends mid-header, {} bytes into {}",
-                    id.get(),
-                    dec.pos(),
-                    buf.len()
-                );
-                break;
-            }
-
-            // The guest is waiting for an answer to this one. Replay never is: the journal's
-            // entries have had their reply flag stripped already, which is why a replayed stream
-            // needs no reply buffer at all.
-            let wants_reply = flags.0 & GENERATE_REPLY != 0 && !replay;
-
-            // Asked before the command runs rather than after, which is where the C's
-            // `vkr_cs_encoder_acquire` asks it too. Running the handler first would let a command
-            // create an object and only then discover there is nowhere to report it -- state
-            // changed on a path that ends in a poisoned context either way.
-            if wants_reply && h.reply.is_none() {
-                unhandled += 1;
-                poison(fatal, id, &dec, cmd, "wants a reply, and no reply stream was ever set");
-                break;
-            }
-
-            let mut enc = Encoder::growing(&mut scratch, &proto);
-            if vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut h).is_none()
-            {
-                // A command type this protocol does not define. We cannot even skip it: its length
-                // is only knowable by decoding it.
-                poison(fatal, id, &dec, cmd, "is not a command type this protocol defines");
-                break;
-            }
-            // How much answer there is. Read here so the encoder's borrow of the scratch ends
-            // before the commit below reads it back.
-            let answer = enc.pos();
-            dispatched += 1;
-
-            // No handler ran: the command was counted for the census and nothing else. There is
-            // no version of that which is safe to continue from. When the guest wanted a reply,
-            // the generator encoded one regardless, out of arguments no handler ever filled in,
-            // and a zeroed reply is shaped exactly like a successful one -- there is no field in
-            // which to say "we did not do this". When it wanted none, the guest is not waiting,
-            // but it does go on believing the host did the thing; the divergence surfaces later,
-            // somewhere that cannot name this command. Either way the context dies here, saying
-            // which command it was. This is also what upstream does: its generated wrapper for a
-            // command with no handler sets fatal before decoding, whatever the reply flag says.
-            // Not counted in `unhandled`: the census above already owns the tally of commands
-            // no handler served, and a second count of the same fact is one that can disagree.
-            if core::mem::take(&mut h.unserved) {
-                poison(fatal, id, &dec, cmd, "is not a command this build serves");
-                break;
-            }
-            // A handler that found the command itself unusable -- an id the guest cannot have, a
-            // length that would send the driver off the end of what was decoded. The handler has
-            // no decoder to say so with; this is where its verdict lands.
-            if let Some(why) = h.reject.take() {
-                poison(fatal, id, &dec, cmd, why);
-            }
-
-            if fatal.load(Ordering::Acquire) {
-                // The decoder poisoned itself inside the command: a malformed argument, or a
-                // shape the generator has no decoder for. Either way the command is what a
-                // reader needs, because without it a gap reaches a user as a hung guest.
-                poison(fatal, id, &dec, cmd, "did not decode");
-                break;
-            }
-
-            // The handler could not proceed and asked to be tried again later. Nothing is
-            // committed: not the position, so the command decodes again from the same byte, and
-            // not the answer, which would otherwise report a wait as finished before it was. The
-            // command is counted twice in `dispatched` for the same reason -- a cosmetic cost of
-            // the resume being a real re-dispatch rather than a resumption of one.
-            if let Some(on) = h.wait.take() {
-                suspended = Some((at, on));
-                break;
-            }
-
-            // The answer goes over only once the command is known to have worked. A poisoned
-            // context has nothing to say, and a rejected command's half-built reply would be an
-            // answer to a question we did not finish -- which the guest cannot tell apart from a
-            // real one.
-            if answer > 0 {
-                let stream = h.reply.as_mut().expect("a reply had a stream before the command ran");
-                if let Err(over) = stream.write(&scratch[..answer]) {
-                    poison(fatal, id, &dec, cmd, &format!("could not be answered: {over}"));
-                    break;
-                }
-            }
-        }
-        self.dispatched += dispatched;
-        self.unhandled += unhandled;
+        self.dispatched += counts.dispatched;
+        self.unhandled += counts.unhandled;
         // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
         // success on the way out. The poison check comes first: a batch that suspended *and* then
         // poisoned has nothing left to resume into.
@@ -716,6 +609,273 @@ fn monitor_period(info: &VkRingCreateInfoMESA) -> Option<Option<u32>> {
 ///
 /// Free-standing rather than a method because the dispatch loop has already lent the rest of the
 /// context to the handlers by the time it needs this.
+/// How many commands a batch dispatched, and how many reached no handler.
+///
+/// One counter travelling through the nested dispatch, so an executed stream's commands land in
+/// the same census as the batch that asked for them.
+#[derive(Default)]
+struct Counts {
+    dispatched: u64,
+    unhandled: u64,
+}
+
+/// Command streams a handler asked to have executed, and where each one's answers go.
+///
+/// Descriptors, not bytes. `streamCount` is bounded only by what fits in the batch, and each
+/// descriptor may name a whole resource, so copying them all out up front would let a guest ask
+/// the host to materialise far more than it ever mapped. The bytes are copied one stream at a
+/// time, in `run_streams`, and peak cost is the largest single stream -- memory the guest has
+/// already paid for.
+struct Execute {
+    streams: Vec<VkCommandStreamDescriptionMESA>,
+    reply_positions: Option<Vec<usize>>,
+}
+
+/// Dispatch every command in one stream of wire bytes.
+///
+/// Returns where the batch stopped when a handler asked to be suspended, and `None` otherwise --
+/// including when it was poisoned, which the caller reads from `fatal`.
+///
+/// `depth` is 0 for a submission and 1 for the streams a `vkExecuteCommandStreamsMESA` names.
+/// Where the C saves and restores its one decoder's state around the nested run, this needs
+/// nothing: each level builds its own decoder, arena and reply scratch, so the outer decode is
+/// untouched by construction and cannot be left half-restored.
+fn run_batch(
+    h: &mut Handlers<'_>,
+    buf: &[u8],
+    fatal: &AtomicBool,
+    counts: &mut Counts,
+    depth: u32,
+) -> Option<(usize, Wait)> {
+    let id = h.ctx;
+    let replay = h.replaying;
+    let objects = h.objects;
+
+    let temp = Bump::new();
+    // One reply buffer for the batch, refilled per command. Host memory: an answer is built
+    // here in full and only then offered to the guest, so a reply that turns out not to fit
+    // never reaches it. See `ReplyStream::write`.
+    let mut scratch: Vec<u8> = Vec::new();
+    let proto = AllOfIt;
+    let mut dec = Decoder::new(buf, &temp, objects, fatal);
+
+    // Where this batch stopped, when it stopped at a wait. The position *before* the command
+    // that asked, so the resume re-decodes it -- see `Submitted::Waiting`.
+    let mut suspended = None;
+
+    while dec.has_command() {
+        dec.clear_soft_fatal();
+
+        let at = dec.pos();
+        let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
+        let flags = dec.decode_scalar::<VkFlags>();
+        if dec.hard_fatal() {
+            // The header itself was short: there is no command here to lose.
+            eprintln!(
+                "[virglrs] ctx {}: submission ends mid-header, {} bytes into {}",
+                id.get(),
+                dec.pos(),
+                buf.len()
+            );
+            break;
+        }
+
+        // The guest is waiting for an answer to this one. Replay never is: the journal's
+        // entries have had their reply flag stripped already, which is why a replayed stream
+        // needs no reply buffer at all.
+        let wants_reply = flags.0 & GENERATE_REPLY != 0 && !replay;
+
+        // Asked before the command runs rather than after, which is where the C's
+        // `vkr_cs_encoder_acquire` asks it too. Running the handler first would let a command
+        // create an object and only then discover there is nowhere to report it -- state
+        // changed on a path that ends in a poisoned context either way.
+        if wants_reply && h.reply.is_none() {
+            counts.unhandled += 1;
+            poison(fatal, id, &dec, cmd, "wants a reply, and no reply stream was ever set");
+            break;
+        }
+
+        let mut enc = Encoder::growing(&mut scratch, &proto);
+        if vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut *h).is_none() {
+            // A command type this protocol does not define. We cannot even skip it: its length
+            // is only knowable by decoding it.
+            poison(fatal, id, &dec, cmd, "is not a command type this protocol defines");
+            break;
+        }
+        // How much answer there is. Read here so the encoder's borrow of the scratch ends
+        // before the commit below reads it back.
+        let answer = enc.pos();
+        counts.dispatched += 1;
+
+        // No handler ran: the command was counted for the census and nothing else. There is
+        // no version of that which is safe to continue from. When the guest wanted a reply,
+        // the generator encoded one regardless, out of arguments no handler ever filled in,
+        // and a zeroed reply is shaped exactly like a successful one -- there is no field in
+        // which to say "we did not do this". When it wanted none, the guest is not waiting,
+        // but it does go on believing the host did the thing; the divergence surfaces later,
+        // somewhere that cannot name this command. Either way the context dies here, saying
+        // which command it was. This is also what upstream does: its generated wrapper for a
+        // command with no handler sets fatal before decoding, whatever the reply flag says.
+        // Not counted in `unhandled`: the census above already owns the tally of commands
+        // no handler served, and a second count of the same fact is one that can disagree.
+        if core::mem::take(&mut h.unserved) {
+            poison(fatal, id, &dec, cmd, "is not a command this build serves");
+            break;
+        }
+        // A handler that found the command itself unusable -- an id the guest cannot have, a
+        // length that would send the driver off the end of what was decoded. The handler has
+        // no decoder to say so with; this is where its verdict lands.
+        if let Some(why) = h.reject.take() {
+            poison(fatal, id, &dec, cmd, why);
+        }
+
+        if fatal.load(Ordering::Acquire) {
+            // The decoder poisoned itself inside the command: a malformed argument, or a
+            // shape the generator has no decoder for. Either way the command is what a
+            // reader needs, because without it a gap reaches a user as a hung guest.
+            poison(fatal, id, &dec, cmd, "did not decode");
+            break;
+        }
+
+        // The handler could not proceed and asked to be tried again later. Nothing is
+        // committed: not the position, so the command decodes again from the same byte, and
+        // not the answer, which would otherwise report a wait as finished before it was. The
+        // command is counted twice in `dispatched` for the same reason -- a cosmetic cost of
+        // the resume being a real re-dispatch rather than a resumption of one.
+        if let Some(on) = h.wait.take() {
+            // Not from inside an execute. A suspension unwinds to `ffi.rs`, which resumes the
+            // *outer* batch from the position it was handed -- and that position names a byte
+            // in the outer stream, not in the copied one this command came from. The C can
+            // block here because it blocks in the handler; we cannot, so this is a deviation
+            // and is logged as one. Mesa's execute streams carry recorded `vkCmd*` work and no
+            // transport waits, which is why nothing real is expected to reach this line.
+            if depth > 0 {
+                poison(
+                    fatal,
+                    id,
+                    &dec,
+                    cmd,
+                    "suspends the batch, and a command stream being executed has nowhere to suspend to",
+                );
+                break;
+            }
+            suspended = Some((at, on));
+            break;
+        }
+
+        // A handler asking for streams to be executed. Same message shape as `wait`, for the
+        // same reason: the nested dispatch needs a decoder, and a handler has none.
+        if let Some(exec) = h.execute.take() {
+            if depth > 0 {
+                poison(
+                    fatal,
+                    id,
+                    &dec,
+                    cmd,
+                    "executes command streams from inside a command stream it is already executing",
+                );
+                break;
+            }
+            run_streams(h, &exec, fatal, counts, depth);
+            if fatal.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        // The answer goes over only once the command is known to have worked. A poisoned
+        // context has nothing to say, and a rejected command's half-built reply would be an
+        // answer to a question we did not finish -- which the guest cannot tell apart from a
+        // real one.
+        if answer > 0 {
+            let stream = h.reply.as_mut().expect("a reply had a stream before the command ran");
+            if let Err(over) = stream.write(&scratch[..answer]) {
+                poison(fatal, id, &dec, cmd, &format!("could not be answered: {over}"));
+                break;
+            }
+        }
+    }
+    suspended
+}
+
+/// Run the streams one `vkExecuteCommandStreamsMESA` named, seeking the reply stream per stream.
+///
+/// Poisons through `fatal` rather than returning a reason: every refusal here names a stream
+/// index, which the one-line `poison` does not carry.
+fn run_streams(
+    h: &mut Handlers<'_>,
+    exec: &Execute,
+    fatal: &AtomicBool,
+    counts: &mut Counts,
+    depth: u32,
+) {
+    let id = h.ctx;
+    for (i, s) in exec.streams.iter().enumerate() {
+        // Before the empty-stream skip, exactly as in the C: a zero-sized stream is still a
+        // position the guest asked its answers to resume from.
+        if let Some(&pos) = exec.reply_positions.as_ref().map(|p| &p[i]) {
+            let stream =
+                h.reply.as_mut().expect("a reply position had a stream before the streams ran");
+            if !stream.seek(pos) {
+                eprintln!(
+                    "[virglrs] ctx {}: vkExecuteCommandStreamsMESA: stream {i} asks its reply to \
+                     resume at {pos}, which is outside the reply stream",
+                    id.get(),
+                );
+                fatal.store(true, Ordering::Release);
+                return;
+            }
+        }
+
+        if s.size == 0 {
+            continue;
+        }
+
+        let Some(map) = ResourceHandle::new(s.resourceId).and_then(|r| h.resources.shm(r)) else {
+            eprintln!(
+                "[virglrs] ctx {}: vkExecuteCommandStreamsMESA: stream {i} is in resource {}, \
+                 which this context has no mapping for",
+                id.get(),
+                s.resourceId,
+            );
+            fatal.store(true, Ordering::Release);
+            return;
+        };
+
+        // Bounds first, allocation second. The size is the guest's, and a size checked only
+        // against nothing is a request for as much host memory as a u64 can name.
+        let end = s.offset.checked_add(s.size);
+        if end.is_none_or(|end| end > map.len()) {
+            eprintln!(
+                "[virglrs] ctx {}: vkExecuteCommandStreamsMESA: stream {i} asks for {} bytes at \
+                 {} of resource {}, which is {} bytes",
+                id.get(),
+                s.size,
+                s.offset,
+                s.resourceId,
+                map.len(),
+            );
+            fatal.store(true, Ordering::Release);
+            return;
+        }
+
+        // Copied out rather than decoded in place. The mapping can be torn down under us -- the
+        // resource is the guest's to detach -- and the `Arc` this holds is what keeps the pages
+        // alive for exactly as long as the copy takes. Decoding straight from guest memory would
+        // instead need that guarantee to hold for the whole nested dispatch, which runs handlers.
+        let mut bytes = vec![0u8; s.size];
+        assert!(
+            map.copy_out(s.offset, &mut bytes),
+            "a copy the bounds check above admitted did not fit",
+        );
+
+        let suspended = run_batch(h, &bytes, fatal, counts, depth + 1);
+        assert!(suspended.is_none(), "a nested batch suspended, which its own depth guard refuses",);
+        if fatal.load(Ordering::Acquire) {
+            return;
+        }
+    }
+}
+
 fn poison(fatal: &AtomicBool, id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
     if !fatal.load(Ordering::Acquire) {
         let name = vn_command_name(cmd)
@@ -783,6 +943,9 @@ pub struct Handlers<'a> {
     /// with the renderer root locked behind that. A handler that slept would hold both, and the
     /// thread it is waiting for needs the first of them to make any progress at all.
     wait: Option<Wait>,
+    /// A handler asking for command streams to be executed, for the same reason `wait` is a
+    /// message: the nested dispatch needs a decoder, and a handler is handed none.
+    execute: Option<Execute>,
     /// Whether this batch is a snapshot journal being replayed rather than a guest talking.
     ///
     /// A created ring reads it: replay restores head and status words the host would otherwise
@@ -1906,6 +2069,45 @@ impl Commands for Handlers<'_> {
             );
             self.reject = Some("seeked a reply stream past the end of its own window");
         }
+    }
+
+    /// Run the command streams the guest recorded elsewhere.
+    ///
+    /// This is how every recorded `vkCmd*` reaches us: mesa fills a resource with a stream and
+    /// then names it here, rather than sending the commands inline. The handler only resolves and
+    /// records what was asked; the loop runs it, because running a stream needs a decoder and a
+    /// handler is handed none. See [`Execute`].
+    ///
+    /// `pDependencies` and `flags` are read by nobody, here or in the C: the streams named are
+    /// executed in the order given, which is what a dependency between them could ask for anyway.
+    fn vkExecuteCommandStreamsMESA(
+        &mut self,
+        args: &mut vn_command_vkExecuteCommandStreamsMESA<'_>,
+    ) {
+        if !args.has_pStreams() {
+            self.reject = Some("executed command streams without saying which");
+            return;
+        }
+        let streams = args.pStreams();
+        if streams.is_empty() {
+            self.reject = Some("executed no command streams at all");
+            return;
+        }
+
+        // Reply positions without a reply stream is not an empty request: the guest has said where
+        // each stream's answers belong, and there is no window they could belong in. Serving the
+        // streams anyway would run them and drop every answer.
+        let reply_positions = match args.pReplyPositions() {
+            Some(_) if self.reply.is_none() => {
+                self.reject =
+                    Some("executed command streams with reply positions and no reply stream");
+                return;
+            }
+            Some(p) => Some(p.to_vec()),
+            None => None,
+        };
+
+        self.execute = Some(Execute { streams: streams.to_vec(), reply_positions });
     }
 
     // The queries that carry a `ret`. Where a command has a field designed to say "no", that is
@@ -3364,6 +3566,239 @@ mod tests {
         buf
     }
 
+    /// An execute command's bytes, naming streams and where each one's answers belong.
+    fn wire_execute(
+        streams: &[super::super::proto::types::VkCommandStreamDescriptionMESA],
+        positions: Option<&[usize]>,
+    ) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkExecuteCommandStreamsMESA_args, vn_sizeof_vkExecuteCommandStreamsMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkExecuteCommandStreamsMESA as Args;
+
+        let mut args = Args::default();
+        // Positions first: both planters set the one count the pair shares, and the streams are
+        // what that count is about.
+        if let Some(p) = positions {
+            args.plant_pReplyPositions(p);
+        }
+        args.plant_pStreams(streams);
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkExecuteCommandStreamsMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkExecuteCommandStreamsMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
+    /// A stream descriptor for bytes already written into the ring resource.
+    fn stream_at(
+        offset: usize,
+        size: usize,
+    ) -> super::super::proto::types::VkCommandStreamDescriptionMESA {
+        reply_at(offset, size)
+    }
+
+    /// The claim the whole command exists for: commands recorded in guest memory run, their
+    /// answers reach the window the outer batch set, and the outer batch carries on afterwards.
+    ///
+    /// The last part is the one the C pays for with `vkr_cs_decoder_save_state`. We build a
+    /// decoder per stream instead, so the outer decode cannot be disturbed -- and this is what
+    /// says so.
+    #[test]
+    fn an_executed_stream_runs_and_the_outer_batch_carries_on() {
+        const WINDOW: usize = 0x21000;
+        const STREAM: usize = 0x22000;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+
+        let inner = wire_seek(0x10, GENERATE_REPLY);
+        assert!(t.1.copy_in(STREAM, &inner));
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_execute(&[stream_at(STREAM, inner.len())], None));
+        batch.extend_from_slice(&wire_seek(0x30, GENERATE_REPLY));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served batch does not poison");
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW + 0x10, &mut got));
+        assert_eq!(got, seek_reply_bytes(), "the executed stream's command ran and answered");
+
+        assert!(t.1.copy_out(WINDOW + 0x30, &mut got));
+        assert_eq!(got, seek_reply_bytes(), "the command after the execute ran too");
+    }
+
+    /// A command that replies without moving the reply position, for the tests about where a
+    /// reply lands. Every other cheap replying command is a seek, which is exactly the thing that
+    /// would hide the position under test.
+    fn wire_instance_version() -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkEnumerateInstanceVersion_args, vn_sizeof_vkEnumerateInstanceVersion_args,
+        };
+        use super::super::proto::types::vn_command_vkEnumerateInstanceVersion as Args;
+
+        let mut out = 0u32;
+        let mut args = Args::default();
+        args.plant_pApiVersion(&mut out);
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkEnumerateInstanceVersion_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkEnumerateInstanceVersion_args(&mut enc, VkFlags(GENERATE_REPLY), &args);
+        buf
+    }
+
+    /// Its reply's first word: the command type, like every reply's.
+    fn instance_version_reply_bytes() -> [u8; 4] {
+        (VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumerateInstanceVersion_EXT.0 as u32).to_le_bytes()
+    }
+
+    /// Each stream's answers start where the guest said they would.
+    #[test]
+    fn each_stream_answers_at_the_position_it_was_given() {
+        const WINDOW: usize = 0x21000;
+        const A: usize = 0x22000;
+        const B: usize = 0x22800;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+
+        let inner = wire_instance_version();
+        assert!(t.1.copy_in(A, &inner));
+        assert!(t.1.copy_in(B, &inner));
+
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_execute(
+            &[stream_at(A, inner.len()), stream_at(B, inner.len())],
+            Some(&[0x40, 0x80]),
+        ));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran());
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW + 0x40, &mut got));
+        assert_eq!(
+            got,
+            instance_version_reply_bytes(),
+            "the first stream answered where it was told"
+        );
+        assert!(t.1.copy_out(WINDOW + 0x80, &mut got));
+        assert_eq!(
+            got,
+            instance_version_reply_bytes(),
+            "the second stream answered where it was told"
+        );
+
+        // Nothing at the top of the window: both answers moved, neither was also appended.
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 4], "a reply position moves the answer, it does not copy it");
+    }
+
+    /// A stream of no bytes is skipped -- but its reply position is honoured first, and a position
+    /// outside the window is refused whether or not there was anything to run.
+    ///
+    /// Two claims in one batch because they are the same claim: the seek happens before the skip,
+    /// which is only visible when the seek is the thing that fails.
+    #[test]
+    fn an_empty_stream_is_skipped_and_its_reply_position_is_still_checked() {
+        const WINDOW: usize = 0x21000;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        // Nothing to run, in a resource that is not even mapped: the skip is what keeps this from
+        // being an error at all.
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        let nowhere = super::super::proto::types::VkCommandStreamDescriptionMESA {
+            resourceId: RING_RES.get() + 1,
+            offset: 0,
+            size: 0,
+        };
+        batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x40])));
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "an empty stream is not an error");
+
+        // The same empty stream, asked to answer past the end of the window.
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x101])));
+        assert!(
+            !ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            "a position past the window is refused"
+        );
+        assert!(ctx.fatal());
+    }
+
+    /// A stream that names memory outside its resource is refused, and so is one whose offset and
+    /// size only fit because they wrapped.
+    #[test]
+    fn a_stream_outside_its_resource_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        for s in [
+            stream_at(t.1.len() - 4, 8),
+            stream_at(usize::MAX, 8),
+            super::super::proto::types::VkCommandStreamDescriptionMESA {
+                resourceId: RING_RES.get() + 1,
+                offset: 0,
+                size: 4,
+            },
+        ] {
+            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+            assert!(
+                !ctx.submit(&wire_execute(&[s], None), &mut todo, &g, &t).ran(),
+                "{} bytes at {} of resource {} is not a stream this resource holds",
+                s.size,
+                s.offset,
+                s.resourceId,
+            );
+            assert!(ctx.fatal());
+        }
+    }
+
+    /// An execute inside an execute is refused, rather than recursing as deep as the guest likes.
+    #[test]
+    fn an_execute_inside_an_executed_stream_is_refused() {
+        const STREAM: usize = 0x22000;
+
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+
+        let inner = wire_execute(&[stream_at(STREAM, 4)], None);
+        assert!(t.1.copy_in(STREAM, &inner));
+
+        let outer = wire_execute(&[stream_at(STREAM, inner.len())], None);
+        assert!(!ctx.submit(&outer, &mut todo, &g, &t).ran(), "nesting is refused");
+        assert!(ctx.fatal());
+    }
+
+    /// Naming no streams at all is refused, and so is asking for reply positions with no window
+    /// for them to be positions in.
+    #[test]
+    fn an_execute_that_cannot_mean_anything_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        assert!(!ctx.submit(&wire_execute(&[], None), &mut todo, &g, &t).ran(), "no streams");
+        assert!(ctx.fatal());
+
+        // Positions, and no reply stream was ever set: the guest has said where every answer
+        // belongs and there is nowhere any of them could belong.
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let w = wire_execute(&[stream_at(0x22000, 4)], Some(&[0]));
+        assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "positions with no window");
+        assert!(ctx.fatal());
+    }
+
     /// What a reply to a seek looks like on the wire: the command type, and nothing else.
     fn seek_reply_bytes() -> [u8; 4] {
         (VkCommandTypeEXT::VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT.0 as u32).to_le_bytes()
@@ -3788,6 +4223,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -4578,6 +5014,7 @@ mod tests {
                     rings: &mut rings,
                     monitor: &mut monitor,
                     wait: None,
+                    execute: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4645,6 +5082,7 @@ mod tests {
                     rings: &mut rings,
                     monitor: &mut monitor,
                     wait: None,
+                    execute: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4749,6 +5187,7 @@ mod tests {
                     rings: &mut rings,
                     monitor: &mut monitor,
                     wait: None,
+                    execute: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4846,6 +5285,7 @@ mod tests {
                     rings: &mut rings,
                     monitor: &mut monitor,
                     wait: None,
+                    execute: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4965,6 +5405,7 @@ mod tests {
                     rings: &mut rings,
                     monitor: &mut monitor,
                     wait: None,
+                    execute: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -5271,6 +5712,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5387,6 +5829,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5895,6 +6338,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5949,6 +6393,7 @@ mod tests {
                 rings: &mut rings,
                 monitor: &mut monitor,
                 wait: None,
+                execute: None,
                 replaying: false,
                 current_ring: None,
                 reply: &mut ctx_reply,
@@ -5992,6 +6437,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6031,6 +6477,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6102,6 +6549,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6145,6 +6593,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6238,6 +6687,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6308,6 +6758,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6344,6 +6795,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6466,6 +6918,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6562,6 +7015,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6611,6 +7065,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6667,6 +7122,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6698,6 +7154,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6785,6 +7242,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6823,6 +7281,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6965,6 +7424,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7039,6 +7499,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7071,6 +7532,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7127,6 +7589,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7173,6 +7636,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7203,6 +7667,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7376,6 +7841,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7457,6 +7923,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7594,6 +8061,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7768,6 +8236,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7962,6 +8431,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8104,6 +8574,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8189,6 +8660,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8252,6 +8724,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8438,6 +8911,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8494,6 +8968,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8685,6 +9160,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8821,6 +9297,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8975,6 +9452,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9060,6 +9538,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9218,6 +9697,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9371,6 +9851,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9510,6 +9991,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9649,6 +10131,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9841,6 +10324,7 @@ mod tests {
             rings: &mut rings,
             monitor: &mut monitor,
             wait: None,
+            execute: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
