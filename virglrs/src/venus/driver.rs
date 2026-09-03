@@ -26,7 +26,7 @@ use super::proto::types::{
     VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExtensionProperties,
     VkExternalMemoryHandleTypeFlagBits, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter,
     VkFormat, VkFramebuffer, VkImage, VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit,
-    VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
+    VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
     VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageType,
     VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
     VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
@@ -1962,6 +1962,33 @@ impl Driver {
                 src,
                 layout,
                 dst,
+                regions.len() as u32,
+                regions.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
+    /// The unscaled sibling of [`Self::cmd_blit_image`]: the regions name one extent, not a
+    /// source rectangle and a destination one, so there is nothing for a filter to do.
+    pub fn cmd_copy_image(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkImage,
+        src_layout: VkImageLayout,
+        dst: VkImage,
+        dst_layout: VkImageLayout,
+        regions: &[VkImageCopy],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe {
+            (d.vkCmdCopyImage())(
+                cb,
+                src,
+                src_layout,
+                dst,
+                dst_layout,
                 regions.len() as u32,
                 regions.as_ptr(),
             )

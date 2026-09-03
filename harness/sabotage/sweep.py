@@ -418,6 +418,59 @@ SABOTAGES = [
         '',
     ),
     (
+        'the image copy the overview blur asks for is refused again',
+        'virglrs/src/venus/context.rs',
+        """    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_copy_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstImage,
+            args.dstImageLayout,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+""",
+        """""",
+        '',
+    ),
+    (
+        "an image copy hands each image the other one's layout",
+        'virglrs/src/venus/context.rs',
+        """    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_copy_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstImage,
+            args.dstImageLayout,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+""",
+        """    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_copy_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.dstImageLayout,
+            args.dstImage,
+            args.srcImageLayout,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+""",
+        '',
+    ),
+    (
         'only the fd half of the emulated external memory is advertised',
         'virglrs/src/venus/driver.rs',
         """            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));""",
