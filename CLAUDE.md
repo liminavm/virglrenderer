@@ -108,6 +108,12 @@ it. Fix the template.
   cleanly, which is also what a compositor that died at startup produces. Each is a true signal
   about something; none of them is a pixel. A claim about what is on the screen is only ever
   settled by what is on the screen.
+- **The worst proxy is the one telling the truth.** A compositor reporting
+  `ActiveState=active SubState=running NRestarts=0 ExecMainStatus=0` may be genuinely alive and
+  still have presented nothing — the screen stays the boot console and the captured frame stops
+  being rewritten. Nothing there is false; the signal answers "is the process up", and the
+  question was "is there a desktop". A signal cannot be corrected into an answer to a question
+  it does not address, so reach for the artifact the claim is actually about.
 - **For a load-bearing claim, look at it.** Not a status field, not a count, not a hash — the
   frame. `harness/vm/frame.py` prints facts about a captured frame and deliberately renders no
   verdict, because a script concluding "looks seated" is a new proxy and would be trusted faster
