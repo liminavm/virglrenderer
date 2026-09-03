@@ -163,6 +163,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
+  `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 34
+  shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
+  `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
+  pixels, which cannot say *which* line of a 200-line shader went wrong; the GLSL can. It is
+  recorded with `vm/prefix-debug` (a `-Db_ndebug=false` build of the C; the release prefix
+  compiles the dump out) as `VREND_DEBUG=shader ./vrend-replay.sh ../vm/captures/vrend.bin`,
+  normalised by `vrend-shader-log.py`. The Rust tests in `virglrs/src/vrend/tgsi/fixture.rs`
+  read it and hold the parser to the TGSI half: every dump parses and prints back byte for
+  byte. The GLSL half is the translator's oracle.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).

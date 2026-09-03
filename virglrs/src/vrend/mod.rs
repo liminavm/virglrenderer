@@ -10,7 +10,7 @@
 //! to diff against. `pipe` is gallium's vocabulary, the enums those types are made of.
 //!
 //! `formats` is what each format *is* (gallium's description, which every transfer size comes
-//! from) and what GL calls it.
+//! from) and what GL calls it. `tgsi` is the shader language the guest sends, as typed tokens.
 //!
 //! `egl` and `gl` are the host side: the winsys and the driver's entry points, the two named
 //! unsafe modules of this renderer (CLAUDE.md). Everything above them is safe Rust.
@@ -25,6 +25,7 @@ pub mod gl;
 pub mod pipe;
 pub mod proto;
 pub mod resource;
+pub mod tgsi;
 pub mod transfer;
 #[allow(clippy::module_inception)]
 pub mod vrend;

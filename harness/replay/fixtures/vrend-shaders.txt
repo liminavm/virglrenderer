@@ -1,0 +1,2311 @@
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2].xy, GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[2].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[2].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[2].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[2].wwww
+  6: ADD OUT[2].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+   out  vec4 vso_g0;
+   out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_2.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_2.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_2.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_2.wwww))).xy);
+vso_g1.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[1].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], IN[0], TEMP[0]
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2].xy, GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[2].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[2].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[2].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[2].wwww
+  6: ADD OUT[2].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+ smooth    out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_2.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_2.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_2.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_2.wwww))).xy);
+vso_g1.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[1].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], IN[0], TEMP[0]
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[1].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], IN[0], TEMP[0]
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL IN[3]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2], GENERIC[1]
+DCL CONST[0..11]
+DCL TEMP[0..17]
+DCL TEMP[18..21]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[2].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[2].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[2].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[2].wwww
+  6: ADD OUT[2].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6].xy, CONST[8].xyyy, IN[3].xxxx
+  8: MUL TEMP[7].xy, CONST[9].xyyy, IN[3].yyyy
+  9: ADD TEMP[8].xy, TEMP[6].xyxx, TEMP[7].xyxx
+ 10: MUL TEMP[9].xy, CONST[10].xyyy, IN[3].zzzz
+ 11: ADD TEMP[10].xy, TEMP[8].xyxx, TEMP[9].xyxx
+ 12: MUL TEMP[11].xy, CONST[11].xyyy, IN[3].wwww
+ 13: ADD OUT[2].zw, TEMP[10].xxxy, TEMP[11].xxxy
+ 14: MUL TEMP[12], CONST[0], IN[0].xxxx
+ 15: MUL TEMP[13], CONST[1], IN[0].yyyy
+ 16: ADD TEMP[14], TEMP[12], TEMP[13]
+ 17: MUL TEMP[15], CONST[2], IN[0].zzzz
+ 18: ADD TEMP[16], TEMP[14], TEMP[15]
+ 19: MUL TEMP[17], CONST[3], IN[0].wwww
+ 20: ADD OUT[0], TEMP[16], TEMP[17]
+ 21: MOV OUT[1], IN[1]
+ 22: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+in vec4 in_3;
+ smooth    out  vec4 vso_g0;
+ smooth    out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+ vec4 temp16;
+ vec4 temp17;
+ vec4 temp18;
+ vec4 temp19;
+ vec4 temp20;
+ vec4 temp21;
+uniform uvec4 vsconst0[12];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_2.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_2.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_2.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_2.wwww))).xy);
+vso_g1.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6.xy = vec2(((uintBitsToFloat(vsconst0[8].xyyy) * (in_3.xxxx))).xy);
+temp7.xy = vec2(((uintBitsToFloat(vsconst0[9].xyyy) * (in_3.yyyy))).xy);
+temp8.xy = vec2((( vec4(temp6).xyxx  +  vec4(temp7).xyxx )).xy);
+temp9.xy = vec2(((uintBitsToFloat(vsconst0[10].xyyy) * (in_3.zzzz))).xy);
+temp10.xy = vec2((( vec4(temp8).xyxx  +  vec4(temp9).xyxx )).xy);
+temp11.xy = vec2(((uintBitsToFloat(vsconst0[11].xyyy) * (in_3.wwww))).xy);
+vso_g1.zw = vec2((( vec4(temp10).xxxy  +  vec4(temp11).xxxy )).zw);
+temp12 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp13 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp14 = vec4((( vec4(temp12)  +  vec4(temp13) )));
+temp15 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp16 = vec4((( vec4(temp14)  +  vec4(temp15) )));
+temp17 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp16)  +  vec4(temp17) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SAMP[1]
+DCL SVIEW[0], 2D, FLOAT
+DCL SVIEW[1], 2D, FLOAT
+DCL CONST[0]
+DCL TEMP[0..4]
+DCL TEMP[5..8]
+  0: MOV TEMP[0].xy, IN[1].xyxx
+  1: TEX TEMP[1], TEMP[0].xyxx, SAMP[0], 2D
+  2: MOV TEMP[2].xy, IN[1].zwxx
+  3: TEX TEMP[3], TEMP[2].xyxx, SAMP[1], 2D
+  4: LRP TEMP[4], CONST[0].wwww, TEMP[1], TEMP[3]
+  5: MUL OUT[0], TEMP[4], IN[0]
+  6: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+uniform uvec4 fsconst0[1];
+uniform highp  sampler2D fssamp0;
+uniform highp  sampler2D fssamp1;
+void main(void)
+{
+temp0.xy = vec2(((vso_g1.xyxx).xy));
+temp1 = vec4((texture(fssamp0,  vec4(temp0).xyxx .xy)));
+temp2.xy = vec2(((vso_g1.zwxx).xy));
+temp3 = vec4((texture(fssamp1,  vec4(temp2).xyxx .xy)));
+temp4 = mix(vec4( vec4(temp3) ), vec4( vec4(temp1) ), vec4(uintBitsToFloat(fsconst0[0].wwww)));
+fsout_c0 = vec4((( vec4(temp4)  * (vso_g0))));
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SAMP[1]
+DCL SVIEW[0], 2D, FLOAT
+DCL SVIEW[1], 2D, FLOAT
+DCL CONST[0]
+DCL TEMP[0..4]
+DCL TEMP[5..8]
+  0: MOV TEMP[0].xy, IN[1].xyxx
+  1: TEX TEMP[1], TEMP[0].xyxx, SAMP[0], 2D
+  2: MOV TEMP[2].xy, IN[1].zwxx
+  3: TEX TEMP[3], TEMP[2].xyxx, SAMP[1], 2D
+  4: LRP TEMP[4], CONST[0].wwww, TEMP[1], TEMP[3]
+  5: MUL OUT[0], TEMP[4], IN[0]
+  6: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+uniform uvec4 fsconst0[1];
+uniform highp  sampler2D fssamp0;
+uniform highp  sampler2D fssamp1;
+void main(void)
+{
+temp0.xy = vec2(((vso_g1.xyxx).xy));
+temp1 = vec4((texture(fssamp0,  vec4(temp0).xyxx .xy)));
+temp2.xy = vec2(((vso_g1.zwxx).xy));
+temp3 = vec4((texture(fssamp1,  vec4(temp2).xyxx .xy)));
+temp4 = mix(vec4( vec4(temp3) ), vec4( vec4(temp1) ), vec4(uintBitsToFloat(fsconst0[0].wwww)));
+fsout_c0 = vec4((( vec4(temp4)  * (vso_g0))));
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[1].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], IN[0], TEMP[0]
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL CONST[0..3]
+DCL TEMP[0..5]
+DCL TEMP[6..9]
+  0: MUL TEMP[0], CONST[0], IN[0].xxxx
+  1: MUL TEMP[1], CONST[1], IN[0].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[2], IN[0].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[3], IN[0].wwww
+  6: ADD OUT[0], TEMP[4], TEMP[5]
+  7: MOV OUT[1], IN[1]
+  8: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+smooth   out vec4 vso_g1;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+uniform uvec4 vsconst0[4];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp4)  +  vec4(temp5) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL TEMP[0..3]
+  0: MOV OUT[0], IN[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ flat    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+void main(void)
+{
+fsout_c0 = vec4(((vso_g0)));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL CONST[0..3]
+DCL TEMP[0..5]
+DCL TEMP[6..9]
+  0: MUL TEMP[0], CONST[0], IN[0].xxxx
+  1: MUL TEMP[1], CONST[1], IN[0].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[2], IN[0].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[3], IN[0].wwww
+  6: ADD OUT[0], TEMP[4], TEMP[5]
+  7: MOV OUT[1], IN[1]
+  8: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+flat   out vec4 vso_g1;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+uniform uvec4 vsconst0[4];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp4)  +  vec4(temp5) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL TEMP[0..3]
+  0: MOV OUT[0], IN[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+void main(void)
+{
+fsout_c0 = vec4(((vso_g0)));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL CONST[0..3]
+DCL TEMP[0..5]
+DCL TEMP[6..9]
+  0: MUL TEMP[0], CONST[0], IN[0].xxxx
+  1: MUL TEMP[1], CONST[1], IN[0].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[2], IN[0].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[3], IN[0].wwww
+  6: ADD OUT[0], TEMP[4], TEMP[5]
+  7: MOV OUT[1], IN[1]
+  8: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+uniform uvec4 vsconst0[4];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp4)  +  vec4(temp5) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL TEMP[0..3]
+  0: MOV OUT[0], IN[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+void main(void)
+{
+fsout_c0 = vec4(((vso_g0)));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2].xy, GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[2].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[2].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[2].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[2].wwww
+  6: ADD OUT[2].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+   out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_2.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_2.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_2.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_2.wwww))).xy);
+vso_g1.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0..3]
+IMM[0] UINT32 {1065353216, 0, 0, 0}
+DCL TEMP[4..7]
+  0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
+  1: MUL TEMP[2], IN[0], TEMP[1]
+  2: MOV TEMP[0].xyz, TEMP[2].xyzx
+  3: MOV TEMP[0].w, IMM[0].xxxx
+  4: FSLT TEMP[3].x, IMM[0].yyyy, TEMP[2].wxxx
+  5: UCMP TEMP[4], TEMP[3].xxxx, TEMP[0], TEMP[2]
+  6: MOV OUT[0], TEMP[4]
+  7: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+temp2 = vec4((((vso_g0) *  vec4(temp1) )));
+temp0.xyz = vec3(( vec4(temp2).xyzx .xyz));
+temp0.w = float((uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)).w));
+temp3.x = float(uintBitsToFloat(uint(lessThan(vec4(uintBitsToFloat(uvec4(0U,0U,0U,0U))), vec4( vec4(temp2).wxxx )).x) * uint(0xffffffff)));
+temp4 = mix( vec4(temp2) ,  vec4(temp0) , notEqual(floatBitsToUint( vec4(temp3).xxxx ), uvec4(0.0)));
+fsout_c0 = vec4(( vec4(temp4) ));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2].xy, GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[2].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[2].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[2].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[2].wwww
+  6: ADD OUT[2].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+ smooth    out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_2.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_2.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_2.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_2.wwww))).xy);
+vso_g1.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1].xy, GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL TEMP[0..3]
+IMM[0] UINT32 {1065353216, 0, 0, 0}
+DCL TEMP[4..7]
+  0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
+  1: MUL TEMP[2], IN[0], TEMP[1]
+  2: MOV TEMP[0].xyz, TEMP[2].xyzx
+  3: MOV TEMP[0].w, IMM[0].xxxx
+  4: FSLT TEMP[3].x, IMM[0].yyyy, TEMP[2].wxxx
+  5: UCMP TEMP[4], TEMP[3].xxxx, TEMP[0], TEMP[2]
+  6: MOV OUT[0], TEMP[4]
+  7: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+temp2 = vec4((((vso_g0) *  vec4(temp1) )));
+temp0.xyz = vec3(( vec4(temp2).xyzx .xyz));
+temp0.w = float((uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)).w));
+temp3.x = float(uintBitsToFloat(uint(lessThan(vec4(uintBitsToFloat(uvec4(0U,0U,0U,0U))), vec4( vec4(temp2).wxxx )).x) * uint(0xffffffff)));
+temp4 = mix( vec4(temp2) ,  vec4(temp0) , notEqual(floatBitsToUint( vec4(temp3).xxxx ), uvec4(0.0)));
+fsout_c0 = vec4(( vec4(temp4) ));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2], GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0], CONST[4], IN[2].xxxx
+  1: MUL TEMP[1], CONST[5], IN[2].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[6], IN[2].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[7], IN[2].wwww
+  6: ADD OUT[2], TEMP[4], TEMP[5]
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+ smooth    out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[4]) * (in_2.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[5]) * (in_2.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[6]) * (in_2.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[7]) * (in_2.wwww))));
+vso_g1 = vec4((( vec4(temp4)  +  vec4(temp5) )));
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL CONST[0..2]
+DCL TEMP[0..36]
+IMM[0] UINT32 {1075866777, 1069547520, 3204448256, 1069066811}
+IMM[1] UINT32 {1, 3212836864, 1073741824, 2}
+DCL TEMP[37..40]
+  0: MUL TEMP[9].xy, IMM[0].xyxx, CONST[0].xxxx
+  1: RCP TEMP[7].x, TEMP[9].xxxx
+  2: MUL TEMP[10].x, CONST[0].xxxx, CONST[0].xxxx
+  3: DIV TEMP[11].x, IMM[0].zzzz, TEMP[10].xxxx
+  4: MUL TEMP[12].x, TEMP[11].xxxx, IMM[0].wwww
+  5: EX2 TEMP[13].x, TEMP[12].xxxx
+  6: MUL TEMP[14].x, TEMP[13].xxxx, TEMP[13].xxxx
+  7: TEX TEMP[15], IN[1].xyyy, SAMP[0], 2D
+  8: MUL TEMP[8], TEMP[15], TEMP[7].xxxx
+  9: MOV TEMP[4].x, TEMP[13].xxxx
+ 10: MOV TEMP[4].y, TEMP[14].xxxx
+ 11: MOV TEMP[3].x, TEMP[7].xxxx
+ 12: MOV TEMP[3].y, TEMP[13].xxxx
+ 13: MUL TEMP[2].xy, TEMP[3].xyxy, TEMP[4].xyxy
+ 14: CEIL TEMP[16].x, TEMP[9].yxxx
+ 15: F2I TEMP[17].x, TEMP[16].xxxx
+ 16: SHL TEMP[18].x, TEMP[17].xxxx, IMM[1].xxxx
+ 17: MOV TEMP[2].z, TEMP[14].xxxx
+ 18: MOV TEMP[5].xyz, TEMP[2].xyzz
+ 19: MOV TEMP[6].x, IMM[1].xxxx
+ 20: BGNLOOP :0
+ 21:   ISLT TEMP[19].x, TEMP[18].xxxx, TEMP[6].xxxx
+ 22:   UIF TEMP[19].xxxx :24
+ 23:     BRK
+ 24:   ENDIF
+ 25:   MUL TEMP[20].xy, TEMP[5].xyyy, TEMP[5].yzyy
+ 26:   ADD TEMP[21].x, TEMP[5].xxxx, TEMP[20].xxxx
+ 27:   I2F TEMP[22].x, TEMP[6].xxxx
+ 28:   DIV TEMP[23].x, TEMP[20].xxxx, TEMP[21].xxxx
+ 29:   ADD TEMP[24].x, TEMP[22].xxxx, TEMP[23].xxxx
+ 30:   MUL TEMP[25].xy, CONST[2].xyyy, TEMP[24].xxxx
+ 31:   MUL TEMP[26].xy, TEMP[25].xyyy, CONST[1].xxxx
+ 32:   MUL TEMP[27].xy, TEMP[26].xyxx, IMM[1].yyyy
+ 33:   ADD TEMP[28].xy, IN[1].xyyy, TEMP[26].xyyy
+ 34:   TEX TEMP[29], TEMP[28].xyxx, SAMP[0], 2D
+ 35:   MUL TEMP[30], TEMP[29], TEMP[21].xxxx
+ 36:   ADD TEMP[31], TEMP[8], TEMP[30]
+ 37:   ADD TEMP[32].xy, IN[1].xyxx, TEMP[27].xyxx
+ 38:   TEX TEMP[33], TEMP[32].xyxx, SAMP[0], 2D
+ 39:   MUL TEMP[34], TEMP[33], TEMP[21].xxxx
+ 40:   ADD TEMP[8], TEMP[31], TEMP[34]
+ 41:   MUL TEMP[35].x, IMM[1].zzzz, TEMP[21].xxxx
+ 42:   ADD TEMP[7].x, TEMP[7].xxxx, TEMP[35].xxxx
+ 43:   MOV TEMP[1].x, TEMP[20].yxxx
+ 44:   MOV TEMP[1].y, TEMP[5].xzxx
+ 45:   MUL TEMP[0].xy, TEMP[20].xyxy, TEMP[1].xyxy
+ 46:   UADD TEMP[6].x, TEMP[6].xxxx, IMM[1].wwww
+ 47:   MOV TEMP[0].z, TEMP[5].xxzx
+ 48:   MOV TEMP[5].xyz, TEMP[0].xyzz
+ 49: ENDLOOP :0
+ 50: DIV TEMP[36], TEMP[8], TEMP[7].xxxx
+ 51: MUL OUT[0], IN[0], TEMP[36]
+ 52: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+ vec4 temp16;
+ vec4 temp17;
+ vec4 temp18;
+ vec4 temp19;
+ vec4 temp20;
+ vec4 temp21;
+ vec4 temp22;
+ vec4 temp23;
+ vec4 temp24;
+ vec4 temp25;
+ vec4 temp26;
+ vec4 temp27;
+ vec4 temp28;
+ vec4 temp29;
+ vec4 temp30;
+ vec4 temp31;
+ vec4 temp32;
+ vec4 temp33;
+ vec4 temp34;
+ vec4 temp35;
+ vec4 temp36;
+ vec4 temp37;
+ vec4 temp38;
+ vec4 temp39;
+ vec4 temp40;
+uniform uvec4 fsconst0[3];
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp9.xy = vec2(((uintBitsToFloat(uvec4(1075866777U,1069547520U,1075866777U,1075866777U)) * uintBitsToFloat(fsconst0[0].xxxx))).xy);
+temp7.x = float(1.0/( vec4(temp9).xxxx ));
+temp10.x = float(((uintBitsToFloat(fsconst0[0].xxxx) * uintBitsToFloat(fsconst0[0].xxxx))).x);
+temp11.x = float(((uintBitsToFloat(uvec4(3204448256U,3204448256U,3204448256U,3204448256U)) /  vec4(temp10).xxxx )).x);
+temp12.x = float((( vec4(temp11).xxxx  * uintBitsToFloat(uvec4(1069066811U,1069066811U,1069066811U,1069066811U)))).x);
+temp13.x = float((exp2( vec4(temp12).xxxx )).x);
+temp14.x = float((( vec4(temp13).xxxx  *  vec4(temp13).xxxx )).x);
+temp15 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+temp8 = vec4((( vec4(temp15)  *  vec4(temp7).xxxx )));
+temp4.x = float(( vec4(temp13).xxxx .x));
+temp4.y = float(( vec4(temp14).xxxx .y));
+temp3.x = float(( vec4(temp7).xxxx .x));
+temp3.y = float(( vec4(temp13).xxxx .y));
+temp2.xy = vec2((( vec4(temp3).xyxy  *  vec4(temp4).xyxy )).xy);
+temp16.x = float((ceil( vec4(temp9).yxxx )).x);
+temp17.x = float(intBitsToFloat(ivec4( vec4(temp16).xxxx )).x);
+temp18.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp17).xxxx) << (uvec4(1U,1U,1U,1U)))).x);
+temp2.z = float(( vec4(temp14).xxxx .z));
+temp5.xyz = vec3(( vec4(temp2).xyzz .xyz));
+temp6.x = float((uintBitsToFloat(uvec4(1U,1U,1U,1U)).x));
+do {
+	temp19.x = float(uintBitsToFloat(uint(lessThan(ivec4(floatBitsToInt(vec4(temp18).xxxx)), ivec4(floatBitsToInt(vec4(temp6).xxxx))).x) * uint(0xffffffff)));
+	if (bool(floatBitsToUint(vec4(temp19).xxxx).x)) {
+		break;
+		}
+	temp20.xy = vec2((( vec4(temp5).xyyy  *  vec4(temp5).yzyy )).xy);
+	temp21.x = float((( vec4(temp5).xxxx  +  vec4(temp20).xxxx )).x);
+	temp22.x = float(ivec4(floatBitsToInt(vec4(temp6).xxxx)).x);
+	temp23.x = float((( vec4(temp20).xxxx  /  vec4(temp21).xxxx )).x);
+	temp24.x = float((( vec4(temp22).xxxx  +  vec4(temp23).xxxx )).x);
+	temp25.xy = vec2(((uintBitsToFloat(fsconst0[2].xyyy) *  vec4(temp24).xxxx )).xy);
+	temp26.xy = vec2((( vec4(temp25).xyyy  * uintBitsToFloat(fsconst0[1].xxxx))).xy);
+	temp27.xy = vec2((( vec4(temp26).xyxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).xy);
+	temp28.xy = vec2((((vso_g1.xyyy) +  vec4(temp26).xyyy )).xy);
+	temp29 = vec4((texture(fssamp0,  vec4(temp28).xyxx .xy)));
+	temp30 = vec4((( vec4(temp29)  *  vec4(temp21).xxxx )));
+	temp31 = vec4((( vec4(temp8)  +  vec4(temp30) )));
+	temp32.xy = vec2((((vso_g1.xyxx) +  vec4(temp27).xyxx )).xy);
+	temp33 = vec4((texture(fssamp0,  vec4(temp32).xyxx .xy)));
+	temp34 = vec4((( vec4(temp33)  *  vec4(temp21).xxxx )));
+	temp8 = vec4((( vec4(temp31)  +  vec4(temp34) )));
+	temp35.x = float(((uintBitsToFloat(uvec4(1073741824U,1073741824U,1073741824U,1073741824U)) *  vec4(temp21).xxxx )).x);
+	temp7.x = float((( vec4(temp7).xxxx  +  vec4(temp35).xxxx )).x);
+	temp1.x = float(( vec4(temp20).yxxx .x));
+	temp1.y = float(( vec4(temp5).xzxx .y));
+	temp0.xy = vec2((( vec4(temp20).xyxy  *  vec4(temp1).xyxy )).xy);
+	temp6.x = float(uintBitsToFloat(uvec4(floatBitsToUint(vec4(temp6).xxxx)) + uvec4((uvec4(2U,2U,2U,2U)))).x);
+	temp0.z = float(( vec4(temp5).xxzx .z));
+	temp5.xyz = vec3(( vec4(temp0).xyzz .xyz));
+} while(true);
+temp36 = vec4((( vec4(temp8)  /  vec4(temp7).xxxx )));
+fsout_c0 = vec4((((vso_g0) *  vec4(temp36) )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1].xy, GENERIC[0]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[1].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[1].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[1].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[1].wwww
+  6: ADD OUT[1].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+smooth   out vec4 vso_g1;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_1.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_1.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_1.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_1.wwww))).xy);
+vso_g0.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0].xy, GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL CONST[0]
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[0].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], CONST[0], TEMP[0].wwww
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ flat    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform uvec4 fsconst0[1];
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g0.xyyy).xy)));
+fsout_c0 = vec4(((uintBitsToFloat(fsconst0[0]) *  vec4(temp0).wwww )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1].xy, GENERIC[0]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[1].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[1].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[1].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[1].wwww
+  6: ADD OUT[1].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+flat   out vec4 vso_g1;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_1.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_1.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_1.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_1.wwww))).xy);
+vso_g0.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0].xy, GENERIC[0], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL CONST[0]
+DCL TEMP[0]
+DCL TEMP[1..4]
+  0: TEX TEMP[0], IN[0].xyyy, SAMP[0], 2D
+  1: MUL OUT[0], CONST[0], TEMP[0].wwww
+  2: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+uniform uvec4 fsconst0[1];
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp0 = vec4((texture(fssamp0, (vso_g0.xyyy).xy)));
+fsout_c0 = vec4(((uintBitsToFloat(fsconst0[0]) *  vec4(temp0).wwww )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL OUT[0], POSITION
+DCL OUT[1].xy, GENERIC[0]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0].xy, CONST[4].xyyy, IN[1].xxxx
+  1: MUL TEMP[1].xy, CONST[5].xyyy, IN[1].yyyy
+  2: ADD TEMP[2].xy, TEMP[0].xyxx, TEMP[1].xyxx
+  3: MUL TEMP[3].xy, CONST[6].xyyy, IN[1].zzzz
+  4: ADD TEMP[4].xy, TEMP[2].xyxx, TEMP[3].xyxx
+  5: MUL TEMP[5].xy, CONST[7].xyyy, IN[1].wwww
+  6: ADD OUT[1].xy, TEMP[4].xyxx, TEMP[5].xyxx
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+ smooth    out  vec4 vso_g0;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0.xy = vec2(((uintBitsToFloat(vsconst0[4].xyyy) * (in_1.xxxx))).xy);
+temp1.xy = vec2(((uintBitsToFloat(vsconst0[5].xyyy) * (in_1.yyyy))).xy);
+temp2.xy = vec2((( vec4(temp0).xyxx  +  vec4(temp1).xyxx )).xy);
+temp3.xy = vec2(((uintBitsToFloat(vsconst0[6].xyyy) * (in_1.zzzz))).xy);
+temp4.xy = vec2((( vec4(temp2).xyxx  +  vec4(temp3).xyxx )).xy);
+temp5.xy = vec2(((uintBitsToFloat(vsconst0[7].xyyy) * (in_1.wwww))).xy);
+vso_g0.xy = vec2((( vec4(temp4).xyxx  +  vec4(temp5).xyxx )).xy);
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2], GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0], CONST[4], IN[2].xxxx
+  1: MUL TEMP[1], CONST[5], IN[2].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[6], IN[2].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[7], IN[2].wwww
+  6: ADD OUT[2], TEMP[4], TEMP[5]
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+   out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[4]) * (in_2.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[5]) * (in_2.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[6]) * (in_2.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[7]) * (in_2.wwww))));
+vso_g1 = vec4((( vec4(temp4)  +  vec4(temp5) )));
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL CONST[0..2]
+DCL TEMP[0..24]
+IMM[0] UINT32 {3212836864, 1056964608, 3204448256, 1065353216}
+IMM[1] UINT32 {0, 0, 0, 0}
+DCL TEMP[25..28]
+  0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
+  1: MUL TEMP[2], IN[0], TEMP[1]
+  2: DIV TEMP[3].xy, IN[1].xyyy, CONST[2].xyyy
+  3: ADD TEMP[4].xy, CONST[0], CONST[1].xxxx
+  4: MUL TEMP[5].x, CONST[1].xxxx, IMM[0].xxxx
+  5: ADD TEMP[6].xy, CONST[0].zwzw, TEMP[5].xxxx
+  6: FSLT TEMP[7].xy, TEMP[6].xyxx, TEMP[3].xyxx
+  7: FSLT TEMP[8].xy, TEMP[3].xyxx, TEMP[4].xyxx
+  8: OR TEMP[9].x, TEMP[7].xxxx, TEMP[8].xxxx
+  9: UCMP TEMP[10].xy, TEMP[8].xyxx, TEMP[4].xyxx, TEMP[6].xyxx
+ 10: MUL TEMP[11].xy, TEMP[10].xyxx, IMM[0].xxxx
+ 11: OR TEMP[12].x, TEMP[8].yxxx, TEMP[7].yxxx
+ 12: AND TEMP[13].x, TEMP[12].xxxx, TEMP[9].xxxx
+ 13: UIF TEMP[13].xxxx :26
+ 14:   ADD TEMP[14].xy, TEMP[3].xyxx, TEMP[11].xyxx
+ 15:   DP2 TEMP[15].x, TEMP[14].xyxx, TEMP[14].xyxx
+ 16:   ADD TEMP[16].xy, CONST[1].xxxx, IMM[0].yzyy
+ 17:   MUL TEMP[17].xy, TEMP[16].xyxx, TEMP[16].xyxx
+ 18:   RSQ TEMP[18].x, TEMP[15].xxxx
+ 19:   RCP TEMP[19].x, TEMP[18].xxxx
+ 20:   MUL TEMP[20].x, TEMP[19].xxxx, IMM[0].xxxx
+ 21:   ADD TEMP[21].x, TEMP[16].xxxx, TEMP[20].xxxx
+ 22:   FSGE TEMP[22].x, TEMP[17].yxxx, TEMP[15].xxxx
+ 23:   UCMP TEMP[23].x, TEMP[22].xxxx, IMM[0].wwww, TEMP[21].xxxx
+ 24:   FSGE TEMP[24].x, TEMP[15].xxxx, TEMP[17].xxxx
+ 25:   UCMP TEMP[0].x, TEMP[24].xxxx, IMM[1].xxxx, TEMP[23].xxxx
+ 26: ELSE :28
+ 27:   MOV TEMP[0].x, IMM[0].wwww
+ 28: ENDIF
+ 29: MUL OUT[0], TEMP[2], TEMP[0].xxxx
+ 30: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+ vec4 temp16;
+ vec4 temp17;
+ vec4 temp18;
+ vec4 temp19;
+ vec4 temp20;
+ vec4 temp21;
+ vec4 temp22;
+ vec4 temp23;
+ vec4 temp24;
+ vec4 temp25;
+ vec4 temp26;
+ vec4 temp27;
+ vec4 temp28;
+uniform uvec4 fsconst0[3];
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+temp2 = vec4((((vso_g0) *  vec4(temp1) )));
+temp3.xy = vec2((((vso_g1.xyyy) / uintBitsToFloat(fsconst0[2].xyyy))).xy);
+temp4.xy = vec2(((uintBitsToFloat(fsconst0[0]) + uintBitsToFloat(fsconst0[1].xxxx))).xy);
+temp5.x = float(((uintBitsToFloat(fsconst0[1].xxxx) * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
+temp6.xy = vec2(((uintBitsToFloat(fsconst0[0].zwzw) +  vec4(temp5).xxxx )).xy);
+temp7.xy = vec2(uintBitsToFloat(uvec2(lessThan(vec4( vec4(temp6).xyxx ), vec4( vec4(temp3).xyxx )).xy) * uvec2(0xffffffff)));
+temp8.xy = vec2(uintBitsToFloat(uvec2(lessThan(vec4( vec4(temp3).xyxx ), vec4( vec4(temp4).xyxx )).xy) * uvec2(0xffffffff)));
+temp9.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp7).xxxx) | floatBitsToUint(vec4(temp8).xxxx))).x);
+temp10.xy = mix( vec4(temp6).xyxx ,  vec4(temp4).xyxx , notEqual(floatBitsToUint( vec4(temp8).xyxx ), uvec4(0.0))).xy;
+temp11.xy = vec2((( vec4(temp10).xyxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).xy);
+temp12.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp8).yxxx) | floatBitsToUint(vec4(temp7).yxxx))).x);
+temp13.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp12).xxxx) & floatBitsToUint(vec4(temp9).xxxx))).x);
+if (bool(floatBitsToUint(vec4(temp13).xxxx).x)) {
+	temp14.xy = vec2((( vec4(temp3).xyxx  +  vec4(temp11).xyxx )).xy);
+	temp15.x = float(dot(vec2( vec4(temp14).xyxx ), vec2( vec4(temp14).xyxx )));
+	temp16.xy = vec2(((uintBitsToFloat(fsconst0[1].xxxx) + uintBitsToFloat(uvec4(1056964608U,3204448256U,1056964608U,1056964608U)))).xy);
+	temp17.xy = vec2((( vec4(temp16).xyxx  *  vec4(temp16).xyxx )).xy);
+	temp18.x = float(inversesqrt( vec4(temp15).xxxx .x));
+	temp19.x = float(1.0/( vec4(temp18).xxxx ));
+	temp20.x = float((( vec4(temp19).xxxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
+	temp21.x = float((( vec4(temp16).xxxx  +  vec4(temp20).xxxx )).x);
+	temp22.x = float(uintBitsToFloat(uint(greaterThanEqual(vec4( vec4(temp17).yxxx ), vec4( vec4(temp15).xxxx )).x) * uint(0xffffffff)));
+	temp23.x = mix( vec4(temp21).xxxx , uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)), notEqual(floatBitsToUint( vec4(temp22).xxxx ), uvec4(0.0))).x;
+	temp24.x = float(uintBitsToFloat(uint(greaterThanEqual(vec4( vec4(temp15).xxxx ), vec4( vec4(temp17).xxxx )).x) * uint(0xffffffff)));
+	temp0.x = mix( vec4(temp23).xxxx , uintBitsToFloat(uvec4(0U,0U,0U,0U)), notEqual(floatBitsToUint( vec4(temp24).xxxx ), uvec4(0.0))).x;
+} else {
+	temp0.x = float((uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)).x));
+	}
+fsout_c0 = vec4((( vec4(temp2)  *  vec4(temp0).xxxx )));
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL IN[1]
+DCL IN[2]
+DCL OUT[0], POSITION
+DCL OUT[1], GENERIC[0]
+DCL OUT[2], GENERIC[1]
+DCL CONST[0..7]
+DCL TEMP[0..11]
+DCL TEMP[12..15]
+  0: MUL TEMP[0], CONST[4], IN[2].xxxx
+  1: MUL TEMP[1], CONST[5], IN[2].yyyy
+  2: ADD TEMP[2], TEMP[0], TEMP[1]
+  3: MUL TEMP[3], CONST[6], IN[2].zzzz
+  4: ADD TEMP[4], TEMP[2], TEMP[3]
+  5: MUL TEMP[5], CONST[7], IN[2].wwww
+  6: ADD OUT[2], TEMP[4], TEMP[5]
+  7: MUL TEMP[6], CONST[0], IN[0].xxxx
+  8: MUL TEMP[7], CONST[1], IN[0].yyyy
+  9: ADD TEMP[8], TEMP[6], TEMP[7]
+ 10: MUL TEMP[9], CONST[2], IN[0].zzzz
+ 11: ADD TEMP[10], TEMP[8], TEMP[9]
+ 12: MUL TEMP[11], CONST[3], IN[0].wwww
+ 13: ADD OUT[0], TEMP[10], TEMP[11]
+ 14: MOV OUT[1], IN[1]
+ 15: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+in vec4 in_1;
+in vec4 in_2;
+ smooth    out  vec4 vso_g0;
+ smooth    out  vec4 vso_g1;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+uniform uvec4 vsconst0[8];
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+temp0 = vec4(((uintBitsToFloat(vsconst0[4]) * (in_2.xxxx))));
+temp1 = vec4(((uintBitsToFloat(vsconst0[5]) * (in_2.yyyy))));
+temp2 = vec4((( vec4(temp0)  +  vec4(temp1) )));
+temp3 = vec4(((uintBitsToFloat(vsconst0[6]) * (in_2.zzzz))));
+temp4 = vec4((( vec4(temp2)  +  vec4(temp3) )));
+temp5 = vec4(((uintBitsToFloat(vsconst0[7]) * (in_2.wwww))));
+vso_g1 = vec4((( vec4(temp4)  +  vec4(temp5) )));
+temp6 = vec4(((uintBitsToFloat(vsconst0[0]) * (in_0.xxxx))));
+temp7 = vec4(((uintBitsToFloat(vsconst0[1]) * (in_0.yyyy))));
+temp8 = vec4((( vec4(temp6)  +  vec4(temp7) )));
+temp9 = vec4(((uintBitsToFloat(vsconst0[2]) * (in_0.zzzz))));
+temp10 = vec4((( vec4(temp8)  +  vec4(temp9) )));
+temp11 = vec4(((uintBitsToFloat(vsconst0[3]) * (in_0.wwww))));
+gl_Position = vec4((( vec4(temp10)  +  vec4(temp11) )));
+vso_g0 = vec4(((in_1)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+DCL IN[0], GENERIC[0], PERSPECTIVE
+DCL IN[1], GENERIC[1], PERSPECTIVE
+DCL OUT[0], COLOR
+DCL SAMP[0]
+DCL SVIEW[0], 2D, FLOAT
+DCL CONST[0..2]
+DCL TEMP[0..24]
+IMM[0] UINT32 {3212836864, 1056964608, 3204448256, 1065353216}
+IMM[1] UINT32 {0, 0, 0, 0}
+DCL TEMP[25..28]
+  0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
+  1: MUL TEMP[2], IN[0], TEMP[1]
+  2: DIV TEMP[3].xy, IN[1].xyyy, CONST[2].xyyy
+  3: ADD TEMP[4].xy, CONST[0], CONST[1].xxxx
+  4: MUL TEMP[5].x, CONST[1].xxxx, IMM[0].xxxx
+  5: ADD TEMP[6].xy, CONST[0].zwzw, TEMP[5].xxxx
+  6: FSLT TEMP[7].xy, TEMP[6].xyxx, TEMP[3].xyxx
+  7: FSLT TEMP[8].xy, TEMP[3].xyxx, TEMP[4].xyxx
+  8: OR TEMP[9].x, TEMP[7].xxxx, TEMP[8].xxxx
+  9: UCMP TEMP[10].xy, TEMP[8].xyxx, TEMP[4].xyxx, TEMP[6].xyxx
+ 10: MUL TEMP[11].xy, TEMP[10].xyxx, IMM[0].xxxx
+ 11: OR TEMP[12].x, TEMP[8].yxxx, TEMP[7].yxxx
+ 12: AND TEMP[13].x, TEMP[12].xxxx, TEMP[9].xxxx
+ 13: UIF TEMP[13].xxxx :26
+ 14:   ADD TEMP[14].xy, TEMP[3].xyxx, TEMP[11].xyxx
+ 15:   DP2 TEMP[15].x, TEMP[14].xyxx, TEMP[14].xyxx
+ 16:   ADD TEMP[16].xy, CONST[1].xxxx, IMM[0].yzyy
+ 17:   MUL TEMP[17].xy, TEMP[16].xyxx, TEMP[16].xyxx
+ 18:   RSQ TEMP[18].x, TEMP[15].xxxx
+ 19:   RCP TEMP[19].x, TEMP[18].xxxx
+ 20:   MUL TEMP[20].x, TEMP[19].xxxx, IMM[0].xxxx
+ 21:   ADD TEMP[21].x, TEMP[16].xxxx, TEMP[20].xxxx
+ 22:   FSGE TEMP[22].x, TEMP[17].yxxx, TEMP[15].xxxx
+ 23:   UCMP TEMP[23].x, TEMP[22].xxxx, IMM[0].wwww, TEMP[21].xxxx
+ 24:   FSGE TEMP[24].x, TEMP[15].xxxx, TEMP[17].xxxx
+ 25:   UCMP TEMP[0].x, TEMP[24].xxxx, IMM[1].xxxx, TEMP[23].xxxx
+ 26: ELSE :28
+ 27:   MOV TEMP[0].x, IMM[0].wwww
+ 28: ENDIF
+ 29: MUL OUT[0], TEMP[2], TEMP[0].xxxx
+ 30: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ smooth    in  vec4 vso_g0;
+ smooth    in  vec4 vso_g1;
+   out  vec4 fsout_c0;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+ vec4 temp4;
+ vec4 temp5;
+ vec4 temp6;
+ vec4 temp7;
+ vec4 temp8;
+ vec4 temp9;
+ vec4 temp10;
+ vec4 temp11;
+ vec4 temp12;
+ vec4 temp13;
+ vec4 temp14;
+ vec4 temp15;
+ vec4 temp16;
+ vec4 temp17;
+ vec4 temp18;
+ vec4 temp19;
+ vec4 temp20;
+ vec4 temp21;
+ vec4 temp22;
+ vec4 temp23;
+ vec4 temp24;
+ vec4 temp25;
+ vec4 temp26;
+ vec4 temp27;
+ vec4 temp28;
+uniform uvec4 fsconst0[3];
+uniform highp  sampler2D fssamp0;
+void main(void)
+{
+temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
+temp2 = vec4((((vso_g0) *  vec4(temp1) )));
+temp3.xy = vec2((((vso_g1.xyyy) / uintBitsToFloat(fsconst0[2].xyyy))).xy);
+temp4.xy = vec2(((uintBitsToFloat(fsconst0[0]) + uintBitsToFloat(fsconst0[1].xxxx))).xy);
+temp5.x = float(((uintBitsToFloat(fsconst0[1].xxxx) * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
+temp6.xy = vec2(((uintBitsToFloat(fsconst0[0].zwzw) +  vec4(temp5).xxxx )).xy);
+temp7.xy = vec2(uintBitsToFloat(uvec2(lessThan(vec4( vec4(temp6).xyxx ), vec4( vec4(temp3).xyxx )).xy) * uvec2(0xffffffff)));
+temp8.xy = vec2(uintBitsToFloat(uvec2(lessThan(vec4( vec4(temp3).xyxx ), vec4( vec4(temp4).xyxx )).xy) * uvec2(0xffffffff)));
+temp9.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp7).xxxx) | floatBitsToUint(vec4(temp8).xxxx))).x);
+temp10.xy = mix( vec4(temp6).xyxx ,  vec4(temp4).xyxx , notEqual(floatBitsToUint( vec4(temp8).xyxx ), uvec4(0.0))).xy;
+temp11.xy = vec2((( vec4(temp10).xyxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).xy);
+temp12.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp8).yxxx) | floatBitsToUint(vec4(temp7).yxxx))).x);
+temp13.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp12).xxxx) & floatBitsToUint(vec4(temp9).xxxx))).x);
+if (bool(floatBitsToUint(vec4(temp13).xxxx).x)) {
+	temp14.xy = vec2((( vec4(temp3).xyxx  +  vec4(temp11).xyxx )).xy);
+	temp15.x = float(dot(vec2( vec4(temp14).xyxx ), vec2( vec4(temp14).xyxx )));
+	temp16.xy = vec2(((uintBitsToFloat(fsconst0[1].xxxx) + uintBitsToFloat(uvec4(1056964608U,3204448256U,1056964608U,1056964608U)))).xy);
+	temp17.xy = vec2((( vec4(temp16).xyxx  *  vec4(temp16).xyxx )).xy);
+	temp18.x = float(inversesqrt( vec4(temp15).xxxx .x));
+	temp19.x = float(1.0/( vec4(temp18).xxxx ));
+	temp20.x = float((( vec4(temp19).xxxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
+	temp21.x = float((( vec4(temp16).xxxx  +  vec4(temp20).xxxx )).x);
+	temp22.x = float(uintBitsToFloat(uint(greaterThanEqual(vec4( vec4(temp17).yxxx ), vec4( vec4(temp15).xxxx )).x) * uint(0xffffffff)));
+	temp23.x = mix( vec4(temp21).xxxx , uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)), notEqual(floatBitsToUint( vec4(temp22).xxxx ), uvec4(0.0))).x;
+	temp24.x = float(uintBitsToFloat(uint(greaterThanEqual(vec4( vec4(temp15).xxxx ), vec4( vec4(temp17).xxxx )).x) * uint(0xffffffff)));
+	temp0.x = mix( vec4(temp23).xxxx , uintBitsToFloat(uvec4(0U,0U,0U,0U)), notEqual(floatBitsToUint( vec4(temp24).xxxx ), uvec4(0.0))).x;
+} else {
+	temp0.x = float((uintBitsToFloat(uvec4(1065353216U,1065353216U,1065353216U,1065353216U)).x));
+	}
+fsout_c0 = vec4((( vec4(temp2)  *  vec4(temp0).xxxx )));
+}
+
+TGSI received:
+FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL OUT[0], COLOR
+DCL CONST[0]
+DCL TEMP[0..3]
+  0: MOV OUT[0], CONST[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+ flat    in  vec4 vso_g0;
+ flat    in  vec4 vso_g1;
+layout (location=0) out vec4 fsout_c0;
+layout (location=1) out vec4 fsout_c1;
+layout (location=2) out vec4 fsout_c2;
+layout (location=3) out vec4 fsout_c3;
+layout (location=4) out vec4 fsout_c4;
+layout (location=5) out vec4 fsout_c5;
+layout (location=6) out vec4 fsout_c6;
+layout (location=7) out vec4 fsout_c7;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+uniform uvec4 fsconst0[1];
+void main(void)
+{
+fsout_c0 = vec4((uintBitsToFloat(fsconst0[0])));
+fsout_c1 = fsout_c0;
+fsout_c2 = fsout_c0;
+fsout_c3 = fsout_c0;
+fsout_c4 = fsout_c0;
+fsout_c5 = fsout_c0;
+fsout_c6 = fsout_c0;
+fsout_c7 = fsout_c0;
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL TEMP[0..3]
+  0: MOV OUT[0], IN[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+vec4 clip_dist_temp[2];
+flat   out vec4 vso_g0;
+flat   out vec4 vso_g1;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+gl_Position = vec4(((in_0)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
+TGSI received:
+FRAG
+PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1
+DCL OUT[0], COLOR
+DCL CONST[0]
+DCL TEMP[0..3]
+  0: MOV OUT[0], CONST[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+#extension GL_EXT_blend_func_extended : require
+precision highp float;
+precision highp int;
+layout (location=0) out vec4 fsout_c0;
+layout (location=1) out vec4 fsout_c1;
+layout (location=2) out vec4 fsout_c2;
+layout (location=3) out vec4 fsout_c3;
+layout (location=4) out vec4 fsout_c4;
+layout (location=5) out vec4 fsout_c5;
+layout (location=6) out vec4 fsout_c6;
+layout (location=7) out vec4 fsout_c7;
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+uniform uvec4 fsconst0[1];
+void main(void)
+{
+fsout_c0 = vec4((uintBitsToFloat(fsconst0[0])));
+fsout_c1 = fsout_c0;
+fsout_c2 = fsout_c0;
+fsout_c3 = fsout_c0;
+fsout_c4 = fsout_c0;
+fsout_c5 = fsout_c0;
+fsout_c6 = fsout_c0;
+fsout_c7 = fsout_c0;
+}
+
+TGSI received:
+VERT
+DCL IN[0]
+DCL OUT[0], POSITION
+DCL TEMP[0..3]
+  0: MOV OUT[0], IN[0]
+  1: END
+
+GLSL:
+#version 310 es
+#extension GL_EXT_clip_cull_distance : require
+precision highp float;
+precision highp int;
+in vec4 in_0;
+vec4 clip_dist_temp[2];
+ vec4 temp0;
+ vec4 temp1;
+ vec4 temp2;
+ vec4 temp3;
+layout (std140) uniform VirglBlock {
+	vec4 clipp[8];
+	uint stipple_pattern[32];
+	float winsys_adjust_y;
+	float alpha_ref_val;
+	bool clip_plane_enabled;
+	int drawid_base;
+};
+void main(void)
+{
+gl_Position = vec4(((in_0)));
+if (clip_plane_enabled) {
+  gl_ClipDistance[0] = dot(gl_Position, clipp[0]);
+  gl_ClipDistance[1] = dot(gl_Position, clipp[1]);
+  gl_ClipDistance[2] = dot(gl_Position, clipp[2]);
+  gl_ClipDistance[3] = dot(gl_Position, clipp[3]);
+  gl_ClipDistance[4] = dot(gl_Position, clipp[4]);
+  gl_ClipDistance[5] = dot(gl_Position, clipp[5]);
+  gl_ClipDistance[6] = dot(gl_Position, clipp[6]);
+  gl_ClipDistance[7] = dot(gl_Position, clipp[7]);
+}
+gl_Position.y = gl_Position.y * winsys_adjust_y;
+}
+
