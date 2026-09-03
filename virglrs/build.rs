@@ -33,10 +33,63 @@ fn main() {
         .expect("python3 must be on PATH to build the venus protocol");
     assert!(status.success(), "venus-gen failed");
 
+    gl_bindings(&manifest);
     link_vulkan_loader();
+    link_egl();
 
     #[cfg(feature = "reply-oracle")]
     reply_oracle(&manifest, &protocol, &out);
+}
+
+/// Run the GLES/EGL binding generator into `OUT_DIR/gl`, from the vendored Khronos registries.
+fn gl_bindings(manifest: &std::path::Path) {
+    let generator = manifest.join("gl-gen");
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gl");
+    println!("cargo::rerun-if-changed={}", generator.join("gen.py").display());
+    println!("cargo::rerun-if-changed={}", generator.join("registry").display());
+    let status = Command::new("python3")
+        .arg(generator.join("gen.py"))
+        .arg("--outdir")
+        .arg(&out)
+        .status()
+        .expect("python3 must be on PATH to build the GL bindings");
+    assert!(status.success(), "gl-gen failed");
+}
+
+/// Link Mesa's libEGL, for the same reason the Vulkan loader is linked rather than dlopened.
+///
+/// It is the one GL-side library this crate links: every GLES and EGL entry point is resolved
+/// through `eglGetProcAddress`, so libGLESv2 is never named. The C reaches the same library
+/// through epoxy's bare-soname dlopen, which is what costs the worker its
+/// `DYLD_FALLBACK_LIBRARY_PATH` and the entitlement to keep it.
+///
+/// Found through pkg-config (`egl`), or `EGL_LIB_DIR`, or the zink-on-KosmicKrisp prefix limina
+/// itself defaults to (`MESA_PREFIX`), in that order.
+fn link_egl() {
+    println!("cargo::rerun-if-env-changed=EGL_LIB_DIR");
+    println!("cargo::rerun-if-env-changed=MESA_PREFIX");
+
+    let dir = if let Ok(dir) = std::env::var("EGL_LIB_DIR") {
+        Some(dir)
+    } else {
+        let out = Command::new("pkg-config").args(["--libs-only-L", "egl"]).output();
+        out.ok().filter(|o| o.status.success()).and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix("-L").map(str::to_string))
+        })
+    };
+    let dir = dir.unwrap_or_else(|| {
+        let prefix = std::env::var("MESA_PREFIX")
+            .unwrap_or_else(|_| "/Volumes/mesa-cs/zink-kk-prefix".to_string());
+        format!("{prefix}/lib")
+    });
+    assert!(
+        std::path::Path::new(&dir).join("libEGL.dylib").exists(),
+        "no libEGL.dylib under {dir}; point EGL_LIB_DIR or MESA_PREFIX at a Mesa prefix"
+    );
+    println!("cargo::rustc-link-search=native={dir}");
+    println!("cargo::rustc-link-lib=dylib=EGL");
 }
 
 /// Link the Khronos loader.
@@ -53,6 +106,7 @@ fn link_vulkan_loader() {
 
     if let Ok(dir) = std::env::var("VULKAN_LOADER_LIB_DIR") {
         println!("cargo::rustc-link-search=native={dir}");
+        rpath(&dir);
     } else {
         let out = Command::new("pkg-config")
             .args(["--libs-only-L", "vulkan"])
@@ -65,11 +119,22 @@ fn link_vulkan_loader() {
         for flag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
             if let Some(dir) = flag.strip_prefix("-L") {
                 println!("cargo::rustc-link-search=native={dir}");
+                rpath(dir);
             }
         }
     }
 
     println!("cargo::rustc-link-lib=dylib=vulkan");
+}
+
+/// Give the dylib (and the test binaries) an rpath at `dir`.
+///
+/// zink is not linked to the loader: it dlopens `@rpath/libvulkan.1.dylib`, and `@rpath` is
+/// resolved against the images on the load path -- of which this library is one. Without it the
+/// classic renderer's GL comes up with no Vulkan under it, and the C's answer to that is the
+/// worker's `DYLD_FALLBACK_LIBRARY_PATH`, which this crate's tests do not inherit.
+fn rpath(dir: &str) {
+    println!("cargo::rustc-link-arg=-Wl,-rpath,{dir}");
 }
 
 /// Build venus-protocol's own C renderer encoder for the tests to diff against.
