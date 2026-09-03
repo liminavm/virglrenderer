@@ -43,6 +43,25 @@ The surprise worth keeping: on the **enhanced** image gnome-shell renders throug
 clients, which makes it the mixed case rather than the venus one. Synoik is the desktop workload
 that is venus throughout.
 
+## Pixels are the oracle
+
+Everything else in this rig is a proxy: a systemd target, a `vulkaninfo` line, a renderer log,
+a corpus score. Each answers a real question and none of them answers "is there a desktop on the
+screen" -- a compositor that exits at startup leaves `graphical-session.target` active, a clean
+renderer log and a corpus that replays. The frame is the only thing that settles it.
+
+`frame.py [PNG...]` reports on a captured frame: dimensions, distinct colours, dominant colour and
+its share, and a coarse luminance sketch, then the path. It prints no verdict on purpose -- a
+"looks seated" line would be a new proxy, and a more dangerous one for sounding like it looked.
+Use the numbers to know where to look and then open the file.
+
+Two properties of the capture decide how to use it. It exists only for a **headless** boot, since
+limina refuses `--display-capture` together with a window -- so a windowed boot's oracle is the
+human in front of it, and a headless boot's is the file. And the file holds the **last presented
+frame**, rewritten as frames arrive: read it while the workload runs and it is the current screen,
+read it after shutdown and it is the teardown console. The `*-frame.png` files a capture leaves
+behind are therefore poweroff screens and evidence of nothing.
+
 `--renderer c|rust` picks which build to boot, and picks the bundle with it: `Limina.app` holds
 the C, `Limina-rust.app` holds virglrs. Only the C records — the recorder is a C-tree feature, so a
 virglrs boot yields no corpus and the two legs divide accordingly: the C leg captures, the Rust leg
