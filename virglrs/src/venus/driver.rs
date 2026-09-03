@@ -212,15 +212,26 @@ impl Pools {
     }
 }
 
-/// Why a query pool's results were not read. The driver was not asked.
+/// Why a query command was not put to the driver.
+///
+/// Every command that names a query by index is measured against the pool's record first,
+/// because the driver takes the index on the caller's word: on this host a reset writes host
+/// memory at it, a begin reads a remap table at it, and the recorded ones address the pool's
+/// buffer at it on the GPU.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum QueryRefused {
-    /// The device named has no table here.
+    /// The device named has no table here, or the command buffer no device behind it.
     NoDevice,
+    /// The device exports no `vkResetQueryPool`, having advertised the feature that needs it.
+    NoHostReset,
     /// The pool has no record here: created before this renderer kept one, or never by it.
     UnknownPool,
-    /// The queries named run past the pool's end, or their results past the room offered.
+    /// The queries named run past the pool's end.
+    OutOfPool,
+    /// The results asked for run past the room offered.
     OutOfRoom,
+    /// A pool whose result this renderer cannot size, so it cannot hold the read to the room.
+    Unsized,
 }
 
 /// Why a run of pool objects was not freed. Neither reached the driver.
@@ -1017,10 +1028,14 @@ impl Driver {
         info: &VkQueryPoolCreateInfo,
         alloc: Option<&VkAllocationCallbacks>,
     ) -> Result<VkQueryPool, VkResult> {
-        let facts = QueryFacts::of(info).ok_or(VkResult::VK_ERROR_FEATURE_NOT_PRESENT)?;
         let pool = self.create_object(device, |d| d.vkCreateQueryPool(), info, alloc)?;
-        self.query_pools.insert(pool, facts);
+        self.query_pools.insert(pool, QueryFacts::of(info));
         Ok(pool)
+    }
+
+    /// The record of `pool`, for a command about to name its queries.
+    fn query_facts(&self, pool: VkQueryPool) -> Result<&QueryFacts, QueryRefused> {
+        self.query_pools.get(&pool).ok_or(QueryRefused::UnknownPool)
     }
 
     /// Drop a query pool's record. Called from the two places Vulkan destroys one: the guest's
@@ -1031,7 +1046,7 @@ impl Driver {
 
     /// `vkResetQueryPool`: the host-side reset, a Vulkan 1.2 entry point the guest sends only
     /// once it has enabled the feature the driver advertised for it. A device that advertised
-    /// the feature and exports no entry point is the host contradicting itself, so `None` is a
+    /// the feature and exports no entry point is the host contradicting itself, so that is a
     /// refusal rather than a no-op.
     pub fn reset_query_pool(
         &self,
@@ -1039,11 +1054,14 @@ impl Driver {
         pool: VkQueryPool,
         first: u32,
         count: u32,
-    ) -> Option<()> {
-        let f = self.devices.get(&device)?.fns.try_vkResetQueryPool()?;
-        // SAFETY: a device in this table, and a pool the decoder resolved on it.
+    ) -> Result<(), QueryRefused> {
+        let d = self.devices.get(&device).ok_or(QueryRefused::NoDevice)?;
+        let f = d.fns.try_vkResetQueryPool().ok_or(QueryRefused::NoHostReset)?;
+        self.query_facts(pool)?.holds(first, count)?;
+        // SAFETY: a device in this table, a pool recorded on it, and a range of queries the pool
+        // holds -- which is what the driver writes host memory at.
         unsafe { f(device, pool, first, count) };
-        Some(())
+        Ok(())
     }
 
     /// `vkGetQueryPoolResults`: `count` results from `first` on, laid `stride` apart in `out`.
@@ -1064,10 +1082,9 @@ impl Driver {
         flags: VkQueryResultFlags,
     ) -> Result<VkResult, QueryRefused> {
         let d = self.devices.get(&device).ok_or(QueryRefused::NoDevice)?;
-        let facts = self.query_pools.get(&pool).ok_or(QueryRefused::UnknownPool)?;
-        let in_pool = first.checked_add(count).is_some_and(|end| end <= facts.queries);
-        let fits = facts.bytes_for(count, stride, flags).is_some_and(|n| n <= out.len() as u64);
-        if !in_pool || !fits {
+        let facts = self.query_facts(pool)?;
+        facts.holds(first, count)?;
+        if facts.bytes_for(count, stride, flags)? > out.len() as u64 {
             return Err(QueryRefused::OutOfRoom);
         }
         // SAFETY: a device in this table and a pool recorded on it; `out` holds every byte the
@@ -1827,6 +1844,8 @@ impl Driver {
         self.pools = Pools::default();
         self.queues.clear();
         self.physical_device_exts.clear();
+        self.images.clear();
+        self.query_pools.clear();
     }
 
     /// Stand a pool up with contents already in it, as a run of allocations would have left it.
@@ -2317,24 +2336,46 @@ impl Driver {
         Some(())
     }
 
+    // The query commands. Each names queries by index, and each is held to the pool's record
+    // before the driver sees it: the driver addresses its own memory at that index -- host
+    // memory for a begin, the pool's buffer on the GPU for the rest -- on the caller's word,
+    // and the caller here is a guest. See [`QueryRefused`].
+
+    /// The recorder for `cb` and the record for `pool`, for the query commands.
+    fn query_recorder(
+        &self,
+        cb: VkCommandBuffer,
+        pool: VkQueryPool,
+    ) -> Result<(&DeviceFns, &QueryFacts), QueryRefused> {
+        let d = self.recorder(cb).ok_or(QueryRefused::NoDevice)?;
+        Ok((d, self.query_facts(pool)?))
+    }
+
     pub fn cmd_begin_query(
         &self,
         cb: VkCommandBuffer,
         pool: VkQueryPool,
         query: u32,
         flags: VkQueryControlFlags,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };
-        Some(())
+        Ok(())
     }
 
-    pub fn cmd_end_query(&self, cb: VkCommandBuffer, pool: VkQueryPool, query: u32) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    pub fn cmd_end_query(
+        &self,
+        cb: VkCommandBuffer,
+        pool: VkQueryPool,
+        query: u32,
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdEndQuery())(cb, pool, query) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_reset_query_pool(
@@ -2343,11 +2384,12 @@ impl Driver {
         pool: VkQueryPool,
         first: u32,
         count: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(first, count)?;
+        // SAFETY: as above, and a range of queries the pool holds.
         unsafe { (d.vkCmdResetQueryPool())(cb, pool, first, count) };
-        Some(())
+        Ok(())
     }
 
     pub fn cmd_write_timestamp(
@@ -2356,16 +2398,17 @@ impl Driver {
         stage: VkPipelineStageFlagBits,
         pool: VkQueryPool,
         query: u32,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        // SAFETY: as above, and a query the pool holds.
         unsafe { (d.vkCmdWriteTimestamp())(cb, stage, pool, query) };
-        Some(())
+        Ok(())
     }
 
     /// The GPU-side read-back: results land in a buffer of the guest's, on the device, where the
     /// bounds are the guest's own allocation's -- the same footing as every other `vkCmd*`
-    /// that names a buffer.
+    /// that names a buffer. The queries read are the pool's to hold, as everywhere.
     #[allow(clippy::too_many_arguments)]
     pub fn cmd_copy_query_pool_results(
         &self,
@@ -2377,13 +2420,14 @@ impl Driver {
         offset: VkDeviceSize,
         stride: VkDeviceSize,
         flags: VkQueryResultFlags,
-    ) -> Option<()> {
-        let d = self.recorder(cb)?;
-        // SAFETY: as above.
+    ) -> Result<(), QueryRefused> {
+        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(first, count)?;
+        // SAFETY: as above, and a range of queries the pool holds.
         unsafe {
             (d.vkCmdCopyQueryPoolResults())(cb, pool, first, count, dst, offset, stride, flags)
         };
-        Some(())
+        Ok(())
     }
 
     // ----------------------------------------------------------------------- sync
@@ -3309,53 +3353,76 @@ enum Backing {
     ),
 }
 
-/// What a query pool was created as, for the read-back that has to fit its buffer.
+/// What a query pool was created as, for the commands that name its queries by index and the
+/// read-back that has to fit its buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct QueryFacts {
     /// How many queries the pool holds.
     queries: u32,
     /// How many values one query's result is, before the availability and status words the
     /// read-back flags may append -- one for most kinds, one per counted statistic for a
-    /// pipeline-statistics pool.
-    values: u32,
+    /// pipeline-statistics pool. `None` is a kind this renderer cannot size: a performance
+    /// query's counters are negotiated through an extension, a video encode's feedback through
+    /// its own. Such a pool is created and indexed like any other; only its read-back into
+    /// guest-offered room is refused, since the room cannot be held to a size nobody knows.
+    values: Option<u32>,
 }
 
 impl QueryFacts {
-    /// The facts of a pool `info` would create, or `None` for a query type whose result this
-    /// renderer cannot size -- a performance query's is a list of counters negotiated through an
-    /// extension this build does not offer, and a type from a newer Vulkan than the pinned one is
-    /// a type the guest was never told about.
-    fn of(info: &VkQueryPoolCreateInfo) -> Option<Self> {
+    /// The facts of the pool `info` creates. Total: whether the driver will make the pool is the
+    /// driver's to decide, and a type this renderer has no size for is still a pool.
+    fn of(info: &VkQueryPoolCreateInfo) -> Self {
         let values = match info.queryType {
-            VkQueryType::VK_QUERY_TYPE_OCCLUSION | VkQueryType::VK_QUERY_TYPE_TIMESTAMP => 1,
+            VkQueryType::VK_QUERY_TYPE_OCCLUSION
+            | VkQueryType::VK_QUERY_TYPE_TIMESTAMP
+            | VkQueryType::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT
+            | VkQueryType::VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT
+            | VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR
+            | VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR
+            | VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR
+            | VkQueryType::VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR
+            | VkQueryType::VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT
+            | VkQueryType::VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT => Some(1),
             VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS => {
-                info.pipelineStatistics.0.count_ones()
+                Some(info.pipelineStatistics.0.count_ones())
             }
-            VkQueryType::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT => 2,
-            VkQueryType::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR => 0,
-            _ => return None,
+            VkQueryType::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT => Some(2),
+            VkQueryType::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR => Some(0),
+            _ => None,
         };
-        Some(QueryFacts { queries: info.queryCount, values })
+        QueryFacts { queries: info.queryCount, values }
+    }
+
+    /// Whether queries `first..first + count` are all the pool's.
+    fn holds(&self, first: u32, count: u32) -> Result<(), QueryRefused> {
+        match first.checked_add(count) {
+            Some(end) if end <= self.queries => Ok(()),
+            _ => Err(QueryRefused::OutOfPool),
+        }
     }
 
     /// How many bytes a read of `count` results laid `stride` apart needs, with `flags` saying how
-    /// wide each value is and which words follow it. `None` is arithmetic the guest's numbers
-    /// overflow, which no buffer holds either.
+    /// wide each value is and which words follow it. Arithmetic the guest's numbers overflow is
+    /// a size no buffer holds, and is refused as one.
     fn bytes_for(
         &self,
         count: u32,
         stride: VkDeviceSize,
         flags: VkQueryResultFlags,
-    ) -> Option<u64> {
+    ) -> Result<u64, QueryRefused> {
+        let values = self.values.ok_or(QueryRefused::Unsized)?;
         let Some(last) = count.checked_sub(1) else {
-            return Some(0);
+            return Ok(0);
         };
         let has = |bit: VkQueryResultFlagBits| flags.0 & bit.0 as u32 != 0;
         let width: u64 = if has(VkQueryResultFlagBits::VK_QUERY_RESULT_64_BIT) { 8 } else { 4 };
-        let words = u64::from(self.values)
+        let words = u64::from(values)
             + u64::from(has(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT))
             + u64::from(has(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_STATUS_BIT_KHR));
-        u64::from(last).checked_mul(stride.0)?.checked_add(words.checked_mul(width)?)
+        u64::from(last)
+            .checked_mul(stride.0)
+            .and_then(|n| n.checked_add(words.checked_mul(width)?))
+            .ok_or(QueryRefused::OutOfRoom)
     }
 }
 
@@ -5126,27 +5193,34 @@ mod tests {
         assert_eq!(pad_for_blob(0, Some(HOST_VISIBLE), false), 0);
     }
 
-    /// A query read-back is measured against the pool before the driver sees the buffer.
+    /// Every command that names a query by index is held to the pool before the driver sees it.
     ///
-    /// Vulkan makes the buffer's fit the caller's promise and a miss undefined, and the driver
-    /// takes the promise at its word: it writes `queryCount` results `stride` apart and reads
-    /// `firstQuery` on into its own pool. Here the caller is a guest, so both are checked
-    /// against what the pool was created as, and neither refusal reaches the driver.
+    /// Vulkan makes the index the caller's promise and a miss undefined, and this host's driver
+    /// takes the promise at its word: a host-side reset zeroes host memory at `first + i`, a
+    /// begin reads a remap table at `query`, the recorded commands address the pool's buffer on
+    /// the GPU, and a read-back writes `count` results `stride` apart into whatever it was
+    /// handed. Here the caller is a guest, so all eight are measured against what the pool was
+    /// created as, and no refusal reaches a planted entry point.
     #[test]
-    fn query_results_are_held_to_the_pool_and_to_the_room() {
+    fn every_query_index_is_held_to_the_pool() {
         use super::super::proto::types::{
+            VkCommandPool, VkPipelineStageFlagBits, VkQueryControlFlags,
             VkQueryPipelineStatisticFlags, VkQueryPoolCreateInfo, VkQueryResultFlags, VkQueryType,
         };
         use std::cell::RefCell;
 
         const DEVICE: VkDevice = VkDevice(3);
+        const CB: VkCommandBuffer = VkCommandBuffer(0x30);
         const POOL: VkQueryPool = VkQueryPool(0x50);
         const STATS: VkQueryPool = VkQueryPool(0x51);
+        const PERF: VkQueryPool = VkQueryPool(0x52);
 
-        /// What the driver was asked: first, count, size, stride, flags.
-        type Asked = (u32, u32, usize, u64, u32);
+        // What the driver was asked, by entry point: first (or the query) and count.
         thread_local! {
-            static ASKED: RefCell<Vec<Asked>> = const { RefCell::new(Vec::new()) };
+            static ASKED: RefCell<Vec<(&'static str, u32, u32)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn asked(what: &'static str, first: u32, count: u32) {
+            ASKED.with_borrow_mut(|a| a.push((what, first, count)));
         }
         unsafe extern "C" fn create(
             _d: VkDevice,
@@ -5156,14 +5230,27 @@ mod tests {
         ) -> VkResult {
             // SAFETY: the caller passes a struct and a local of its own.
             unsafe {
-                *out = if (*info).queryType == VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS {
-                    STATS
-                } else {
-                    POOL
+                *out = match (*info).queryType {
+                    VkQueryType::VK_QUERY_TYPE_PIPELINE_STATISTICS => STATS,
+                    VkQueryType::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR => PERF,
+                    _ => POOL,
                 }
             };
             VkResult::VK_SUCCESS
         }
+        unsafe extern "C" fn reset(_d: VkDevice, _p: VkQueryPool, first: u32, count: u32) {
+            asked("reset", first, count);
+        }
+        unsafe extern "C" fn destroy(
+            _d: VkDevice,
+            _p: VkQueryPool,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
         unsafe extern "C" fn results(
             _d: VkDevice,
             _p: VkQueryPool,
@@ -5171,18 +5258,68 @@ mod tests {
             count: u32,
             size: usize,
             _data: *mut core::ffi::c_void,
-            stride: VkDeviceSize,
-            flags: VkQueryResultFlags,
+            _stride: VkDeviceSize,
+            _flags: VkQueryResultFlags,
         ) -> VkResult {
-            ASKED.with_borrow_mut(|a| a.push((first, count, size, stride.0, flags.0)));
+            asked("results", first, count);
+            ASKED.with_borrow_mut(|a| a.push(("bytes", size as u32, 0)));
             VkResult::VK_NOT_READY
+        }
+        unsafe extern "C" fn begin(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            query: u32,
+            _f: VkQueryControlFlags,
+        ) {
+            asked("begin", query, 1);
+        }
+        unsafe extern "C" fn end(_cb: VkCommandBuffer, _p: VkQueryPool, query: u32) {
+            asked("end", query, 1);
+        }
+        unsafe extern "C" fn cmd_reset(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            first: u32,
+            count: u32,
+        ) {
+            asked("cmd_reset", first, count);
+        }
+        unsafe extern "C" fn timestamp(
+            _cb: VkCommandBuffer,
+            _s: VkPipelineStageFlagBits,
+            _p: VkQueryPool,
+            query: u32,
+        ) {
+            asked("timestamp", query, 1);
+        }
+        unsafe extern "C" fn copy(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            first: u32,
+            count: u32,
+            _b: VkBuffer,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _f: VkQueryResultFlags,
+        ) {
+            asked("copy", first, count);
         }
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCreateQueryPool(create);
+        fns.plant_vkResetQueryPool(reset);
         fns.plant_vkGetQueryPoolResults(results);
+        fns.plant_vkCmdBeginQuery(begin);
+        fns.plant_vkCmdEndQuery(end);
+        fns.plant_vkCmdResetQueryPool(cmd_reset);
+        fns.plant_vkCmdWriteTimestamp(timestamp);
+        fns.plant_vkCmdCopyQueryPoolResults(copy);
+        fns.plant_vkDestroyQueryPool(destroy);
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
         let mut d = Driver::new(Account::for_test(None));
         d.plant_device(DEVICE, fns);
+        d.plant_pool(DEVICE, VkCommandPool(0x20), &[(CB, ObjectId(9))]);
 
         let info = VkQueryPoolCreateInfo {
             queryType: VkQueryType::VK_QUERY_TYPE_TIMESTAMP,
@@ -5199,19 +5336,102 @@ mod tests {
                 | VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT.0)
                 as u32,
         );
+        const WITH_STATUS: VkQueryResultFlags =
+            VkQueryResultFlags(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_STATUS_BIT_KHR.0 as u32);
+        const STAGE: VkPipelineStageFlagBits = VkPipelineStageFlagBits(1);
+        const BUF: VkBuffer = VkBuffer(0x60);
         let mut buf = [0u8; 64];
+        let out_of_pool: Result<(), QueryRefused> = Err(QueryRefused::OutOfPool);
+        let read_out_of_pool: Result<VkResult, QueryRefused> = Err(QueryRefused::OutOfPool);
 
-        // Four 32-bit timestamps, four bytes apart: sixteen bytes, and sixteen are offered.
+        // The whole pool, by every command that takes a range, and the last query by every one
+        // that takes a single index: all reach the driver with the guest's own numbers.
+        assert_eq!(d.reset_query_pool(DEVICE, POOL, 0, 4), Ok(()));
+        assert_eq!(d.cmd_reset_query_pool(CB, POOL, 0, 4), Ok(()));
+        assert_eq!(
+            d.cmd_copy_query_pool_results(
+                CB,
+                POOL,
+                0,
+                4,
+                BUF,
+                VkDeviceSize(0),
+                VkDeviceSize(4),
+                NONE
+            ),
+            Ok(())
+        );
+        assert_eq!(d.cmd_begin_query(CB, POOL, 3, VkQueryControlFlags(0)), Ok(()));
+        assert_eq!(d.cmd_end_query(CB, POOL, 3), Ok(()));
+        assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 3), Ok(()));
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf[..16], VkDeviceSize(4), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "the driver's answer, as it gave it");
-        ASKED
-            .with_borrow(|a| assert_eq!(a.as_slice(), [(0, 4, 16, 4, 0)], "and its own arguments"));
+        ASKED.with_borrow(|a| {
+            assert_eq!(
+                a.as_slice(),
+                [
+                    ("reset", 0, 4),
+                    ("cmd_reset", 0, 4),
+                    ("copy", 0, 4),
+                    ("begin", 3, 1),
+                    ("end", 3, 1),
+                    ("timestamp", 3, 1),
+                    ("results", 0, 4),
+                    ("bytes", 16, 0),
+                ],
+                "each with its own arguments, and the read told the room's own length"
+            );
+        });
+        ASKED.with_borrow_mut(Vec::clear);
 
-        // The same four, one byte short.
+        // One past the end, by every command. The one the C forwards blindly into the driver's
+        // host memory is `reset`; the rest would address the pool's buffer past its end.
+        assert_eq!(d.reset_query_pool(DEVICE, POOL, 1, 4), out_of_pool);
+        assert_eq!(
+            d.reset_query_pool(DEVICE, POOL, 0, 0x7fff_ffff),
+            out_of_pool,
+            "a scribble the length of the heap"
+        );
+        assert_eq!(d.cmd_reset_query_pool(CB, POOL, 4, 1), out_of_pool);
+        assert_eq!(
+            d.cmd_copy_query_pool_results(
+                CB,
+                POOL,
+                3,
+                2,
+                BUF,
+                VkDeviceSize(0),
+                VkDeviceSize(4),
+                NONE
+            ),
+            out_of_pool
+        );
+        assert_eq!(d.cmd_begin_query(CB, POOL, 4, VkQueryControlFlags(0)), out_of_pool);
+        assert_eq!(d.cmd_end_query(CB, POOL, u32::MAX), out_of_pool);
+        assert_eq!(d.cmd_write_timestamp(CB, STAGE, POOL, 4), out_of_pool);
+        assert_eq!(
+            d.query_pool_results(DEVICE, POOL, 3, 2, &mut buf, VkDeviceSize(4), NONE),
+            read_out_of_pool
+        );
+        assert_eq!(
+            d.query_pool_results(DEVICE, POOL, u32::MAX, 1, &mut buf, VkDeviceSize(4), NONE),
+            read_out_of_pool,
+            "and a first query that wraps is past it too"
+        );
+        // An empty range at the very end is within the pool; one past that is not.
+        assert_eq!(d.cmd_reset_query_pool(CB, POOL, 4, 0), Ok(()));
+        assert_eq!(d.cmd_reset_query_pool(CB, POOL, 5, 0), out_of_pool);
+        ASKED.with_borrow(|a| {
+            assert_eq!(a.as_slice(), [("cmd_reset", 4, 0)], "no refusal reached the driver")
+        });
+        ASKED.with_borrow_mut(Vec::clear);
+
+        // The read-back is held to the room as well. Four 32-bit timestamps four apart need
+        // sixteen bytes; fifteen is a miss.
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf[..15], VkDeviceSize(4), NONE);
         assert_eq!(r, Err(QueryRefused::OutOfRoom));
-
-        // 64-bit results are twice as wide, and availability adds a word of the same width.
+        // 64-bit results are twice as wide, and availability and status each add a word of the
+        // same width.
         let r = d.query_pool_results(DEVICE, POOL, 0, 2, &mut buf[..16], VkDeviceSize(8), WIDE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY));
         let r =
@@ -5224,18 +5444,15 @@ mod tests {
         let r =
             d.query_pool_results(DEVICE, POOL, 0, 2, &mut buf[..32], VkDeviceSize(16), WIDE_AVAIL);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY), "laid sixteen apart in thirty-two, it does");
-
-        // Past the pool's end, with room to spare: still refused, because the driver would read
-        // its own pool past the end.
-        let r = d.query_pool_results(DEVICE, POOL, 3, 2, &mut buf, VkDeviceSize(4), NONE);
-        assert_eq!(r, Err(QueryRefused::OutOfRoom));
-        let r = d.query_pool_results(DEVICE, POOL, u32::MAX, 1, &mut buf, VkDeviceSize(4), NONE);
-        assert_eq!(r, Err(QueryRefused::OutOfRoom), "and a first query that wraps is past it too");
-
+        let r =
+            d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf[..4], VkDeviceSize(4), WITH_STATUS);
+        assert_eq!(r, Err(QueryRefused::OutOfRoom), "a status word is a second word");
+        let r =
+            d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf[..8], VkDeviceSize(4), WITH_STATUS);
+        assert_eq!(r, Ok(VkResult::VK_NOT_READY));
         // A stride the arithmetic cannot hold is a buffer nothing holds either.
         let r = d.query_pool_results(DEVICE, POOL, 0, 4, &mut buf, VkDeviceSize(u64::MAX), NONE);
         assert_eq!(r, Err(QueryRefused::OutOfRoom));
-
         // Nothing asked for needs no room at all.
         let r = d.query_pool_results(DEVICE, POOL, 4, 0, &mut buf[..0], VkDeviceSize(4), NONE);
         assert_eq!(r, Ok(VkResult::VK_NOT_READY));
@@ -5253,28 +5470,82 @@ mod tests {
         let r = d.query_pool_results(DEVICE, STATS, 0, 1, &mut buf[..8], VkDeviceSize(8), NONE);
         assert_eq!(r, Err(QueryRefused::OutOfRoom));
 
-        // A pool this renderer has no record of is not sized, so it is not read.
-        let r =
-            d.query_pool_results(DEVICE, VkQueryPool(0x99), 0, 1, &mut buf, VkDeviceSize(4), NONE);
-        assert_eq!(r, Err(QueryRefused::UnknownPool));
-        // Which is what a destroyed pool becomes: a recycled handle finds no record.
-        d.forget_query_pool(POOL);
-        let r = d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf, VkDeviceSize(4), NONE);
-        assert_eq!(r, Err(QueryRefused::UnknownPool));
-
-        // A type whose result this renderer cannot size is not created.
+        // A kind whose result this renderer cannot size is still a pool the driver decides on,
+        // and is still indexed; only its read-back into guest room is refused.
         let info = VkQueryPoolCreateInfo {
             queryType: VkQueryType::VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR,
-            queryCount: 1,
+            queryCount: 2,
             ..Default::default()
         };
         assert_eq!(
             d.create_query_pool(DEVICE, &info, None),
-            Err(VkResult::VK_ERROR_FEATURE_NOT_PRESENT)
+            Ok(PERF),
+            "the driver's call, not ours"
         );
+        assert_eq!(d.cmd_begin_query(CB, PERF, 1, VkQueryControlFlags(0)), Ok(()));
+        assert_eq!(d.cmd_begin_query(CB, PERF, 2, VkQueryControlFlags(0)), out_of_pool);
+        let r = d.query_pool_results(DEVICE, PERF, 0, 1, &mut buf, VkDeviceSize(64), NONE);
+        assert_eq!(r, Err(QueryRefused::Unsized));
+        // Whereas a kind this host advertises through an extension is sized like any other.
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT,
+            queryCount: 1,
+            ..Default::default()
+        };
+        assert_eq!(QueryFacts::of(&info).values, Some(1), "one value: primitives generated");
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT,
+            ..Default::default()
+        };
+        assert_eq!(QueryFacts::of(&info).values, Some(2), "two: written, and needed");
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR,
+            ..Default::default()
+        };
+        assert_eq!(QueryFacts::of(&info).values, Some(0), "none: the status word is the result");
+
+        // A pool this renderer has no record of is not sized and not indexed, so it is not
+        // touched -- which is what a destroyed pool becomes: a recycled handle finds no record.
+        let r = d.cmd_end_query(CB, VkQueryPool(0x99), 0);
+        assert_eq!(r, Err(QueryRefused::UnknownPool));
+        d.forget_query_pool(POOL);
+        let r = d.query_pool_results(DEVICE, POOL, 0, 1, &mut buf, VkDeviceSize(4), NONE);
+        assert_eq!(r, Err(QueryRefused::UnknownPool));
+        assert_eq!(d.reset_query_pool(DEVICE, POOL, 0, 1), Err(QueryRefused::UnknownPool));
+
+        // A command buffer with no device behind it, and a device with no table.
+        assert_eq!(d.cmd_end_query(VkCommandBuffer(0x31), STATS, 0), Err(QueryRefused::NoDevice));
+        assert_eq!(d.reset_query_pool(VkDevice(4), STATS, 0, 1), Err(QueryRefused::NoDevice));
+
+        // The other place a pool dies: the guest left it live and the device's teardown took
+        // it. Its record goes too, so the handle the driver may now reuse vouches for nothing.
+        let doomed = [
+            Doomed {
+                id: ObjectId(41),
+                ty: VkObjectType::VK_OBJECT_TYPE_QUERY_POOL,
+                handle: STATS.host(),
+                device: Some(DEVICE),
+            },
+            Doomed {
+                id: ObjectId(42),
+                ty: VkObjectType::VK_OBJECT_TYPE_QUERY_POOL,
+                handle: PERF.host(),
+                device: Some(DEVICE),
+            },
+        ];
+        d.destroy_device(DEVICE, &doomed);
+        assert!(d.query_pools.is_empty(), "no record outlives the pool it describes");
 
         ASKED.with_borrow(|a| {
-            assert_eq!(a.len(), 5, "five reads reached the driver, no refusal did")
+            let reached: Vec<&str> = a.iter().map(|(w, _, _)| *w).collect();
+            assert_eq!(
+                reached,
+                [
+                    "results", "bytes", "results", "bytes", "results", "bytes", "results", "bytes",
+                    "results", "bytes", "begin"
+                ],
+                "only what fit reached the driver, and no refusal did"
+            );
         });
         d.abandon_planted();
     }

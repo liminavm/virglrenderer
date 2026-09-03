@@ -228,10 +228,10 @@ pub struct Decoder<'a> {
 
 /// What became of one command, as the generated dispatch reports it.
 ///
-/// One verdict, read in one place. The ring loop used to learn the same four things from four
-/// channels -- an `Option`, the decoder's poison flag, a per-command soft flag, and the reply
-/// encoder's byte count -- and reading "skipped" off a byte count is how a ghost the guest was
-/// waiting on went unnoticed.
+/// One verdict, read in one place. The loop that runs a batch reads nothing else off the
+/// decoder to learn this: a verdict inferred from a side channel -- a poison flag, a reply's
+/// byte count -- is one that can be inferred wrongly, and "skipped" read off a byte count is
+/// indistinguishable from "answered with nothing".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatched {
     /// The handler ran; when a reply was asked for, it is in the encoder.

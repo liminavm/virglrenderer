@@ -56,16 +56,74 @@ SABOTAGES = [
     (
         'a query read-back is handed to the driver with results that run past the room the guest offered',
         'virglrs/src/venus/driver.rs',
-        """        let fits = facts.bytes_for(count, stride, flags).is_some_and(|n| n <= out.len() as u64);""",
-        """        let fits = true;""",
-        'query_results',
+        """        if facts.bytes_for(count, stride, flags)? > out.len() as u64 {
+            return Err(QueryRefused::OutOfRoom);
+        }""",
+        """        facts.bytes_for(count, stride, flags)?;""",
+        'query',
     ),
     (
         'a query read-back names queries past the end of the pool',
         'virglrs/src/venus/driver.rs',
-        """        let in_pool = first.checked_add(count).is_some_and(|end| end <= facts.queries);""",
-        """        let in_pool = true;""",
-        'query_results',
+        """        let facts = self.query_facts(pool)?;
+        facts.holds(first, count)?;
+        if facts.bytes_for""",
+        """        let facts = self.query_facts(pool)?;
+        if facts.bytes_for""",
+        'query',
+    ),
+    (
+        'a host-side query pool reset is handed to the driver past the end of the pool, and the driver zeroes host memory there',
+        'virglrs/src/venus/driver.rs',
+        """        self.query_facts(pool)?.holds(first, count)?;
+        // SAFETY: a device in this table, a pool recorded on it, and a range of queries the pool
+        // holds -- which is what the driver writes host memory at.""",
+        """        self.query_facts(pool)?;
+        // SAFETY: a device in this table, a pool recorded on it, and a range of queries the pool
+        // holds -- which is what the driver writes host memory at.""",
+        'query',
+    ),
+    (
+        'a recorded query begin is handed to the driver past the end of the pool',
+        'virglrs/src/venus/driver.rs',
+        """        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(query, 1)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };""",
+        """        let (d, _facts) = self.query_recorder(cb, pool)?;
+        // SAFETY: as above, and a query the pool holds.
+        unsafe { (d.vkCmdBeginQuery())(cb, pool, query, flags) };""",
+        'query',
+    ),
+    (
+        'a recorded query-pool result copy is handed to the driver past the end of the pool',
+        'virglrs/src/venus/driver.rs',
+        """        let (d, facts) = self.query_recorder(cb, pool)?;
+        facts.holds(first, count)?;
+        // SAFETY: as above, and a range of queries the pool holds.
+        unsafe {
+            (d.vkCmdCopyQueryPoolResults())""",
+        """        let (d, _facts) = self.query_recorder(cb, pool)?;
+        // SAFETY: as above, and a range of queries the pool holds.
+        unsafe {
+            (d.vkCmdCopyQueryPoolResults())""",
+        'query',
+    ),
+    (
+        'a query kind this host advertises through an extension is sized as one nobody can size, so its read-back is refused',
+        'virglrs/src/venus/driver.rs',
+        """            | VkQueryType::VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT
+            | VkQueryType::VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT""",
+        """            | VkQueryType::VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT""",
+        'query',
+    ),
+    (
+        "a query read-back's status word is not counted in the room it needs",
+        'virglrs/src/venus/driver.rs',
+        """            + u64::from(has(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT))
+            + u64::from(has(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_STATUS_BIT_KHR));""",
+        """            + u64::from(has(VkQueryResultFlagBits::VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));""",
+        'query',
     ),
     (
         'a destroyed query pool keeps its record, so a recycled handle is measured against a previous life',
@@ -76,11 +134,34 @@ SABOTAGES = [
         'query_results',
     ),
     (
-        'a scanout of pages says why it has no surface on every frame, not once',
+        "a query pool the device's teardown took keeps its record",
         'virglrs/src/venus/driver.rs',
-        """            Storage::Linear(p) => !p.it.said.swap(true, std::sync::atomic::Ordering::Relaxed),""",
-        """            Storage::Linear(_) => true,""",
-        'says_so_once',
+        """                VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
+                    self.forget_query_pool(VkQueryPool::from_host(handle));
+                }""",
+        """                VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {}""",
+        'query',
+    ),
+    (
+        'a query command hands the driver its arguments in the wrong order',
+        'virglrs/src/venus/context.rs',
+        """        let done = self.driver.cmd_copy_query_pool_results(
+            args.commandBuffer,
+            args.queryPool,
+            args.firstQuery,
+            args.queryCount,
+            args.dstBuffer,
+            args.dstOffset,
+            args.stride,""",
+        """        let done = self.driver.cmd_copy_query_pool_results(
+            args.commandBuffer,
+            args.queryPool,
+            args.firstQuery,
+            args.queryCount,
+            args.dstBuffer,
+            args.stride,
+            args.dstOffset,""",
+        'query_results',
     ),
     (
         'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
