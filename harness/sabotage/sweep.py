@@ -404,12 +404,10 @@ SABOTAGES = [
         '',
     ),
     (
-        'a published allocation answers the query with the storage size, not the resource size',
-        'virglrs/src/venus/context.rs',
-        """                ResourceBytes::Allocation(published) => published.size,""",
-        """                ResourceBytes::Allocation(published) => {
-                    self.driver.span(&bytes).map_or(published.size, |(_, len)| len)
-                }""",
+        'a published allocation travels without the size of the resource that published it',
+        'virglrs/src/renderer.rs',
+        """                        size: desc.size,""",
+        """                        size: 0,""",
         '',
     ),
     (
