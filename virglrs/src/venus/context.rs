@@ -42,14 +42,15 @@ use super::proto::types::{
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
-    vn_command_vkCreateSampler, vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule,
-    vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
-    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
-    vn_command_vkDestroyDevice, vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer,
-    vn_command_vkDestroyImage, vn_command_vkDestroyImageView, vn_command_vkDestroyInstance,
-    vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
+    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
+    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
+    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyFence,
+    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
+    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
     vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
-    vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler, vn_command_vkDestroySemaphore,
+    vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
+    vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
     vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
     vn_command_vkEnumerateDeviceExtensionProperties,
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
@@ -85,9 +86,10 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceQueueFamilyProperties2,
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties,
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2,
-    vn_command_vkGetPhysicalDeviceToolProperties, vn_command_vkGetRenderAreaGranularity,
-    vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
-    vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
+    vn_command_vkGetPhysicalDeviceToolProperties, vn_command_vkGetPipelineCacheData,
+    vn_command_vkGetRenderAreaGranularity, vn_command_vkGetRenderingAreaGranularity,
+    vn_command_vkGetSemaphoreCounterValue, vn_command_vkImportSemaphoreResourceMESA,
+    vn_command_vkInvalidateMappedMemoryRanges, vn_command_vkMergePipelineCaches,
     vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle,
     vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
     vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
@@ -1487,6 +1489,19 @@ impl Commands for Handlers<'_> {
     simple_destroy!(vkDestroySampler, vn_command_vkDestroySampler, sampler);
 
     simple_create!(
+        vkCreateSamplerYcbcrConversion,
+        vn_command_vkCreateSamplerYcbcrConversion,
+        pCreateInfo,
+        pYcbcrConversion,
+        handle_pYcbcrConversion_mut
+    );
+    simple_destroy!(
+        vkDestroySamplerYcbcrConversion,
+        vn_command_vkDestroySamplerYcbcrConversion,
+        ycbcrConversion
+    );
+
+    simple_create!(
         vkCreateRenderPass,
         vn_command_vkCreateRenderPass,
         pCreateInfo,
@@ -1543,6 +1558,49 @@ impl Commands for Handlers<'_> {
         handle_pPipelineCache_mut
     );
     simple_destroy!(vkDestroyPipelineCache, vn_command_vkDestroyPipelineCache, pipelineCache);
+
+    /// Count-then-fill like the enumerations below, but counted in bytes and asked of the device.
+    /// A guest that has a pipeline cache at all asks this a few seconds after every new pipeline,
+    /// to save the cache to disk -- so a build that refuses it loses every such client on the
+    /// first pipeline it builds, a little after the first frame it presents.
+    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {
+        let device = args.device;
+        let cache = args.pipelineCache;
+        if !self.counted(args.has_pDataSize()) {
+            return;
+        }
+        if !args.has_pData() {
+            let asked = self.driver.pipeline_cache_data(device, cache, None);
+            match asked {
+                Ok((n, ret)) => {
+                    args.ret = ret;
+                    if let Some(size) = args.pDataSize_mut() {
+                        *size = n;
+                    }
+                }
+                Err(e) => args.ret = e,
+            }
+            return;
+        }
+        let Some(out) = self.array(args.pData_mut()) else { return };
+        let asked = self.driver.pipeline_cache_data(device, cache, Some(out));
+        match asked {
+            Ok((n, ret)) => {
+                args.ret = ret;
+                if let Some(size) = args.pDataSize_mut() {
+                    *size = n;
+                }
+            }
+            Err(e) => args.ret = e,
+        }
+    }
+
+    fn vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {
+        let srcs = args.pSrcCaches();
+        match self.driver.merge_pipeline_caches(args.device, args.dstCache, srcs) {
+            Ok(ret) | Err(ret) => args.ret = ret,
+        }
+    }
 
     /// The one simple object with a check in front of it.
     ///
@@ -8436,6 +8494,182 @@ mod tests {
         REACHED.with_borrow(|r| {
             assert_eq!(r.as_slice(), &["vkCmdPushConstants", "vkCreateShaderModule"]);
         });
+
+        h.driver.abandon_planted();
+    }
+
+    /// The four commands a GTK client asks for that synoik and vkcube never did: saving the
+    /// pipeline cache -- count then fill, in bytes -- merging caches, and the YCbCr conversion a
+    /// video texture needs. Each reaches the driver in its own shape, and each answers the guest.
+    ///
+    /// A client with a pipeline cache asks for its data a few seconds after every new pipeline,
+    /// to save it to disk; refused, it is poisoned a little after its first frame.
+    #[test]
+    fn the_commands_a_gtk_client_asks_for_are_served() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDevice, VkPipelineCache, VkSamplerYcbcrConversion,
+            VkSamplerYcbcrConversionCreateInfo, vn_command_vkCreateSamplerYcbcrConversion,
+            vn_command_vkGetPipelineCacheData, vn_command_vkMergePipelineCaches,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const CACHE: u64 = 0x500;
+        const BLOB: [u8; 5] = [0xca, 0xc4, 0xed, 0xda, 0x7a];
+
+        #[derive(Default)]
+        struct Saw {
+            /// `(dst, the sources)`.
+            merged: Vec<(u64, Vec<u64>)>,
+            conversions: u32,
+        }
+        thread_local! { static SAW: RefCell<Saw> = RefCell::new(Saw::default()); }
+
+        unsafe extern "C" fn cache_data(
+            _d: VkDevice,
+            _c: VkPipelineCache,
+            size: *mut usize,
+            data: *mut core::ffi::c_void,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes its own count and the slice it was given, or null.
+            unsafe {
+                if data.is_null() {
+                    *size = BLOB.len();
+                    return VkResult::VK_SUCCESS;
+                }
+                let room = *size;
+                let n = room.min(BLOB.len());
+                core::ptr::copy_nonoverlapping(BLOB.as_ptr(), data.cast::<u8>(), n);
+                *size = n;
+                if n < BLOB.len() { VkResult::VK_INCOMPLETE } else { VkResult::VK_SUCCESS }
+            }
+        }
+        unsafe extern "C" fn merge(
+            _d: VkDevice,
+            dst: VkPipelineCache,
+            n: u32,
+            srcs: *const VkPipelineCache,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes the slice's own pointer and length.
+            let srcs = unsafe { core::slice::from_raw_parts(srcs, n as usize) };
+            SAW.with_borrow_mut(|w| w.merged.push((dst.0, srcs.iter().map(|c| c.0).collect())));
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn conversion(
+            _d: VkDevice,
+            _i: *const VkSamplerYcbcrConversionCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkSamplerYcbcrConversion,
+        ) -> VkResult {
+            SAW.with_borrow_mut(|w| w.conversions += 1);
+            // SAFETY: the caller's local.
+            unsafe { *out = VkSamplerYcbcrConversion(0x9c) };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkGetPipelineCacheData(cache_data);
+        fns.plant_vkMergePipelineCaches(merge);
+        fns.plant_vkCreateSamplerYcbcrConversion(conversion);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        // Count: no array, and the size comes back.
+        let mut size = 0usize;
+        {
+            let mut args = vn_command_vkGetPipelineCacheData::default();
+            args.device = VkDevice(DEVICE);
+            args.pipelineCache = VkPipelineCache(CACHE);
+            args.plant_pDataSize(&mut size);
+            h.vkGetPipelineCacheData(&mut args);
+            assert!(!h.unserved, "served now; a build that still refuses it fails here");
+            assert!(h.reject.is_none());
+            assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        }
+        assert_eq!(size, BLOB.len(), "the count call says how many bytes there are");
+
+        // Fill, with less room than that: what fits, the size it actually wrote, and INCOMPLETE
+        // -- the guest's business, not an error.
+        let mut short = [0u8; 3];
+        let mut size = short.len();
+        {
+            let mut args = vn_command_vkGetPipelineCacheData::default();
+            args.device = VkDevice(DEVICE);
+            args.pipelineCache = VkPipelineCache(CACHE);
+            args.plant_pDataSize(&mut size);
+            args.plant_pData(&mut short);
+            h.vkGetPipelineCacheData(&mut args);
+            assert_eq!(args.ret, VkResult::VK_INCOMPLETE);
+        }
+        assert_eq!(size, 3);
+        assert_eq!(short, BLOB[..3], "the bytes that fit, and no more");
+
+        // Fill with room enough: all of it.
+        let mut full = [0u8; 8];
+        let mut size = full.len();
+        {
+            let mut args = vn_command_vkGetPipelineCacheData::default();
+            args.device = VkDevice(DEVICE);
+            args.pipelineCache = VkPipelineCache(CACHE);
+            args.plant_pDataSize(&mut size);
+            args.plant_pData(&mut full);
+            h.vkGetPipelineCacheData(&mut args);
+            assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        }
+        assert_eq!(size, BLOB.len(), "the size written, not the room offered");
+        assert_eq!(full[..5], BLOB);
+
+        // Merge: every source, under the destination.
+        let srcs = [VkPipelineCache(0x501), VkPipelineCache(0x502)];
+        let mut args = vn_command_vkMergePipelineCaches::default();
+        args.device = VkDevice(DEVICE);
+        args.dstCache = VkPipelineCache(CACHE);
+        args.plant_pSrcCaches(&srcs);
+        h.vkMergePipelineCaches(&mut args);
+        assert!(!h.unserved);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|w| assert_eq!(w.merged, [(CACHE, vec![0x501, 0x502])]));
+
+        // A YCbCr conversion is a plain create: the driver's handle lands in the shadow.
+        let info = VkSamplerYcbcrConversionCreateInfo::default();
+        let mut wire = VkSamplerYcbcrConversion(77);
+        let mut shadow = VkSamplerYcbcrConversion(0);
+        let mut args = vn_command_vkCreateSamplerYcbcrConversion::default();
+        args.device = VkDevice(DEVICE);
+        args.pCreateInfo = Some(&info);
+        args.plant_pYcbcrConversion(&mut wire);
+        args.plant_handle_pYcbcrConversion(&mut shadow);
+        h.vkCreateSamplerYcbcrConversion(&mut args);
+        assert!(!h.unserved);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        assert_eq!(shadow, VkSamplerYcbcrConversion(0x9c));
+        assert_eq!(wire, VkSamplerYcbcrConversion(77), "the guest's id on the wire is left alone");
+        SAW.with_borrow(|w| assert_eq!(w.conversions, 1));
 
         h.driver.abandon_planted();
     }

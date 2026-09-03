@@ -503,6 +503,33 @@ SABOTAGES = [
         '',
     ),
     (
+        'saving the pipeline cache is refused again, and every GTK client dies after its first pipeline',
+        'virglrs/src/venus/context.rs',
+        """    fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {""",
+        """    fn unused_vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData<'_>) {""",
+        '',
+    ),
+    (
+        'the fill call of the pipeline cache data reports the room offered, not the bytes written',
+        'virglrs/src/venus/context.rs',
+        """        let asked = self.driver.pipeline_cache_data(device, cache, Some(out));
+        match asked {
+            Ok((n, ret)) => {""",
+        """        let room = out.len();
+        let asked = self.driver.pipeline_cache_data(device, cache, Some(out));
+        match asked {
+            Ok((_, ret)) => {
+                let n = room;""",
+        '',
+    ),
+    (
+        'merging pipeline caches is refused again',
+        'virglrs/src/venus/context.rs',
+        """    fn vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {""",
+        """    fn unused_vkMergePipelineCaches(&mut self, args: &mut vn_command_vkMergePipelineCaches<'_>) {""",
+        '',
+    ),
+    (
         'the image copy the overview blur asks for is refused again',
         'virglrs/src/venus/context.rs',
         """    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
