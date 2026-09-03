@@ -91,11 +91,13 @@ use super::proto::types::{
     vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
     vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
     vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
-    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences,
+    vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkUpdateDescriptorSets,
+    vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
     vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
+    vn_command_vkWaitVirtqueueSeqnoMESA, vn_command_vkWriteRingExtraMESA,
 };
-use super::ring::{ReplyStream, ReplyStreamError, Ring, RingError, ShmResources};
-use super::ring_thread::RingThread;
+use super::ring::{ReplyStream, ReplyStreamError, Ring, RingControl, RingError, ShmResources};
+use super::ring_thread::{RingThread, RingWaiter, WaitRing, seqno_ge};
 use crate::vulkan::Global;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT`: the guest wants an answer to this command.
@@ -129,6 +131,12 @@ pub struct Context {
     /// Where answers to commands that arrived on the context's own stream go. Each ring holds its
     /// own; this is the one for everything that did not come in on a ring.
     reply: Option<ReplyStream>,
+    /// Where a `vkWaitRingSeqnoMESA` on this context's own stream sleeps.
+    ///
+    /// One per context, shared with every ring thread it owns, because every input to that wait's
+    /// predicate is produced on a ring thread -- which must never block on this context's lock to
+    /// report one. The C's `ctx->wait_ring` is the same object for the same reason.
+    wait_ring: Arc<WaitRing>,
     /// The thread stamping ALIVE into the status word of every ring that asked to be monitored.
     ///
     /// `None` until a ring asks. Once started it runs until the context goes, even if every
@@ -149,6 +157,53 @@ const _: () = {
     is_send::<Context>();
 };
 
+/// What a suspended batch is waiting for.
+///
+/// The two are never interchangeable and never both reachable from one stream: a virtqueue wait is
+/// legal only on a ring's own stream and a ring wait only on the context's, and the handlers
+/// refuse the other way round. They share a type because they share a mechanism -- a batch that
+/// stops partway through and is offered again -- not because a caller ever has to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// `vkWaitVirtqueueSeqnoMESA`: the ring this batch arrived on must sleep until the context
+    /// publishes this seqno for it. Strictly increasing and never wrapped -- it is a guest-side
+    /// counter, not a position in anything.
+    Virtqueue(u64),
+    /// `vkWaitRingSeqnoMESA`: the caller must sleep until `ring`'s head reaches `seqno`. A byte
+    /// position in that ring's buffer, so every comparison against it is wrap-aware.
+    Ring { ring: RingId, seqno: u32 },
+}
+
+/// How a submission ended.
+///
+/// `Waiting` is the reason this is not a `bool`. A batch can stop partway through, and the caller
+/// has to know both that it must wait and how much of its buffer has already run -- passing the
+/// remainder back in is the resume. Losing either half loses commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a suspended batch that is not resumed loses every command after the wait"]
+pub enum Submitted {
+    /// The whole batch ran.
+    Done,
+    /// The stream is poisoned, by this batch or an earlier one.
+    Poisoned,
+    /// The batch stopped. The first `consumed` bytes ran and will not run again; the wait command
+    /// itself was *not* consumed, so offering `buf[consumed..]` once `on` is satisfied re-decodes
+    /// it and lets its handler answer for real.
+    ///
+    /// That the wait command re-runs is what keeps a reply-carrying wait honest: the answer is
+    /// encoded on the pass that proceeds, which is after the wait completed -- the same order a
+    /// handler that could block would have produced.
+    Waiting { consumed: usize, on: Wait },
+}
+
+impl Submitted {
+    /// Whether the batch ran to its end. A suspension is deliberately not "ran": the caller still
+    /// owes it a resume, and a `bool` that said yes would be how the remainder gets dropped.
+    pub fn ran(self) -> bool {
+        matches!(self, Submitted::Done)
+    }
+}
+
 /// A ring, in whichever of its two states it is in.
 ///
 /// The states differ by who owns the ring body, and that is the whole point of making them a type:
@@ -161,6 +216,19 @@ enum RingSlot {
     Idle(Ring),
     /// Reading on its own thread, which owns the body and lends the reply slot to each dispatch.
     Running(RingThread),
+}
+
+impl RingSlot {
+    /// The ring's control words, whichever state it is in.
+    ///
+    /// The one thing that can be asked of a ring without knowing who owns its body -- which is
+    /// exactly why those words live in an `Arc` of their own. See [`RingControl`].
+    fn control(&self) -> &Arc<RingControl> {
+        match self {
+            RingSlot::Idle(r) => &r.control,
+            RingSlot::Running(t) => t.control(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +255,7 @@ impl Context {
             unhandled: 0,
             rings: BTreeMap::new(),
             reply: None,
+            wait_ring: Arc::new(WaitRing::default()),
             monitor: None,
         }
     }
@@ -206,6 +275,30 @@ impl Context {
 
     pub fn objects(&self) -> &Shared {
         &self.objects
+    }
+
+    /// A `vkWaitRingSeqnoMESA` on `ring`, in a form the caller can wait on with nothing locked.
+    ///
+    /// `None` when there is no running ring under that id. An idle one is deliberately not
+    /// enough: nothing advances an idle ring's head, so a wait on one would be a wait on a
+    /// number that cannot arrive, and returning a waiter for it would hand the caller a hang
+    /// instead of the refusal it is owed.
+    pub fn ring_waiter(&self, ring: RingId, seqno: u32) -> Option<RingWaiter> {
+        match self.rings.get(&ring)? {
+            RingSlot::Running(t) => {
+                Some(t.waiter(self.id, seqno, self.wait_ring(), self.fatal_flag()))
+            }
+            RingSlot::Idle(_) => None,
+        }
+    }
+
+    /// A share of the place a ring-seqno wait sleeps, for a ring thread that has to wake it.
+    ///
+    /// One object with many keys, like the poison flag beside it: a ring thread reports a head
+    /// advance, a block on a virtqueue seqno, or its own death into this without ever waiting for
+    /// the context lock -- which it must be able to do, having no lock it may block on at all.
+    pub fn wait_ring(&self) -> Arc<WaitRing> {
+        Arc::clone(&self.wait_ring)
     }
 
     /// Enter replay mode: the journal is about to be fed in, so nothing may answer it.
@@ -238,13 +331,13 @@ impl Context {
         todo: &mut Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
-    ) -> bool {
+    ) -> Submitted {
         // The context lends its own reply slot for the length of the batch. Taking it out and
         // putting it back is what keeps one owner: nothing else can reach it while it is lent.
         let mut reply = self.reply.take();
-        let ok = self.submit_on(None, &mut reply, buf, todo, global, resources);
+        let out = self.submit_on(None, &mut reply, buf, todo, global, resources);
         self.reply = reply;
-        ok
+        out
     }
 
     /// Drain one submission that arrived on `on` -- a ring, or the context's own stream when
@@ -263,9 +356,9 @@ impl Context {
         todo: &mut Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
-    ) -> bool {
+    ) -> Submitted {
         if self.fatal.load(Ordering::Acquire) {
-            return false;
+            return Submitted::Poisoned;
         }
 
         // One arena for the batch. Every temporary a command decodes into lives until the batch
@@ -296,14 +389,20 @@ impl Context {
             resources,
             rings: &mut self.rings,
             monitor: &mut self.monitor,
+            wait: None,
             current_ring: on,
             reply,
             replaying: replay,
         };
 
+        // Where this batch stopped, when it stopped at a wait. The position *before* the command
+        // that asked, so the resume re-decodes it -- see `Submitted::Waiting`.
+        let mut suspended = None;
+
         while dec.has_command() {
             dec.clear_soft_fatal();
 
+            let at = dec.pos();
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let flags = dec.decode_scalar::<VkFlags>();
             if dec.hard_fatal() {
@@ -375,6 +474,16 @@ impl Context {
                 break;
             }
 
+            // The handler could not proceed and asked to be tried again later. Nothing is
+            // committed: not the position, so the command decodes again from the same byte, and
+            // not the answer, which would otherwise report a wait as finished before it was. The
+            // command is counted twice in `dispatched` for the same reason -- a cosmetic cost of
+            // the resume being a real re-dispatch rather than a resumption of one.
+            if let Some(on) = h.wait.take() {
+                suspended = Some((at, on));
+                break;
+            }
+
             // The answer goes over only once the command is known to have worked. A poisoned
             // context has nothing to say, and a rejected command's half-built reply would be an
             // answer to a question we did not finish -- which the guest cannot tell apart from a
@@ -390,8 +499,15 @@ impl Context {
         self.dispatched += dispatched;
         self.unhandled += unhandled;
         // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
-        // success on the way out.
-        !self.fatal.load(Ordering::Acquire)
+        // success on the way out. The poison check comes first: a batch that suspended *and* then
+        // poisoned has nothing left to resume into.
+        if self.fatal.load(Ordering::Acquire) {
+            return Submitted::Poisoned;
+        }
+        match suspended {
+            Some((consumed, on)) => Submitted::Waiting { consumed, on },
+            None => Submitted::Done,
+        }
     }
 
     /// A submission that arrived on one ring's stream.
@@ -430,11 +546,26 @@ impl Context {
             Some(RingSlot::Idle(r)) => r.reply.take(),
             _ => None,
         };
-        let ok = self.submit_on(Some(ring), &mut reply, buf, todo, global, resources);
+        let out = self.submit_on(Some(ring), &mut reply, buf, todo, global, resources);
         if let Some(RingSlot::Idle(r)) = self.rings.get_mut(&ring) {
             r.reply = reply;
         }
-        ok
+        // A journal is a record of commands that already ran on a live guest, replayed into a
+        // context whose rings have no threads yet. Nothing here can satisfy a wait and nothing is
+        // waiting for one, so a journal carrying one is a journal that does not describe a run
+        // this renderer can rebuild -- which is a fact about the journal, said once, here.
+        match out {
+            Submitted::Done => true,
+            Submitted::Poisoned => false,
+            Submitted::Waiting { .. } => {
+                eprintln!(
+                    "[virglrs] ctx {}: {ring} replayed a wait, which replay cannot serve",
+                    self.id.get()
+                );
+                self.fatal.store(true, Ordering::Release);
+                false
+            }
+        }
     }
 
     /// Run a batch a ring's own thread read, answering into the slot that thread owns.
@@ -450,7 +581,7 @@ impl Context {
         todo: &mut Unimplemented,
         global: &Global,
         resources: &dyn ShmResources,
-    ) -> bool {
+    ) -> Submitted {
         self.submit_on(Some(ring), reply, buf, todo, global, resources)
     }
 
@@ -644,6 +775,14 @@ pub struct Handlers<'a> {
     rings: &'a mut BTreeMap<RingId, RingSlot>,
     /// The context's ring monitor, started here by the first ring that asks for one.
     monitor: &'a mut Option<Monitor>,
+    /// A handler asking to be suspended: it cannot proceed until something outside this context
+    /// happens, and it must not sleep here.
+    ///
+    /// Read back and cleared by the loop, like `reject`. The reason it is a message rather than a
+    /// blocking call is the lock: this loop runs with the context locked and, on the ABI path,
+    /// with the renderer root locked behind that. A handler that slept would hold both, and the
+    /// thread it is waiting for needs the first of them to make any progress at all.
+    wait: Option<Wait>,
     /// Whether this batch is a snapshot journal being replayed rather than a guest talking.
     ///
     /// A created ring reads it: replay restores head and status words the host would otherwise
@@ -1545,10 +1684,10 @@ impl Commands for Handlers<'_> {
                 return;
             };
             match self.monitor {
-                Some(m) => m.watch(&ring.status, period_us),
+                Some(m) => m.watch(&ring.control, period_us),
                 None => {
                     let m = Monitor::start(self.ctx, period_us);
-                    m.watch(&ring.status, period_us);
+                    m.watch(&ring.control, period_us);
                     *self.monitor = Some(m);
                 }
             }
@@ -1593,6 +1732,115 @@ impl Commands for Handlers<'_> {
             // at the end of this batch, and a fresh thread reads the tail before it can park.
             Some(RingSlot::Idle(_)) => {}
             Some(RingSlot::Running(t)) => t.notify(),
+        }
+    }
+
+    /// Write one guest-named word into a ring's `extra` region.
+    ///
+    /// The whole of the command: the offset is checked against `extra` alone, not against the
+    /// mapping, because the rest of the resource is not the guest's to reach through this door.
+    fn vkWriteRingExtraMESA(&mut self, args: &mut vn_command_vkWriteRingExtraMESA<'_>) {
+        if self.current_ring.is_some() {
+            self.reject = Some("wrote a ring's extra word from inside a ring's own stream");
+            return;
+        }
+        match self.rings.get(&RingId(args.ring)) {
+            None => self.reject = Some("wrote the extra word of a ring that was never created"),
+            Some(slot) => {
+                if !slot.control().write_extra(args.offset, args.value) {
+                    self.reject = Some("wrote outside the ring's extra region");
+                }
+            }
+        }
+    }
+
+    /// Publish a virtqueue seqno for a ring, releasing any wait of that ring's that it satisfies.
+    ///
+    /// The counterpart of [`Self::vkWaitVirtqueueSeqnoMESA`], and the *only* producer of the value
+    /// that one consumes -- which is why a ring blocked on a seqno this stream has not published
+    /// can never be unblocked by this stream waiting instead. See [`RingWaiter`].
+    ///
+    /// An idle ring is a ring created earlier in this very batch: the seqno is stored in its body
+    /// and carried into its thread's park state at promotion, because it is state and not an edge.
+    fn vkSubmitVirtqueueSeqnoMESA(&mut self, args: &mut vn_command_vkSubmitVirtqueueSeqnoMESA<'_>) {
+        if self.current_ring.is_some() {
+            self.reject = Some("submitted a virtqueue seqno from inside a ring's own stream");
+            return;
+        }
+        match self.rings.get_mut(&RingId(args.ring)) {
+            None => {
+                self.reject = Some("submitted a virtqueue seqno for a ring that was never created")
+            }
+            Some(RingSlot::Idle(r)) => r.virtqueue_seqno = r.virtqueue_seqno.max(args.seqno),
+            Some(RingSlot::Running(t)) => t.submit_virtqueue_seqno(args.seqno),
+        }
+    }
+
+    /// Block this ring until the context publishes a virtqueue seqno.
+    ///
+    /// Only legal on a ring's own stream -- it has no `ring` argument because the ring is the one
+    /// it arrived on -- and it does not block here. The dispatch it is inside holds the context
+    /// lock, and the thread that would satisfy this wait needs that same lock to run the command
+    /// that satisfies it; sleeping here would be sleeping on a door held shut from this side. So
+    /// the batch suspends instead and the ring's own loop does the waiting, where a stop can
+    /// still reach it. See [`Submitted::Waiting`].
+    fn vkWaitVirtqueueSeqnoMESA(&mut self, args: &mut vn_command_vkWaitVirtqueueSeqnoMESA<'_>) {
+        let Some(id) = self.current_ring else {
+            self.reject = Some("waited on a virtqueue seqno from the context's own stream");
+            return;
+        };
+        // Already satisfied is the common case and costs nothing: the guest submits the seqno and
+        // waits for it in that order far more often than it gets ahead of itself.
+        let published = match self.rings.get(&id) {
+            None => {
+                self.reject = Some("waited on a virtqueue seqno for a ring that is not here");
+                return;
+            }
+            Some(RingSlot::Idle(r)) => r.virtqueue_seqno,
+            Some(RingSlot::Running(t)) => t.virtqueue_seqno(),
+        };
+        if published < args.seqno {
+            self.wait = Some(Wait::Virtqueue(args.seqno));
+        }
+    }
+
+    /// Block this stream until a ring's head reaches a position.
+    ///
+    /// Only legal on the context's own stream. Like its sibling it suspends rather than blocks,
+    /// and for a sharper reason: this dispatch runs on the virtio-gpu control queue thread, which
+    /// is one thread for the whole *device*. Sleeping here with the context locked would stop the
+    /// ring being waited for, and sleeping at all would stop every other context's submissions,
+    /// every scanout flush and every fence with it.
+    ///
+    /// The ring is woken first, as the C does: a parked ring must drain to a state the waiter's
+    /// guards can judge, or a wait that can never be satisfied looks the same as one that has not
+    /// been yet.
+    fn vkWaitRingSeqnoMESA(&mut self, args: &mut vn_command_vkWaitRingSeqnoMESA<'_>) {
+        if self.current_ring.is_some() {
+            self.reject = Some("waited on a ring seqno from inside a ring's own stream");
+            return;
+        }
+        // A ring seqno is a byte position in a 32-bit free-running counter, widened to fit the
+        // wire's field. A guest naming a value that does not fit is describing a position its own
+        // ring cannot hold; truncating it would build a wait on a number nobody asked for.
+        let Ok(seqno) = u32::try_from(args.seqno) else {
+            self.reject = Some("waited on a ring seqno too large to be a position in a ring");
+            return;
+        };
+        match self.rings.get(&RingId(args.ring)) {
+            None => self.reject = Some("waited on the seqno of a ring that was never created"),
+            // Nothing advances an idle ring's head -- it has no thread yet, and promotion happens
+            // only once this batch is over, which this command is inside. Suspending on it would
+            // be suspending forever.
+            Some(RingSlot::Idle(_)) => {
+                self.reject = Some("waited on the seqno of a ring that is not reading yet")
+            }
+            Some(RingSlot::Running(t)) => {
+                t.notify();
+                if !seqno_ge(t.control().head(), seqno) {
+                    self.wait = Some(Wait::Ring { ring: RingId(args.ring), seqno });
+                }
+            }
         }
     }
 
@@ -3030,13 +3278,13 @@ mod tests {
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
         assert!(
-            !ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES),
+            !ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES).ran(),
             "a stubbed decoder must poison"
         );
         assert!(ctx.fatal());
 
         // The poison outlives the batch: a stream we stopped trusting stays untrusted.
-        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES));
+        assert!(!ctx.submit(&header(cmd, 0), &mut todo, &g, &NO_RESOURCES).ran());
     }
 
     /// A command that wants an answer has nowhere to be answered into, so it poisons -- but only
@@ -3052,7 +3300,7 @@ mod tests {
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
         full.extend_from_slice(&0u64.to_le_bytes()); // no allocator
-        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES));
+        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
         assert_eq!(ctx.unhandled, 1);
 
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
@@ -3060,7 +3308,7 @@ mod tests {
         // what separates the two paths is whether the command was dispatched at all.
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
-        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES));
+        assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
         assert_eq!(ctx.dispatched, 1);
         assert_eq!(ctx.unhandled, 0);
     }
@@ -3142,7 +3390,7 @@ mod tests {
         // rather than that everything happens to land at zero.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_seek(AT, GENERATE_REPLY));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served batch does not poison");
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served batch does not poison");
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW + AT, &mut got));
@@ -3171,7 +3419,10 @@ mod tests {
         // Two bytes of room for a four-byte answer.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 2));
         batch.extend_from_slice(&wire_seek(0, GENERATE_REPLY));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "an answer with nowhere to go poisons");
+        assert!(
+            !ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            "an answer with nowhere to go poisons"
+        );
         assert!(ctx.fatal());
 
         let mut got = [0u8; 4];
@@ -3196,7 +3447,7 @@ mod tests {
             let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
             batch.extend_from_slice(&wire_seek(position, 0));
             assert_eq!(
-                ctx.submit(&batch, &mut todo, &g, &t),
+                ctx.submit(&batch, &mut todo, &g, &t).ran(),
                 ok,
                 "seeking to {position:#x} in a {SIZE:#x}-byte window"
             );
@@ -3221,7 +3472,7 @@ mod tests {
         // Out of range, and asking for a reply: the seek fails and the answer must not land.
         let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
         batch.extend_from_slice(&wire_seek(SIZE + 1, GENERATE_REPLY));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "a rejected command poisons");
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "a rejected command poisons");
 
         let mut got = [0u8; 4];
         assert!(t.1.copy_out(WINDOW, &mut got));
@@ -3236,7 +3487,7 @@ mod tests {
         let mut todo = Unimplemented::default();
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
-        assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t), "there is nothing to seek");
+        assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t).ran(), "there is nothing to seek");
         assert!(ctx.fatal());
     }
 
@@ -3424,7 +3675,7 @@ mod tests {
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&cmd);
             assert!(
-                ctx.submit(&batch, &mut todo, &g, &t),
+                ctx.submit(&batch, &mut todo, &g, &t).ran(),
                 "{name} is served, so it does not poison"
             );
             assert!(todo.seen.is_empty(), "{name} reached a handler, so it is off the census");
@@ -3536,6 +3787,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -3644,7 +3896,7 @@ mod tests {
             ty::vn_command_vkDeviceWaitIdle { device: VkDevice(GUEST_ID), ..Default::default() },
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served command does not poison");
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served command does not poison");
         CALLS.with_borrow(|c| {
             assert_eq!(*c, [DEVICE], "the driver was called, with the host handle not the guest id")
         });
@@ -3869,7 +4121,7 @@ mod tests {
             },
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "three served commands do not poison");
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "three served commands do not poison");
 
         SAW.with_borrow(|s| {
             assert_eq!(
@@ -3961,7 +4213,7 @@ mod tests {
             cv,
             GENERATE_REPLY
         ));
-        assert!(!ctx.submit(&batch, &mut todo, &g, &t), "no device to ask");
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "no device to ask");
         assert!(ctx.fatal());
     }
 
@@ -4113,7 +4365,7 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a served query does not poison");
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "a served query does not poison");
         SAW.with_borrow(|v| {
             assert_eq!(
                 *v,
@@ -4232,7 +4484,10 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "a resource the guest owns is answered");
+        assert!(
+            ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            "a resource the guest owns is answered"
+        );
 
         let (mut want_props, mut want_size) = asked();
         want_props.memoryTypeBits = HOST_VISIBLE_MASK;
@@ -4267,7 +4522,7 @@ mod tests {
             GENERATE_REPLY
         ));
         assert!(
-            ctx.submit(&batch, &mut todo, &g, &t),
+            ctx.submit(&batch, &mut todo, &g, &t).ran(),
             "an id that names nothing keeps the ring alive"
         );
 
@@ -4322,6 +4577,7 @@ mod tests {
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
+                    wait: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4388,6 +4644,7 @@ mod tests {
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
+                    wait: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4491,6 +4748,7 @@ mod tests {
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
+                    wait: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4587,6 +4845,7 @@ mod tests {
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
+                    wait: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4705,6 +4964,7 @@ mod tests {
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
+                    wait: None,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4782,7 +5042,7 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "the handshake does not poison");
+        assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "the handshake does not poison");
 
         let mut want_props = speaks.clone();
         let mut want_n = 2u32;
@@ -4902,7 +5162,10 @@ mod tests {
             q,
             GENERATE_REPLY
         ));
-        assert!(ctx.submit(&batch, &mut todo, &g, &t), "the driver answered, so the ring lives on");
+        assert!(
+            ctx.submit(&batch, &mut todo, &g, &t).ran(),
+            "the driver answered, so the ring lives on"
+        );
         SAW.with_borrow(|v| {
             assert_eq!(
                 *v,
@@ -5007,6 +5270,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5122,6 +5386,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5159,7 +5424,7 @@ mod tests {
             ty::vn_command_vkQueueWaitIdle::default(),
             0
         );
-        assert!(!ctx.submit(&cmd, &mut todo, &g, &t), "a queue with no device behind it");
+        assert!(!ctx.submit(&cmd, &mut todo, &g, &t).ran(), "a queue with no device behind it");
         assert!(ctx.fatal());
     }
 
@@ -5213,7 +5478,7 @@ mod tests {
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
 
             assert!(
-                !ctx.submit(&batch, &mut todo, &g, &t),
+                !ctx.submit(&batch, &mut todo, &g, &t).ran(),
                 "an unserved command, reply wanted: {reply_wanted}"
             );
 
@@ -5249,7 +5514,10 @@ mod tests {
         let mut todo = Unimplemented::default();
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
-        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t), "ring 7 is accepted");
+        assert!(
+            ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran(),
+            "ring 7 is accepted"
+        );
 
         // Two streams, two windows, set down the stream each belongs to -- the ring's first, so
         // that a context-wide slot would have the context's window in it by the time the ring
@@ -5263,7 +5531,9 @@ mod tests {
             &g,
             &t
         ));
-        assert!(ctx.submit(&wire_set_reply(&reply_at(CONTEXT_WINDOW, 0x100)), &mut todo, &g, &t));
+        assert!(
+            ctx.submit(&wire_set_reply(&reply_at(CONTEXT_WINDOW, 0x100)), &mut todo, &g, &t).ran()
+        );
 
         // The question arrives on the ring, so the answer belongs in the ring's window.
         assert!(ctx.submit_ring(RingId(7), &wire_seek(0, GENERATE_REPLY), &mut todo, &g, &t));
@@ -5330,7 +5600,7 @@ mod tests {
         ctx.replay_begin();
 
         assert!(
-            ctx.submit(&wire_monitored_ring(7, 1_000), &mut todo, &g, &t),
+            ctx.submit(&wire_monitored_ring(7, 1_000), &mut todo, &g, &t).ran(),
             "a monitor request is part of the protocol, not an unknown chained struct"
         );
 
@@ -5360,8 +5630,179 @@ mod tests {
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
-        assert!(!ctx.submit(&wire_monitored_ring(7, 0), &mut todo, &g, &t), "refused");
+        assert!(!ctx.submit(&wire_monitored_ring(7, 0), &mut todo, &g, &t).ran(), "refused");
         assert!(ctx.rings.is_empty(), "and the ring it came with was never registered");
+    }
+
+    /// One transport command, encoded with whatever arguments the caller wants.
+    fn wire_transport(
+        cmd: impl FnOnce(&mut crate::venus::cs::Encoder<'_>),
+        size: usize,
+    ) -> Vec<u8> {
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; size];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        cmd(&mut enc);
+        buf
+    }
+
+    fn wire_submit_vq(ring: u64, seqno: u64) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkSubmitVirtqueueSeqnoMESA_args, vn_sizeof_vkSubmitVirtqueueSeqnoMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkSubmitVirtqueueSeqnoMESA as Args;
+        let args = Args { ring, seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        wire_transport(
+            |e| vn_encode_vkSubmitVirtqueueSeqnoMESA_args(e, VkFlags(0), &args),
+            vn_sizeof_vkSubmitVirtqueueSeqnoMESA_args(&proto, &args),
+        )
+    }
+
+    fn wire_wait_vq(seqno: u64) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkWaitVirtqueueSeqnoMESA_args, vn_sizeof_vkWaitVirtqueueSeqnoMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkWaitVirtqueueSeqnoMESA as Args;
+        let args = Args { seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        wire_transport(
+            |e| vn_encode_vkWaitVirtqueueSeqnoMESA_args(e, VkFlags(0), &args),
+            vn_sizeof_vkWaitVirtqueueSeqnoMESA_args(&proto, &args),
+        )
+    }
+
+    fn wire_wait_ring(ring: u64, seqno: u64) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkWaitRingSeqnoMESA_args, vn_sizeof_vkWaitRingSeqnoMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkWaitRingSeqnoMESA as Args;
+        let args = Args { ring, seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        wire_transport(
+            |e| vn_encode_vkWaitRingSeqnoMESA_args(e, VkFlags(0), &args),
+            vn_sizeof_vkWaitRingSeqnoMESA_args(&proto, &args),
+        )
+    }
+
+    fn wire_write_extra(ring: u64, offset: usize, value: u32) -> Vec<u8> {
+        use super::super::proto::serialize::{
+            vn_encode_vkWriteRingExtraMESA_args, vn_sizeof_vkWriteRingExtraMESA_args,
+        };
+        use super::super::proto::types::vn_command_vkWriteRingExtraMESA as Args;
+        let args = Args { ring, offset, value, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        wire_transport(
+            |e| vn_encode_vkWriteRingExtraMESA_args(e, VkFlags(0), &args),
+            vn_sizeof_vkWriteRingExtraMESA_args(&proto, &args),
+        )
+    }
+
+    /// A context with one ring, idle, so a batch can be aimed at either stream.
+    fn ctx_with_ring(t: &OneShm) -> Context {
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.replay_begin();
+        assert!(
+            ctx.submit(&wire_create_ring(7, &ring_info()), &mut todo, &g, t).ran(),
+            "the ring was created"
+        );
+        ctx
+    }
+
+    /// Every transport command is legal on exactly one of the two streams, and the wrong one is
+    /// refused rather than served somewhere it would mean something else.
+    ///
+    /// Not a tidiness check. `vkWaitVirtqueueSeqnoMESA` names no ring at all -- it means "the ring
+    /// this arrived on" -- so on the context's own stream there is nothing for it to refer to, and
+    /// a build that served it anyway would be inventing a ring. The other three name a ring and
+    /// reach the context's ring table, which a ring's own dispatch is inside: serving them there
+    /// is the reentrancy the C's `is_dispatched_from_vkr_context` checks exist to stop. Both
+    /// directions, because a check that only fired one way would leave the other silent.
+    #[test]
+    fn a_transport_command_on_the_wrong_stream_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        // Ring-only, sent on the context's own stream.
+        let mut ctx = ctx_with_ring(&t);
+        assert!(
+            !ctx.submit(&wire_wait_vq(1), &mut todo, &g, &t).ran(),
+            "a virtqueue wait names no ring, so the context's own stream cannot send it"
+        );
+
+        // Context-only, each sent on a ring's stream.
+        for (what, batch) in [
+            ("a virtqueue submit", wire_submit_vq(7, 1)),
+            ("a ring-seqno wait", wire_wait_ring(7, 1)),
+            ("a ring extra write", wire_write_extra(7, 0, 1)),
+        ] {
+            let mut ctx = ctx_with_ring(&t);
+            assert!(
+                !ctx.submit_ring(RingId(7), &batch, &mut todo, &g, &t),
+                "{what} reaches the ring table, which a ring's own dispatch is inside"
+            );
+        }
+    }
+
+    /// A ring-seqno wait on a ring that is not reading is refused, not slept on.
+    ///
+    /// Nothing advances an idle ring's head -- promotion happens at the end of the batch, and this
+    /// command is inside that batch. A build that suspended here would suspend forever, holding
+    /// the virtio-gpu control queue for the whole device while it did.
+    #[test]
+    fn a_ring_seqno_wait_on_a_ring_that_is_not_reading_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = ctx_with_ring(&t);
+        assert!(!ctx.submit(&wire_wait_ring(7, 1), &mut todo, &g, &t).ran(), "refused");
+    }
+
+    /// A ring seqno is a position in a 32-bit counter widened to fit the wire. A guest naming a
+    /// value that does not fit is describing a position its own ring cannot hold, and truncating
+    /// it -- which the C does -- would build the wait on a number nobody asked for.
+    #[test]
+    fn a_ring_seqno_too_large_to_be_a_position_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = ctx_with_ring(&t);
+        assert!(
+            !ctx.submit(&wire_wait_ring(7, u64::from(u32::MAX) + 1), &mut todo, &g, &t).ran(),
+            "one past what a ring position can be"
+        );
+    }
+
+    /// The `extra` region is a door of a fixed size, and the offset comes from the guest at write
+    /// time with no layout left to have checked it. Everything past that region is the rest of a
+    /// resource the guest does not get to reach through this command.
+    #[test]
+    fn a_ring_extra_write_stays_inside_the_extra_region() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+
+        let mut ctx = ctx_with_ring(&t);
+        assert!(
+            ctx.submit(&wire_write_extra(7, 0, 0xfeed), &mut todo, &g, &t).ran(),
+            "the one word `extra` holds is the guest's to write"
+        );
+        assert_eq!(
+            t.1.load_u32(ring_info().extraOffset).expect("inside the mapping"),
+            0xfeed,
+            "and it landed where the layout says extra begins"
+        );
+
+        for (what, offset) in [("one word past the end", 4), ("far past the end", 0x1000)] {
+            let mut ctx = ctx_with_ring(&t);
+            assert!(
+                !ctx.submit(&wire_write_extra(7, offset, 1), &mut todo, &g, &t).ran(),
+                "{what} is outside the region and is refused"
+            );
+        }
     }
 
     /// Two rings, two reply streams, and they stay two.
@@ -5382,7 +5823,7 @@ mod tests {
 
         for ring in [7u64, 9] {
             assert!(
-                ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t),
+                ctx.submit(&wire_create_ring(ring, &info), &mut todo, &g, &t).ran(),
                 "ring {ring} is one we accept"
             );
         }
@@ -5423,10 +5864,10 @@ mod tests {
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
-        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t));
+        assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran());
 
         let d = reply_at(0x21000, 0x100);
-        assert!(ctx.submit(&wire_set_reply(&d), &mut todo, &g, &t));
+        assert!(ctx.submit(&wire_set_reply(&d), &mut todo, &g, &t).ran());
 
         assert_eq!(
             ctx.reply.as_ref().expect("the context was given a stream").window().begin(),
@@ -5465,6 +5906,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5518,6 +5960,7 @@ mod tests {
                 resources: &t,
                 rings: &mut rings,
                 monitor: &mut monitor,
+                wait: None,
                 replaying: false,
                 current_ring: None,
                 reply: &mut ctx_reply,
@@ -5560,6 +6003,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5598,6 +6042,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5630,7 +6075,10 @@ mod tests {
             "there is no ring 7 to submit to"
         );
         assert!(!ctx.fatal(), "and the context is still usable");
-        assert!(ctx.submit(&[], &mut todo, &g, &NO_RESOURCES), "so its own stream still works");
+        assert!(
+            ctx.submit(&[], &mut todo, &g, &NO_RESOURCES).ran(),
+            "so its own stream still works"
+        );
     }
 
     /// The witness the RingId split owed: two rings whose ids differ only above bit 32 are two
@@ -5665,6 +6113,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5707,6 +6156,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5799,6 +6249,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5868,6 +6319,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5903,6 +6355,7 @@ mod tests {
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6024,6 +6477,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6119,6 +6573,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6167,6 +6622,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6222,6 +6678,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6252,6 +6709,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6338,6 +6796,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6375,6 +6834,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6516,6 +6976,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6589,6 +7050,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6620,6 +7082,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6675,6 +7138,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6720,6 +7184,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6749,6 +7214,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6921,6 +7387,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7001,6 +7468,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7137,6 +7605,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7310,6 +7779,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7503,6 +7973,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7644,6 +8115,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7728,6 +8200,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7790,6 +8263,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7975,6 +8449,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8030,6 +8505,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8220,6 +8696,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8355,6 +8832,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8508,6 +8986,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8592,6 +9071,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8749,6 +9229,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8901,6 +9382,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9039,6 +9521,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9177,6 +9660,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9368,6 +9852,7 @@ mod tests {
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
+            wait: None,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,

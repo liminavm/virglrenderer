@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use crate::ids::CtxId;
 
 use super::proto::types::VkRingStatusFlagBitsMESA;
-use super::ring::RingStatus;
+use super::ring::RingControl;
 
 /// The ALIVE bit, as the guest reads it: "the renderer is still being scheduled".
 const STATUS_ALIVE: u32 = VkRingStatusFlagBitsMESA::VK_RING_STATUS_ALIVE_BIT_MESA.0 as u32;
@@ -57,7 +57,7 @@ struct Shared {
     /// The rings to stamp, as `Weak` handles. Never keyed by ring id: a ring's entry is live
     /// exactly while its ring is, so liveness is the identity, and there is no id here to have
     /// gone stale against the one the context holds.
-    rings: Mutex<Vec<Weak<RingStatus>>>,
+    rings: Mutex<Vec<Weak<RingControl>>>,
     /// The shortest period any monitored ring asked for, and the condvar the thread sleeps on.
     ///
     /// One value: the cadence the thread wakes at and the lateness it complains about are both
@@ -111,7 +111,7 @@ impl Monitor {
     ///
     /// The registry takes a `Weak`: the ring's own `Arc` is the only thing keeping its status word
     /// reachable, so destroying the ring un-registers it with no destroy path to remember.
-    pub fn watch(&self, status: &Arc<RingStatus>, period_us: u32) {
+    pub fn watch(&self, status: &Arc<RingControl>, period_us: u32) {
         self.shared
             .rings
             .lock()
@@ -231,19 +231,46 @@ fn run(ctx: CtxId, shared: &Shared) {
 mod tests {
     use super::*;
     use crate::guest_mem::{self, GuestMap};
+    use crate::ids::ResourceHandle;
+    use crate::venus::proto::types::VkRingCreateInfoMESA;
+    use crate::venus::ring::{Ring, ShmResources};
 
     fn ctx() -> CtxId {
         CtxId::new(3).expect("3 is a context id")
     }
+    const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const AT: usize = 8;
 
-    /// A status word in real shared memory, and a handle on it of the shape a ring hands out.
-    fn word() -> (Arc<GuestMap>, Arc<RingStatus>) {
-        let (fd, map) = guest_mem::anonymous_shm(0x1000, "virglrs-ringmon").expect("shm");
+    struct OneShm(Arc<GuestMap>);
+    impl ShmResources for OneShm {
+        fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>> {
+            (handle == RES).then(|| Arc::clone(&self.0))
+        }
+    }
+
+    /// A real ring's control words, reached the way a ring hands them out. Built through
+    /// `Ring::create` rather than assembled here, so the offsets under test are the ones a
+    /// validated layout produces.
+    fn word() -> (Arc<GuestMap>, Arc<RingControl>) {
+        let (fd, map) = guest_mem::anonymous_shm(0x24000, "virglrs-ringmon").expect("shm");
         drop(fd);
         let map = Arc::new(map);
-        let status = Arc::new(RingStatus::new(Arc::clone(&map), AT));
-        (map, status)
+        let info = VkRingCreateInfoMESA {
+            resourceId: RES.get(),
+            offset: 0,
+            size: 0x200c4,
+            idleTimeout: 1_000_000,
+            headOffset: 0,
+            tailOffset: 4,
+            statusOffset: AT,
+            bufferOffset: 0xc0,
+            bufferSize: 0x20000,
+            extraOffset: 0x200c0,
+            extraSize: 4,
+            ..Default::default()
+        };
+        let ring = Ring::create(&OneShm(Arc::clone(&map)), &info, false).expect("a layout we take");
+        (map, Arc::clone(&ring.control))
     }
 
     /// Wait for something the monitor thread must do, and fail rather than hang if it does not.

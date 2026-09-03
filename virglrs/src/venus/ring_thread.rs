@@ -36,10 +36,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ids::RingId;
+use crate::ids::{CtxId, RingId};
 
 use super::proto::types::VkRingStatusFlagBitsMESA;
-use super::ring::{ReplyStream, Ring};
+use super::ring::{ReplyStream, Ring, RingControl};
 
 /// The IDLE bit, as the guest reads it: "this ring is asleep, ring the doorbell".
 const STATUS_IDLE: u32 = VkRingStatusFlagBitsMESA::VK_RING_STATUS_IDLE_BIT_MESA.0 as u32;
@@ -56,6 +56,15 @@ pub enum Verdict {
     Busy,
     /// The context is poisoned. The ring is finished.
     Poisoned,
+    /// The batch stopped at a `vkWaitVirtqueueSeqnoMESA`. The first `consumed` bytes ran; the
+    /// wait command and everything after it have not, and must be offered again once the context
+    /// has published `seqno`.
+    ///
+    /// The wait command is *not* consumed, so re-offering re-decodes it and its handler decides
+    /// again. That is what keeps a reply-carrying wait honest: the generated wrapper encodes the
+    /// answer on the pass that proceeds, which is after the wait was satisfied, exactly as a
+    /// handler that had blocked would have. It costs the command being decoded twice.
+    Wait { consumed: usize, seqno: u64 },
 }
 
 /// Running one batch, wherever the state to run it against actually lives.
@@ -70,16 +79,172 @@ pub trait Dispatch: Send + Sync {
     fn try_dispatch(&self, ring: RingId, reply: &mut Option<ReplyStream>, buf: &[u8]) -> Verdict;
 }
 
-/// Where a sleeping ring waits, and how it is woken.
+/// Everything a sleeping ring waits on, and how it is woken.
+///
+/// One mutex and one condvar serve all four reasons a ring sleeps -- the idle park, the doorbell,
+/// the stop, and a `vkWaitVirtqueueSeqnoMESA` -- because they are one question asked three ways:
+/// "has anything changed that I was waiting for". The C reaches the same shape from the same
+/// pressure, serving idle, roundtrip and stop from a single cond with predicate re-checks.
 ///
 /// A leaf lock: nothing else is ever acquired while this is held, which is what keeps it out of
-/// any cycle. `notified` is inside the mutex rather than beside it because a condvar needs the
-/// predicate and the wait to be atomic -- a flag checked outside would let a notify land in the
-/// gap between the check and the wait, and the ring would sleep through its own doorbell.
+/// any cycle, and what makes it safe for the *context* thread to take it -- which it does, to
+/// publish a virtqueue seqno and to ask whether a ring is blocked on one.
+///
+/// The state is inside the mutex rather than beside it because a condvar needs the predicate and
+/// the wait to be atomic -- a flag checked outside would let a wake land in the gap between the
+/// check and the wait, and the ring would sleep through its own doorbell.
 #[derive(Default)]
 struct Park {
-    notified: Mutex<bool>,
+    state: Mutex<ParkState>,
     wake: Condvar,
+}
+
+/// What a parked ring is waiting for, and what it has been told.
+#[derive(Default)]
+struct ParkState {
+    /// The doorbell rang. Cleared by whoever consumes it.
+    notified: bool,
+    /// The highest virtqueue seqno the *context* has published for this ring.
+    ///
+    /// State, not an edge: a `vkSubmitVirtqueueSeqnoMESA` that arrives before the ring ever waits
+    /// must still satisfy that later wait, so this is stored and compared, never signalled and
+    /// forgotten. It only ever rises.
+    vq_seqno: u64,
+    /// The virtqueue seqno this ring is asleep waiting for, if it is.
+    ///
+    /// Published so a `vkWaitRingSeqnoMESA` on the context's own stream can see that this ring
+    /// cannot advance until *the asking thread* publishes that seqno -- which it cannot, because
+    /// it is the thread doing the asking. Without it the two waits deadlock the whole device.
+    blocked_on_vq: Option<u64>,
+}
+
+impl Park {
+    /// The virtqueue seqno this ring is asleep on *and cannot reach*, if it is in that state.
+    ///
+    /// One answer under one lock rather than two questions asked separately. Asked apart, the
+    /// ring can wake between them and the caller reads a stall that has already resolved -- and
+    /// this caller's response to a stall is to poison a context, which is not a verdict to reach
+    /// on two values that were never true at the same moment.
+    fn stalled_on(&self) -> Option<u64> {
+        let state = self.state.lock().expect("the park lock is never poisoned");
+        state.blocked_on_vq.filter(|&want| state.vq_seqno < want)
+    }
+}
+
+/// Wrap-aware "has `a` reached `b`", for the free-running byte positions in a ring.
+///
+/// The head and tail count commands forever and wrap at 32 bits, so only their *difference* means
+/// anything: `a >= b` as plain integers calls a head that has just wrapped past a seqno that has
+/// not "behind", and the wait it is deciding never ends. This is the C's `vkr_seqno_ge`.
+pub fn seqno_ge(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) >= 0
+}
+
+/// A `vkWaitRingSeqnoMESA` in the one form it can safely be waited on: with nothing locked.
+///
+/// Assembled while the context is held and waited on after it is released, because the thread it
+/// is waiting for needs that very lock to make the progress being waited for. Every field is an
+/// `Arc` to something the ring thread also holds, so once this exists it needs the renderer for
+/// nothing at all.
+#[must_use = "a waiter that is never waited on is a submission that never finished"]
+pub struct RingWaiter {
+    ctx: CtxId,
+    id: RingId,
+    seqno: u32,
+    control: Arc<RingControl>,
+    park: Arc<Park>,
+    wait_ring: Arc<WaitRing>,
+    fatal: Arc<AtomicBool>,
+}
+
+/// How long a ring wait may block before the log names it, in ms.
+///
+/// `LIMINA_RING_WAIT_WARN_MS` lowers it, so the slow path -- otherwise at the mercy of host load
+/// -- can be exercised on purpose. Inherited from the C along with the diagnostic itself.
+fn wait_warn() -> Duration {
+    let ms = std::env::var("LIMINA_RING_WAIT_WARN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(500);
+    Duration::from_millis(ms)
+}
+
+impl RingWaiter {
+    /// Sleep until the ring's head reaches the seqno. `false` means the context is poisoned.
+    ///
+    /// Two of the three ways out are refusals, and both are deadlocks caught rather than waited
+    /// through. They are checked before the first sleep and again on every wake, because the
+    /// state that makes them true can arrive either side of the sleep beginning.
+    pub fn wait(self) -> bool {
+        let warn = wait_warn();
+        let mut logged = false;
+        loop {
+            if self.fatal.load(Ordering::Acquire) {
+                return false;
+            }
+            if seqno_ge(self.control.head(), self.seqno) {
+                return true;
+            }
+
+            // The ring is asleep on a virtqueue seqno nobody has published. The only command that
+            // publishes one arrives on *this* stream, and this stream is here -- so the ring
+            // cannot advance, this wait cannot end, and neither can be rescued by waiting longer.
+            // Left to sleep, the two hold the virtio-gpu control queue between them, which is one
+            // queue for the whole device: every other context's submissions, every scanout flush
+            // and every fence would stop with them. The C's guard runs only in the ring thread's
+            // idle branch and never sees this pair at all.
+            if let Some(want) = self.park.stalled_on() {
+                eprintln!(
+                    "[virglrs] ctx {}: {} waits for ring seqno {} while {} sleeps for virtqueue                      seqno {}, which only this stream can publish -- neither can proceed",
+                    self.ctx, self.id, self.seqno, self.id, want,
+                );
+                self.die();
+                return false;
+            }
+
+            // The ring has consumed everything the guest wrote and is still short of the seqno
+            // asked for, so no head this ring can reach will ever satisfy it: the guest asked to
+            // be told about bytes it never sent. This is the C's guard, asked from the waiting
+            // side rather than from the ring's idle branch -- the head advancing to meet the tail
+            // is itself a wake, so the re-check that sees this always happens.
+            let (head, tail) = (self.control.head(), self.control.tail());
+            if head == tail && !seqno_ge(tail, self.seqno) {
+                eprintln!(
+                    "[virglrs] ctx {}: {} is drained at {head} and cannot reach ring seqno {}",
+                    self.ctx, self.id, self.seqno,
+                );
+                self.die();
+                return false;
+            }
+
+            if self.wait_ring.wait(warn) && !logged {
+                // A timeout is the diagnostic firing, never a failure: the wait goes on. Latched
+                // to one line, because this dispatch runs per exported frame sync fd -- hundreds
+                // of times a second on a busy compositor -- and an unconditional log here is a
+                // frame stutter.
+                eprintln!(
+                    "[virglrs] ctx {}: {} ring-seqno wait stuck >{}ms: want {} head {} tail {}                      status {:#x}",
+                    self.ctx,
+                    self.id,
+                    warn.as_millis(),
+                    self.seqno,
+                    self.control.head(),
+                    self.control.tail(),
+                    self.control.status(),
+                );
+                logged = true;
+            }
+        }
+    }
+
+    /// Kill the ring and the context with it. The guest is told through the status word, because
+    /// a wait that ends this way has no reply to carry the news.
+    fn die(&self) {
+        self.control.set_bits(STATUS_FATAL);
+        self.fatal.store(true, Ordering::Release);
+        self.wait_ring.changed();
+    }
 }
 
 /// A running ring, from the outside.
@@ -90,6 +255,9 @@ struct Park {
 pub struct RingThread {
     id: RingId,
     park: Arc<Park>,
+    /// The ring's control words. Held here because a running ring has no body anyone else can
+    /// reach, and three of those words are still other threads' business -- see [`RingControl`].
+    control: Arc<RingControl>,
     started: Arc<AtomicBool>,
     thread: Option<JoinHandle<Ring>>,
 }
@@ -106,9 +274,58 @@ impl RingThread {
     /// mutex across its predicate check and its wait, so this either lands before the check (the
     /// thread sees it and never sleeps) or after the wait has begun (the signal reaches it).
     pub fn notify(&self) {
-        let mut notified = self.park.notified.lock().expect("the park lock is never poisoned");
-        *notified = true;
+        let mut state = self.park.state.lock().expect("the park lock is never poisoned");
+        state.notified = true;
         self.park.wake.notify_one();
+    }
+
+    /// This ring's control words, for the callers that must reach them while it is running.
+    pub fn control(&self) -> &Arc<RingControl> {
+        &self.control
+    }
+
+    /// The context published a virtqueue seqno for this ring.
+    ///
+    /// Only ever raises it. A guest that submits seqnos out of order is describing a past it has
+    /// already passed, and lowering the value would un-satisfy a wait this ring may already have
+    /// been released from.
+    pub fn submit_virtqueue_seqno(&self, seqno: u64) {
+        let mut state = self.park.state.lock().expect("the park lock is never poisoned");
+        state.vq_seqno = state.vq_seqno.max(seqno);
+        self.park.wake.notify_one();
+    }
+
+    /// The virtqueue seqno this ring is asleep on, if it is asleep on one.
+    ///
+    /// The question a `vkWaitRingSeqnoMESA` asks before it sleeps: a ring blocked on a seqno the
+    /// asking thread has not published is a ring that thread can never unblock, because
+    /// publishing is the asking thread's own job and it is here instead.
+    pub fn blocked_on(&self) -> Option<u64> {
+        self.park.state.lock().expect("the park lock is never poisoned").blocked_on_vq
+    }
+
+    /// The highest virtqueue seqno published for this ring so far.
+    pub fn virtqueue_seqno(&self) -> u64 {
+        self.park.state.lock().expect("the park lock is never poisoned").vq_seqno
+    }
+
+    /// A wait on this ring's head, in a form that holds nothing of the renderer.
+    pub fn waiter(
+        &self,
+        ctx: CtxId,
+        seqno: u32,
+        wait_ring: Arc<WaitRing>,
+        fatal: Arc<AtomicBool>,
+    ) -> RingWaiter {
+        RingWaiter {
+            ctx,
+            id: self.id,
+            seqno,
+            control: Arc::clone(&self.control),
+            park: Arc::clone(&self.park),
+            wait_ring,
+            fatal,
+        }
     }
 
     /// Stop the ring and take its body back.
@@ -119,7 +336,7 @@ impl RingThread {
         // Under the park mutex, for the same reason `notify` is: a thread about to sleep must not
         // miss this between checking `started` and waiting.
         {
-            let _held = self.park.notified.lock().expect("the park lock is never poisoned");
+            let _held = self.park.state.lock().expect("the park lock is never poisoned");
             self.started.store(false, Ordering::Release);
             self.park.wake.notify_one();
         }
@@ -141,7 +358,7 @@ impl Drop for RingThread {
     /// this is the backstop for every other path, and a detached ring loop terminates on its own
     /// -- it can no longer reach a context, so its next dispatch is `Verdict::Poisoned`.
     fn drop(&mut self) {
-        let _held = self.park.notified.lock().expect("the park lock is never poisoned");
+        let _held = self.park.state.lock().expect("the park lock is never poisoned");
         self.started.store(false, Ordering::Release);
         self.park.wake.notify_one();
     }
@@ -178,6 +395,50 @@ fn relax(iter: &mut u32) {
     std::thread::sleep(Duration::from_micros(us));
 }
 
+/// Where a `vkWaitRingSeqnoMESA` sleeps, and what wakes it.
+///
+/// The waiter is on the context's own stream, so it is not this module's caller -- but every input
+/// to its predicate is produced here, on a ring thread, which must never block on a context lock
+/// to report one. So the wake lives in a leaf object both sides hold an `Arc` of, exactly as the
+/// C's `ctx->wait_ring` does.
+///
+/// It carries no seqno and no head. Those are read from [`RingControl`] by whoever is waiting: the
+/// head in guest memory is the one value, and a copy published beside it would be a second.
+#[derive(Default)]
+pub struct WaitRing {
+    /// Held across the waiter's predicate check and its sleep, so a wake cannot land in between.
+    changed: Mutex<()>,
+    wake: Condvar,
+}
+
+impl WaitRing {
+    /// Something a ring-seqno waiter's predicate depends on has changed: a head advanced, a ring
+    /// went to sleep on a virtqueue seqno, or a ring died.
+    ///
+    /// Broadcast rather than signalled: one context may have several ring waits outstanding on
+    /// different threads once the Rust API has more than one caller, and waking the wrong one
+    /// costs a predicate re-check while waking none costs a hang.
+    pub fn changed(&self) {
+        let _held = self.changed.lock().expect("the wait-ring lock is never poisoned");
+        self.wake.notify_all();
+    }
+
+    /// Sleep until [`Self::changed`] fires or `timeout` elapses. Returns whether it timed out.
+    ///
+    /// The caller re-checks its own predicate around this; nothing is decided here. A timeout is
+    /// not a failure -- it is the diagnostic firing, and the wait goes on. (The C has to say this
+    /// at length because its C11 shim maps `ETIMEDOUT` to `thrd_busy` rather than `thrd_timeout`,
+    /// and testing the wrong one turned every slow wait into a poisoned context. `wait_timeout`
+    /// has no such trap: the timeout is a distinct value, not an error.)
+    #[must_use]
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let held = self.changed.lock().expect("the wait-ring lock is never poisoned");
+        let (_g, r) =
+            self.wake.wait_timeout(held, timeout).expect("the wait-ring lock is never poisoned");
+        r.timed_out()
+    }
+}
+
 /// Start a thread draining `ring`.
 ///
 /// `fatal` is the context's poison, shared rather than copied: a ring whose stream goes bad takes
@@ -189,8 +450,17 @@ pub fn spawn(
     ring: Ring,
     dispatch: Arc<dyn Dispatch>,
     fatal: Arc<AtomicBool>,
+    wait_ring: Arc<WaitRing>,
 ) -> RingThread {
-    let park = Arc::new(Park::default());
+    // The seqno the ring was carrying while it was idle comes along. A
+    // `vkSubmitVirtqueueSeqnoMESA` may legitimately arrive in the same batch that created the
+    // ring, before there was a thread to tell -- and it is state, not an edge, so dropping it
+    // here would strand the first wait rather than merely delay it.
+    let park = Arc::new(Park {
+        state: Mutex::new(ParkState { vq_seqno: ring.virtqueue_seqno, ..ParkState::default() }),
+        wake: Condvar::new(),
+    });
+    let control = Arc::clone(&ring.control);
     let started = Arc::new(AtomicBool::new(true));
 
     let thread = {
@@ -198,11 +468,11 @@ pub fn spawn(
         let started = Arc::clone(&started);
         std::thread::Builder::new()
             .name(format!("virglrs-ring-{}", id.0))
-            .spawn(move || run(id, ring, &park, &started, dispatch.as_ref(), &fatal))
+            .spawn(move || run(id, ring, &park, &started, dispatch.as_ref(), &fatal, &wait_ring))
             .expect("the host can start a ring thread")
     };
 
-    RingThread { id, park, started, thread: Some(thread) }
+    RingThread { id, park, control, started, thread: Some(thread) }
 }
 
 /// The loop itself. Returns the ring body so a stop can hand it back.
@@ -213,6 +483,7 @@ fn run(
     started: &AtomicBool,
     dispatch: &dyn Dispatch,
     fatal: &AtomicBool,
+    wait_ring: &WaitRing,
 ) -> Ring {
     // Where we have read up to. Free-running, like the guest's tail: both wrap at 32 bits and only
     // their difference means anything, which is why every comparison below is a wrapping one.
@@ -246,7 +517,7 @@ fn run(
                     "[virglrs] {id}: guest wrote {available} bytes into a {}-byte ring",
                     ring.layout.buffer.size()
                 );
-                die(&ring, fatal);
+                die(&ring, fatal, wait_ring);
                 break;
             }
         }
@@ -264,11 +535,29 @@ fn run(
                 // still says they are unread -- which is what a `Busy` answer depends on.
                 cur = cur.wrapping_add(pending.len() as u32);
                 ring.set_head(cur);
+                // A `vkWaitRingSeqnoMESA` is waiting on exactly this number. It re-reads the head
+                // itself; what it cannot do is know when to look.
+                wait_ring.changed();
                 pending.clear();
                 last_work = Instant::now();
                 iter = 0;
             }
             Verdict::Busy => relax(&mut iter),
+            Verdict::Wait { consumed, seqno } => {
+                // The prefix ran and is published before the sleep, so a `vkWaitRingSeqnoMESA`
+                // on the context's stream sees exactly the work that actually completed -- and
+                // so the wait command itself stays unconsumed, to be decoded again on the way
+                // out. `pending` keeps it and everything after it.
+                cur = cur.wrapping_add(consumed as u32);
+                ring.set_head(cur);
+                pending.drain(..consumed);
+                wait_ring.changed();
+                if wait_virtqueue_seqno(park, started, wait_ring, seqno) {
+                    break;
+                }
+                last_work = Instant::now();
+                iter = 0;
+            }
             Verdict::Poisoned => {
                 ring.set_status_bits(STATUS_FATAL);
                 break;
@@ -276,13 +565,53 @@ fn run(
         }
     }
 
+    // Whatever this ring was blocked on, it is not blocked on it now. Left set, it would tell a
+    // later `vkWaitRingSeqnoMESA` that a thread which no longer exists is about to advance.
+    park.state.lock().expect("the park lock is never poisoned").blocked_on_vq = None;
+    wait_ring.changed();
     ring
 }
 
+/// Sleep until the context publishes `seqno` for this ring, or the ring is stopped.
+///
+/// Returns whether it was stopped. Nothing here can fail: an unreachable seqno is not this
+/// thread's to diagnose, because from in here it is indistinguishable from one that has not
+/// arrived yet. The thread that *can* tell the difference is a `vkWaitRingSeqnoMESA` on the
+/// context's own stream, which is why `blocked_on_vq` is published before the sleep and the
+/// waiter is woken -- see [`WaitRing`].
+fn wait_virtqueue_seqno(
+    park: &Park,
+    started: &AtomicBool,
+    wait_ring: &WaitRing,
+    seqno: u64,
+) -> bool {
+    let mut state = park.state.lock().expect("the park lock is never poisoned");
+    // Set before the wake below and before the first sleep, so a waiter that arrives at any point
+    // from here on reads the true answer rather than a stale `None`.
+    state.blocked_on_vq = Some(seqno);
+    drop(state);
+    wait_ring.changed();
+
+    let mut state = park.state.lock().expect("the park lock is never poisoned");
+    while started.load(Ordering::Acquire) && state.vq_seqno < seqno {
+        state = park.wake.wait(state).expect("the park lock is never poisoned");
+    }
+    state.blocked_on_vq = None;
+    drop(state);
+    // The ring is moving again, and a waiter that refused to sleep on the strength of
+    // `blocked_on_vq` must get the chance to re-check now that it is clear.
+    wait_ring.changed();
+    !started.load(Ordering::Acquire)
+}
+
 /// Tell the guest the ring is dead, and poison the context with it.
-fn die(ring: &Ring, fatal: &AtomicBool) {
+fn die(ring: &Ring, fatal: &AtomicBool, wait_ring: &WaitRing) {
     ring.set_status_bits(STATUS_FATAL);
     fatal.store(true, Ordering::Release);
+    // A `vkWaitRingSeqnoMESA` on this ring is waiting for a head that will never move again. Its
+    // predicate reads the poison, but only when something wakes it to look -- this is the C's
+    // `vkr_context_on_ring_fatal` signalling `wait_ring`, and for the same reason.
+    wait_ring.changed();
 }
 
 /// Announce the ring is going to sleep and, if nothing arrived while we said so, sleep.
@@ -297,13 +626,13 @@ fn die(ring: &Ring, fatal: &AtomicBool) {
 /// to wake it. The C's `vkr_ring_load_tail_seqcst` carries the same reasoning, and records that the
 /// 2ms poll it replaced existed only to survive this race.
 fn park_if_quiet(ring: &Ring, park: &Park, started: &AtomicBool, cur: &mut u32) -> bool {
-    let mut notified = park.notified.lock().expect("the park lock is never poisoned");
-    *notified = false;
+    let mut state = park.state.lock().expect("the park lock is never poisoned");
+    state.notified = false;
     ring.set_status_bits(STATUS_IDLE);
 
     if *cur == ring.tail_seqcst() {
-        while started.load(Ordering::Acquire) && !*notified {
-            notified = park.wake.wait(notified).expect("the park lock is never poisoned");
+        while started.load(Ordering::Acquire) && !state.notified {
+            state = park.wake.wait(state).expect("the park lock is never poisoned");
         }
     }
 
@@ -412,10 +741,11 @@ mod tests {
         }
     }
 
-    fn spawn_with(rec: Arc<Recorder>, r: Ring) -> (RingThread, Arc<AtomicBool>) {
+    fn spawn_with(rec: Arc<Recorder>, r: Ring) -> (RingThread, Arc<AtomicBool>, Arc<WaitRing>) {
         let fatal = Arc::new(AtomicBool::new(false));
-        let t = spawn(RingId(7), r, rec, Arc::clone(&fatal));
-        (t, fatal)
+        let wait_ring = Arc::new(WaitRing::default());
+        let t = spawn(RingId(7), r, rec, Arc::clone(&fatal), Arc::clone(&wait_ring));
+        (t, fatal, wait_ring)
     }
 
     /// The loop's whole job: what the guest put in the buffer reaches the seam, and the head moves
@@ -424,7 +754,7 @@ mod tests {
     fn a_ring_thread_runs_what_the_guest_wrote() {
         let (map, r) = ring(Duration::from_secs(3600));
         let rec = Arc::new(Recorder::default());
-        let (t, fatal) = spawn_with(Arc::clone(&rec), r);
+        let (t, fatal, _wr) = spawn_with(Arc::clone(&rec), r);
 
         guest_writes(&map, 0, b"hello ring");
         until("the batch to be dispatched", || !rec.batches.lock().unwrap().is_empty());
@@ -441,7 +771,7 @@ mod tests {
     fn a_stopped_ring_gives_its_body_back() {
         let (map, r) = ring(Duration::from_secs(3600));
         let want = r.layout;
-        let (t, _) = spawn_with(Arc::new(Recorder::default()), r);
+        let (t, _, _wr) = spawn_with(Arc::new(Recorder::default()), r);
         guest_writes(&map, 0, b"x");
         let back = t.stop();
         assert_eq!(back.layout, want, "the same ring came back");
@@ -453,7 +783,7 @@ mod tests {
         // Park almost immediately, so the test does not depend on how fast the machine is.
         let (map, r) = ring(Duration::from_millis(1));
         let rec = Arc::new(Recorder::default());
-        let (t, _) = spawn_with(Arc::clone(&rec), r);
+        let (t, _, _wr) = spawn_with(Arc::clone(&rec), r);
 
         until("the ring to announce it is idle", || status(&map) & STATUS_IDLE != 0);
 
@@ -473,7 +803,7 @@ mod tests {
     #[test]
     fn a_parked_ring_can_still_be_stopped() {
         let (map, r) = ring(Duration::from_millis(1));
-        let (t, _) = spawn_with(Arc::new(Recorder::default()), r);
+        let (t, _, _wr) = spawn_with(Arc::new(Recorder::default()), r);
         until("the ring to park", || status(&map) & STATUS_IDLE != 0);
         t.stop();
         assert_eq!(status(&map) & STATUS_IDLE, 0, "a stopped ring is not left claiming to be idle");
@@ -485,7 +815,7 @@ mod tests {
     fn a_busy_dispatch_offers_the_same_batch_again() {
         let (map, r) = ring(Duration::from_secs(3600));
         let rec = Arc::new(Recorder { busy_first: Mutex::new(3), ..Default::default() });
-        let (t, _) = spawn_with(Arc::clone(&rec), r);
+        let (t, _, _wr) = spawn_with(Arc::clone(&rec), r);
 
         guest_writes(&map, 0, b"retry me");
         until("the batch to get through", || !rec.batches.lock().unwrap().is_empty());
@@ -505,7 +835,7 @@ mod tests {
     fn a_batch_larger_than_the_ring_poisons_the_context() {
         let (map, r) = ring(Duration::from_secs(3600));
         let rec = Arc::new(Recorder::default());
-        let (t, fatal) = spawn_with(Arc::clone(&rec), r);
+        let (t, fatal, _wr) = spawn_with(Arc::clone(&rec), r);
 
         // One byte more than the buffer can hold.
         assert!(map.store_u32(4, BUF_SIZE as u32 + 1));
@@ -523,7 +853,7 @@ mod tests {
     fn a_batch_that_wraps_the_end_of_the_buffer_arrives_in_order() {
         let (map, r) = ring(Duration::from_secs(3600));
         let rec = Arc::new(Recorder::default());
-        let (t, _) = spawn_with(Arc::clone(&rec), r);
+        let (t, _, _wr) = spawn_with(Arc::clone(&rec), r);
 
         // Walk the position to six bytes from the end the only way there is: by feeding the ring
         // that much and letting it consume it.
