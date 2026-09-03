@@ -21,21 +21,22 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
+use super::monitor::Monitor;
 use super::objects::Shared;
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandTypeEXT, VkDeviceMemory, VkFlags, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkObjectType, VkPhysicalDevice, VkResult, vn_command_vkAllocateCommandBuffers,
-    vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
-    vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
-    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
-    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
-    vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
-    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    VkObjectType, VkPhysicalDevice, VkResult, VkRingCreateInfoMESA, VkRingMonitorInfoMESA,
+    vn_command_vkAllocateCommandBuffers, vn_command_vkAllocateDescriptorSets,
+    vn_command_vkAllocateMemory, vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory,
+    vn_command_vkBindBufferMemory2, vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage,
+    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw,
+    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport,
+    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
@@ -128,6 +129,11 @@ pub struct Context {
     /// Where answers to commands that arrived on the context's own stream go. Each ring holds its
     /// own; this is the one for everything that did not come in on a ring.
     reply: Option<ReplyStream>,
+    /// The thread stamping ALIVE into the status word of every ring that asked to be monitored.
+    ///
+    /// `None` until a ring asks. Once started it runs until the context goes, even if every
+    /// monitored ring is destroyed -- see [`Monitor`].
+    monitor: Option<Monitor>,
 }
 
 /// A context must be `Send`: each one is owned by whoever is driving it, and a ring's thread will
@@ -181,6 +187,7 @@ impl Context {
             unhandled: 0,
             rings: BTreeMap::new(),
             reply: None,
+            monitor: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl Context {
             unserved: false,
             resources,
             rings: &mut self.rings,
+            monitor: &mut self.monitor,
             current_ring: on,
             reply,
             replaying: replay,
@@ -558,6 +566,18 @@ impl Drop for Context {
     }
 }
 
+/// What a ring's create info asked of the monitor: nothing, or a reporting period.
+///
+/// Three answers in two layers, because they are three different things: no chained monitor info
+/// at all (`None` -- this ring is not monitored), a monitor info asking for zero (`Some(None)` --
+/// a guest error), and a real period (`Some(Some(us))`). Collapsing the first two would turn a
+/// malformed request into a silently unmonitored ring, and the guest would abort itself seconds
+/// later with nothing said about why.
+fn monitor_period(info: &VkRingCreateInfoMESA) -> Option<Option<u32>> {
+    let m: &VkRingMonitorInfoMESA = driver::chained(&info.pNext)?;
+    Some(Some(m.maxReportingPeriodMicroseconds).filter(|&us| us != 0))
+}
+
 /// Poison a context, naming the command that did it -- once.
 ///
 /// A ring the guest can no longer use looks the same from inside the guest whatever caused it, so
@@ -622,6 +642,8 @@ pub struct Handlers<'a> {
     reply: &'a mut Option<ReplyStream>,
     /// The rings this context has stood up. Held mutably because creating one is a command.
     rings: &'a mut BTreeMap<RingId, RingSlot>,
+    /// The context's ring monitor, started here by the first ring that asks for one.
+    monitor: &'a mut Option<Monitor>,
     /// Whether this batch is a snapshot journal being replayed rather than a guest talking.
     ///
     /// A created ring reads it: replay restores head and status words the host would otherwise
@@ -1512,6 +1534,25 @@ impl Commands for Handlers<'_> {
                 return;
             }
         };
+
+        // A guest that wants to hear from us says so here, and says how often. Zero is not a
+        // period the protocol leaves room to interpret -- it is a guest asking for a stamp every
+        // no-time -- and it is refused rather than substituted, before the ring is registered, so
+        // nothing has to be unwound.
+        if let Some(want) = monitor_period(info) {
+            let Some(period_us) = want else {
+                self.reject = Some("asked to be monitored with a reporting period of zero");
+                return;
+            };
+            match self.monitor {
+                Some(m) => m.watch(&ring.status, period_us),
+                None => {
+                    let m = Monitor::start(self.ctx, period_us);
+                    m.watch(&ring.status, period_us);
+                    *self.monitor = Some(m);
+                }
+            }
+        }
 
         // Registered idle, never started here. Promotion happens at the end of the batch, which is
         // where the caller knows whether it was replaying -- and doing it there rather than in the
@@ -3483,6 +3524,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -3493,6 +3535,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -4267,6 +4310,7 @@ mod tests {
             ($args:expr) => {{
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
+                let mut monitor = None;
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -4277,6 +4321,7 @@ mod tests {
                     unserved: false,
                     resources: &t,
                     rings: &mut rings,
+                    monitor: &mut monitor,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4331,6 +4376,7 @@ mod tests {
             ($call:expr) => {{
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
+                let mut monitor = None;
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -4341,6 +4387,7 @@ mod tests {
                     unserved: false,
                     resources: &t,
                     rings: &mut rings,
+                    monitor: &mut monitor,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4432,6 +4479,7 @@ mod tests {
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
                 #[allow(unused_mut)]
+                let mut monitor = None;
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -4442,6 +4490,7 @@ mod tests {
                     unserved: false,
                     resources: &t,
                     rings: &mut rings,
+                    monitor: &mut monitor,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4526,6 +4575,7 @@ mod tests {
             ($args:expr) => {{
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
+                let mut monitor = None;
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -4536,6 +4586,7 @@ mod tests {
                     unserved: false,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
+                    monitor: &mut monitor,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4642,6 +4693,7 @@ mod tests {
             ($args:expr) => {{
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
+                let mut monitor = None;
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -4652,6 +4704,7 @@ mod tests {
                     unserved: false,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
+                    monitor: &mut monitor,
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
@@ -4942,6 +4995,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -4952,6 +5006,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5055,6 +5110,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5065,6 +5121,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5241,6 +5298,72 @@ mod tests {
         buf
     }
 
+    /// A ring create that asks to be monitored, at the period the caller names.
+    ///
+    /// The chain is built with a real `VkRingMonitorInfoMESA` rather than a hand-rolled wire
+    /// blob, so the decoder's own `pNext` walk is what is being exercised -- an unknown chained
+    /// struct poisons the stream, and a monitor that only worked against a synthetic chain would
+    /// leave that undiscovered until a guest boot.
+    fn wire_monitored_ring(ring: u64, period_us: u32) -> Vec<u8> {
+        let monitor = VkRingMonitorInfoMESA {
+            sType: crate::venus::proto::types::VkStructureType::VK_STRUCTURE_TYPE_RING_MONITOR_INFO_MESA,
+            pNext: core::ptr::null(),
+            maxReportingPeriodMicroseconds: period_us,
+        };
+        let info = VkRingCreateInfoMESA { pNext: (&raw const monitor).cast(), ..ring_info() };
+        wire_create_ring(ring, &info)
+    }
+
+    /// A monitored ring is stamped, and the stamping outlives every command that set it up.
+    ///
+    /// The guest's `vn_relax` clears this bit at the start of any wait and, seconds later,
+    /// aborts the *guest process* if it is still clear. So a renderer that decodes the request
+    /// and does nothing with it is not a renderer that runs slowly -- it is one that kills the
+    /// guest a few seconds into the first cold shader compile. Nothing in replay can see this:
+    /// there is no ring buffer there and no thread, so this witness is the whole of the coverage.
+    #[test]
+    fn a_ring_that_asks_to_be_monitored_gets_its_alive_bit_stamped() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.replay_begin();
+
+        assert!(
+            ctx.submit(&wire_monitored_ring(7, 1_000), &mut todo, &g, &t),
+            "a monitor request is part of the protocol, not an unknown chained struct"
+        );
+
+        let status = ring_info().statusOffset;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let alive =
+            crate::venus::proto::types::VkRingStatusFlagBitsMESA::VK_RING_STATUS_ALIVE_BIT_MESA.0
+                as u32;
+        while std::time::Instant::now() < deadline {
+            if t.1.load_u32(status).expect("the status word is in the mapping") & alive != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the monitored ring was never stamped alive");
+    }
+
+    /// A reporting period of zero is a guest asking to be told it is alive every no-time. There
+    /// is no reading of that which the host can serve, and no default it may quietly substitute:
+    /// picking one would leave the guest with a contract it never agreed to and no way to learn
+    /// that. It is refused, and the context stops, before the ring is registered anywhere.
+    #[test]
+    fn a_reporting_period_of_zero_is_refused() {
+        let t = ring_table();
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.replay_begin();
+
+        assert!(!ctx.submit(&wire_monitored_ring(7, 0), &mut todo, &g, &t), "refused");
+        assert!(ctx.rings.is_empty(), "and the ring it came with was never registered");
+    }
+
     /// Two rings, two reply streams, and they stay two.
     ///
     /// This is the witness the per-stream slot owes, and it runs through the real submission path
@@ -5330,6 +5453,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
 
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5340,6 +5464,7 @@ mod tests {
             unserved: false,
             resources: &t,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5381,6 +5506,7 @@ mod tests {
             let mut driver = Driver::new(Account::for_test(None));
             let mut rings = BTreeMap::new();
             let mut ctx_reply = None;
+            let mut monitor = None;
             let mut h = Handlers {
                 objects: &objects,
                 todo: &mut todo,
@@ -5391,6 +5517,7 @@ mod tests {
                 unserved: false,
                 resources: &t,
                 rings: &mut rings,
+                monitor: &mut monitor,
                 replaying: false,
                 current_ring: None,
                 reply: &mut ctx_reply,
@@ -5421,6 +5548,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5431,6 +5559,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5457,6 +5586,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5467,6 +5597,7 @@ mod tests {
             unserved: false,
             resources: &t,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5522,6 +5653,7 @@ mod tests {
         let high: u64 = 0x0000_0002_dead_beef;
         assert_eq!(low as u32, high as u32, "the two ids are identical in their low word");
 
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5532,6 +5664,7 @@ mod tests {
             unserved: false,
             resources: &t,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5562,6 +5695,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5572,6 +5706,7 @@ mod tests {
             unserved: false,
             resources: &t,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5652,6 +5787,7 @@ mod tests {
         driver.plant_memory_types(VkDevice(DEVICE), &[VkMemoryPropertyFlags(0)]);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5662,6 +5798,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5719,6 +5856,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5729,6 +5867,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5752,6 +5891,7 @@ mod tests {
         let mut driver = Driver::new(Account::for_test(None));
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5762,6 +5902,7 @@ mod tests {
             unserved: false,
             resources: &t,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5871,6 +6012,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5881,6 +6023,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -5964,6 +6107,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5974,6 +6118,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6010,6 +6155,7 @@ mod tests {
 
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6020,6 +6166,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6063,6 +6210,7 @@ mod tests {
 
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6073,6 +6221,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6091,6 +6240,7 @@ mod tests {
         let mut empty = Cmd::default();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6101,6 +6251,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6175,6 +6326,7 @@ mod tests {
 
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6185,6 +6337,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6210,6 +6363,7 @@ mod tests {
         args.plant_pPhysicalDeviceGroupProperties(&mut props);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6220,6 +6374,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6349,6 +6504,7 @@ mod tests {
 
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6359,6 +6515,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6420,6 +6577,7 @@ mod tests {
         args.plant_pQueueFamilyPropertyCount(&mut n);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6430,6 +6588,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6449,6 +6608,7 @@ mod tests {
         args.plant_pQueueFamilyProperties(&mut props);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6459,6 +6619,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6502,6 +6663,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6512,6 +6674,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6545,6 +6708,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6555,6 +6719,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6572,6 +6737,7 @@ mod tests {
         args.plant_pFeatures(&mut asked);
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6582,6 +6748,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6742,6 +6909,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6752,6 +6920,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6820,6 +6989,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6830,6 +7000,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -6954,6 +7125,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6964,6 +7136,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7125,6 +7298,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7135,6 +7309,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7316,6 +7491,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7326,6 +7502,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7455,6 +7632,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7465,6 +7643,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7537,6 +7716,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7547,6 +7727,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7597,6 +7778,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7607,6 +7789,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7780,6 +7963,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7790,6 +7974,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -7833,6 +8018,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7843,6 +8029,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8021,6 +8208,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8031,6 +8219,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8154,6 +8343,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8164,6 +8354,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8305,6 +8496,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8315,6 +8507,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8387,6 +8580,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8397,6 +8591,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8542,6 +8737,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8552,6 +8748,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8692,6 +8889,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8702,6 +8900,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8828,6 +9027,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8838,6 +9038,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -8964,6 +9165,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8974,6 +9176,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
@@ -9153,6 +9356,7 @@ mod tests {
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
+        let mut monitor = None;
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9163,6 +9367,7 @@ mod tests {
             unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
+            monitor: &mut monitor,
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,

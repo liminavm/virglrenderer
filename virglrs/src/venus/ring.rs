@@ -253,6 +253,43 @@ pub trait ShmResources {
     }
 }
 
+/// The one status word of one ring, and the mapping it lives in.
+///
+/// Split out of [`Ring`] because it is the only part of a ring that more than one thread has a
+/// reason to touch. The ring's own thread owns the body and everything else in it; the context's
+/// [`Monitor`](super::monitor::Monitor) has to stamp the ALIVE bit on a schedule the guest set,
+/// including while that thread is deep in a dispatch or parked on its condvar.
+///
+/// Shared as an `Arc` and never copied. A monitor holding a `(map, offset)` pair of its own would
+/// be a second value that has to agree with this one, and would go on stamping a word whose ring
+/// was destroyed; a `Weak` to this object stops resolving the moment the ring drops, so a dead
+/// ring cannot be stamped and nothing has to remember to purge it.
+pub struct RingStatus {
+    map: Arc<GuestMap>,
+    at: usize,
+}
+
+impl RingStatus {
+    /// The status word at `at` in `map`. `at` is inside the mapping -- the layout is parsed
+    /// before this is built, which is what the assertions below rest on.
+    pub fn new(map: Arc<GuestMap>, at: usize) -> RingStatus {
+        RingStatus { map, at }
+    }
+
+    /// Tell the guest something about the ring changed.
+    pub fn set_bits(&self, bits: u32) {
+        assert!(self.map.fetch_or_u32(self.at, bits), "a validated status word is in the mapping");
+    }
+
+    /// Take a status bit back.
+    pub fn unset_bits(&self, bits: u32) {
+        assert!(
+            self.map.fetch_and_u32(self.at, !bits),
+            "a validated status word is in the mapping"
+        );
+    }
+}
+
 /// A ring the guest created and the host has agreed to read from.
 ///
 /// It holds a share of the mapping rather than a way to find one. That is what makes it outlive
@@ -272,6 +309,9 @@ pub struct Ring {
     /// The guest's number, kept because it is the guest's call: it knows its own cadence, and a
     /// ring that parks too eagerly pays a doorbell round trip on the next submit.
     pub idle_timeout: Duration,
+    /// The word the guest reads this ring's state out of. An `Arc` because the context's monitor
+    /// holds a `Weak` to the same object -- see [`RingStatus`].
+    pub status: Arc<RingStatus>,
     /// How far the host has read, free-running and masked into the buffer only when used.
     ///
     /// Established here rather than in the thread that advances it, because a ring restored from a
@@ -310,9 +350,11 @@ impl Ring {
         if !replaying && (head != 0 || status != 0) {
             return Err(RingError::NotOurs { head, status });
         }
+        let status = Arc::new(RingStatus::new(Arc::clone(&map), layout.status.begin()));
         Ok(Ring {
             layout,
             map,
+            status,
             reply: None,
             idle_timeout: Duration::from_nanos(info.idleTimeout),
             cur: if replaying { head } else { 0 },
@@ -344,10 +386,7 @@ impl Ring {
 
     /// Take back a status bit -- the ring is no longer idle.
     pub fn unset_status_bits(&self, bits: u32) {
-        assert!(
-            self.map.fetch_and_u32(self.layout.status.begin(), !bits),
-            "a validated status word is inside the mapping"
-        );
+        self.status.unset_bits(bits);
     }
 
     /// Copy the `len` bytes at the free-running position `cur` into `out`.
@@ -389,10 +428,7 @@ impl Ring {
 
     /// Tell the guest something about the ring changed.
     pub fn set_status_bits(&self, bits: u32) {
-        assert!(
-            self.map.fetch_or_u32(self.layout.status.begin(), bits),
-            "a validated status word is inside the mapping"
-        );
+        self.status.set_bits(bits);
     }
 
     /// Write one guest-named word in the `extra` region.
