@@ -394,6 +394,32 @@ SABOTAGES = [
         '',
     ),
     (
+        'the property query resolves a resource the allocation would not',
+        'virglrs/src/venus/context.rs',
+        """        let Some(_) = self.driver.span(&bytes) else {
+            args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+        };""",
+        """""",
+        '',
+    ),
+    (
+        'a published allocation answers the query with the storage size, not the resource size',
+        'virglrs/src/venus/context.rs',
+        """                ResourceBytes::Allocation(published) => published.size,""",
+        """                ResourceBytes::Allocation(published) => {
+                    self.driver.span(&bytes).map_or(published.size, |(_, len)| len)
+                }""",
+        '',
+    ),
+    (
+        'a resource id resolves to whatever another context filed under the same number',
+        'virglrs/src/renderer.rs',
+        """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",
+        """                BlobSource::Exported { mem, .. } => {""",
+        '',
+    ),
+    (
         'only the fd half of the emulated external memory is advertised',
         'virglrs/src/venus/driver.rs',
         """            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));""",
