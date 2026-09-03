@@ -820,16 +820,46 @@ impl Renderer {
     /// A resource whose surface has gone answers `None` because there is no longer a surface to
     /// ask, which is the same thing said once instead of purged at each destroy site.
     pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
-        // The lock is released before venus is asked, for the reason `resource_host_mapping`
-        // gives: a read lock held across a call into a context deadlocks against its ring thread.
-        let (ctx, mem) = self.with_resource(handle, |r| match &r.backing {
+        let (ctx, mem) = self.published_allocation(handle)?;
+        self.venus_context(ctx, |c| c.driver().memory_surface_id(ObjectId(mem.0))).ok()?
+    }
+
+    /// Copy a scanout resource's presented pixels into a caller's buffer, `stride` bytes per row.
+    ///
+    /// The headless display sink's only way to see a frame: a venus scanout blob has no CPU
+    /// transfer path, because the frame exists nowhere but the surface's shared storage.
+    ///
+    /// The count of rows that landed, so a caller that asked for more than the surface holds is
+    /// told so rather than handed a buffer with a stale tail in it.
+    pub fn resource_read_iosurface(
+        &self,
+        handle: ResourceHandle,
+        dst: &mut [u8],
+        stride: usize,
+        height: u32,
+    ) -> Option<u32> {
+        let (ctx, mem) = self.published_allocation(handle)?;
+        self.venus_context(ctx, |c| {
+            c.driver().memory_read_surface(ObjectId(mem.0), dst, stride, height)
+        })
+        .ok()?
+    }
+
+    /// The allocation a resource publishes, and the context that published it.
+    ///
+    /// One resolution for everything that reaches through a resource to the memory behind it, so
+    /// two callers cannot disagree about which allocation a handle names.
+    ///
+    /// The resource lock is released before venus is asked anything: a read lock held across a
+    /// call into a context deadlocks against that context's own ring thread.
+    fn published_allocation(&self, handle: ResourceHandle) -> Option<(CtxId, BlobId)> {
+        self.with_resource(handle, |r| match &r.backing {
             Backing::Blob { desc, .. } => match desc.source {
                 BlobSource::Exported { ctx, mem } => Some((ctx, mem)),
                 BlobSource::HostMinted => None,
             },
             Backing::Classic(_) | Backing::Imported { .. } => None,
-        })??;
-        self.venus_context(ctx, |c| c.driver().memory_surface_id(ObjectId(mem.0))).ok()?
+        })?
     }
 
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {

@@ -291,6 +291,51 @@ impl Surface {
         n
     }
 
+    /// Copy the surface's rows into a buffer whose own rows are `stride` bytes apart.
+    ///
+    /// Two pitches, and they are not the same number: a surface lays its rows out however
+    /// IOSurface chose to, and the caller's buffer is laid out however the caller chose to. Each
+    /// row is copied by the narrower of the two, so neither side is read or written past its own
+    /// row, and the count of rows that landed comes back.
+    ///
+    /// It stops early rather than repairing anything: a row that would read past the surface's
+    /// allocation or write past `dst` ends the copy, and the caller is told how far it got. The C
+    /// this replaces copies `height` rows unconditionally and reads off the end of a short
+    /// surface to do it.
+    pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> u32 {
+        let src_stride = self.bytes_per_row() as usize;
+        let alloc = self.alloc_size() as usize;
+        let row_bytes = stride.min(src_stride);
+        if row_bytes == 0 {
+            return 0;
+        }
+        // SAFETY: as `read_into` -- the lock is what makes the GPU's writes visible to this
+        // process, and a failed lock leaves nothing to unlock and nothing to read.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) } != 0 {
+            return 0;
+        }
+        // SAFETY: the lock is held, so the base address addresses `alloc` readable bytes that no
+        // one else is writing through the CPU's view.
+        let base = unsafe { IOSurfaceGetBaseAddress(self.as_ref()) }.cast::<u8>();
+        let mut rows = 0;
+        while rows < height {
+            let (from, to) = (rows as usize * src_stride, rows as usize * stride);
+            if from + row_bytes > alloc || to + row_bytes > dst.len() {
+                break;
+            }
+            // SAFETY: both ends were bounded above -- `from + row_bytes` against the surface's
+            // own allocation and `to + row_bytes` against `dst`'s length. The regions cannot
+            // overlap: one is the caller's memory and the other is the surface's.
+            unsafe {
+                core::ptr::copy_nonoverlapping(base.add(from), dst.as_mut_ptr().add(to), row_bytes);
+            }
+            rows += 1;
+        }
+        // SAFETY: balanced against the lock above, with the same options, as IOSurface requires.
+        unsafe { IOSurfaceUnlock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) };
+        rows
+    }
+
     fn as_ref(&self) -> CfTypeRef {
         self.surface.as_ptr()
     }

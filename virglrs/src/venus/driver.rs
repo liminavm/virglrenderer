@@ -2540,16 +2540,24 @@ impl Driver {
         self.memory.get(&id)?.surface().map(Surface::id)
     }
 
-    /// Where an allocation this context already owns lives, for a second allocation that names
-    /// it: the host address and how far it runs.
+    /// Copy an allocation's presented pixels out, for an allocation that is a scanout.
     ///
-    /// One value, because an address and the length it is good for are only meaningful together
-    /// -- the caller clamps the guest's figure to the second before handing the driver the first.
+    /// The surface itself never leaves this module: an `IOSurfaceRef` handed outward is a
+    /// lifetime no one can see, which is the whole reason `metal.rs` owns them. What leaves is
+    /// the bytes and how many rows of them there were.
     ///
-    /// `None` for storage there is no address for: an allocation the driver keeps to itself, or
-    /// one that is itself an alias. Only a scanout has an address before anyone asks; ordinary
-    /// memory has one once it has been published, and the guest publishes before it imports,
-    /// because the resource it names is the blob that publishing made.
+    /// `None` for an allocation that is not a scanout -- there is no surface to read, which is a
+    /// different answer from a surface that read nothing.
+    pub fn memory_read_surface(
+        &self,
+        id: ObjectId,
+        dst: &mut [u8],
+        stride: usize,
+        height: u32,
+    ) -> Option<u32> {
+        Some(self.memory.get(&id)?.surface()?.read_rows(dst, stride, height))
+    }
+
     /// Where a resource's bytes are, as the one pair a caller can do anything with.
     ///
     /// The only place either shape of [`ResourceBytes`] becomes an address and a length, so the
@@ -2562,6 +2570,16 @@ impl Driver {
         }
     }
 
+    /// Where an allocation this context already owns lives, for a second allocation that names
+    /// it: the host address and how far it runs.
+    ///
+    /// One value, because an address and the length it is good for are only meaningful together
+    /// -- the caller clamps the guest's figure to the second before handing the driver the first.
+    ///
+    /// `None` for storage there is no address for: an allocation the driver keeps to itself, or
+    /// one that is itself an alias. Only a scanout has an address before anyone asks; ordinary
+    /// memory has one once it has been published, and the guest publishes before it imports,
+    /// because the resource it names is the blob that publishing made.
     fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
         let record = self.memory.get(&id)?;
         match &record.backing {
