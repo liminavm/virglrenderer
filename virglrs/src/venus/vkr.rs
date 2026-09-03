@@ -564,6 +564,87 @@ mod tests {
         v.context_destroy(ctx_id());
     }
 
+    /// A ring seqno is a position in a 32-bit counter, widened to fit the wire's field. A guest
+    /// naming a value that does not fit is describing a position its own ring cannot hold.
+    ///
+    /// This needs a *running* ring to mean anything, which is why it is here and not beside the
+    /// other refusals: truncating -- which the C does -- turns the huge number into a small one
+    /// the head has usually already passed, so the wait quietly succeeds. Against an idle ring
+    /// both behaviours refuse, for different reasons, and the difference is invisible.
+    #[test]
+    fn a_ring_seqno_too_large_to_be_a_position_is_refused() {
+        let (mut v, _map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        assert_eq!(
+            v.submit(ctx_id(), &wire_wait_ring(7, u64::from(u32::MAX) + 1)),
+            Ok(Submitted::Poisoned),
+            "one past what a ring position can be -- truncated it becomes zero, which the head \
+             has already reached, and the wait would quietly succeed"
+        );
+        v.context_destroy(ctx_id());
+    }
+
+    /// A virtqueue seqno published in the same batch that created the ring is not lost.
+    ///
+    /// A ring is idle for exactly the length of the batch that made it -- promotion happens when
+    /// the batch ends -- so this is the one window where a submit has no thread to tell. The
+    /// seqno is state, not an edge: kept in the body and carried into the thread's park state at
+    /// promotion. Dropped instead, the ring's first wait strands rather than merely waits.
+    #[test]
+    fn a_virtqueue_seqno_submitted_before_the_ring_started_survives_promotion() {
+        let (mut v, map) = vkr();
+        let mut batch = wire_create_ring(7, &ring_info());
+        batch.extend_from_slice(&wire_submit_vq(7, 4));
+        assert!(v.submit(ctx_id(), &batch).expect("accepted").ran(), "created and published");
+
+        // The ring only starts reading once that batch is over, so this wait is the first thing
+        // it ever sees -- and it must already be satisfied.
+        let wait = wire_wait_vq(4);
+        guest_writes(&map, &wait);
+        until("the ring to run the wait through without sleeping", || {
+            head(&map) == wait.len() as u32
+        });
+        v.context_destroy(ctx_id());
+    }
+
+    /// A wait that the head satisfies ends because the ring thread said so, not because the
+    /// waiter's diagnostic timer went off.
+    ///
+    /// The wake is not an optimisation. Without it the wait still ends -- the 500ms stuck-log
+    /// timeout doubles as a poll -- but every ring wait then takes half a second and prints a
+    /// line the C's own comment calls a frame stutter, on a path that runs per exported frame
+    /// sync fd. The clock is the assertion: a wake is microseconds, a poll is the whole timeout.
+    #[test]
+    fn a_ring_wait_ends_on_the_wake_and_not_on_the_stuck_timer() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        let work = wire_ring_work();
+
+        let waiter = match v.submit(ctx_id(), &wire_wait_ring(7, work.len() as u64)) {
+            Ok(Submitted::Waiting { on: Wait::Ring { ring, seqno }, .. }) => {
+                v.ring_waiter(ctx_id(), ring, seqno).expect("the ring is running")
+            }
+            other => panic!("expected a suspended ring wait on an empty ring, got {other:?}"),
+        };
+        // Written only once the waiter exists, so the head advance it is waiting for happens
+        // while it is asleep -- which is the only arrangement in which the wake is what ends it.
+        guest_writes(&map, &work);
+        let began = Instant::now();
+        assert!(waited(waiter), "the head reached the seqno");
+        assert!(
+            began.elapsed() < Duration::from_millis(250),
+            "ended after {:?}, which is the stuck timer rather than the head-advance wake",
+            began.elapsed()
+        );
+        v.context_destroy(ctx_id());
+    }
+
     /// A ring that waits for a seqno the context has not published yet sleeps, and the submit
     /// wakes it.
     ///

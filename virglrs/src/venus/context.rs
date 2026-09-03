@@ -5726,10 +5726,13 @@ mod tests {
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
 
-        // Ring-only, sent on the context's own stream.
+        // Ring-only, sent on the context's own stream. Poisoned specifically, not merely "did
+        // not finish": a build that took the wrong stream's command and *suspended* on it would
+        // also fail a `ran()` check, while having invented a ring for a command that names none.
         let mut ctx = ctx_with_ring(&t);
-        assert!(
-            !ctx.submit(&wire_wait_vq(1), &mut todo, &g, &t).ran(),
+        assert_eq!(
+            ctx.submit(&wire_wait_vq(1), &mut todo, &g, &t),
+            Submitted::Poisoned,
             "a virtqueue wait names no ring, so the context's own stream cannot send it"
         );
 
@@ -5759,21 +5762,6 @@ mod tests {
         let mut todo = Unimplemented::default();
         let mut ctx = ctx_with_ring(&t);
         assert!(!ctx.submit(&wire_wait_ring(7, 1), &mut todo, &g, &t).ran(), "refused");
-    }
-
-    /// A ring seqno is a position in a 32-bit counter widened to fit the wire. A guest naming a
-    /// value that does not fit is describing a position its own ring cannot hold, and truncating
-    /// it -- which the C does -- would build the wait on a number nobody asked for.
-    #[test]
-    fn a_ring_seqno_too_large_to_be_a_position_is_refused() {
-        let t = ring_table();
-        let g = crate::vulkan::global();
-        let mut todo = Unimplemented::default();
-        let mut ctx = ctx_with_ring(&t);
-        assert!(
-            !ctx.submit(&wire_wait_ring(7, u64::from(u32::MAX) + 1), &mut todo, &g, &t).ran(),
-            "one past what a ring position can be"
-        );
     }
 
     /// The `extra` region is a door of a fixed size, and the offset comes from the guest at write
