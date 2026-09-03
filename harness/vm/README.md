@@ -112,6 +112,41 @@ instead of a bare fd close at exit.
 `--out` is what keeps the two apart. Without it every synoik capture writes `synoik.vkrc` and
 replaces the corpus a pinned score was recorded from.
 
+## Client corpora, and why the C cannot score them
+
+Two more corpora come from the synoik guest with a Vulkan client in front of the compositor:
+
+| | `synoik-vkcube.vkrc` | `synoik-ptyxis.vkrc` |
+|---|---|---|
+| client | `vkcube --wsi wayland` | Ptyxis (GTK4, `GSK_RENDERER=vulkan`), rendering a long directory listing |
+| adds to the other corpora | the cross-context import: a compositor reaching a client's buffer; `vkCmdCopyImageToBuffer` | `vkGetPipelineCacheData`, both calls -- an out-blob, the guest saving its pipeline cache; `vkFreeDescriptorSets` |
+| dumped | mid-workload, client still running | mid-workload, after the guest wrote `~/.cache/gtk-4.0/vulkan-pipeline-cache` |
+
+Neither has a fixture under `../replay/fixtures`, because the C build cannot replay them: the
+client's export and the compositor's import are recorded out of execution order, the C's import
+of the not-yet-created resource tombstones the image, and KosmicKrisp asserts on the next
+descriptor that samples it. So they gate virglrs against its own previous build -- the score at
+HEAD against the score with the change -- rather than against the C. What a score sees of the
+commands they add is that each decodes and is served to the end of the stream: a build that
+refuses or poisons on one shows as `cmds` short of the total. A reply's *shape* it cannot see,
+because a recording holds requests only -- an out-blob decoded as absent replays to a
+byte-identical score, and that half is the unit tests' to pin (`../sabotage/sweep.py` lists
+which).
+
+To capture the Ptyxis one:
+
+```sh
+./capture.sh synoik --renderer c --out synoik-ptyxis
+# in the guest, once /run/user/1000/wayland-1 exists:
+#   XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 GSK_RENDERER=vulkan \
+#     ptyxis -- sh -c 'ls -lR /usr/share/icons | head -n 4000; sleep 300'
+# wait for a new file under ~/.cache/gtk-4.0/vulkan-pipeline-cache, then
+./dump.sh synoik-ptyxis
+```
+
+GTK's gpu renderer creates no query pools, so no corpus carries the query-pool commands; they
+are pinned by unit tests alone.
+
 ## Capturing
 
 Both recorders are armed by capacity and write only when asked, through a FIFO — so arming one
