@@ -880,6 +880,41 @@ SABOTAGES = [
         """""",
         '',
     ),
+    (
+        'a classic blend factor is read from the bit beside it',
+        'virglrs/src/vrend/decode.rs',
+        "Some(RtBlendEq { rgb: eq(1, 4, 9)?, alpha: eq(14, 17, 22)? })",
+        "Some(RtBlendEq { rgb: eq(1, 5, 9)?, alpha: eq(14, 17, 22)? })",
+        'vrend',
+    ),
+    (
+        'a refused classic command does not end its batch',
+        'virglrs/src/vrend/decode.rs',
+        "self.at = if decoded.is_ok() { end } else { self.words.len() };",
+        "self.at = end;",
+        'vrend',
+    ),
+    (
+        'a classic slot range past the per-stage array is bound',
+        'virglrs/src/vrend/decode.rs',
+        "if count > max || start as usize > max - count {",
+        "if count > max {",
+        'vrend',
+    ),
+    (
+        'a classic shader continuation is taken for a new shader',
+        'virglrs/src/vrend/decode.rs',
+        "let chunk = if offlen >> 31 != 0 {",
+        "let chunk = if offlen >> 31 == 2 {",
+        'vrend',
+    ),
+    (
+        'an inline write hands its bytes over starting one dword early',
+        'virglrs/src/vrend/decode.rs',
+        "Command::ResourceInlineWrite { transfer: w.transfer()?, data: w.tail(12) }",
+        "Command::ResourceInlineWrite { transfer: w.transfer()?, data: w.tail(11) }",
+        'vrend',
+    ),
 ]
 
 # Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single

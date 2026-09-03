@@ -57,6 +57,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   never the bytes a renderer wrote back — and it tolerates the guest's padding bytes, which mesa
   leaves uninitialised and this renderer zeroes on purpose; the encoder reports exactly which
   ranges those are, so the tolerance is a set of offsets rather than a loose comparison.
+- `rs/` builds `vrend-roundtrip`, the same differential for the classic decoder. A vrend trace
+  dump holds every command the C dispatched, grouped by the submit that carried it, so the Rust
+  decoder frames each recorded batch, decodes each command, re-encodes it and compares dwords:
+  `cargo run --release --bin vrend-roundtrip -- ../../vm/captures/vrend.bin`, well under a second.
+  Two things make it a gate rather than a smoke test. The C recorded only what it *accepted*, so
+  a refusal here is a command a real guest sent and the C served -- a decoder stricter than the
+  wire shows up as one. And the decoder is exact where the C is loose (a trailing partial element,
+  dwords past the ones a command reads), because a decoder that ignores dwords cannot reproduce
+  them and the comparison would be blind exactly there; `END_TRANSFERS` keeps the slack mesa pads
+  the transfer prologue with for the same reason. All 13,646 commands of `vrend.bin` reproduce.
+  Like `venus-roundtrip` it never calls a handler: it proves the wire is read where it lives,
+  not what is done with it.
 - `rs/` builds `venus-reply-oracle` for the half `venus-roundtrip` cannot reach. The corpus asks
   for replies and holds none of them, and those are two separate facts. The requests keep their
   `VN_CS_COMMAND_FLAG_GENERATE_REPLY` bit: 137 of venus's commands in 24 kinds and 64 of synoik's

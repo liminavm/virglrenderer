@@ -18,9 +18,9 @@
 #[path = "corpus.rs"]
 mod corpus;
 
-use std::sync::atomic::AtomicBool;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
 use bumpalo::Bump;
 use virglrenderer::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
