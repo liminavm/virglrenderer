@@ -494,6 +494,23 @@ buildable throughout as the A-side reference.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
+  The order is by what unblocks the next observable thing: decode, resources and
+  formats, and enough of the state machine to CLEAR, BLIT, copy and transfer, scored
+  against `vrend-nodraw.score` -- the classic corpus with every `DRAW_VBO` dropped,
+  10,876 commands and 316 readback hashes that need no shader; then the IOSurface
+  scanout and the first pixel gate, **kmscube on the stock image at
+  `multi-user.target`** against the C's frame of the same; then TGSI and the shader
+  translation against `vrend.score`; then the cross-import both ways (the seated GNOME
+  with `vkcube --wsi wayland` is the frame with both halves of virglrs in it); video
+  last.
+  **What the host GL offers, measured 2026-09-03** with the replayer's environment
+  (zink on KosmicKrisp through Mesa's EGL, surfaceless): OpenGL ES 3.1 (not 3.2), and
+  desktop OpenGL 3.3 in both core and compatibility profiles (4.3 refused) carrying
+  `ARB_compute_shader`, `ARB_shader_storage_buffer_object`,
+  `ARB_shader_image_load_store`, `ARB_tessellation_shader`, and `ARB_gl_spirv` with one
+  shader binary format. GLES has no SPIR-V path. limina's C build binds GLES
+  (`VIRGL_RENDERER_USE_GLES` is in its init flags), so a SPIR-V shader target means a
+  desktop-GL host context, which is the C's other winsys leg.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
