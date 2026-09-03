@@ -31,9 +31,9 @@ use crate::config::Config;
 use crate::ids::{CtxId, RingId};
 
 use super::budget::Budget;
-use super::context::{Context, Unimplemented};
+use super::context::{Context, Submitted, Unimplemented, Wait};
 use super::ring::{ReplyStream, Ring, ShmResources};
-use super::ring_thread::{self, Dispatch, Verdict};
+use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
 use crate::vulkan::Global;
 
 /// Why a venus call could not be served. Both are the caller's mistake, not ours: a context that
@@ -41,6 +41,10 @@ use crate::vulkan::Global;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     NoContext,
+    /// A submission asked to wait on a ring this context does not have running. Distinct from
+    /// `NoContext` because it names a different mistake and, unlike it, is reachable from a
+    /// guest -- a ring destroyed while a wait on it was in flight.
+    NoRing,
     Poisoned,
 }
 
@@ -110,10 +114,17 @@ impl Dispatch for RingDispatch {
         let Ok(mut todo) = self.todo.try_lock() else {
             return Verdict::Busy;
         };
-        if ctx.dispatch_ring(ring, reply, buf, &mut todo, &self.global, &*resources) {
-            Verdict::Ran
-        } else {
-            Verdict::Poisoned
+        match ctx.dispatch_ring(ring, reply, buf, &mut todo, &self.global, &*resources) {
+            Submitted::Done => Verdict::Ran,
+            Submitted::Poisoned => Verdict::Poisoned,
+            // A ring's own stream may only wait on a virtqueue seqno; the handler for the other
+            // wait refuses this origin outright, so there is no ring wait to translate here.
+            Submitted::Waiting { consumed, on: Wait::Virtqueue(seqno) } => {
+                Verdict::Wait { consumed, seqno }
+            }
+            Submitted::Waiting { on: Wait::Ring { .. }, .. } => {
+                unreachable!("a ring stream's vkWaitRingSeqnoMESA is refused by its handler")
+            }
         }
     }
 }
@@ -199,6 +210,7 @@ impl Vkr {
             return;
         }
         let fatal = ctx.fatal_flag();
+        let wait_ring = ctx.wait_ring();
         ctx.start_idle_rings(|ring_id, ring: Ring| {
             let dispatch = RingDispatch {
                 ctx: Weak::clone(&weak),
@@ -206,7 +218,13 @@ impl Vkr {
                 todo: Arc::clone(&todo),
                 global: Arc::clone(&global),
             };
-            ring_thread::spawn(ring_id, ring, Arc::new(dispatch), Arc::clone(&fatal))
+            ring_thread::spawn(
+                ring_id,
+                ring,
+                Arc::new(dispatch),
+                Arc::clone(&fatal),
+                Arc::clone(&wait_ring),
+            )
         });
     }
 
@@ -216,17 +234,37 @@ impl Vkr {
     /// reading the moment the batch that created it is over -- and not before. Replay does not
     /// promote: its rings wait for `replay_end`, which is the C's `ctx->replaying` check moved to
     /// the place that knows the answer.
-    pub fn submit(&mut self, id: CtxId, buf: &[u8]) -> Result<(), Error> {
-        self.on_context(id, |ctx, todo, global, resources| {
+    /// Returns how the batch ended, because it may not have ended: a `vkWaitRingSeqnoMESA` stops
+    /// it partway, and the caller has to wait *with no lock of this renderer held* and come back
+    /// with the rest. It cannot be waited on here -- `on_context` holds the context, the resource
+    /// table and the census, and the ring whose head we would be waiting for needs the first of
+    /// those to advance it. See [`Submitted`].
+    ///
+    /// Rings are promoted whether the batch finished or suspended. A `vkCreateRingMESA` before the
+    /// wait has to start reading, or the wait is on a ring that will never run.
+    pub fn submit(&mut self, id: CtxId, buf: &[u8]) -> Result<Submitted, Error> {
+        let out = self.on_context(id, |ctx, todo, global, resources| {
             ctx.submit(buf, todo, global, resources)
         })?;
         self.promote(id);
-        Ok(())
+        Ok(out)
+    }
+
+    /// What a suspended submission has to wait for, assembled while the context is locked and
+    /// waited on after it is not.
+    ///
+    /// Every piece is an `Arc` to something a ring thread also holds, so the wait needs nothing
+    /// from this renderer once it has been handed over -- which is the whole point: the thread it
+    /// is waiting for needs the locks the waiter would otherwise still be holding.
+    pub fn ring_waiter(&self, id: CtxId, ring: RingId, seqno: u32) -> Result<RingWaiter, Error> {
+        let arc = self.contexts.get(&id).ok_or(Error::NoContext)?;
+        let ctx = arc.lock().expect("a context lock is never poisoned");
+        ctx.ring_waiter(ring, seqno).ok_or(Error::NoRing)
     }
 
     /// Feed one journal entry to a ring's stream. Replay only, so nothing is promoted here.
     pub fn submit_ring(&mut self, id: CtxId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
-        self.on_context(id, |ctx, todo, global, resources| {
+        self.on_context_ok(id, |ctx, todo, global, resources| {
             ctx.submit_ring(ring, buf, todo, global, resources)
         })
     }
@@ -236,20 +274,25 @@ impl Vkr {
     /// The two locks are taken here, in the order this module documents, so that no caller picks
     /// its own. `false` from the closure is a poisoned stream, which is the only way a submission
     /// fails once the context has been found.
-    fn on_context(
+    fn on_context<T>(
         &mut self,
         id: CtxId,
-        f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> bool,
-    ) -> Result<(), Error> {
+        f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> T,
+    ) -> Result<T, Error> {
         let ctx = self.contexts.get(&id).ok_or(Error::NoContext)?;
         let resources = self.resources.read().expect("the resource lock is never poisoned");
         let mut ctx = ctx.lock().expect("a context lock is never poisoned");
         let mut todo = self.todo.lock().expect("the census lock is never poisoned");
-        if f(&mut ctx, &mut todo, &self.global, &*resources) {
-            Ok(())
-        } else {
-            Err(Error::Poisoned)
-        }
+        Ok(f(&mut ctx, &mut todo, &self.global, &*resources))
+    }
+
+    /// The same, for the callers whose only two answers are "it ran" and "it poisoned".
+    fn on_context_ok(
+        &mut self,
+        id: CtxId,
+        f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> bool,
+    ) -> Result<(), Error> {
+        if self.on_context(id, f)? { Ok(()) } else { Err(Error::Poisoned) }
     }
 
     pub fn replay_begin(&mut self, id: CtxId) -> Result<(), Error> {
@@ -390,6 +433,52 @@ mod tests {
         buf
     }
 
+    /// `vkSubmitVirtqueueSeqnoMESA`, which is the context's stream's to send.
+    fn wire_submit_vq(ring: u64, seqno: u64) -> Vec<u8> {
+        use crate::venus::proto::serialize::{
+            vn_encode_vkSubmitVirtqueueSeqnoMESA_args, vn_sizeof_vkSubmitVirtqueueSeqnoMESA_args,
+        };
+        use crate::venus::proto::types::vn_command_vkSubmitVirtqueueSeqnoMESA as Args;
+
+        let args = Args { ring, seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkSubmitVirtqueueSeqnoMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkSubmitVirtqueueSeqnoMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
+    /// `vkWaitVirtqueueSeqnoMESA`, which is a ring's own stream's to send. It names no ring: the
+    /// ring is whichever one it arrived on.
+    fn wire_wait_vq(seqno: u64) -> Vec<u8> {
+        use crate::venus::proto::serialize::{
+            vn_encode_vkWaitVirtqueueSeqnoMESA_args, vn_sizeof_vkWaitVirtqueueSeqnoMESA_args,
+        };
+        use crate::venus::proto::types::vn_command_vkWaitVirtqueueSeqnoMESA as Args;
+
+        let args = Args { seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkWaitVirtqueueSeqnoMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkWaitVirtqueueSeqnoMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
+    /// `vkWaitRingSeqnoMESA`, the context's stream's to send.
+    fn wire_wait_ring(ring: u64, seqno: u64) -> Vec<u8> {
+        use crate::venus::proto::serialize::{
+            vn_encode_vkWaitRingSeqnoMESA_args, vn_sizeof_vkWaitRingSeqnoMESA_args,
+        };
+        use crate::venus::proto::types::vn_command_vkWaitRingSeqnoMESA as Args;
+
+        let args = Args { ring, seqno, ..Default::default() };
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkWaitRingSeqnoMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkWaitRingSeqnoMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
     /// Wait for something a ring thread does, or fail rather than hang the suite.
     fn until(what: &str, mut pred: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -422,11 +511,193 @@ mod tests {
     #[test]
     fn a_live_ring_reads_what_the_guest_writes() {
         let (mut v, map) = vkr();
-        v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("the ring was created");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info()))
+                .expect("the ring was created")
+                .ran(),
+            "the ring was created"
+        );
 
         guest_writes(&map, &wire_ring_work());
         until("the ring thread to consume the batch", || head(&map) != 0);
 
+        v.context_destroy(ctx_id());
+    }
+
+    /// A ring that waits for a virtqueue seqno the context has already published never sleeps.
+    ///
+    /// The ordinary case, and the one that must cost nothing: a guest submits the seqno and then
+    /// waits for it far more often than it gets ahead of itself. A handler that suspended
+    /// unconditionally would still pass a liveness test -- the resume satisfies it -- while
+    /// turning every wait into a round trip through the ring loop.
+    #[test]
+    fn a_virtqueue_wait_already_satisfied_does_not_suspend() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        assert!(
+            v.submit(ctx_id(), &wire_submit_vq(7, 5)).expect("submitted").ran(),
+            "the seqno is published before the ring ever asks for it"
+        );
+
+        guest_writes(&map, &wire_wait_vq(5));
+        until("the ring to consume the wait without stopping at it", || {
+            head(&map) == wire_wait_vq(5).len() as u32
+        });
+        v.context_destroy(ctx_id());
+    }
+
+    /// A ring that waits for a seqno the context has not published yet sleeps, and the submit
+    /// wakes it.
+    ///
+    /// The head is the witness: it stops at the wait command and stays there -- the wait is not
+    /// consumed, so a resume re-decodes it -- and moves past only once the seqno lands.
+    #[test]
+    fn a_virtqueue_wait_sleeps_until_the_context_submits() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        // Something to run before the wait, so the prefix having run exactly once is visible: the
+        // head must sit at the end of it, not at zero and not past the wait.
+        let prefix = wire_ring_work();
+        let mut batch = prefix.clone();
+        batch.extend_from_slice(&wire_wait_vq(9));
+        guest_writes(&map, &batch);
+
+        until("the prefix to run and the ring to stop at the wait", || {
+            head(&map) == prefix.len() as u32
+        });
+        // Long enough that a ring which was going to run through the wait would have.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(head(&map), prefix.len() as u32, "the wait command itself was not consumed");
+
+        assert!(v.submit(ctx_id(), &wire_submit_vq(7, 9)).expect("submitted").ran(), "published");
+        until("the woken ring to run the wait through", || head(&map) == batch.len() as u32);
+        v.context_destroy(ctx_id());
+    }
+
+    /// Tearing a context down releases a ring asleep on a virtqueue seqno that never arrives.
+    ///
+    /// The stop has to reach a thread parked on the seqno predicate, not only one parked on the
+    /// idle condvar -- which is why both sleep on the same condvar and both re-check `started`.
+    /// A ring waiting on its own condition with its own wake would hang here, and `context_destroy`
+    /// would never return.
+    #[test]
+    fn teardown_releases_a_ring_asleep_on_a_virtqueue_seqno() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        guest_writes(&map, &wire_wait_vq(1));
+        // Nothing will ever publish seqno 1, so the ring is asleep for good when this lands.
+        std::thread::sleep(Duration::from_millis(20));
+        v.context_destroy(ctx_id());
+    }
+
+    /// The whole-device deadlock, caught rather than waited through.
+    ///
+    /// A ring blocks on a virtqueue seqno; the context's own stream then waits for that ring's
+    /// head. The only command that publishes a virtqueue seqno arrives on the context's stream,
+    /// and the context's stream is here, waiting -- so neither can move. In the C the pair holds
+    /// the virtio-gpu control queue, which is one queue for the whole device: every other
+    /// context's submissions, every scanout flush and every fence stop with it, and nothing times
+    /// out. The C's guard runs only in the ring thread's idle branch and never sees this pair.
+    ///
+    /// This test passing at all is the claim: it returns instead of hanging, and it returns a
+    /// poison rather than a success. The `until` timeouts everywhere else in this module are the
+    /// harness that turns a regression here into a failure rather than a wedged suite.
+    #[test]
+    fn a_ring_blocked_on_a_seqno_only_the_waiter_can_publish_poisons_instead_of_hanging() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        guest_writes(&map, &wire_wait_vq(1));
+        until("the ring to block on the virtqueue seqno", || {
+            v.contexts[&ctx_id()]
+                .lock()
+                .expect("not poisoned")
+                .ring_waiter(RingId(7), 1)
+                .is_some_and(|_| true)
+        });
+        // The ring is asleep on a seqno nobody has published. Give it a moment to be certainly
+        // parked rather than merely about to be.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let out = v.submit(ctx_id(), &wire_wait_ring(7, 1_000));
+        let waiter = match out.expect("the batch was accepted") {
+            Submitted::Waiting { on: Wait::Ring { ring, seqno }, .. } => {
+                v.ring_waiter(ctx_id(), ring, seqno).expect("the ring is running")
+            }
+            other => panic!("expected a suspended ring wait, got {other:?}"),
+        };
+        assert!(!waiter.wait(), "the pair is refused, not waited through");
+        v.context_destroy(ctx_id());
+    }
+
+    /// A ring wait for a position past everything the guest ever wrote is refused.
+    ///
+    /// The C's guard, asked from the waiting side rather than from the ring's idle branch: the
+    /// ring has consumed the whole tail and is still short, so no head it can reach will do. Left
+    /// to wait, this is the same permanent stall as the pair above with one fewer participant.
+    #[test]
+    fn a_ring_wait_past_the_tail_is_refused() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        let work = wire_ring_work();
+        guest_writes(&map, &work);
+        until("the ring to drain", || head(&map) == work.len() as u32);
+
+        let waiter = match v.submit(ctx_id(), &wire_wait_ring(7, 0x4000)).expect("accepted") {
+            Submitted::Waiting { on: Wait::Ring { ring, seqno }, .. } => {
+                v.ring_waiter(ctx_id(), ring, seqno).expect("the ring is running")
+            }
+            other => panic!("expected a suspended ring wait, got {other:?}"),
+        };
+        assert!(!waiter.wait(), "a seqno past the tail of a drained ring is refused");
+        v.context_destroy(ctx_id());
+    }
+
+    /// A ring the guest is actually feeding satisfies a wait on its head, and the wait ends.
+    ///
+    /// The half of the mechanism the refusals above cannot show: a wait that is *meant* to
+    /// succeed does, and it does so because the ring thread wakes the waiter when it advances the
+    /// head rather than because the waiter polled.
+    #[test]
+    fn a_ring_wait_ends_when_the_head_reaches_the_seqno() {
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+        let work = wire_ring_work();
+        guest_writes(&map, &work);
+
+        // Asked for exactly what the guest wrote, from a thread that is not the one advancing it.
+        let waiter = match v.submit(ctx_id(), &wire_wait_ring(7, work.len() as u64)) {
+            Ok(Submitted::Done) => {
+                // The ring got there before the wait was even dispatched, which is a legitimate
+                // outcome of the same mechanism -- the handler checks the head before suspending.
+                v.context_destroy(ctx_id());
+                return;
+            }
+            Ok(Submitted::Waiting { on: Wait::Ring { ring, seqno }, .. }) => {
+                v.ring_waiter(ctx_id(), ring, seqno).expect("the ring is running")
+            }
+            other => panic!("expected a ring wait, got {other:?}"),
+        };
+        assert!(waiter.wait(), "the head reached the seqno and the wait ended");
         v.context_destroy(ctx_id());
     }
 
@@ -466,10 +737,18 @@ mod tests {
 
             // Measured before a ring holds anything: the test's share and the resource table's.
             let before = Arc::strong_count(&map);
-            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("the ring was created");
+            assert!(
+                v.submit(ctx_id(), &wire_create_ring(7, &ring_info()))
+                    .expect("the ring was created")
+                    .ran(),
+                "the ring was created"
+            );
             until("the ring thread to start consuming", || head(&map) != 0);
 
-            v.submit(ctx_id(), &wire_destroy_ring(7)).expect("the ring was destroyed");
+            assert!(
+                v.submit(ctx_id(), &wire_destroy_ring(7)).expect("the ring was destroyed").ran(),
+                "the ring was destroyed"
+            );
             // Synchronous, not eventual: the ring's share of the mapping is gone the moment the
             // destroy returns, which it can only be if the thread was joined rather than merely
             // told to stop.
@@ -498,7 +777,12 @@ mod tests {
         let seen = Arc::clone(&map);
         let before = Arc::strong_count(&map);
 
-        v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("the ring was created");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info()))
+                .expect("the ring was created")
+                .ran(),
+            "the ring was created"
+        );
         guest_writes(&map, &wire_ring_work());
         until("the ring thread to start consuming", || head(&map) != 0);
 
@@ -541,7 +825,12 @@ mod tests {
         assert!(map.store_u32(0, QUIESCED_AT), "the head is inside the mapping");
         assert!(map.store_u32(4, QUIESCED_AT), "the tail is inside the mapping");
 
-        v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("the ring was created");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info()))
+                .expect("the ring was created")
+                .ran(),
+            "the ring was created"
+        );
         v.replay_end(ctx_id()).expect("replay ended");
 
         // Nothing new has arrived, so a ring that resumed correctly has nothing to do.
@@ -564,7 +853,12 @@ mod tests {
     fn a_replayed_ring_does_not_start_until_replay_ends() {
         let (mut v, map) = vkr();
         v.replay_begin(ctx_id()).expect("replay began");
-        v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("the ring was created");
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info()))
+                .expect("the ring was created")
+                .ran(),
+            "the ring was created"
+        );
 
         // Still idle: the journal may yet address this ring, and a thread reading it meanwhile
         // would be a second reader of the same buffer.

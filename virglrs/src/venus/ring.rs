@@ -253,40 +253,101 @@ pub trait ShmResources {
     }
 }
 
-/// The one status word of one ring, and the mapping it lives in.
+/// The words of a ring that more than one thread has a reason to touch, and the mapping they are
+/// in.
 ///
-/// Split out of [`Ring`] because it is the only part of a ring that more than one thread has a
-/// reason to touch. The ring's own thread owns the body and everything else in it; the context's
-/// [`Monitor`](super::monitor::Monitor) has to stamp the ALIVE bit on a schedule the guest set,
-/// including while that thread is deep in a dispatch or parked on its condvar.
+/// Split out of [`Ring`] because the ring's own thread owns the body and everything else in it,
+/// while three other threads need these four words: the context's
+/// [`Monitor`](super::monitor::Monitor) stamps `status` on a schedule the guest set, a
+/// `vkWaitRingSeqnoMESA` on the context's own stream reads `head` and `tail` to decide whether it
+/// may ever be satisfied, and a `vkWriteRingExtraMESA` writes `extra` for a ring whose body is
+/// away with its thread.
 ///
-/// Shared as an `Arc` and never copied. A monitor holding a `(map, offset)` pair of its own would
-/// be a second value that has to agree with this one, and would go on stamping a word whose ring
-/// was destroyed; a `Weak` to this object stops resolving the moment the ring drops, so a dead
-/// ring cannot be stamped and nothing has to remember to purge it.
-pub struct RingStatus {
+/// Shared as an `Arc` and never copied. A holder with a `(map, offset)` pair of its own would be a
+/// second value that has to agree with this one, and would go on reading and writing the words of
+/// a ring that was destroyed; a `Weak` to this object stops resolving the moment the ring drops,
+/// so nothing has to remember to purge anything.
+pub struct RingControl {
     map: Arc<GuestMap>,
-    at: usize,
+    head: usize,
+    tail: usize,
+    status: usize,
+    extra: Region,
 }
 
-impl RingStatus {
-    /// The status word at `at` in `map`. `at` is inside the mapping -- the layout is parsed
-    /// before this is built, which is what the assertions below rest on.
-    pub fn new(map: Arc<GuestMap>, at: usize) -> RingStatus {
-        RingStatus { map, at }
+impl RingControl {
+    /// The control words at the offsets `layout` validated. Every accessor below asserts rather
+    /// than reports, because that validation is what makes each of them in-bounds.
+    fn new(map: Arc<GuestMap>, layout: &RingLayout) -> RingControl {
+        RingControl {
+            map,
+            head: layout.head.begin(),
+            tail: layout.tail.begin(),
+            status: layout.status.begin(),
+            extra: layout.extra,
+        }
+    }
+
+    /// How far the host has read. Written by us, read by the guest.
+    pub fn set_head(&self, head: u32) {
+        assert!(self.map.store_u32(self.head, head), "a validated head is inside the mapping");
+    }
+
+    /// The same word, read back. The one value -- a waiter reads the head the ring thread wrote,
+    /// never a copy of it published beside it.
+    pub fn head(&self) -> u32 {
+        self.map.load_u32(self.head).expect("a validated head is inside the mapping")
+    }
+
+    /// How far the guest says it has written.
+    pub fn tail(&self) -> u32 {
+        self.map.load_u32(self.tail).expect("a validated tail is inside the mapping")
+    }
+
+    /// The same, ordered against the status word the guest is reading.
+    ///
+    /// Only the park check may use this. See [`GuestMap::load_u32_seqcst`] for the race it closes;
+    /// everywhere else the acquire load is both correct and cheaper.
+    pub fn tail_seqcst(&self) -> u32 {
+        self.map.load_u32_seqcst(self.tail).expect("a validated tail is inside the mapping")
+    }
+
+    /// The status word as it stands. For a diagnostic; no decision rests on it.
+    pub fn status(&self) -> u32 {
+        self.map.load_u32(self.status).expect("a validated status word is inside the mapping")
     }
 
     /// Tell the guest something about the ring changed.
     pub fn set_bits(&self, bits: u32) {
-        assert!(self.map.fetch_or_u32(self.at, bits), "a validated status word is in the mapping");
+        assert!(
+            self.map.fetch_or_u32(self.status, bits),
+            "a validated status word is inside the mapping"
+        );
     }
 
     /// Take a status bit back.
     pub fn unset_bits(&self, bits: u32) {
         assert!(
-            self.map.fetch_and_u32(self.at, !bits),
-            "a validated status word is in the mapping"
+            self.map.fetch_and_u32(self.status, !bits),
+            "a validated status word is inside the mapping"
         );
+    }
+
+    /// Write one guest-named word in the `extra` region.
+    ///
+    /// The offset is relative to `extra` and arrives from the guest at write time, with no layout
+    /// left to have checked it -- so unlike the accessors above this one can legitimately fail,
+    /// and says so rather than asserting.
+    #[must_use]
+    pub fn write_extra(&self, offset: usize, value: u32) -> bool {
+        let Some(at) = self.extra.begin().checked_add(offset) else { return false };
+        // Inside `extra`, not merely inside the mapping: the rest of the resource is not the
+        // guest's to have us write through this door.
+        let Some(end) = at.checked_add(size_of::<u32>()) else { return false };
+        if end > self.extra.begin() + self.extra.size() {
+            return false;
+        }
+        self.map.store_u32(at, value)
     }
 }
 
@@ -309,9 +370,9 @@ pub struct Ring {
     /// The guest's number, kept because it is the guest's call: it knows its own cadence, and a
     /// ring that parks too eagerly pays a doorbell round trip on the next submit.
     pub idle_timeout: Duration,
-    /// The word the guest reads this ring's state out of. An `Arc` because the context's monitor
-    /// holds a `Weak` to the same object -- see [`RingStatus`].
-    pub status: Arc<RingStatus>,
+    /// The words of this ring that other threads reach. An `Arc` because the monitor holds a
+    /// `Weak` to the same object and a running ring's thread holds a clone -- see [`RingControl`].
+    pub control: Arc<RingControl>,
     /// How far the host has read, free-running and masked into the buffer only when used.
     ///
     /// Established here rather than in the thread that advances it, because a ring restored from a
@@ -319,6 +380,14 @@ pub struct Ring {
     /// the host resumes where it left off. A thread starting from zero on such a ring would treat
     /// every byte the guest had already been answered for as new work.
     pub cur: u32,
+    /// The highest virtqueue seqno the context has published for this ring while it was idle.
+    ///
+    /// A ring is idle from the `vkCreateRingMESA` that made it to the end of that batch, and a
+    /// `vkSubmitVirtqueueSeqnoMESA` in that same batch is legal -- it names a ring that exists.
+    /// The seqno is state rather than an edge, so it is kept here and carried into the thread's
+    /// park state at spawn; dropped instead, it would strand the ring's first wait rather than
+    /// merely delay it.
+    pub virtqueue_seqno: u64,
 }
 
 impl Ring {
@@ -350,11 +419,12 @@ impl Ring {
         if !replaying && (head != 0 || status != 0) {
             return Err(RingError::NotOurs { head, status });
         }
-        let status = Arc::new(RingStatus::new(Arc::clone(&map), layout.status.begin()));
+        let control = Arc::new(RingControl::new(Arc::clone(&map), &layout));
         Ok(Ring {
             layout,
             map,
-            status,
+            control,
+            virtqueue_seqno: 0,
             reply: None,
             idle_timeout: Duration::from_nanos(info.idleTimeout),
             cur: if replaying { head } else { 0 },
@@ -363,7 +433,7 @@ impl Ring {
 
     /// How far the guest says it has written.
     pub fn tail(&self) -> u32 {
-        self.map.load_u32(self.layout.tail.begin()).expect("a validated tail is inside the mapping")
+        self.control.tail()
     }
 
     /// The same, ordered against the status word the guest is reading.
@@ -371,22 +441,17 @@ impl Ring {
     /// Only the park check may use this. See [`GuestMap::load_u32_seqcst`] for the race it closes;
     /// everywhere else the acquire load is both correct and cheaper.
     pub fn tail_seqcst(&self) -> u32 {
-        self.map
-            .load_u32_seqcst(self.layout.tail.begin())
-            .expect("a validated tail is inside the mapping")
+        self.control.tail_seqcst()
     }
 
     /// How far the host has read. Written by us, read by the guest.
     pub fn set_head(&self, head: u32) {
-        assert!(
-            self.map.store_u32(self.layout.head.begin(), head),
-            "a validated head is inside the mapping"
-        );
+        self.control.set_head(head);
     }
 
     /// Take back a status bit -- the ring is no longer idle.
     pub fn unset_status_bits(&self, bits: u32) {
-        self.status.unset_bits(bits);
+        self.control.unset_bits(bits);
     }
 
     /// Copy the `len` bytes at the free-running position `cur` into `out`.
@@ -428,24 +493,13 @@ impl Ring {
 
     /// Tell the guest something about the ring changed.
     pub fn set_status_bits(&self, bits: u32) {
-        self.status.set_bits(bits);
+        self.control.set_bits(bits);
     }
 
-    /// Write one guest-named word in the `extra` region.
-    ///
-    /// The offset is relative to `extra` and arrives from the guest at write time, with no layout
-    /// left to have checked it -- so unlike the three above this one can legitimately fail, and
-    /// says so rather than asserting.
+    /// Write one guest-named word in the `extra` region. See [`RingControl::write_extra`].
     #[must_use]
     pub fn write_extra(&self, offset: usize, value: u32) -> bool {
-        let Some(at) = self.layout.extra.begin().checked_add(offset) else { return false };
-        // Inside `extra`, not merely inside the mapping: the rest of the resource is not the
-        // guest's to have us write through this door.
-        let Some(end) = at.checked_add(size_of::<u32>()) else { return false };
-        if end > self.layout.extra.begin() + self.layout.extra.size() {
-            return false;
-        }
-        self.map.store_u32(at, value)
+        self.control.write_extra(offset, value)
     }
 }
 

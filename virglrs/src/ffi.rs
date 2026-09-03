@@ -31,6 +31,7 @@ use crate::config::{CapsetId, Config};
 use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
+use crate::venus::context::{Submitted, Wait};
 
 /// Decode a capset id the guest chose.
 ///
@@ -101,6 +102,7 @@ fn errno(e: renderer::Error) -> c_int {
         | NoContext
         | RendererAbsent
         | Poisoned
+        | NoRing
         | NoAllocation
         | NotMappable
         | ZeroSize
@@ -945,13 +947,51 @@ pub extern "C" fn virgl_renderer_submit_cmd(
     let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) else {
         return EINVAL;
     };
-    with_cmd_bytes(buffer, ndw, |buf| {
-        with(EINVAL, |r| match r.submit_cmd(id, buf) {
-            Ok(()) => 0,
-            Err(e) => errno(e),
-        })
-    })
-    .unwrap_or(EINVAL)
+    with_cmd_bytes(buffer, ndw, |buf| submit_all(id, buf)).unwrap_or(EINVAL)
+}
+
+/// Run a whole submission, sleeping outside the renderer lock for any wait it contains.
+///
+/// The loop is the point. `with` holds the one global lock across the call, so a
+/// `vkWaitRingSeqnoMESA` that blocked inside `submit_cmd` would hold it for the whole wait --
+/// against a ring thread that needs the context under it to advance the very head being waited
+/// for, and against every other ABI entry point in the process, scanout and fence retirement
+/// included. So the renderer hands the wait back instead: it says how much of the buffer ran and
+/// what to wait for, this drops the guard, waits, and comes back with the remainder.
+///
+/// The C has no equivalent because it has no such lock -- its ring threads dispatch against the
+/// context with nothing held at all, which is the design this rewrite exists to replace.
+fn submit_all(id: CtxId, buf: &[u8]) -> c_int {
+    let mut at = 0usize;
+    loop {
+        let out = with(Err(renderer::Error::NoContext), |r| r.submit_cmd(id, &buf[at..]));
+        let waiter = match out {
+            Err(e) => return errno(e),
+            Ok(Submitted::Done) => return 0,
+            Ok(Submitted::Poisoned) => return errno(renderer::Error::Poisoned),
+            Ok(Submitted::Waiting { consumed, on: Wait::Ring { ring, seqno } }) => {
+                at += consumed;
+                // Fetched under the lock and waited on after it: the waiter holds only `Arc`s to
+                // things the ring thread also holds, so from here the renderer is not involved.
+                match with(Err(renderer::Error::NoContext), |r| r.ring_waiter(id, ring, seqno)) {
+                    Ok(w) => w,
+                    // The ring went between the command naming it and this lookup, or was never
+                    // running. Either way nothing will ever advance that head.
+                    Err(e) => return errno(e),
+                }
+            }
+            // A virtqueue wait is legal only on a ring's own stream, and this is the context's.
+            // Its handler refuses that origin, so the stream poisons rather than arriving here.
+            Ok(Submitted::Waiting { on: Wait::Virtqueue(_), .. }) => {
+                unreachable!(
+                    "a context stream's vkWaitVirtqueueSeqnoMESA is refused by its handler"
+                )
+            }
+        };
+        if !waiter.wait() {
+            return errno(renderer::Error::Poisoned);
+        }
+    }
 }
 
 /// A submission as the ABI describes it: a pointer and a length in *dwords*, not bytes.

@@ -15,6 +15,7 @@ use crate::ids::{
     BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
 };
 use crate::venus;
+use crate::venus::context::Submitted;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError};
 use std::collections::BTreeMap;
@@ -44,6 +45,8 @@ pub enum Error {
     RendererUnimplemented,
     /// The stream violated the protocol; its context is poisoned and accepts nothing further.
     Poisoned,
+    /// A submission waited on a ring that is not running in that context.
+    NoRing,
     /// Nothing is allocated under that id in that context.
     NoAllocation,
     /// The allocation exists but the driver would not map it; see [`MemoryError::NotMappable`].
@@ -81,6 +84,7 @@ fn export_error(e: venus::driver::ExportError) -> Error {
 fn venus_error(e: venus::vkr::Error) -> Error {
     match e {
         venus::vkr::Error::NoContext => Error::NoContext,
+        venus::vkr::Error::NoRing => Error::NoRing,
         venus::vkr::Error::Poisoned => Error::Poisoned,
     }
 }
@@ -95,6 +99,7 @@ impl std::fmt::Display for Error {
             Error::RendererAbsent => "this build was not initialized to serve that capset",
             Error::RendererUnimplemented => "no renderer serves that capset yet",
             Error::Poisoned => "the context is poisoned",
+            Error::NoRing => "no such running ring in that context",
             Error::NoAllocation => "no such allocation in that context",
             Error::NotMappable => "that allocation cannot be mapped for reading",
             Error::AlreadyExported => "that allocation is already published as a blob",
@@ -646,7 +651,12 @@ impl Renderer {
 
     /// Route a submission to the renderer the context bound. `Err` is a context that named no
     /// renderer we have, or a stream that poisoned the one it named.
-    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
+    ///
+    /// A submission does not always finish: a `vkWaitRingSeqnoMESA` in the stream suspends it,
+    /// and the answer says how much ran. The caller waits -- holding none of this renderer, which
+    /// is the whole reason the wait is not taken here -- and comes back with the remainder. See
+    /// [`Submitted`] and [`Renderer::ring_waiter`].
+    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<Submitted, Error> {
         let Some(c) = self.contexts.get(&ctx) else {
             return Err(Error::NoContext);
         };
@@ -655,6 +665,21 @@ impl Renderer {
             // vrend arrives in P3.
             _ => Err(Error::RendererUnimplemented),
         }
+    }
+
+    /// The wait a suspended submission named, ready to be waited on with nothing of this renderer
+    /// held. See [`Submitted::Waiting`].
+    pub fn ring_waiter(
+        &self,
+        ctx: CtxId,
+        ring: RingId,
+        seqno: u32,
+    ) -> Result<venus::ring_thread::RingWaiter, Error> {
+        self.venus
+            .as_ref()
+            .ok_or(Error::RendererAbsent)?
+            .ring_waiter(ctx, ring, seqno)
+            .map_err(venus_error)
     }
 
     /// The venus renderer, or the error a caller gets when this build has none.
@@ -668,7 +693,13 @@ impl Renderer {
 
     /// Feed one replay journal entry to a context's default stream.
     pub fn venus_replay_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
-        self.venus_mut()?.submit(ctx, buf).map_err(venus_error)
+        // A journal entry never suspends: `Context::submit_ring` and the replay path refuse a
+        // wait outright, because there is no thread on the other side of one during a replay.
+        match self.venus_mut()?.submit(ctx, buf).map_err(venus_error)? {
+            Submitted::Done => Ok(()),
+            Submitted::Poisoned => Err(Error::Poisoned),
+            Submitted::Waiting { .. } => Err(Error::Poisoned),
+        }
     }
 
     /// Feed one replay journal entry to a named ring's stream.
