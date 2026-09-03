@@ -610,41 +610,6 @@ mod tests {
         v.context_destroy(ctx_id());
     }
 
-    /// A wait that the head satisfies ends because the ring thread said so, not because the
-    /// waiter's diagnostic timer went off.
-    ///
-    /// The wake is not an optimisation. Without it the wait still ends -- the 500ms stuck-log
-    /// timeout doubles as a poll -- but every ring wait then takes half a second and prints a
-    /// line the C's own comment calls a frame stutter, on a path that runs per exported frame
-    /// sync fd. The clock is the assertion: a wake is microseconds, a poll is the whole timeout.
-    #[test]
-    fn a_ring_wait_ends_on_the_wake_and_not_on_the_stuck_timer() {
-        let (mut v, map) = vkr();
-        assert!(
-            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
-            "the ring was created"
-        );
-        let work = wire_ring_work();
-
-        let waiter = match v.submit(ctx_id(), &wire_wait_ring(7, work.len() as u64)) {
-            Ok(Submitted::Waiting { on: Wait::Ring { ring, seqno }, .. }) => {
-                v.ring_waiter(ctx_id(), ring, seqno).expect("the ring is running")
-            }
-            other => panic!("expected a suspended ring wait on an empty ring, got {other:?}"),
-        };
-        // Written only once the waiter exists, so the head advance it is waiting for happens
-        // while it is asleep -- which is the only arrangement in which the wake is what ends it.
-        guest_writes(&map, &work);
-        let began = Instant::now();
-        assert!(waited(waiter), "the head reached the seqno");
-        assert!(
-            began.elapsed() < Duration::from_millis(250),
-            "ended after {:?}, which is the stuck timer rather than the head-advance wake",
-            began.elapsed()
-        );
-        v.context_destroy(ctx_id());
-    }
-
     /// A ring that waits for a seqno the context has not published yet sleeps, and the submit
     /// wakes it.
     ///

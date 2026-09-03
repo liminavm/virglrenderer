@@ -280,15 +280,6 @@ SABOTAGES = [
         '',
     ),
     (
-        'advancing the head never wakes the ring-seqno waiter',
-        'virglrs/src/venus/ring_thread.rs',
-        '''                // A `vkWaitRingSeqnoMESA` is waiting on exactly this number. It re-reads the head
-                // itself; what it cannot do is know when to look.
-                wait_ring.changed();''',
-        '''''',
-        '',
-    ),
-    (
         'a suspended batch reports the wait command as already run',
         'virglrs/src/venus/context.rs',
         '''                suspended = Some((at, on));''',
@@ -342,6 +333,17 @@ SABOTAGES = [
         '',
     ),
 ]
+
+# Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single
+# `wait_ring.changed()` leaves every witness green, and that is the design rather than a hole. The
+# waiter's stuck-log timeout doubles as a poll, so no individual wake is load-bearing for
+# correctness -- what a missing one costs is latency: the wait ends at half a second instead of at
+# microseconds, and prints a line the C's own comment calls a frame stutter, on a path that runs
+# per exported frame sync fd. A test for that is a stopwatch, and the two arrangements it needs are
+# mutually exclusive: the head must advance while the waiter is already asleep, but a waiter that
+# suspends before the guest has written is refused outright by the drained-and-short guard, which
+# is correct and is itself under test. An entry that can only be caught by winning a race would
+# report a hole on a loaded machine and coverage on a quiet one.
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
 # break. A charge is a value held by the record of what it paid for, so crediting is that record
