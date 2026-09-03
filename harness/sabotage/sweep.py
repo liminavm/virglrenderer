@@ -421,6 +421,31 @@ SABOTAGES = [
         '',
     ),
     (
+        "a ring's shared memory is reachable by any context that guesses its handle",
+        'virglrs/src/renderer.rs',
+        """        if !res.attached.contains(&ctx) {
+            eprintln!(
+                "[virglrs] ctx {}: resource {handle:?} is not attached to this context",
+                ctx.get(),
+            );
+            return None;
+        }
+        if let Some(map) = res.shm() {
+            return Some(ResourceBytes::Host(Arc::clone(map)));
+        }""",
+        """        if let Some(map) = res.shm() {
+            return Some(ResourceBytes::Host(Arc::clone(map)));
+        }
+        if !res.attached.contains(&ctx) {
+            eprintln!(
+                "[virglrs] ctx {}: resource {handle:?} is not attached to this context",
+                ctx.get(),
+            );
+            return None;
+        }""",
+        'a_context_reaches_the_resources_the_guest_attached_to_it',
+    ),
+    (
         'the gate on what the guest attached to a context is dropped',
         'virglrs/src/renderer.rs',
         """        if !res.attached.contains(&ctx) {""",
