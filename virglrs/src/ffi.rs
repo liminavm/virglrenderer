@@ -883,14 +883,39 @@ pub extern "C" fn virgl_renderer_resource_get_iosurface_id(
     })
 }
 
+/// The frame a headless VMM presents, copied out of the surface it lives in.
+///
+/// The rows are the C's contract: `dst_stride` bytes apart, `height` of them, top-down. A caller
+/// asking for rows the surface does not have gets `EINVAL` and an untouched tail rather than a
+/// partly-written buffer reported as a frame -- the C copies `height` rows whatever the surface
+/// holds, reading past its allocation to do it.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_resource_read_iosurface(
-    _res_handle: u32,
-    _dst: *mut c_void,
-    _dst_stride: u32,
-    _height: u32,
+    res_handle: u32,
+    dst: *mut c_void,
+    dst_stride: u32,
+    height: u32,
 ) -> c_int {
-    EINVAL
+    let (Some(handle), false, 1..) = (ResourceHandle::new(res_handle), dst.is_null(), dst_stride)
+    else {
+        return EINVAL;
+    };
+    let Some(len) = (dst_stride as usize).checked_mul(height as usize) else {
+        return EINVAL;
+    };
+    // SAFETY: the C contract is that `dst` addresses `height` rows of `dst_stride` bytes, which
+    // is exactly `len`. Nothing else in this process holds a reference to the caller's buffer.
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst.cast::<u8>(), len) };
+    with(EINVAL, |r| match r.resource_read_iosurface(handle, dst, dst_stride as usize, height) {
+        Some(rows) if rows == height => 0,
+        other => {
+            eprintln!(
+                "[virglrs] read_iosurface: resource {res_handle} gave {other:?} of {height} rows \
+                 at {dst_stride} bytes",
+            );
+            EINVAL
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
