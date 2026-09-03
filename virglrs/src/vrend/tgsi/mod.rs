@@ -24,6 +24,45 @@ pub mod text;
 
 pub use info::{Opcode, OutputMode};
 
+/// Why a guest's shader text was refused: the parser said no, or the scan did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    Text(text::Error),
+    Scan(scan::Refusal),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Text(e) => write!(f, "{e}"),
+            Refusal::Scan(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// A program read from a guest's text and scanned: what the translator takes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Program {
+    pub shader: Shader,
+    pub info: scan::Info,
+}
+
+impl Program {
+    /// `tgsi_text_translate` with the C's allowance: the guest sizes its program at `num_tokens`
+    /// packed tokens and the C parses into ten more than that.
+    pub fn parse(text: &[u8], num_tokens: u32) -> Result<Shader, Refusal> {
+        text::parse(text, num_tokens.saturating_add(10)).map_err(Refusal::Text)
+    }
+
+    /// `tgsi_scan_shader`, the translator's first step.
+    pub fn scan(shader: Shader) -> Result<Program, Refusal> {
+        let info = scan::scan(&shader).map_err(Refusal::Scan)?;
+        Ok(Program { shader, info })
+    }
+}
+
 /// A macro for the named enumerations the wire spells out in text: each gets its C ordinal, its
 /// spelling, and a lookup by ordinal for the places the C indexes a name table.
 macro_rules! named {
