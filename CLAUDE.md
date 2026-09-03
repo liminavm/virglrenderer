@@ -11,8 +11,9 @@ We are not porting for fashion. The language is the point: it is meant to remove
 of the bugs this renderer has cost us. Every rule below is that reason, applied.
 
 **Keep `unsafe` minimal and wrapped.** Unsafe lives in named modules and nowhere else. They are:
-the Vulkan and GLES bindings (`vulkan.rs`, `venus/driver.rs`); the IOSurface and Metal bindings
-(`metal.rs`), which are the only Objective-C in the tree; the guest-memory
+the Vulkan bindings (`vulkan.rs`, `venus/driver.rs`); the EGL winsys and the GLES bindings
+(`vrend/egl.rs`, `vrend/gl.rs`, with the tables `gl-gen` generates into them); the IOSurface and
+Metal bindings (`metal.rs`), which are the only Objective-C in the tree; the guest-memory
 mapping (`guest_mem.rs`); the C shim (`ffi.rs`, `abi.rs`); and the venus wire decoder (`venus/cs.rs`), which owns
 the arena every decoded pointer points into. Every unsafe block carries a `SAFETY:` comment naming
 the invariant and who upholds it. The rest of the renderer is safe Rust, and an unsafe block
