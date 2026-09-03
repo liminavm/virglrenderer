@@ -1582,8 +1582,10 @@ impl Driver {
     pub(super) fn plant_scanout_allocation(&mut self, id: ObjectId, surface: Surface) {
         let size = surface.alloc_size();
         self.plant_allocation(id, size);
-        self.memory.get_mut(&id).expect("just planted").backing =
-            Backing::Scanout(Arc::new(surface));
+        let planted = self.memory.get_mut(&id).expect("just planted");
+        // The surface carries the charge; the record's own is for driver memory only.
+        let charge = planted.charge.take().expect("a test ledger has no cap");
+        planted.backing = Backing::Scanout(Arc::new(Minted { surface, charge }));
     }
 
     /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
@@ -2519,27 +2521,19 @@ impl Driver {
         }
 
         // What the bytes are decides both how they are freed and what they cost, so it is settled
-        // once, here, and read twice.
-        let backing = match (import, surface) {
-            (Some(_), _) => Backing::Imported,
-            (None, Some(s)) => Backing::Scanout(Arc::new(s)),
-            (None, None) => Backing::Driver,
-        };
-        // Charged before the driver is asked, so a refusal costs no host memory -- and credited
-        // by `charge` going out of scope if the driver then refuses. A scanout is charged at the
-        // surface's own extent, because the surface is the commitment; the allocation importing
-        // its pages commits nothing further. An import commits nothing at all.
-        let charge = match &backing {
-            Backing::Driver => Some(self.account.try_charge("device memory", size)),
-            Backing::Scanout(s) => Some(self.account.try_charge("IOSurface", s.alloc_size())),
-            Backing::Imported => None,
-        };
-        let charge = match charge.transpose() {
-            Ok(c) => c,
-            Err(refused) => {
-                self.account.report_refusal(refused);
-                return Err(NoMemory::OverBudget { stop: self.account.kills_context() });
+        // once, here. Charged before the driver is asked, so a refusal costs no host memory --
+        // and credited by the charge going out of scope if the driver then refuses. A scanout is
+        // charged at the surface's own extent, because the surface is the commitment, and the
+        // charge goes into the surface rather than beside it: the surface may outlive this
+        // allocation and this context, and the bytes are the host's for as long as it does. An
+        // import commits nothing at all.
+        let (backing, charge) = match (import, surface) {
+            (Some(_), _) => (Backing::Imported, None),
+            (None, Some(surface)) => {
+                let charge = self.admit("IOSurface", surface.alloc_size())?;
+                (Backing::Scanout(Arc::new(Minted { surface, charge })), None)
             }
+            (None, None) => (Backing::Driver, Some(self.admit("device memory", size)?)),
         };
 
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
@@ -2558,6 +2552,14 @@ impl Driver {
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
         self.memory.insert(id, Allocated { size, backing, props, exported: None, charge });
         Ok(out)
+    }
+
+    /// Take `size` bytes against the budget, or say why the allocation is refused.
+    fn admit(&self, what: &'static str, size: u64) -> Result<Charge, NoMemory> {
+        self.account.try_charge(what, size).map_err(|refused| {
+            self.account.report_refusal(refused);
+            NoMemory::OverBudget { stop: self.account.kills_context() }
+        })
     }
 
     /// The IOSurface an allocation is backed by, asked of the surface itself.
@@ -2616,7 +2618,7 @@ impl Driver {
     fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
         let record = self.memory.get(&id)?;
         match &record.backing {
-            Backing::Scanout(s) => Some((s.host_addr(), s.alloc_size())),
+            Backing::Scanout(m) => Some((m.surface.host_addr(), m.surface.alloc_size())),
             Backing::Driver => Some((record.exported?, record.size)),
             Backing::Imported => None,
         }
@@ -2925,9 +2927,12 @@ struct Allocated {
     /// `None` for an import, which costs nothing: its bytes are the exporter's, charged where
     /// they were made. The same rule as [`Allocated::censused`], for the same reason -- storage
     /// is accounted once, at whoever owns it.
-    #[expect(
-        dead_code,
-        reason = "held for its Drop -- crediting the ledger is this field going away"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "held for its Drop -- crediting the ledger is this field going away"
+        )
     )]
     charge: Option<Charge>,
 }
@@ -2948,7 +2953,7 @@ enum Backing {
     /// nothing to unmap, and dropping this record is what releases it. Reading goes through
     /// [`crate::metal::Surface::read_into`], because a surface read without its lock sees
     /// whatever the CPU's view last held rather than what the GPU wrote.
-    Scanout(Arc<Surface>),
+    Scanout(Arc<Minted>),
     /// Storage another context owns, which this allocation only aliases.
     ///
     /// A guest imports when one context has to reach what another rendered -- a compositor
@@ -2969,7 +2974,7 @@ impl Allocated {
     /// The surface behind it, for the one backing that has one.
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
-            Backing::Scanout(s) => Some(&**s),
+            Backing::Scanout(m) => Some(&m.surface),
             Backing::Driver | Backing::Imported => None,
         }
     }
@@ -2983,7 +2988,12 @@ impl Allocated {
     /// `None`, and the caller refuses rather than sharing something it cannot keep alive.
     fn shared(&self) -> Option<Storage> {
         match &self.backing {
-            Backing::Scanout(s) => Some(Storage::Texture(Arc::clone(s))),
+            Backing::Scanout(m) => {
+                // From here the surface may outlive this context, so its charge stops being
+                // this context's alone. See [`Charge::share`].
+                m.charge.share();
+                Some(Storage::Texture(Arc::clone(m)))
+            }
             Backing::Driver | Backing::Imported => None,
         }
     }
@@ -3056,7 +3066,27 @@ pub enum Storage {
     /// An IOSurface this renderer minted. The pages are the surface's, and the surface outlives
     /// every Vulkan object that ever imported them -- it depends on no device, no instance and no
     /// object table, so nothing cascades from holding one.
-    Texture(Arc<Surface>),
+    Texture(Arc<Minted>),
+}
+
+/// A surface this renderer minted, and what it cost -- one value, because they have one lifetime.
+///
+/// The charge lives here rather than on the allocation record so that it is credited when the
+/// *surface* goes, not when the allocation does. A resource holding a share keeps the surface
+/// alive past the context that made it, and those bytes are still the host's to count; a charge
+/// on the record would have been credited at the context's destroy while the memory stood.
+pub struct Minted {
+    surface: Surface,
+    charge: Charge,
+}
+
+impl Storage {
+    /// A share over a real surface, charged to `account`, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
+        let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
+        Storage::Texture(Arc::new(Minted { surface, charge }))
+    }
 }
 
 /// Two shares are the same share when they name the same storage -- not when they describe
@@ -3076,7 +3106,7 @@ impl Eq for Storage {}
 impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Storage::Texture(s) => f.debug_tuple("Texture").field(&s.id()).finish(),
+            Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface.id()).finish(),
         }
     }
 }
@@ -3085,21 +3115,21 @@ impl Storage {
     /// Where the bytes are and how far they run, as the one pair anything can act on.
     pub fn span(&self) -> (usize, u64) {
         match self {
-            Storage::Texture(s) => (s.host_addr(), s.alloc_size()),
+            Storage::Texture(m) => (m.surface.host_addr(), m.surface.alloc_size()),
         }
     }
 
     /// The surface's id, for the presentation path that publishes one.
     pub fn surface_id(&self) -> Option<SurfaceId> {
         match self {
-            Storage::Texture(s) => Some(s.id()),
+            Storage::Texture(m) => Some(m.surface.id()),
         }
     }
 
     /// Copy the presented pixels out, `stride` bytes per row, under the surface's own lock.
     pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> u32 {
         match self {
-            Storage::Texture(s) => s.read_rows(dst, stride, height),
+            Storage::Texture(m) => m.surface.read_rows(dst, stride, height),
         }
     }
 }
@@ -3502,6 +3532,35 @@ mod tests {
     /// are what the allocation is clamped against, and a length that could travel separately from
     /// its address is the pair this tree spells as one value.
     ///
+    /// The share a scanout lends carries the surface's charge with it, so the ledger counts the
+    /// surface for as long as anyone holds the share -- not for as long as the allocation that
+    /// minted it happens to stand.
+    #[test]
+    fn a_shared_surface_stays_charged_after_its_allocation_is_gone() {
+        use super::super::budget::Budget;
+        let budget = Budget::with_cap(None, false);
+        let one = crate::ids::CtxId::new(1).expect("not zero");
+        let mut d = Driver::new(Account::open(&budget, one));
+
+        let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
+        let extent = surface.alloc_size();
+        d.plant_scanout_allocation(ObjectId(66), surface);
+        assert_eq!(budget.live(), extent, "minted, and charged to the context that minted it");
+        assert_eq!(budget.live_for(one), extent);
+
+        let share =
+            d.memory.get(&ObjectId(66)).expect("planted").shared().expect("a scanout lends");
+        assert_eq!(budget.live_for(one), 0, "once shared, the context alone holds none of it");
+        assert_eq!(budget.live(), extent, "but the surface is as live as it was");
+
+        // The allocation goes -- a free, or the context's whole memory table at its destroy.
+        drop(d.memory.remove(&ObjectId(66)));
+        assert_eq!(budget.live(), extent, "the share is what keeps it counted now");
+
+        drop(share);
+        assert_eq!(budget.live(), 0, "and the last share going is what credits it");
+    }
+
     /// Three backings, three answers: a scanout has an address from the moment it is minted, a
     /// driver allocation has one only once it has been published, and an import has none of its
     /// own to lend.

@@ -1149,7 +1149,8 @@ mod tests {
 
         let surface = crate::metal::Surface::scanout(64, 8, crate::metal::PixelFormat::Bgra, 256)
             .expect("the system minted a surface");
-        let share = Storage::Texture(Arc::new(surface));
+        let account = crate::venus::budget::Account::for_test(None);
+        let share = Storage::minted_for_test(surface, &account);
 
         let mut table = BTreeMap::new();
         table.insert(
