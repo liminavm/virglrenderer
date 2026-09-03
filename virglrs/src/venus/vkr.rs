@@ -479,6 +479,21 @@ mod tests {
         buf
     }
 
+    /// Perform a ring-seqno wait on its own thread, and fail rather than hang if it never ends.
+    ///
+    /// The deadline is the assertion. Every guard these waits carry exists because its absence
+    /// produces a wait that never returns -- so a test calling `wait()` on this thread would wedge
+    /// the suite, and the sabotage sweep with it, instead of reporting the hole. A regression here
+    /// has to be a failure, and the only way for it to be one is for something to be counting.
+    fn waited(waiter: RingWaiter) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waiter.wait());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the wait never ended: the guard that should have refused it is gone")
+    }
+
     /// Wait for something a ring thread does, or fail rather than hang the suite.
     fn until(what: &str, mut pred: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -639,7 +654,7 @@ mod tests {
             }
             other => panic!("expected a suspended ring wait, got {other:?}"),
         };
-        assert!(!waiter.wait(), "the pair is refused, not waited through");
+        assert!(!waited(waiter), "the pair is refused, not waited through");
         v.context_destroy(ctx_id());
     }
 
@@ -665,7 +680,7 @@ mod tests {
             }
             other => panic!("expected a suspended ring wait, got {other:?}"),
         };
-        assert!(!waiter.wait(), "a seqno past the tail of a drained ring is refused");
+        assert!(!waited(waiter), "a seqno past the tail of a drained ring is refused");
         v.context_destroy(ctx_id());
     }
 
@@ -697,7 +712,7 @@ mod tests {
             }
             other => panic!("expected a ring wait, got {other:?}"),
         };
-        assert!(waiter.wait(), "the head reached the seqno and the wait ended");
+        assert!(waited(waiter), "the head reached the seqno and the wait ended");
         v.context_destroy(ctx_id());
     }
 

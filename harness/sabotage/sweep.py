@@ -17,10 +17,14 @@ has been refactored away fails loudly instead of quietly testing nothing -- a sw
 `RED` for an edit it never made is worse than no sweep.
 """
 
+import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 RS = ROOT / 'virglrs'
@@ -345,8 +349,26 @@ SABOTAGES = [
 # that cannot be written because the bug cannot be written is the design working.
 
 
-def run(cmd, cwd=RS):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+def run(cmd, cwd=RS, timeout=None):
+    """Run a command, killing the whole process group if it outstays `timeout`.
+
+    The group, not the child: `cargo test` spawns the test binary, and a sabotage that deadlocks
+    leaves that binary wedged forever. Killing only cargo would orphan it, and the next run would
+    contend with a process holding the same shared memory.
+
+    A timeout is reported, never raised. It is a legitimate verdict here -- see `main`.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        proc.communicate()
+        return SimpleNamespace(returncode=124, stdout='', stderr='', timed_out=True)
+    return SimpleNamespace(returncode=proc.returncode, stdout=out, stderr=err, timed_out=False)
 
 
 def main():
@@ -359,9 +381,13 @@ def main():
     if dirty:
         sys.exit('the tree has uncommitted changes; sweep would restore over them:\n' + dirty)
 
+    started = time.monotonic()
     baseline = run(['cargo', 'test'])
     if baseline.returncode != 0:
         sys.exit('the tests do not pass before any sabotage; fix that first')
+    # Derived from the clean run rather than fixed, so a slow machine is not called a hang and a
+    # fast one still catches a wedge quickly. The floor covers a rebuild after each edit.
+    budget = max(180.0, (time.monotonic() - started) * 8)
 
     holes = []
     for name, rel, old, new, filt in chosen:
@@ -370,9 +396,17 @@ def main():
         assert old in original, 'sabotage %r no longer matches %s' % (name, rel)
         path.write_text(original.replace(old, new, 1))
         try:
-            r = run(['cargo', 'test'] + ([filt] if filt else []))
+            r = run(['cargo', 'test'] + ([filt] if filt else []), timeout=budget)
         finally:
             path.write_text(original)
+        if r.timed_out:
+            # Caught, and in the loudest way there is. Several of these sabotages delete a
+            # deadlock guard, and a missing deadlock guard does not produce a wrong answer -- it
+            # produces a wait that never ends. A sweep with no clock of its own hangs here rather
+            # than reporting it, which is the instrument failing at exactly the cases it was
+            # extended to cover.
+            print('RED       %-58s the suite hung: nothing on that path ends on its own' % name)
+            continue
         if r.returncode == 0:
             holes.append(name)
             print('SURVIVED  %s' % name)
