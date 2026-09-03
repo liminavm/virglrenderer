@@ -346,7 +346,11 @@ buildable throughout as the A-side reference.
   `vkSubmitVirtqueueSeqnoMESA`, `vkWaitVirtqueueSeqnoMESA` and `vkWaitRingSeqnoMESA`.
   None of the five is reachable by replay (`harness/README.md`), which is why the seated
   boot is a gate and not a formality: a build missing all five scores every corpus clean
-  while the compositor dies before it presents a frame. They are a design task —
+  and puts nothing on the screen. What the compositor does varies — it has both exited
+  at startup and stayed running with every systemd field healthy — and neither presents
+  a frame, so the state of the process is not the measurement. The frame is
+  (`harness/vm/frame.py`); the C leg on the same guest shows a wallpaper, a top bar and
+  a clock. They are a design task —
   `vkExecuteCommandStreamsMESA` swaps the decoder onto a resource-backed stream, and the
   seqno waits are what a ring blocks on — not a port-by-rote.
 
