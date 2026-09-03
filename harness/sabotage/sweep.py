@@ -580,7 +580,8 @@ SABOTAGES = [
         """                hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
                        'let Some(a) = dec.alloc_temp_array::<u8>(n) else { return };',
                        '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]""",
-        """                hit = ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]""",
+        """                hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
+                       '%s = %s;' % (m, null)]""",
         'an_out_blob_is_room',
     ),
     (
