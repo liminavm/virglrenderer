@@ -1919,6 +1919,31 @@ impl Driver {
         Some(())
     }
 
+    /// The mirror of [`Self::cmd_copy_buffer_to_image`]: the image is the source, so it is the
+    /// image that carries the layout and the buffer that does not.
+    pub fn cmd_copy_image_to_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        src: VkImage,
+        layout: VkImageLayout,
+        dst: VkBuffer,
+        regions: &[VkBufferImageCopy],
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe {
+            (d.vkCmdCopyImageToBuffer())(
+                cb,
+                src,
+                layout,
+                dst,
+                regions.len() as u32,
+                regions.as_ptr(),
+            )
+        };
+        Some(())
+    }
+
     // Vulkan's own signature: the two images each carry a layout, and the filter is a
     // parameter of the blit rather than of a region.
     #[allow(clippy::too_many_arguments)]
