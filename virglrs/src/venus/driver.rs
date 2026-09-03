@@ -939,6 +939,52 @@ impl Driver {
     ///
     /// `VK_INCOMPLETE` is the driver having more than the guest asked for. That is the guest's
     /// business rather than an error: it sized the array and it gets what fits.
+    /// A pipeline cache's serialised contents, in Vulkan's count-then-fill shape -- but counted
+    /// in bytes, with a `size_t` where the enumerations have a `u32`, and on the device table.
+    ///
+    /// The guest saves this to disk between runs, so it is asked a few seconds after every new
+    /// pipeline, on every client that has a cache at all.
+    pub fn pipeline_cache_data(
+        &self,
+        device: VkDevice,
+        cache: VkPipelineCache,
+        out: Option<&mut [u8]>,
+    ) -> Result<(usize, VkResult), VkResult> {
+        let f = self
+            .devices
+            .get(&device)
+            .and_then(|d| d.fns.try_vkGetPipelineCacheData())
+            .ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED)?;
+        let (mut n, room, data) = match out {
+            Some(s) => (s.len(), Some(s.len()), s.as_mut_ptr().cast::<core::ffi::c_void>()),
+            None => (0, None, core::ptr::null_mut()),
+        };
+        // SAFETY: a device and a cache this context made, and `n` is initialised to the length of
+        // the buffer `data` points at -- the pair the caller handed us as one slice.
+        let r = unsafe { f(device, cache, &mut n, data) };
+        if let Some(room) = room {
+            assert!(n <= room, "the driver wrote more cache data than the room it was given");
+        }
+        Ok((n, r))
+    }
+
+    /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
+    /// driver's, and the count Vulkan is given is the slice's own length.
+    pub fn merge_pipeline_caches(
+        &self,
+        device: VkDevice,
+        dst: VkPipelineCache,
+        srcs: &[VkPipelineCache],
+    ) -> Result<VkResult, VkResult> {
+        let f = self
+            .devices
+            .get(&device)
+            .and_then(|d| d.fns.try_vkMergePipelineCaches())
+            .ok_or(VkResult::VK_ERROR_INITIALIZATION_FAILED)?;
+        // SAFETY: handles this context made, and the count is the slice's own length.
+        Ok(unsafe { f(device, dst, srcs.len() as u32, srcs.as_ptr()) })
+    }
+
     pub fn enumerate_into<H, T, R>(
         &self,
         h: H,
