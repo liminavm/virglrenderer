@@ -282,8 +282,8 @@ SABOTAGES = [
     (
         'a suspended batch reports the wait command as already run',
         'virglrs/src/venus/context.rs',
-        '''                suspended = Some((at, on));''',
-        '''                suspended = Some((dec.pos(), on));''',
+        '''            suspended = Some((at, on));''',
+        '''            suspended = Some((dec.pos(), on));''',
         '',
     ),
     (
@@ -330,6 +330,83 @@ SABOTAGES = [
             return;
         };''',
         '''        let id = self.current_ring.unwrap_or(RingId(7));''',
+        '',
+    ),
+    (
+        'an executed stream is not bounds-checked against the resource holding it',
+        'virglrs/src/venus/context.rs',
+        """        let end = s.offset.checked_add(s.size);
+        if end.is_none_or(|end| end > map.len()) {""",
+        """        let end = s.offset.checked_add(s.size);
+        if false {""",
+        '',
+    ),
+    (
+        'an executed stream may execute streams of its own, as deep as the guest likes',
+        'virglrs/src/venus/context.rs',
+        """            if depth > 0 {
+                poison(
+                    fatal,
+                    id,
+                    &dec,
+                    cmd,
+                    "executes command streams from inside a command stream it is already executing",
+                );
+                break;
+            }""",
+        """""",
+        '',
+    ),
+    (
+        'a per-stream reply position is ignored',
+        'virglrs/src/venus/context.rs',
+        """        if let Some(&pos) = exec.reply_positions.as_ref().map(|p| &p[i]) {""",
+        """        if let Some(&pos) = None::<&usize> {""",
+        '',
+    ),
+    (
+        'a reply position outside the window is clamped rather than refused',
+        'virglrs/src/venus/context.rs',
+        """            if !stream.seek(pos) {""",
+        """            let pos = pos.min(stream.window().size());
+            if !stream.seek(pos) {""",
+        '',
+    ),
+    (
+        'an empty stream skips before its reply position is honoured',
+        'virglrs/src/venus/context.rs',
+        """        if let Some(&pos) = exec.reply_positions.as_ref().map(|p| &p[i]) {""",
+        """        if s.size == 0 {
+            continue;
+        }
+        if let Some(&pos) = exec.reply_positions.as_ref().map(|p| &p[i]) {""",
+        '',
+    ),
+    (
+        'reply positions are accepted with no window for them to be positions in',
+        'virglrs/src/venus/context.rs',
+        """            Some(_) if self.reply.is_none() => {
+                self.reject =
+                    Some("executed command streams with reply positions and no reply stream");
+                return;
+            }""",
+        """""",
+        '',
+    ),
+    (
+        'a transport wait inside an executed stream suspends a batch it cannot resume',
+        'virglrs/src/venus/context.rs',
+        """            if depth > 0 {
+                poison(
+                    fatal,
+                    id,
+                    &dec,
+                    cmd,
+                    "suspends the batch, and a command stream being executed has nowhere to suspend to",
+                );
+                break;
+            }""",
+        """""",
         '',
     ),
 ]
