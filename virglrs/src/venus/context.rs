@@ -762,6 +762,14 @@ fn run_batch(
             break;
         }
 
+        // Poisoned from outside while the command ran -- a ring thread stopping this context.
+        // The command itself was served, and its answer must not go over: a reply from a
+        // context that has stopped is one the guest would act on.
+        if fatal.load(Ordering::Acquire) {
+            poison(id, &dec, cmd, "ran while the context was being poisoned elsewhere");
+            break;
+        }
+
         // The handler could not proceed and asked to be tried again later. Nothing is
         // committed: not the position, so the command decodes again from the same byte, and
         // not the answer, which would otherwise report a wait as finished before it was. The
@@ -1104,6 +1112,30 @@ impl Handlers<'_> {
     /// a ring over it would cost the guest everything to punish a request that asked for nothing.
     fn array_or_empty<'w, T>(&mut self, a: Option<&'w [T]>) -> &'w [T] {
         a.unwrap_or_default()
+    }
+
+    /// The verdict on a query command that names queries by index. Every refusal is the guest
+    /// naming what it does not have -- a pool with no record, queries past the pool, results
+    /// past the room -- or a device this table cannot reach, and none of them reached the
+    /// driver, which would have trusted the index.
+    fn queried<R>(&mut self, r: Result<R, driver::QueryRefused>) -> Option<R> {
+        use driver::QueryRefused as Q;
+        match r {
+            Ok(r) => Some(r),
+            Err(why) => {
+                self.reject = Some(match why {
+                    Q::NoDevice => "named a query pool on a device with no table here",
+                    Q::NoHostReset => {
+                        "reset a query pool from the host on a device that exports no reset"
+                    }
+                    Q::UnknownPool => "named a query pool this renderer has no record of",
+                    Q::OutOfPool => "named queries past the end of the pool",
+                    Q::OutOfRoom => "asked for query results past the room it offered",
+                    Q::Unsized => "read results of a query kind this renderer cannot size",
+                });
+                None
+            }
+        }
     }
 
     /// The verdict on a free, for both frees. A run that was not the pool's is the guest naming
@@ -1633,10 +1665,8 @@ impl Commands for Handlers<'_> {
         }
     }
 
-    /// Not [`simple_create`]: the pool is recorded, because a read-back is measured against it
-    /// -- see [`Driver::query_pool_results`]. A query type this renderer cannot size is refused
-    /// as a feature this device does not have, which is what it is: every such type comes with
-    /// an extension this build does not offer.
+    /// Not [`simple_create`]: the pool is recorded, because every command naming its queries is
+    /// measured against it -- see [`driver::QueryRefused`].
     fn vkCreateQueryPool(&mut self, args: &mut vn_command_vkCreateQueryPool<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
         let host = self.driver.create_query_pool(args.device, info, args.pAllocator);
@@ -1662,9 +1692,7 @@ impl Commands for Handlers<'_> {
             args.firstQuery,
             args.queryCount,
         );
-        if done.is_none() {
-            self.reject = Some("reset a query pool from the host on a device that cannot");
-        }
+        self.queried(done);
     }
 
     /// The read-back. `pData` is room the guest offered, `dataSize` bytes of it, and the reply
@@ -1677,18 +1705,15 @@ impl Commands for Handlers<'_> {
         let (first, count, stride, flags) =
             (args.firstQuery, args.queryCount, args.stride, args.flags);
         let Some(out) = self.array(args.pData_mut()) else { return };
-        match self.driver.query_pool_results(device, pool, first, count, out, stride, flags) {
-            Ok(ret) => args.ret = ret,
-            Err(driver::QueryRefused::NoDevice) => {
-                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
-            }
-            Err(driver::QueryRefused::UnknownPool) => {
-                self.reject = Some("read a query pool this renderer has no record of");
-            }
-            Err(driver::QueryRefused::OutOfRoom) => {
-                self.reject =
-                    Some("asked for query results past the pool, or past the room it offered");
-            }
+        let read = self.driver.query_pool_results(device, pool, first, count, out, stride, flags);
+        // The one query command with a result, so a device with no table here is answered the
+        // way every other device call answers it, rather than refused.
+        if read == Err(driver::QueryRefused::NoDevice) {
+            args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+            return;
+        }
+        if let Some(ret) = self.queried(read) {
+            args.ret = ret;
         }
     }
 
@@ -3431,12 +3456,12 @@ impl Commands for Handlers<'_> {
     fn vkCmdBeginQuery(&mut self, args: &mut vn_command_vkCmdBeginQuery<'_>) {
         let done =
             self.driver.cmd_begin_query(args.commandBuffer, args.queryPool, args.query, args.flags);
-        self.recorded(done);
+        self.queried(done);
     }
 
     fn vkCmdEndQuery(&mut self, args: &mut vn_command_vkCmdEndQuery<'_>) {
         let done = self.driver.cmd_end_query(args.commandBuffer, args.queryPool, args.query);
-        self.recorded(done);
+        self.queried(done);
     }
 
     fn vkCmdResetQueryPool(&mut self, args: &mut vn_command_vkCmdResetQueryPool<'_>) {
@@ -3446,7 +3471,7 @@ impl Commands for Handlers<'_> {
             args.firstQuery,
             args.queryCount,
         );
-        self.recorded(done);
+        self.queried(done);
     }
 
     fn vkCmdWriteTimestamp(&mut self, args: &mut vn_command_vkCmdWriteTimestamp<'_>) {
@@ -3456,7 +3481,7 @@ impl Commands for Handlers<'_> {
             args.queryPool,
             args.query,
         );
-        self.recorded(done);
+        self.queried(done);
     }
 
     fn vkCmdCopyQueryPoolResults(&mut self, args: &mut vn_command_vkCmdCopyQueryPoolResults<'_>) {
@@ -3470,7 +3495,7 @@ impl Commands for Handlers<'_> {
             args.stride,
             args.flags,
         );
-        self.recorded(done);
+        self.queried(done);
     }
 
     // --------------------------------------------------------------------------- sync
@@ -9616,16 +9641,19 @@ mod tests {
         }
     }
 
-    /// A query read-back is served through the record its create left, and refused without it.
+    /// The query commands are served through the record their create left, and refused without
+    /// it.
     ///
     /// The driver's bounds check is [`super::driver::tests`]'s to pin; this is the handler's
-    /// wiring around it: the pool the guest creates is the pool the read is measured against,
-    /// the driver's own answer is what goes back, a read past the room is a refusal rather than
-    /// a driver call, and a destroyed pool's record goes with it.
+    /// wiring around it: the pool the guest creates is the pool every query command is measured
+    /// against, each hands the driver the guest's own arguments in the guest's own order, the
+    /// driver's answer is what goes back, a query past the pool or a read past the room is a
+    /// refusal rather than a driver call, and a destroyed pool's record goes with it.
     #[test]
     fn query_results_are_read_through_the_pool_the_guest_created() {
         use super::super::proto::types::{
-            VkAllocationCallbacks, VkDeviceSize, VkQueryPool, VkQueryPoolCreateInfo,
+            VkAllocationCallbacks, VkBuffer, VkCommandBuffer, VkCommandPool, VkDeviceSize,
+            VkPipelineStageFlagBits, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
             VkQueryResultFlags, VkQueryType,
         };
         use std::cell::RefCell;
@@ -9633,9 +9661,57 @@ mod tests {
         const DEVICE: u64 = 3;
         const POOL: u64 = 40;
         const HOST_POOL: VkQueryPool = VkQueryPool(0x50);
+        const CB: VkCommandBuffer = VkCommandBuffer(0x30);
 
         thread_local! {
             static READS: RefCell<u32> = const { RefCell::new(0) };
+            static SAW: RefCell<Vec<(&'static str, u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
+        }
+        fn saw(what: &'static str, a: u64, b: u64, c: u64) {
+            SAW.with_borrow_mut(|s| s.push((what, a, b, c)));
+        }
+        unsafe extern "C" fn reset(_d: VkDevice, _p: VkQueryPool, first: u32, count: u32) {
+            saw("reset", first.into(), count.into(), 0);
+        }
+        unsafe extern "C" fn begin(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            query: u32,
+            flags: VkQueryControlFlags,
+        ) {
+            saw("begin", query.into(), flags.0.into(), 0);
+        }
+        unsafe extern "C" fn end(_cb: VkCommandBuffer, _p: VkQueryPool, query: u32) {
+            saw("end", query.into(), 0, 0);
+        }
+        unsafe extern "C" fn cmd_reset(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            first: u32,
+            count: u32,
+        ) {
+            saw("cmd_reset", first.into(), count.into(), 0);
+        }
+        unsafe extern "C" fn timestamp(
+            _cb: VkCommandBuffer,
+            stage: VkPipelineStageFlagBits,
+            _p: VkQueryPool,
+            query: u32,
+        ) {
+            saw("timestamp", stage.0 as u64, query.into(), 0);
+        }
+        unsafe extern "C" fn copy(
+            _cb: VkCommandBuffer,
+            _p: VkQueryPool,
+            first: u32,
+            count: u32,
+            buffer: VkBuffer,
+            offset: VkDeviceSize,
+            stride: VkDeviceSize,
+            flags: VkQueryResultFlags,
+        ) {
+            saw("copy", first.into(), count.into(), buffer.0);
+            saw("copy'", offset.0, stride.0, flags.0.into());
         }
         unsafe extern "C" fn create(
             _d: VkDevice,
@@ -9677,6 +9753,12 @@ mod tests {
         fns.plant_vkCreateQueryPool(create);
         fns.plant_vkDestroyQueryPool(destroy);
         fns.plant_vkGetQueryPoolResults(results);
+        fns.plant_vkResetQueryPool(reset);
+        fns.plant_vkCmdBeginQuery(begin);
+        fns.plant_vkCmdEndQuery(end);
+        fns.plant_vkCmdResetQueryPool(cmd_reset);
+        fns.plant_vkCmdWriteTimestamp(timestamp);
+        fns.plant_vkCmdCopyQueryPoolResults(copy);
 
         let objects = Shared::new();
         objects
@@ -9685,6 +9767,7 @@ mod tests {
             .unwrap();
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(VkDevice(DEVICE), VkCommandPool(0x20), &[(CB, ObjectId(9))]);
         let mut todo = Unimplemented::default();
         let global = crate::vulkan::global();
         let mut rings = BTreeMap::new();
@@ -9753,6 +9836,131 @@ mod tests {
         assert!(h.reject.take().is_some(), "a read past the room is a refusal");
         assert_eq!(short, [0xff; 7], "and nothing was written");
         READS.with_borrow(|n| assert_eq!(*n, 1, "only the read that fit reached the driver"));
+
+        // The other seven, each with distinct values in every interchangeable-looking slot, so
+        // a handler that swapped two of them would be seen. All within the pool's two queries.
+        let mut args = vn_command_vkResetQueryPool {
+            device,
+            queryPool: HOST_POOL,
+            firstQuery: 1,
+            queryCount: 1,
+            ..Default::default()
+        };
+        h.vkResetQueryPool(&mut args);
+        let mut args = vn_command_vkCmdBeginQuery {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: 1,
+            flags: VkQueryControlFlags(0x1),
+            ..Default::default()
+        };
+        h.vkCmdBeginQuery(&mut args);
+        let mut args = vn_command_vkCmdEndQuery {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: 1,
+            ..Default::default()
+        };
+        h.vkCmdEndQuery(&mut args);
+        let mut args = vn_command_vkCmdResetQueryPool {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            firstQuery: 0,
+            queryCount: 2,
+            ..Default::default()
+        };
+        h.vkCmdResetQueryPool(&mut args);
+        let mut args = vn_command_vkCmdWriteTimestamp {
+            commandBuffer: CB,
+            pipelineStage: VkPipelineStageFlagBits(0x400),
+            queryPool: HOST_POOL,
+            query: 1,
+            ..Default::default()
+        };
+        h.vkCmdWriteTimestamp(&mut args);
+        let mut args = vn_command_vkCmdCopyQueryPoolResults {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            firstQuery: 1,
+            queryCount: 1,
+            dstBuffer: VkBuffer(0x60),
+            dstOffset: VkDeviceSize(0x70),
+            stride: VkDeviceSize(0x80),
+            flags: VkQueryResultFlags(0x1),
+            ..Default::default()
+        };
+        h.vkCmdCopyQueryPoolResults(&mut args);
+        assert!(h.reject.is_none(), "every one of them was within the pool");
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.as_slice(),
+                [
+                    ("reset", 1, 1, 0),
+                    ("begin", 1, 0x1, 0),
+                    ("end", 1, 0, 0),
+                    ("cmd_reset", 0, 2, 0),
+                    ("timestamp", 0x400, 1, 0),
+                    ("copy", 1, 1, 0x60),
+                    ("copy'", 0x70, 0x80, 0x1),
+                ],
+                "the guest's own arguments, in the guest's own order"
+            );
+        });
+        SAW.with_borrow_mut(Vec::clear);
+
+        // And each of them, one query past the pool: refused, and the driver never sees it.
+        let mut args = vn_command_vkResetQueryPool {
+            device,
+            queryPool: HOST_POOL,
+            firstQuery: 0,
+            queryCount: 0x7fff_ffff,
+            ..Default::default()
+        };
+        h.vkResetQueryPool(&mut args);
+        assert!(h.reject.take().is_some(), "a host-side reset past the pool is a heap scribble");
+        let mut args = vn_command_vkCmdBeginQuery {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: 2,
+            ..Default::default()
+        };
+        h.vkCmdBeginQuery(&mut args);
+        assert!(h.reject.take().is_some());
+        let mut args = vn_command_vkCmdEndQuery {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: u32::MAX,
+            ..Default::default()
+        };
+        h.vkCmdEndQuery(&mut args);
+        assert!(h.reject.take().is_some());
+        let mut args = vn_command_vkCmdResetQueryPool {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            firstQuery: 1,
+            queryCount: 2,
+            ..Default::default()
+        };
+        h.vkCmdResetQueryPool(&mut args);
+        assert!(h.reject.take().is_some());
+        let mut args = vn_command_vkCmdWriteTimestamp {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            query: 2,
+            ..Default::default()
+        };
+        h.vkCmdWriteTimestamp(&mut args);
+        assert!(h.reject.take().is_some());
+        let mut args = vn_command_vkCmdCopyQueryPoolResults {
+            commandBuffer: CB,
+            queryPool: HOST_POOL,
+            firstQuery: 2,
+            queryCount: 1,
+            ..Default::default()
+        };
+        h.vkCmdCopyQueryPoolResults(&mut args);
+        assert!(h.reject.take().is_some());
+        SAW.with_borrow(|s| assert!(s.is_empty(), "no refusal reached the driver"));
 
         // Destroyed, the pool's record goes with it, and a read of it is a refusal too.
         let mut args =
