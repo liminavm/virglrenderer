@@ -557,7 +557,11 @@ impl Context {
     ///
     /// Here for the reason [`Self::memory_read`] gives: the table owns the handle and the device,
     /// the driver owns the size and the mapping, and neither holds a copy of the other's answer.
-    pub fn memory_export(&mut self, id: ObjectId, blob_size: u64) -> Result<Exported, ExportError> {
+    pub fn memory_export(
+        &mut self,
+        id: ObjectId,
+        blob_size: u64,
+    ) -> Result<(Exported, Option<driver::Storage>), ExportError> {
         let (handle, device) = {
             let objects = self.objects.borrow();
             let handle = objects
@@ -2608,7 +2612,7 @@ impl Commands for Handlers<'_> {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
-        let Some(_) = self.driver.span(&bytes) else {
+        let Some(span) = self.driver.span(&bytes) else {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
@@ -2628,6 +2632,10 @@ impl Commands for Handlers<'_> {
         {
             size.allocationSize = match &bytes {
                 ResourceBytes::Host(map) => map.len() as u64,
+                // The span the import will alias, reported as the size the guest may allocate
+                // over it -- literally the same number, so the query cannot promise an extent
+                // the allocation then clamps away.
+                ResourceBytes::Shared(_) => span.1,
                 ResourceBytes::Allocation(published) => published.size,
             };
         }

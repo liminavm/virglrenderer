@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::cs::ObjectId;
+use super::driver::Storage;
 use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
 use crate::ids::{CtxId, ResourceHandle};
@@ -240,10 +241,12 @@ pub trait ShmResources {
     /// The guest reads the first and hands what it says straight to the second, so a resource
     /// only one of them can resolve is a guest told to bind memory the host then refuses.
     ///
-    /// `ctx` is not a formality for the allocation arm. A resource id is a *guest* id, unique
-    /// only within the context that chose it, so an export belonging to another context would
-    /// resolve to whatever this context happens to have filed under the same number. Answering
-    /// only for the caller's own exports is what makes the id mean something.
+    /// `ctx` says which context is asking, and the answer is bounded by what the guest kernel
+    /// attached to it -- not by which context created the resource. Resource ids are device-wide,
+    /// and a compositor reaching a client's buffer is the ordinary case, not an error.
+    ///
+    /// The remaining allocation arm is still answered only for its own context, because what it
+    /// carries *is* a name in that context's table.
     ///
     /// The default answers only the mapping arm: a table with no exports in it has nothing to say
     /// about allocations, and every test stub is one of those.
@@ -261,6 +264,10 @@ pub trait ShmResources {
 pub enum ResourceBytes {
     /// Pages the renderer holds a mapping of.
     Host(Arc<GuestMap>),
+    /// Storage a published allocation handed the resource a share of, which the resource keeps
+    /// alive for as long as it holds it. Resolvable by any context the guest attached it to,
+    /// because a share is not a name in anybody's table.
+    Shared(Storage),
     /// Device memory a context allocated and then published as a resource.
     Allocation(Published),
 }
