@@ -247,6 +247,96 @@ SABOTAGES = [
 }''',
         '',
     ),
+    (
+        'a ring blocks on a virtqueue seqno without telling the waiter',
+        'virglrs/src/venus/ring_thread.rs',
+        '''    state.blocked_on_vq = Some(seqno);''',
+        '''    state.blocked_on_vq = None;''',
+        '',
+    ),
+    (
+        'a ring wait sleeps without ever checking whether it is the only thing that could end it',
+        'virglrs/src/venus/ring_thread.rs',
+        '''            if let Some(want) = self.park.stalled_on() {''',
+        '''            if let Some(want) = None::<u64> {''',
+        '',
+    ),
+    (
+        'a stalled ring is judged on two values that were never true together',
+        'virglrs/src/venus/ring_thread.rs',
+        '''        state.blocked_on_vq.filter(|&want| state.vq_seqno < want)''',
+        '''        state.blocked_on_vq''',
+        '',
+    ),
+    (
+        'a ring wait past everything the guest wrote is waited through',
+        'virglrs/src/venus/ring_thread.rs',
+        '''            if head == tail && !seqno_ge(tail, self.seqno) {''',
+        '''            if false {''',
+        '',
+    ),
+    (
+        'advancing the head never wakes the ring-seqno waiter',
+        'virglrs/src/venus/ring_thread.rs',
+        '''                // A `vkWaitRingSeqnoMESA` is waiting on exactly this number. It re-reads the head
+                // itself; what it cannot do is know when to look.
+                wait_ring.changed();''',
+        '''''',
+        '',
+    ),
+    (
+        'a suspended batch reports the wait command as already run',
+        'virglrs/src/venus/context.rs',
+        '''                suspended = Some((at, on));''',
+        '''                suspended = Some((dec.pos(), on));''',
+        '',
+    ),
+    (
+        'a virtqueue wait suspends even when the seqno is already published',
+        'virglrs/src/venus/context.rs',
+        '''        if published < args.seqno {
+            self.wait = Some(Wait::Virtqueue(args.seqno));
+        }''',
+        '''        let _ = published;
+        self.wait = Some(Wait::Virtqueue(args.seqno));''',
+        '',
+    ),
+    (
+        'a ring seqno wider than a ring position is truncated instead of refused',
+        'virglrs/src/venus/context.rs',
+        '''        let Ok(seqno) = u32::try_from(args.seqno) else {
+            self.reject = Some("waited on a ring seqno too large to be a position in a ring");
+            return;
+        };''',
+        '''        let seqno = args.seqno as u32;''',
+        '',
+    ),
+    (
+        'a ring extra write reaches past the extra region',
+        'virglrs/src/venus/ring.rs',
+        '''        if end > self.extra.begin() + self.extra.size() {
+            return false;
+        }''',
+        '''''',
+        '',
+    ),
+    (
+        'a virtqueue seqno submitted before the ring started is dropped',
+        'virglrs/src/venus/ring_thread.rs',
+        '''        state: Mutex::new(ParkState { vq_seqno: ring.virtqueue_seqno, ..ParkState::default() }),''',
+        '''        state: Mutex::new(ParkState::default()),''',
+        '',
+    ),
+    (
+        'a transport command is served on whichever stream it arrives on',
+        'virglrs/src/venus/context.rs',
+        '''        let Some(id) = self.current_ring else {
+            self.reject = Some("waited on a virtqueue seqno from the context's own stream");
+            return;
+        };''',
+        '''        let id = self.current_ring.unwrap_or(RingId(7));''',
+        '',
+    ),
 ]
 
 # Not here, and deliberately: "a free forgets to credit the ledger". There is no such line to
