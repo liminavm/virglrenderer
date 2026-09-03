@@ -32,13 +32,13 @@ use super::proto::types::{
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
     vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
-    vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer,
-    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor,
-    vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
     vn_command_vkCreateSampler, vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule,
     vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
@@ -2651,6 +2651,18 @@ impl Commands for Handlers<'_> {
             args.srcBuffer,
             args.dstImage,
             args.dstImageLayout,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyImageToBuffer(&mut self, args: &mut vn_command_vkCmdCopyImageToBuffer<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_copy_image_to_buffer(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstBuffer,
             regions,
         );
         self.recorded(done);
@@ -8764,6 +8776,99 @@ mod tests {
     ///
     /// Two shapes beyond the recording four: two arrays under two independent counts, cleared as
     /// a product rather than a pair; and a blob whose length is its own `size` member.
+    /// The two directions of an image/buffer copy take the same five values in a different order,
+    /// and the layout belongs to whichever side is the image. A handler that mirrors its sibling
+    /// too faithfully attaches the layout to the buffer -- which still compiles, because a layout
+    /// is a layout -- so this asserts each value arrives where it belongs and as itself.
+    ///
+    /// Absent from three of the four corpora and present once in the fourth, which is what a
+    /// live desktop asked for and this build refused.
+    #[test]
+    fn copying_an_image_to_a_buffer_hands_the_layout_to_the_image() {
+        use super::super::proto::types::{
+            VkBuffer, VkBufferImageCopy, VkCommandBuffer, VkCommandPool, VkDevice, VkImage,
+            VkImageLayout, vn_command_vkCmdCopyImageToBuffer,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        thread_local! {
+            static SAW: RefCell<Vec<(u64, i32, u64, u32)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn copy(
+            _cb: VkCommandBuffer,
+            src: VkImage,
+            layout: VkImageLayout,
+            dst: VkBuffer,
+            count: u32,
+            p: *const VkBufferImageCopy,
+        ) {
+            // SAFETY: the wrapper passes a slice's own pointer and its own length.
+            let regions = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            SAW.with_borrow_mut(|s| {
+                s.push((src.0, layout.0, dst.0, regions.len() as u32));
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdCopyImageToBuffer(copy);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        let regions = [VkBufferImageCopy::default(); 3];
+        let mut args = vn_command_vkCmdCopyImageToBuffer::default();
+        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.srcImage = VkImage(0x44);
+        args.srcImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        args.dstBuffer = VkBuffer(0x55);
+        args.plant_pRegions(&regions);
+        h.vkCmdCopyImageToBuffer(&mut args);
+
+        assert!(h.reject.is_none(), "a served command does not reject");
+        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.as_slice(),
+                [(0x44, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.0, 0x55, 3)],
+                "the image, its layout, the buffer and all three regions, none standing in \
+                 for another"
+            );
+        });
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
+        h.driver.abandon_planted();
+    }
+
     #[test]
     fn the_commands_that_write_pixels_hand_the_driver_what_the_guest_sent() {
         use super::super::proto::types::{
