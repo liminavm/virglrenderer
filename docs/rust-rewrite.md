@@ -337,22 +337,28 @@ buildable throughout as the A-side reference.
   Recording scanout geometry beside the ring stream lands here too — it is what turns
   the venus IOSurface score from a count into a frame hash, and a zero-copy blob has no
   other CPU-readable copy of its pixels.
-  The remaining gap is the ring transport, and it is enumerable rather than something to
-  be discovered one boot at a time. The C dispatches ten transport commands
-  (`src/venus/vkr_transport.c`); this tree serves five — `vkCreateRingMESA`,
-  `vkDestroyRingMESA`, `vkNotifyRingMESA`, `vkSetReplyCommandStreamMESA`,
-  `vkSeekReplyCommandStreamMESA`. The five outstanding are
-  `vkExecuteCommandStreamsMESA`, `vkWriteRingExtraMESA`,
-  `vkSubmitVirtqueueSeqnoMESA`, `vkWaitVirtqueueSeqnoMESA` and `vkWaitRingSeqnoMESA`.
-  None of the five is reachable by replay (`harness/README.md`), which is why the seated
-  boot is a gate and not a formality: a build missing all five scores every corpus clean
-  and puts nothing on the screen. What the compositor does varies — it has both exited
-  at startup and stayed running with every systemd field healthy — and neither presents
-  a frame, so the state of the process is not the measurement. The frame is
-  (`harness/vm/frame.py`); the C leg on the same guest shows a wallpaper, a top bar and
-  a clock. They are a design task —
-  `vkExecuteCommandStreamsMESA` swaps the decoder onto a resource-backed stream, and the
-  seqno waits are what a ring blocks on — not a port-by-rote.
+  The remaining gap is the ring transport. The C dispatches ten transport commands
+  (`src/venus/vkr_transport.c`); this tree serves nine, and the outstanding one is
+  `vkExecuteCommandStreamsMESA`, which swaps the decoder onto a resource-backed stream
+  and is how every command-buffer recording arrives. None of the ten is reachable by
+  replay (`harness/README.md`), which is why the seated boot is a gate and not a
+  formality: a build missing all of them scores every corpus clean and puts nothing on
+  the screen. What the compositor does varies — it has both exited at startup and stayed
+  running with every systemd field healthy — and neither presents a frame, so the state
+  of the process is not the measurement. The frame is (`harness/vm/frame.py`); the C leg
+  on the same guest shows a wallpaper, a top bar and a clock.
+
+  **A transport wait suspends the batch; it never blocks a handler.** The C sleeps inside
+  the handler — a ring thread in its own dispatch, a ring-seqno wait on the virtio-gpu
+  control queue thread — and neither ports, because here a handler runs with the context
+  locked and, on the ABI path, the one global renderer mutex behind that. Sleeping would
+  hold both against the thread whose progress is being waited for, and `RingThread::stop`
+  — called from `vkDestroyRingMESA`, itself inside that lock — would join a thread that
+  never reaches its stop check. So `Submitted::Waiting` says how much of the batch ran and
+  what to wait for; the caller waits with nothing held and returns with the remainder. The
+  wait command is deliberately not consumed, so the resume re-decodes it, which is what
+  makes a reply-carrying wait truthful with no special case: the answer is encoded on the
+  pass that proceeds.
 
   Three facts about the transport, established against the C and the guest mesa rather
   than inferred, because each one changes a design:
@@ -383,17 +389,22 @@ buildable throughout as the A-side reference.
   idle host even with the thread's QoS pinned. A `maxReportingPeriodMicroseconds` of
   zero is a guest error and is refused, never defaulted.
 
-  *A guest can deadlock the whole device, and the C does not stop it.* The existing
-  guard only fires in the ring thread's idle branch, so it misses this: a guest sends
-  `vkWaitVirtqueueSeqnoMESA` on a ring with no submit behind it, blocking that ring
-  inside a dispatch, then `vkWaitRingSeqnoMESA` on the virtqueue for a head the blocked
-  ring can no longer advance. The only producer of the virtqueue seqno is the thread now
-  asleep. Nothing times out, and the control queue is shared, so every context's submits,
-  every scanout flush and every fence stop with it. A buggy guest reaches it as easily as
-  a hostile one. The fix is not a timeout: the two blockers can see each other, so a ring
-  carries what virtqueue seqno it is blocked on, and a context wait checks that before
-  sleeping and on every re-check — if the ring is blocked on a seqno past what it has,
-  nothing can advance it, and the context is poisoned then and there.
+  *A guest can deadlock the whole device, and the C does not stop it.* The C's guard only
+  fires in the ring thread's idle branch, so it misses this: a guest sends
+  `vkWaitVirtqueueSeqnoMESA` on a ring with no submit behind it, blocking that ring, then
+  `vkWaitRingSeqnoMESA` for a head the blocked ring can no longer advance. The only
+  producer of the virtqueue seqno is the stream now waiting. Nothing times out, and the
+  control queue is one queue for the whole device, so every context's submits, every
+  scanout flush and every fence stop with it. A buggy guest reaches it as easily as a
+  hostile one. The fix here is structural, not a timeout: a ring publishes what virtqueue
+  seqno it is blocked on before it sleeps and wakes the waiter, and the waiter checks —
+  before its first sleep and on every wake — whether it is itself the only thing that
+  could release the ring. It poisons by name. "Blocked" and "blocked on something it
+  cannot get" are read as one question under one lock: asked separately, a waiter can land
+  in the gap where a ring has been released but not yet woken, and poison a context that
+  was about to proceed. The C's tail-too-short guard is ported alongside it, asked from
+  the waiting side, where the head advancing to meet the tail is itself the wake that
+  triggers the re-check.
 
   They are also why an unserved command poisons the context whether or not it carries a
   reply. A command whose only product is its answer costs the guest one command when it
