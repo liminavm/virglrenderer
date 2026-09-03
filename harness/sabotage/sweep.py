@@ -54,6 +54,28 @@ SABOTAGES = [
         'unserved_command',
     ),
     (
+        'a query read-back is handed to the driver with results that run past the room the guest offered',
+        'virglrs/src/venus/driver.rs',
+        """        let fits = facts.bytes_for(count, stride, flags).is_some_and(|n| n <= out.len() as u64);""",
+        """        let fits = true;""",
+        'query_results',
+    ),
+    (
+        'a query read-back names queries past the end of the pool',
+        'virglrs/src/venus/driver.rs',
+        """        let in_pool = first.checked_add(count).is_some_and(|end| end <= facts.queries);""",
+        """        let in_pool = true;""",
+        'query_results',
+    ),
+    (
+        'a destroyed query pool keeps its record, so a recycled handle is measured against a previous life',
+        'virglrs/src/venus/context.rs',
+        """        self.driver.forget_query_pool(args.queryPool);
+        self.driver.destroy_object(""",
+        """        self.driver.destroy_object(""",
+        'query_results',
+    ),
+    (
         'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
         'virglrs/src/venus/context.rs',
         """                if wants_reply {

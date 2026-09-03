@@ -30,26 +30,29 @@ use super::proto::types::{
     VkRingCreateInfoMESA, VkRingMonitorInfoMESA, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
-    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginRenderPass,
-    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
-    vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
-    vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
-    vn_command_vkCmdCopyImage, vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw,
-    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
-    vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport,
+    vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage,
+    vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
+    vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
+    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults, vn_command_vkCmdDraw,
+    vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer,
+    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp,
     vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
-    vn_command_vkCreatePipelineLayout, vn_command_vkCreateRenderPass, vn_command_vkCreateRingMESA,
-    vn_command_vkCreateSampler, vn_command_vkCreateSamplerYcbcrConversion,
-    vn_command_vkCreateSemaphore, vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer,
-    vn_command_vkDestroyCommandPool, vn_command_vkDestroyDescriptorPool,
-    vn_command_vkDestroyDescriptorSetLayout, vn_command_vkDestroyDevice, vn_command_vkDestroyFence,
-    vn_command_vkDestroyFramebuffer, vn_command_vkDestroyImage, vn_command_vkDestroyImageView,
-    vn_command_vkDestroyInstance, vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
-    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyRenderPass,
-    vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
+    vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
+    vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
+    vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
+    vn_command_vkCreateShaderModule, vn_command_vkDestroyBuffer, vn_command_vkDestroyCommandPool,
+    vn_command_vkDestroyDescriptorPool, vn_command_vkDestroyDescriptorSetLayout,
+    vn_command_vkDestroyDevice, vn_command_vkDestroyFence, vn_command_vkDestroyFramebuffer,
+    vn_command_vkDestroyImage, vn_command_vkDestroyImageView, vn_command_vkDestroyInstance,
+    vn_command_vkDestroyPipeline, vn_command_vkDestroyPipelineCache,
+    vn_command_vkDestroyPipelineLayout, vn_command_vkDestroyQueryPool,
+    vn_command_vkDestroyRenderPass, vn_command_vkDestroyRingMESA, vn_command_vkDestroySampler,
     vn_command_vkDestroySamplerYcbcrConversion, vn_command_vkDestroySemaphore,
     vn_command_vkDestroyShaderModule, vn_command_vkDeviceWaitIdle, vn_command_vkEndCommandBuffer,
     vn_command_vkEnumerateDeviceExtensionProperties,
@@ -87,13 +90,13 @@ use super::proto::types::{
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties,
     vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2,
     vn_command_vkGetPhysicalDeviceToolProperties, vn_command_vkGetPipelineCacheData,
-    vn_command_vkGetRenderAreaGranularity, vn_command_vkGetRenderingAreaGranularity,
-    vn_command_vkGetSemaphoreCounterValue, vn_command_vkImportSemaphoreResourceMESA,
-    vn_command_vkInvalidateMappedMemoryRanges, vn_command_vkMergePipelineCaches,
-    vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit, vn_command_vkQueueWaitIdle,
-    vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
+    vn_command_vkGetQueryPoolResults, vn_command_vkGetRenderAreaGranularity,
+    vn_command_vkGetRenderingAreaGranularity, vn_command_vkGetSemaphoreCounterValue,
+    vn_command_vkImportSemaphoreResourceMESA, vn_command_vkInvalidateMappedMemoryRanges,
+    vn_command_vkMergePipelineCaches, vn_command_vkNotifyRingMESA, vn_command_vkQueueSubmit,
+    vn_command_vkQueueWaitIdle, vn_command_vkResetCommandBuffer, vn_command_vkResetCommandPool,
     vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
-    vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
+    vn_command_vkResetQueryPool, vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
     vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
     vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkUpdateDescriptorSets,
     vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
@@ -1627,6 +1630,65 @@ impl Commands for Handlers<'_> {
                 }
             }
             Err(e) => args.ret = e,
+        }
+    }
+
+    /// Not [`simple_create`]: the pool is recorded, because a read-back is measured against it
+    /// -- see [`Driver::query_pool_results`]. A query type this renderer cannot size is refused
+    /// as a feature this device does not have, which is what it is: every such type comes with
+    /// an extension this build does not offer.
+    fn vkCreateQueryPool(&mut self, args: &mut vn_command_vkCreateQueryPool<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_query_pool(args.device, info, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateQueryPool", args.pQueryPool(), args.handle_pQueryPool_mut(), host);
+    }
+
+    /// Not [`simple_destroy`]: the record [`Self::vkCreateQueryPool`] made goes with the pool.
+    fn vkDestroyQueryPool(&mut self, args: &mut vn_command_vkDestroyQueryPool<'_>) {
+        self.driver.forget_query_pool(args.queryPool);
+        self.driver.destroy_object(
+            args.device,
+            |d| d.vkDestroyQueryPool(),
+            args.queryPool,
+            args.pAllocator,
+        );
+    }
+
+    fn vkResetQueryPool(&mut self, args: &mut vn_command_vkResetQueryPool<'_>) {
+        let done = self.driver.reset_query_pool(
+            args.device,
+            args.queryPool,
+            args.firstQuery,
+            args.queryCount,
+        );
+        if done.is_none() {
+            self.reject = Some("reset a query pool from the host on a device that cannot");
+        }
+    }
+
+    /// The read-back. `pData` is room the guest offered, `dataSize` bytes of it, and the reply
+    /// carries all of it back whatever the driver filled -- the wire's shape, not a choice. What
+    /// is checked here is that the queries named and the results asked for fit: a pool has
+    /// so many queries, and a result has a size the pool's record fixes.
+    fn vkGetQueryPoolResults(&mut self, args: &mut vn_command_vkGetQueryPoolResults<'_>) {
+        let device = args.device;
+        let pool = args.queryPool;
+        let (first, count, stride, flags) =
+            (args.firstQuery, args.queryCount, args.stride, args.flags);
+        let Some(out) = self.array(args.pData_mut()) else { return };
+        match self.driver.query_pool_results(device, pool, first, count, out, stride, flags) {
+            Ok(ret) => args.ret = ret,
+            Err(driver::QueryRefused::NoDevice) => {
+                args.ret = VkResult::VK_ERROR_INITIALIZATION_FAILED;
+            }
+            Err(driver::QueryRefused::UnknownPool) => {
+                self.reject = Some("read a query pool this renderer has no record of");
+            }
+            Err(driver::QueryRefused::OutOfRoom) => {
+                self.reject =
+                    Some("asked for query results past the pool, or past the room it offered");
+            }
         }
     }
 
@@ -3362,6 +3424,51 @@ impl Commands for Handlers<'_> {
             args.stageFlags,
             args.offset,
             values,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginQuery(&mut self, args: &mut vn_command_vkCmdBeginQuery<'_>) {
+        let done =
+            self.driver.cmd_begin_query(args.commandBuffer, args.queryPool, args.query, args.flags);
+        self.recorded(done);
+    }
+
+    fn vkCmdEndQuery(&mut self, args: &mut vn_command_vkCmdEndQuery<'_>) {
+        let done = self.driver.cmd_end_query(args.commandBuffer, args.queryPool, args.query);
+        self.recorded(done);
+    }
+
+    fn vkCmdResetQueryPool(&mut self, args: &mut vn_command_vkCmdResetQueryPool<'_>) {
+        let done = self.driver.cmd_reset_query_pool(
+            args.commandBuffer,
+            args.queryPool,
+            args.firstQuery,
+            args.queryCount,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdWriteTimestamp(&mut self, args: &mut vn_command_vkCmdWriteTimestamp<'_>) {
+        let done = self.driver.cmd_write_timestamp(
+            args.commandBuffer,
+            args.pipelineStage,
+            args.queryPool,
+            args.query,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyQueryPoolResults(&mut self, args: &mut vn_command_vkCmdCopyQueryPoolResults<'_>) {
+        let done = self.driver.cmd_copy_query_pool_results(
+            args.commandBuffer,
+            args.queryPool,
+            args.firstQuery,
+            args.queryCount,
+            args.dstBuffer,
+            args.dstOffset,
+            args.stride,
+            args.flags,
         );
         self.recorded(done);
     }
@@ -9507,6 +9614,157 @@ mod tests {
                 "every id in a refused run is a ghost, not just the first"
             );
         }
+    }
+
+    /// A query read-back is served through the record its create left, and refused without it.
+    ///
+    /// The driver's bounds check is [`super::driver::tests`]'s to pin; this is the handler's
+    /// wiring around it: the pool the guest creates is the pool the read is measured against,
+    /// the driver's own answer is what goes back, a read past the room is a refusal rather than
+    /// a driver call, and a destroyed pool's record goes with it.
+    #[test]
+    fn query_results_are_read_through_the_pool_the_guest_created() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkDeviceSize, VkQueryPool, VkQueryPoolCreateInfo,
+            VkQueryResultFlags, VkQueryType,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 40;
+        const HOST_POOL: VkQueryPool = VkQueryPool(0x50);
+
+        thread_local! {
+            static READS: RefCell<u32> = const { RefCell::new(0) };
+        }
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            _i: *const VkQueryPoolCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkQueryPool,
+        ) -> VkResult {
+            // SAFETY: the caller passes a local of its own.
+            unsafe { *out = HOST_POOL };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy(
+            _d: VkDevice,
+            _p: VkQueryPool,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn results(
+            _d: VkDevice,
+            _p: VkQueryPool,
+            _first: u32,
+            count: u32,
+            size: usize,
+            data: *mut core::ffi::c_void,
+            _stride: VkDeviceSize,
+            _flags: VkQueryResultFlags,
+        ) -> VkResult {
+            READS.with_borrow_mut(|n| *n += 1);
+            // SAFETY: `size` bytes at `data` are the caller's buffer, as just measured.
+            let out = unsafe { core::slice::from_raw_parts_mut(data.cast::<u8>(), size) };
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            assert_eq!(count as usize * 4, size);
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateQueryPool(create);
+        fns.plant_vkDestroyQueryPool(destroy);
+        fns.plant_vkGetQueryPoolResults(results);
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+            .unwrap();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        let device = VkDevice(DEVICE);
+
+        /// A read of `count` 32-bit results from the start of the pool, four bytes apart.
+        fn read<'a>(device: VkDevice, count: u32) -> vn_command_vkGetQueryPoolResults<'a> {
+            let mut args = vn_command_vkGetQueryPoolResults::default();
+            args.device = device;
+            args.queryPool = HOST_POOL;
+            args.queryCount = count;
+            args.stride = VkDeviceSize(4);
+            args
+        }
+
+        // Two timestamps.
+        let info = VkQueryPoolCreateInfo {
+            queryType: VkQueryType::VK_QUERY_TYPE_TIMESTAMP,
+            queryCount: 2,
+            ..Default::default()
+        };
+        let mut id = VkQueryPool(POOL);
+        let mut shadow = VkQueryPool(0);
+        let mut args = vn_command_vkCreateQueryPool::default();
+        args.device = device;
+        args.pCreateInfo = Some(&info);
+        args.plant_pQueryPool(&mut id);
+        args.plant_handle_pQueryPool(&mut shadow);
+        h.vkCreateQueryPool(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        assert_eq!(shadow, HOST_POOL, "the driver's handle, in the shadow the reply reads");
+        assert!(h.reject.is_none());
+
+        // Both, 32-bit, four apart, into eight bytes: exactly enough.
+        let mut room = [0xffu8; 8];
+        let mut args = read(device, 2);
+        args.plant_pData(&mut room);
+        h.vkGetQueryPoolResults(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS, "the driver's answer");
+        assert!(h.reject.is_none());
+        assert_eq!(room, [0, 1, 2, 3, 4, 5, 6, 7], "and the driver's bytes, in the guest's room");
+
+        // The same read into seven bytes: refused, and the driver never sees it.
+        let mut short = [0xffu8; 7];
+        let mut args = read(device, 2);
+        args.plant_pData(&mut short);
+        h.vkGetQueryPoolResults(&mut args);
+        assert!(h.reject.take().is_some(), "a read past the room is a refusal");
+        assert_eq!(short, [0xff; 7], "and nothing was written");
+        READS.with_borrow(|n| assert_eq!(*n, 1, "only the read that fit reached the driver"));
+
+        // Destroyed, the pool's record goes with it, and a read of it is a refusal too.
+        let mut args =
+            vn_command_vkDestroyQueryPool { device, queryPool: HOST_POOL, ..Default::default() };
+        h.vkDestroyQueryPool(&mut args);
+        let mut args = read(device, 1);
+        args.plant_pData(&mut room[..4]);
+        h.vkGetQueryPoolResults(&mut args);
+        assert!(h.reject.take().is_some(), "a pool with no record is not read");
+        READS.with_borrow(|n| assert_eq!(*n, 1));
+
+        h.driver.abandon_planted();
     }
 
     /// A refused pool allocation ghosts every id in the run, not just the first.
