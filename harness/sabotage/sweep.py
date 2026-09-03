@@ -46,6 +46,14 @@ SABOTAGES = [
         'witness',
     ),
     (
+        'an unserved command is counted and then continues, as though the host had done it',
+        'virglrs/src/venus/context.rs',
+        """        *self.todo.seen.entry(cmd.0).or_default() += 1;
+        self.reject = Some("is not a command this build serves");""",
+        """        *self.todo.seen.entry(cmd.0).or_default() += 1;""",
+        'unserved_command',
+    ),
+    (
         'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
         'virglrs/src/venus/context.rs',
         """                if wants_reply {
