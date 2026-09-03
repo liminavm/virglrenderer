@@ -40,6 +40,7 @@ use super::proto::types::{
     VkStructureType, VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkViewport,
     VkWriteDescriptorSet,
 };
+use super::ring::ResourceBytes;
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
 use crate::metal::{PixelFormat, Surface};
@@ -2438,7 +2439,7 @@ impl Driver {
         id: ObjectId,
         info: &VkMemoryAllocateInfo,
         alloc: Option<&VkAllocationCallbacks>,
-        exported_allocation: &dyn Fn(ResourceHandle) -> Option<ObjectId>,
+        resource_bytes: &dyn Fn(ResourceHandle) -> Option<ResourceBytes>,
     ) -> Result<VkDeviceMemory, NoMemory> {
         let Some(d) = self.devices.get(&device) else {
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INITIALIZATION_FAILED));
@@ -2463,7 +2464,7 @@ impl Driver {
         // it meant to reach stays where it is. That is wrong for the guest -- it renders into a
         // buffer nobody presents -- but it is the driver's own behaviour for a `pNext` link it
         // does not recognise, and inventing a refusal here would fail allocations the C serves.
-        let alias = import.and_then(|r| self.aliased_span(exported_allocation(r)?));
+        let alias = import.and_then(|r| self.span(&resource_bytes(r)?));
         let surface = if import.is_some() { None } else { self.scanout_surface(device, &info) };
         let mut host_pointer = VkImportMemoryHostPointerInfoEXT {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -2549,6 +2550,18 @@ impl Driver {
     /// one that is itself an alias. Only a scanout has an address before anyone asks; ordinary
     /// memory has one once it has been published, and the guest publishes before it imports,
     /// because the resource it names is the blob that publishing made.
+    /// Where a resource's bytes are, as the one pair a caller can do anything with.
+    ///
+    /// The only place either shape of [`ResourceBytes`] becomes an address and a length, so the
+    /// property query that says a resource is importable and the allocation that imports it get
+    /// the same answer or no answer at all -- they cannot get two.
+    pub fn span(&self, bytes: &ResourceBytes) -> Option<(usize, u64)> {
+        match bytes {
+            ResourceBytes::Host(map) => Some((map.host_addr(), map.len() as u64)),
+            ResourceBytes::Allocation(published) => self.aliased_span(published.memory),
+        }
+    }
+
     fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
         let record = self.memory.get(&id)?;
         match &record.backing {

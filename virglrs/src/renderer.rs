@@ -18,6 +18,7 @@ use crate::venus;
 use crate::venus::context::Submitted;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError};
+use crate::venus::ring::{Published, ResourceBytes};
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -309,13 +310,49 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
         self.get(&handle)?.shm().map(Arc::clone)
     }
 
-    fn exported_allocation(&self, ctx: CtxId, handle: ResourceHandle) -> Option<ObjectId> {
-        match self.get(&handle)?.backing {
+    fn bytes(&self, ctx: CtxId, handle: ResourceHandle) -> Option<ResourceBytes> {
+        let Some(res) = self.get(&handle) else {
+            eprintln!("[virglrs] ctx {}: resource {handle:?} is not in the table", ctx.get());
+            return None;
+        };
+        if let Some(map) = res.shm() {
+            return Some(ResourceBytes::Host(Arc::clone(map)));
+        }
+        match res.backing {
             Backing::Blob { ref desc, .. } => match desc.source {
-                BlobSource::Exported { ctx: owner, mem } if owner == ctx => Some(ObjectId(mem.0)),
-                BlobSource::Exported { .. } | BlobSource::HostMinted => None,
+                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {
+                    Some(ResourceBytes::Allocation(Published {
+                        memory: ObjectId(mem.0),
+                        size: desc.size,
+                    }))
+                }
+                // Named by the wrong context. Not a mistake the guest made in this command: it is
+                // one context reaching for another's export, which the ids cannot express.
+                BlobSource::Exported { ctx: owner, .. } => {
+                    eprintln!(
+                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, and a resource \
+                         id means nothing outside the context that chose it",
+                        ctx.get(),
+                        owner.get(),
+                    );
+                    None
+                }
+                BlobSource::HostMinted => {
+                    eprintln!(
+                        "[virglrs] ctx {}: resource {handle:?} is a host-minted blob with no \
+                         mapping of its own",
+                        ctx.get(),
+                    );
+                    None
+                }
             },
-            Backing::Classic(_) | Backing::Imported { .. } => None,
+            Backing::Classic(_) | Backing::Imported { .. } => {
+                eprintln!(
+                    "[virglrs] ctx {}: resource {handle:?} is not host-addressable",
+                    ctx.get(),
+                );
+                None
+            }
         }
     }
 }
@@ -985,19 +1022,46 @@ mod tests {
         );
 
         assert_eq!(
-            table.exported_allocation(one, blob),
-            Some(ObjectId(66)),
-            "the context that exported it finds its own allocation"
+            match table.bytes(one, blob) {
+                Some(ResourceBytes::Allocation(published)) => Some(published),
+                _ => None,
+            },
+            Some(Published { memory: ObjectId(66), size: 4128768 }),
+            "the context that exported it finds its own allocation, at the size the resource has"
         );
-        assert_eq!(
-            table.exported_allocation(two, blob),
-            None,
+        assert!(
+            table.bytes(two, blob).is_none(),
             "and another context finds nothing, rather than its own id 66"
         );
-        assert_eq!(
-            table.exported_allocation(one, ResourceHandle::new(2).unwrap()),
-            None,
+        assert!(
+            table.bytes(one, ResourceHandle::new(2).unwrap()).is_none(),
             "a resource that is not here is not an export either"
+        );
+
+        // A blob the host minted and never mapped publishes no allocation either: there is
+        // storage somewhere, but nothing here can say where, and saying so would be inventing it.
+        let minted = ResourceHandle::new(3).unwrap();
+        table.insert(
+            minted,
+            Resource {
+                handle: minted,
+                backing: Backing::Blob {
+                    desc: BlobDesc {
+                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                        blob_flags: 1,
+                        source: BlobSource::HostMinted,
+                        size: 4096,
+                    },
+                    host: None,
+                },
+                iov: Vec::new(),
+                priv_: VmmPtr(core::ptr::null_mut()),
+                attached: Vec::new(),
+            },
+        );
+        assert!(
+            table.bytes(one, minted).is_none(),
+            "a host-minted blob with no mapping resolves to nothing"
         );
     }
 

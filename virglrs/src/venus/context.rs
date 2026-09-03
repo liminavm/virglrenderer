@@ -98,7 +98,9 @@ use super::proto::types::{
     vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
     vn_command_vkWaitVirtqueueSeqnoMESA, vn_command_vkWriteRingExtraMESA,
 };
-use super::ring::{ReplyStream, ReplyStreamError, Ring, RingControl, RingError, ShmResources};
+use super::ring::{
+    ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
+};
 use super::ring_thread::{RingThread, RingWaiter, WaitRing, seqno_ge};
 use crate::vulkan::Global;
 
@@ -1375,7 +1377,7 @@ impl Commands for Handlers<'_> {
         // shared reference and an id, so the resolver borrows nothing the driver also wants.
         let (resources, ctx) = (self.resources, self.ctx);
         let host = self.driver.allocate_memory(args.device, id, info, args.pAllocator, &|handle| {
-            resources.exported_allocation(ctx, handle)
+            resources.bytes(ctx, handle)
         });
         // A budget refusal stops the context, and it is this handler's to say so: the guest is
         // never going to read `ret`, which is the whole reason the budget module exists. A
@@ -2596,7 +2598,17 @@ impl Commands for Handlers<'_> {
         //
         // Zero is folded in with them: it cannot become a [`ResourceHandle`], and a guest that
         // sends one has named a resource that is not there by the shortest route.
-        let Some(map) = ResourceHandle::new(named).and_then(|r| self.resources.shm(r)) else {
+        // `bytes` is the same resolution `vkAllocateMemory` performs on the resource the guest
+        // will name next, and the span below is the same span the import will alias. Two answers
+        // to one question is what the C's own comment records losing: a query that said a buffer
+        // was importable, and an allocation that then refused it.
+        let Some(bytes) =
+            ResourceHandle::new(named).and_then(|r| self.resources.bytes(self.ctx, r))
+        else {
+            args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            return;
+        };
+        let Some(_) = self.driver.span(&bytes) else {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
@@ -2614,7 +2626,10 @@ impl Commands for Handlers<'_> {
         if let Some(size) =
             driver::chained_mut::<VkMemoryResourceAllocationSizePropertiesMESA>(&mut out.pNext)
         {
-            size.allocationSize = map.len() as u64;
+            size.allocationSize = match &bytes {
+                ResourceBytes::Host(map) => map.len() as u64,
+                ResourceBytes::Allocation(published) => published.size,
+            };
         }
         args.ret = VkResult::VK_SUCCESS;
     }
@@ -5051,6 +5066,80 @@ mod tests {
         args.resourceId = RING_RES.get();
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
+        assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
+    }
+
+    /// A resource the property query can resolve and the allocation could not alias.
+    ///
+    /// The two commands read one resolution now, so the only way they can still disagree is for
+    /// the resolution to name an allocation the driver has no record of -- a memory freed between
+    /// the query and its answer, say. That is a resource the guest must be told is not importable,
+    /// because the import that follows would fall through to ordinary memory and hand it a buffer
+    /// nobody presents.
+    ///
+    /// It is the guest's own state and not ours, so it is answered rather than refused: the ring
+    /// stays alive, exactly as it does for a resource id that names nothing.
+    #[test]
+    fn an_allocation_the_import_could_not_alias_is_not_called_importable() {
+        use super::super::proto::types::{
+            VkMemoryResourcePropertiesMESA, vn_command_vkGetMemoryResourcePropertiesMESA as Cmd,
+        };
+        use super::super::ring::Published;
+
+        /// A table whose one resource publishes an allocation that is not in any driver.
+        struct GhostExport;
+        impl ShmResources for GhostExport {
+            fn shm(
+                &self,
+                _: crate::ids::ResourceHandle,
+            ) -> Option<std::sync::Arc<crate::guest_mem::GuestMap>> {
+                None
+            }
+            fn bytes(&self, _: CtxId, _: crate::ids::ResourceHandle) -> Option<ResourceBytes> {
+                Some(ResourceBytes::Allocation(Published { memory: ObjectId(0x9999), size: 4096 }))
+            }
+        }
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let t = GhostExport;
+
+        let mut props = VkMemoryResourcePropertiesMESA::default();
+        let mut args = Cmd::default();
+        args.device = VkDevice(0x5001);
+        args.resourceId = 7;
+        args.plant_pMemoryResourceProperties(&mut props);
+
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &t,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+        h.vkGetMemoryResourcePropertiesMESA(&mut args);
+
+        assert!(h.reject.is_none(), "the guest's own state does not poison the ring");
+        assert_eq!(
+            args.ret,
+            VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE,
+            "a resource the import cannot alias is not importable",
+        );
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
     }
 

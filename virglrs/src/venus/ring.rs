@@ -233,24 +233,47 @@ pub trait ShmResources {
     /// side both mean "no memory", and the caller that can tell them apart says so in its log.
     fn shm(&self, handle: ResourceHandle) -> Option<Arc<GuestMap>>;
 
-    /// The allocation this resource *is*, when the resource was published from `ctx`'s own
-    /// device memory.
+    /// Where a resource the guest named keeps its bytes.
     ///
-    /// A guest that imports a resource into a second allocation is naming storage that already
-    /// exists, and this is the only way to find out which: the resource table is the renderer's
-    /// and the id it hands back is the guest's, so the driver can resolve it in the one map that
-    /// knows where those bytes are.
+    /// One question with one answer, because two commands have to agree about it: the property
+    /// query that tells a guest a resource can be imported, and the allocation that imports it.
+    /// The guest reads the first and hands what it says straight to the second, so a resource
+    /// only one of them can resolve is a guest told to bind memory the host then refuses.
     ///
-    /// `ctx` is not a formality. The id is a *guest* id, unique only within the context that
-    /// chose it, so an export belonging to another context would resolve here to whatever this
-    /// context happens to have filed under the same number. Answering only for the caller's own
-    /// exports is what makes the id mean something.
+    /// `ctx` is not a formality for the allocation arm. A resource id is a *guest* id, unique
+    /// only within the context that chose it, so an export belonging to another context would
+    /// resolve to whatever this context happens to have filed under the same number. Answering
+    /// only for the caller's own exports is what makes the id mean something.
     ///
-    /// The default is `None`: a table with no exports in it has no answer to give, and every
-    /// test stub is one of those.
-    fn exported_allocation(&self, _ctx: CtxId, _handle: ResourceHandle) -> Option<ObjectId> {
-        None
+    /// The default answers only the mapping arm: a table with no exports in it has nothing to say
+    /// about allocations, and every test stub is one of those.
+    fn bytes(&self, _ctx: CtxId, handle: ResourceHandle) -> Option<ResourceBytes> {
+        self.shm(handle).map(ResourceBytes::Host)
     }
+}
+
+/// Where a resource's bytes are, in the two shapes a resource can hold them.
+///
+/// The pair a caller ultimately wants -- an address and a length -- is deliberately not here: an
+/// allocation's address is the driver's to know, and reconstituting it needs the memory table.
+/// See [`Driver::span`](crate::venus::driver::Driver::span), which is the one place that turns
+/// either of these into that pair.
+pub enum ResourceBytes {
+    /// Pages the renderer holds a mapping of.
+    Host(Arc<GuestMap>),
+    /// Device memory a context allocated and then published as a resource.
+    Allocation(Published),
+}
+
+/// An allocation a resource publishes, and the size the resource was given.
+///
+/// The size is the guest's figure for the resource, never the extent of the storage behind it:
+/// what backs an allocation may be page-rounded by whatever minted it, and a guest asking about
+/// its resource did not ask about that rounding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Published {
+    pub memory: ObjectId,
+    pub size: u64,
 }
 
 /// The words of a ring that more than one thread has a reason to touch, and the mapping they are
