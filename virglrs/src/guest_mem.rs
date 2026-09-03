@@ -348,6 +348,35 @@ impl<'a> Iov<'a> {
     }
 }
 
+/// Host bytes presented as one guest span, for a transfer whose bytes arrive in the command
+/// stream rather than in attached pages (`RESOURCE_INLINE_WRITE`).
+///
+/// Holds the one-entry list an [`Iov`] walks, and borrows the bytes for as long as it lives, so
+/// the entry cannot outlive what it points at.
+pub struct HostSpan<'a> {
+    entry: [crate::abi::GuestIov; 1],
+    bytes: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> HostSpan<'a> {
+    pub fn new(bytes: &'a [u8]) -> HostSpan<'a> {
+        HostSpan {
+            entry: [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(bytes.as_ptr().cast_mut().cast()),
+                len: bytes.len(),
+            }],
+            bytes: std::marker::PhantomData,
+        }
+    }
+
+    /// The span as pages. Only ever read from: `Iov::copy_out` reads `len` bytes at `base`,
+    /// which is the borrowed slice, live for `'a`. A `copy_in` would write through a shared
+    /// borrow; no transfer writes to the pages it was given as a source.
+    pub fn iov(&self) -> Iov<'_> {
+        Iov(&self.entry)
+    }
+}
+
 /// The host's page size, which is what a mapping's length has to be a multiple of.
 pub fn page_size() -> usize {
     // SAFETY: a plain sysconf query with no pointers involved.

@@ -185,6 +185,12 @@ impl Features {
         self.have.contains(&f)
     }
 
+    /// Withdraw a feature the driver advertises but the winsys cannot honour -- sRGB write
+    /// control without `EGL_KHR_gl_colorspace`, as `vrend_renderer_init` withdraws it.
+    pub fn clear(&mut self, f: Feature) {
+        self.have.remove(&f);
+    }
+
     pub fn has_extension(&self, name: &str) -> bool {
         self.extensions.contains(name)
     }

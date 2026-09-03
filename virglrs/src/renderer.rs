@@ -21,6 +21,7 @@ use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
 use crate::venus::objects::ObjectKey;
 use crate::venus::ring::{Published, ResourceBytes};
 use crate::vrend;
+use crate::vrend::context::Guest;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
 use std::collections::BTreeMap;
@@ -391,6 +392,23 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
     }
 }
 
+/// The resource table answering what vrend asks of the guest side: whether a context may reach
+/// a resource, and the pages behind it. Attachment is the gate here for the reason it is in
+/// `ShmResources`: it is the decision virtio-gpu already made.
+impl Guest for BTreeMap<ResourceHandle, Resource> {
+    fn attached(&self, ctx: CtxId, handle: ResourceHandle) -> bool {
+        self.get(&handle).is_some_and(|r| r.attached.contains(&ctx))
+    }
+
+    fn pages(&self, ctx: CtxId, handle: ResourceHandle) -> Option<Iov<'_>> {
+        let r = self.get(&handle)?;
+        if !r.attached.contains(&ctx) || r.iov.is_empty() {
+            return None;
+        }
+        Some(Iov::new(&r.iov))
+    }
+}
+
 impl Resource {
     /// The host mapping of this resource, for the only backing that has one.
     ///
@@ -753,9 +771,11 @@ impl Renderer {
                 }
             }
             CapsetId::Virgl | CapsetId::Virgl2 => {
+                let table = self.resources.read().expect("the resource lock is never poisoned");
                 if let Some(v) = self.vrend.as_mut()
-                    && let Err(e) = v.context_create(id)
+                    && let Err(e) = v.context_create(id, &*table)
                 {
+                    drop(table);
                     eprintln!("[virglrs] ctx {}: no GL context: {e}", id.get());
                     self.contexts.remove(&id);
                     return Err(Error::RendererAbsent);
@@ -774,7 +794,8 @@ impl Renderer {
             v.context_destroy(id);
         }
         if let Some(v) = self.vrend.as_mut() {
-            v.context_destroy(id);
+            let table = self.resources.read().expect("the resource lock is never poisoned");
+            v.context_destroy(id, &*table);
         }
         // A destroyed context releases its claim on every resource; the resources themselves
         // survive, because the VMM unrefs them separately and may still be holding one.
@@ -856,8 +877,22 @@ impl Renderer {
         };
         match c.capset {
             CapsetId::Venus => self.venus_mut()?.submit(ctx, buf).map_err(venus_error),
-            // vrend arrives in P3.
-            _ => Err(Error::RendererUnimplemented),
+            CapsetId::Virgl | CapsetId::Virgl2 => {
+                // The classic wire is dwords; a stream that is not whole dwords is not a stream.
+                if !buf.len().is_multiple_of(4) {
+                    return Err(Error::Poisoned);
+                }
+                let words: Vec<u32> =
+                    buf.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+                let table = self.resources.read().expect("the resource lock is never poisoned");
+                let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
+                match v.submit(ctx, &words, &*table) {
+                    None => Err(Error::NoContext),
+                    Some(Ok(())) => Ok(Submitted::Done),
+                    Some(Err(_fault)) => Ok(Submitted::Poisoned),
+                }
+            }
+            CapsetId::Unknown(_) => Err(Error::RendererUnimplemented),
         }
     }
 

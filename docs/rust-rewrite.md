@@ -511,6 +511,19 @@ buildable throughout as the A-side reference.
   shader binary format. GLES has no SPIR-V path. limina's C build binds GLES
   (`VIRGL_RENDERER_USE_GLES` is in its init flags), so a SPIR-V shader target means a
   desktop-GL host context, which is the C's other winsys leg.
+  **The host context is GLES 3.1 and the shader target is GLSL ES**, the C's gles leg,
+  because that is the leg the goldens were recorded on: a differential against a
+  different host profile would be comparing two renderers *and* two drivers. A
+  desktop-GL context is its own gated change afterwards, one differential at a time.
+  **Where P3 stands.** Decode, resources, transfers and the context layer are in:
+  sub-contexts with a GL context each, object tables, every state command recorded,
+  the immediate GL the C emits on a bind, framebuffer state, clears, copy-image and
+  framebuffer blits, resource copies through them, queries and streamout. The
+  `vrend-nodraw.score` gate reproduces all 310 readbacks with `submit-errors 0`; the
+  five IOSurface lines are the scanout's, which is next. Not served yet, each counted
+  and named in the log when a stream asks: draws and `LINK_SHADER` (TGSI→GLSL), the
+  shader blitter (a blit whose formats swizzle differently), implicit-multisample
+  surfaces, the resource-copy fallback through guest memory, blob resources, video.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
