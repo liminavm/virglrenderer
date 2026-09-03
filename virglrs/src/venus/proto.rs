@@ -303,6 +303,123 @@ mod tests {
         );
     }
 
+    /// An output blob is room the guest offers and bytes the host sends back, and the two calls
+    /// that shape it look nothing alike on the wire.
+    ///
+    /// The count call sends a size pointer whose value is whatever the guest had lying around --
+    /// GTK's is an uninitialised `size_t` -- and a zero count for the blob; the decoder must
+    /// carry the value and allocate nothing. The data call sends the room as the count, and the
+    /// decoder must hand the handler exactly that much arena to write into. Either call that the
+    /// decoder drops on the floor reaches the guest as no reply at all, which the driver reports
+    /// as `VK_ERROR_OUT_OF_HOST_MEMORY` and a client then treats as a malloc of the garbage size.
+    #[test]
+    fn an_out_blob_is_room_the_guest_offers_and_bytes_the_host_returns() {
+        const CMD: VkCommandTypeEXT = VkCommandTypeEXT::VK_COMMAND_TYPE_vkGetPipelineCacheData_EXT;
+        const GARBAGE: usize = 0xdead_beef_dead_beef;
+
+        #[derive(Default)]
+        struct Cache {
+            saw: Vec<(bool, usize)>,
+            reply: Vec<u8>,
+        }
+        impl Commands for Cache {
+            fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
+                panic!("{cmd:?} was refused");
+            }
+            fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData) {
+                let offered = *args.pDataSize_mut().expect("the size pointer was sent");
+                self.saw.push((args.has_pData(), offered));
+                args.ret = VkResult::VK_SUCCESS;
+                match args.pData_mut() {
+                    // The count call: say how much there is.
+                    None => *args.pDataSize_mut().unwrap() = 5,
+                    // The data call: fill what fits and say how much that was.
+                    Some(room) => {
+                        let n = room.len().min(5);
+                        room[..n].copy_from_slice(&b"cache"[..n]);
+                        *args.pDataSize_mut().unwrap() = n;
+                    }
+                }
+                let size = vn_sizeof_vkGetPipelineCacheData_reply(&AllOfIt, args);
+                self.reply = vec![0u8; size];
+                let mut enc = Encoder::new(&mut self.reply, &AllOfIt);
+                vn_encode_vkGetPipelineCacheData_reply(&mut enc, args);
+                assert!(!enc.fatal());
+            }
+        }
+
+        fn call(size: usize, room: u64) -> Vec<u8> {
+            wire(&[
+                &1u64.to_le_bytes(), // device
+                &2u64.to_le_bytes(), // pipelineCache
+                &1u64.to_le_bytes(), // pDataSize: present
+                &size.to_le_bytes(), // its value, which is only meaningful with pData
+                &room.to_le_bytes(), // pData: the room offered, and no bytes
+            ])
+        }
+        fn reply(ret: i32, size: usize, blob: &[&[u8]]) -> Vec<u8> {
+            let mut w = wire(&[
+                &(CMD.0).to_le_bytes(),
+                &ret.to_le_bytes(),
+                &1u64.to_le_bytes(),
+                &size.to_le_bytes(),
+            ]);
+            w.extend(wire(blob));
+            w
+        }
+
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut h = Cache::default();
+
+        // The count call, as GTK sends it: the size is garbage and the blob is absent.
+        let w = call(GARBAGE, 0);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert!(!dec.fatal(), "a garbage size beside an absent blob is what every count call is");
+        assert_eq!(dec.pos(), w.len());
+        assert_eq!(h.saw, [(false, GARBAGE)]);
+        assert_eq!(h.reply, reply(0, 5, &[&0u64.to_le_bytes()]));
+
+        // The data call: the room is the count, and the blob comes back padded to the word.
+        let w = call(8, 8);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert!(!dec.fatal());
+        assert_eq!(dec.pos(), w.len());
+        assert_eq!(h.saw, [(false, GARBAGE), (true, 8)]);
+        assert_eq!(h.reply, reply(0, 5, &[&5u64.to_le_bytes(), b"cache\0\0\0"]));
+
+        // A guest that disagrees with itself about the room is not served.
+        let w = call(8, 4);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert!(dec.fatal(), "the count and the length member are one value");
+        assert_eq!(h.saw.len(), 2, "a poisoned decode reaches no handler");
+
+        // Nor is one that offers more room than the arena will ever hold.
+        let hard = AtomicBool::new(false);
+        let huge = crate::venus::cs::TEMP_POOL_MAX + 1;
+        let w = call(huge, huge as u64);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert!(dec.fatal(), "the room is bounded at the trust boundary, not by malloc");
+        assert_eq!(h.saw.len(), 2);
+
+        // And the round trip reproduces both calls byte for byte, garbage included.
+        for w in [call(GARBAGE, 0), call(8, 8)] {
+            let hard = AtomicBool::new(false);
+            let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+            let mut buf = vec![0u8; w.len() + 8];
+            let mut enc = Encoder::new(&mut buf, &AllOfIt);
+            let size =
+                vn_round_trip_args(&mut dec, &mut enc, CMD, VkFlags(0)).expect("a defined command");
+            assert!(!dec.fatal());
+            assert_eq!(size, w.len() + 8, "the header the caller consumed is the encoder\'s");
+            assert_eq!(enc.written()[8..], w[..]);
+        }
+    }
+
     /// The capset hands the guest a bitmask indexed by extension number, and the guest reads it
     /// to decide what it may send. A table that disagrees with what the serializer can actually
     /// decode is a protocol mismatch that shows up as a corrupt stream, not as an error.
