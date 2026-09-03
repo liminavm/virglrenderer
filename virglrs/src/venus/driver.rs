@@ -2781,7 +2781,11 @@ impl Driver {
         // the resource both, for exactly as long as the driver may still reach them.
         let alias = import.and_then(resource_bytes);
         let alias_span = alias.as_ref().and_then(|b| self.span(b));
-        let surface = if import.is_some() { None } else { self.scanout_surface(device, &info) };
+        let surface = if import.is_some() {
+            Err(NoSurface::NotExported)
+        } else {
+            self.scanout_surface(device, &info)
+        };
         // The third shape: memory the guest asked to be able to export, that is not a window
         // buffer. The driver would allocate it and later lend a mapping -- a pointer with the
         // device's lifetime, which no other context could be handed. So the pages are minted here
@@ -2790,7 +2794,7 @@ impl Driver {
         // and minting pages for it would be storage nobody reaches. Plain host-visible memory
         // the guest never asked to export keeps the driver's own allocation, unchanged.
         let pages = if import.is_none()
-            && surface.is_none()
+            && surface.is_err()
             && exports_memory(info.pNext)
             && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)
         {
@@ -2813,14 +2817,14 @@ impl Driver {
         // an import but the ordinary allocation it fell through to, and is charged as one.
         let backing = match (alias, surface, pages) {
             (Some(bytes), _, _) => Backing::Imported(bytes),
-            (None, Some(surface), _) => {
+            (None, Ok(surface), _) => {
                 let charge = self.admit("IOSurface", surface.alloc_size())?;
                 Backing::Owned {
                     storage: Storage::Texture(Arc::new(Charged { it: surface, charge })),
                     published: false,
                 }
             }
-            (None, None, Some(len)) => {
+            (None, Err(why), Some(len)) => {
                 let charge = self.admit("exported pages", len as u64)?;
                 let map = match GuestMap::anonymous(len) {
                     Ok(map) => map,
@@ -2829,12 +2833,9 @@ impl Driver {
                         return Err(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY));
                     }
                 };
-                Backing::Owned {
-                    storage: Storage::Linear(Arc::new(Charged { it: map, charge })),
-                    published: false,
-                }
+                Backing::Owned { storage: Storage::pages(map, charge, why), published: false }
             }
-            (None, None, None) => {
+            (None, Err(_), None) => {
                 Backing::Driver { charge: self.admit("device memory", size)?, mapped: None }
             }
         };
@@ -2959,22 +2960,24 @@ impl Driver {
     /// (`VkMemoryDedicatedAllocateInfo`). That is what a window buffer is, and nothing else in a
     /// venus stream looks like it.
     ///
-    /// `None` at every step that cannot be answered honestly -- a format no IOSurface has, a
-    /// driver that will not report a layout, a pitch the surface would not take. Every one of
-    /// those leaves an ordinary allocation, which renders correctly and merely cannot be
-    /// composited without a copy. A surface whose rows sit somewhere other than where the driver
-    /// will write them is worse than no surface: it displays, and it displays sheared.
+    /// A named refusal at every step that cannot be answered honestly -- a format no IOSurface
+    /// has, a driver that will not report a layout, a pitch the surface would not take. Every one
+    /// of those leaves an ordinary allocation, which renders correctly and merely cannot be
+    /// composited without a copy; the reason travels with the pages, so a scanout that later
+    /// asks them for a surface can say which question the image failed. A surface whose rows
+    /// sit somewhere other than where the driver will write them is worse than no surface: it
+    /// displays, and it displays sheared.
     fn scanout_surface(
         &mut self,
         device: VkDevice,
         info: &VkMemoryAllocateInfo,
-    ) -> Option<Surface> {
+    ) -> Result<Surface, NoSurface> {
         if !exports_memory(info.pNext) {
-            return None;
+            return Err(NoSurface::NotExported);
         }
-        let image = dedicated_image(info.pNext)?;
-        let facts = *self.images.get(&image)?;
-        let format = pixel_format(facts.format)?;
+        let image = dedicated_image(info.pNext).ok_or(NoSurface::NotDedicated)?;
+        let facts = *self.images.get(&image).ok_or(NoSurface::UnknownImage)?;
+        let format = pixel_format(facts.format).ok_or(NoSurface::Format(facts.format))?;
         // Only a layout the CPU can address has rows to alias. An OPTIMAL image is opaque: the
         // driver keeps its storage in a private layout of its own choosing, renders there, and
         // would never write a byte into pages minted here. Asked for its row pitch it answers
@@ -2985,12 +2988,12 @@ impl Driver {
             VkImageTiling::VK_IMAGE_TILING_LINEAR
                 | VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
         ) {
-            return None;
+            return Err(NoSurface::Tiling(facts.tiling));
         }
 
-        let d = self.devices.get(&device)?;
+        let d = self.devices.get(&device).ok_or(NoSurface::Layout)?;
         let layout = {
-            let query = d.fns.try_vkGetImageSubresourceLayout()?;
+            let query = d.fns.try_vkGetImageSubresourceLayout().ok_or(NoSurface::Layout)?;
             let subresource = VkImageSubresource {
                 aspectMask: VkImageAspectFlags(
                     VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT.0 as u32,
@@ -3003,25 +3006,24 @@ impl Driver {
             unsafe { query(device, image, &subresource, &mut layout) };
             layout
         };
-        let pitch = u32::try_from(layout.rowPitch.0).ok()?;
-        if pitch == 0 {
-            return None;
-        }
+        let pitch =
+            u32::try_from(layout.rowPitch.0).ok().filter(|p| *p != 0).ok_or(NoSurface::Layout)?;
         // The record says how wide the guest asked for; the live query says how the driver laid
         // it out. A record left behind by an image whose handle has since been recycled will not
         // describe this image, and this is where that shows: the rows would not add up.
         if layout.size.0 != u64::from(pitch) * u64::from(facts.height) {
-            return None;
+            return Err(NoSurface::Layout);
         }
 
-        let surface = Surface::scanout(facts.width, facts.height, format, pitch).ok()?;
+        let surface = Surface::scanout(facts.width, facts.height, format, pitch)
+            .map_err(|_| NoSurface::Layout)?;
         // IOSurface may lay the rows out its own way. The allocation is about to be a
         // host-pointer import of these pages, so a pitch that is not the driver's is a surface
         // whose every row is at the wrong offset.
         if surface.bytes_per_row() != pitch {
-            return None;
+            return Err(NoSurface::Layout);
         }
-        Some(surface)
+        Ok(surface)
     }
 
     /// Record what an image was created as, for a scanout allocation that has to match it.
@@ -3207,7 +3209,7 @@ impl Driver {
         // there is nothing for `vkMapMemory` to map -- the driver imported them.
         if let Backing::Owned { storage: Storage::Linear(p), .. } = &record.backing {
             let n = buf.len().min(size as usize);
-            assert!(p.it.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
+            assert!(p.it.map.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
             return Ok(n);
         }
         let Some(d) = self.devices.get(&device) else {
@@ -3371,7 +3373,7 @@ impl Allocated {
     /// The surface behind it, for the one backing that has one.
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
-            Backing::Owned { storage, .. } => storage.surface(),
+            Backing::Owned { storage, .. } => storage.surface().ok(),
             Backing::Driver { .. } | Backing::Imported(_) => None,
         }
     }
@@ -3475,7 +3477,59 @@ pub enum Storage {
     /// Pages this renderer minted for an allocation the guest meant to share, and handed the
     /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
     /// fences are the only barrier over them, as they are for any host-visible allocation.
-    Linear(Arc<Charged<GuestMap>>),
+    Linear(Arc<Charged<Pages>>),
+}
+
+/// Minted pages, and why they are pages rather than a surface.
+///
+/// Every export that is not a recognised scanout ends up here, and a compositor can still be
+/// handed a share of it and try to present from it. There is no surface to present, and the
+/// reason is the one fact worth having at that moment -- which image, and which question it
+/// failed -- so it is kept with the pages and said once, the first time the share is asked.
+pub struct Pages {
+    map: GuestMap,
+    why: NoSurface,
+    /// Whether the refusal has been said. A compositor asks every frame and the answer does not
+    /// change, so it is said once per storage rather than sixty times a second.
+    said: std::sync::atomic::AtomicBool,
+}
+
+/// Why an exported allocation was given pages and not a surface.
+///
+/// The steps of [`Driver::scanout_surface`], each named for the question it asks of the image,
+/// because a black window is otherwise the only symptom and it says nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NoSurface {
+    /// The guest did not ask to export it, so nothing outside the guest was ever going to see
+    /// it. Never the reason behind minted pages, which are minted only for an export.
+    NotExported,
+    /// Not dedicated to one image: a buffer, or an image allocation the guest left undedicated.
+    NotDedicated,
+    /// Dedicated to an image this renderer has no record of.
+    UnknownImage,
+    /// A pixel format IOSurface has no equivalent of.
+    Format(VkFormat),
+    /// An opaque layout: the driver keeps its storage in a layout of its own, and would never
+    /// write a byte into pages minted here.
+    Tiling(VkImageTiling),
+    /// The driver's layout is not rows a surface could alias -- no layout query, a zero pitch,
+    /// rows that do not add up to the image, or a pitch IOSurface would not take.
+    Layout,
+}
+
+impl core::fmt::Display for NoSurface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NoSurface::NotExported => f.write_str("the guest never exported it"),
+            NoSurface::NotDedicated => f.write_str("the memory is not dedicated to an image"),
+            NoSurface::UnknownImage => f.write_str("the image it is dedicated to has no record"),
+            NoSurface::Format(format) => write!(f, "IOSurface has no format for {format:?}"),
+            NoSurface::Tiling(tiling) => write!(f, "the image's layout is opaque ({tiling:?})"),
+            NoSurface::Layout => {
+                f.write_str("the driver's row layout is not one a surface could alias")
+            }
+        }
+    }
 }
 
 /// Storage this renderer minted, and what it cost -- one value, because they have one lifetime.
@@ -3503,7 +3557,13 @@ impl Storage {
     pub(crate) fn pages_for_test(len: usize, account: &Account) -> Storage {
         let map = GuestMap::anonymous(len).expect("the host has pages");
         let charge = account.try_charge("exported pages", map.len() as u64).expect("no cap");
-        Storage::Linear(Arc::new(Charged { it: map, charge }))
+        Storage::pages(map, charge, NoSurface::NotDedicated)
+    }
+
+    /// A share over minted pages, carrying why they are not a surface.
+    fn pages(map: GuestMap, charge: Charge, why: NoSurface) -> Storage {
+        let it = Pages { map, why, said: std::sync::atomic::AtomicBool::new(false) };
+        Storage::Linear(Arc::new(Charged { it, charge }))
     }
 }
 
@@ -3528,7 +3588,9 @@ impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Storage::Texture(m) => f.debug_tuple("Texture").field(&m.it.id()).finish(),
-            Storage::Linear(p) => f.debug_tuple("Linear").field(&p.it.len()).finish(),
+            Storage::Linear(p) => {
+                f.debug_tuple("Linear").field(&p.it.map.len()).field(&p.it.why).finish()
+            }
         }
     }
 }
@@ -3538,17 +3600,27 @@ impl Storage {
     pub fn span(&self) -> (usize, u64) {
         match self {
             Storage::Texture(m) => (m.it.host_addr(), m.it.alloc_size()),
-            Storage::Linear(p) => (p.it.host_addr(), p.it.len() as u64),
+            Storage::Linear(p) => (p.it.map.host_addr(), p.it.map.len() as u64),
         }
     }
 
-    /// The surface, for storage that is one. Pages are not: a buffer presented from them has
-    /// nothing to adopt and no presented pixels to read, and the one question -- "is this a
-    /// surface" -- is answered here once rather than per thing a caller wants from it.
-    pub fn surface(&self) -> Option<&Surface> {
+    /// The surface, for storage that is one -- or why this storage is not. Pages have nothing
+    /// to adopt and no presented pixels to read, and the one question -- "is this a surface" --
+    /// is answered here once rather than per thing a caller wants from it.
+    pub fn surface(&self) -> Result<&Surface, NoSurface> {
         match self {
-            Storage::Texture(m) => Some(&m.it),
-            Storage::Linear(_) => None,
+            Storage::Texture(m) => Ok(&m.it),
+            Storage::Linear(p) => Err(p.it.why),
+        }
+    }
+
+    /// Whether this is the first time the storage has been asked for a surface it does not
+    /// have. `true` once per storage, so the caller says the reason exactly once; `false` for a
+    /// surface, which has nothing to explain.
+    pub fn first_refusal(&self) -> bool {
+        match self {
+            Storage::Texture(_) => false,
+            Storage::Linear(p) => !p.it.said.swap(true, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -4493,6 +4565,11 @@ mod tests {
         assert!(!MAPPED.with(Cell::get), "the driver was never asked to map what it imported");
         let share = share.expect("pages lend a share");
         assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
+        assert_eq!(
+            share.surface().err(),
+            Some(NoSurface::NotDedicated),
+            "which know why they are not a surface: this export dedicated no image"
+        );
         assert_eq!(share.span(), span, "resolving to exactly what the driver was handed");
         assert_eq!(budget.live_for(one), span.1, "shared, and still this context's while it lives");
 

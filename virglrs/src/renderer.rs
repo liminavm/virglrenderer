@@ -879,8 +879,24 @@ impl Renderer {
     /// remembered one names whoever minted next, and releasing it would free *their* surface.
     /// A resource whose surface has gone answers `None` because there is no longer a surface to
     /// ask, which is the same thing said once instead of purged at each destroy site.
+    ///
+    /// A share of pages has no surface, and a compositor presenting from one gets a black
+    /// window with nothing to say why. The pages know why -- which question the image failed
+    /// at allocate -- and say it here, once, the first time they are asked.
     pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
-        Some(self.resource_storage(handle)?.surface()?.id())
+        let storage = self.resource_storage(handle)?;
+        match storage.surface() {
+            Ok(surface) => Some(surface.id()),
+            Err(why) => {
+                if storage.first_refusal() {
+                    eprintln!(
+                        "[virglrs] resource {}: presented from pages with no surface -- {why}",
+                        handle.get()
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// The share of storage a resource holds, for the paths that act on the bytes themselves.
@@ -912,7 +928,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
-        Some(self.resource_storage(handle)?.surface()?.read_rows(dst, stride, height))
+        Some(self.resource_storage(handle)?.surface().ok()?.read_rows(dst, stride, height))
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.
@@ -1491,6 +1507,42 @@ mod tests {
             Err(Error::NoAllocation),
             "and a fresh allocation under the same id does not answer for it"
         );
+    }
+
+    /// A scanout of pages answers no surface, and says why -- once.
+    ///
+    /// The line itself goes to stderr, where a test cannot read it; what is pinned is that the
+    /// share knows the reason and hands out the first refusal exactly once, so a compositor
+    /// asking every frame gets one line and not a log of them.
+    #[test]
+    fn a_scanout_of_pages_has_no_surface_and_says_so_once() {
+        use crate::venus::budget::Account;
+        use crate::venus::driver::NoSurface;
+
+        let mut r = renderer(Config { venus: true, ..Config::default() });
+        let one = CtxId::new(1).unwrap();
+        let account = Account::for_test(None);
+        let pages = Storage::pages_for_test(4096, &account);
+        assert_eq!(pages.surface().err(), Some(NoSurface::NotDedicated), "the pages know why");
+
+        let blob = ResourceHandle::new(5).unwrap();
+        r.insert(
+            blob,
+            Backing::Blob {
+                desc: BlobDesc {
+                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                    blob_flags: 1,
+                    source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                    size: 4096,
+                },
+                storage: BlobStorage::Shared { storage: pages.clone(), caching: Caching::Cached },
+            },
+            Vec::new(),
+        );
+        assert_eq!(r.resource_iosurface_id(blob), None, "nothing to present from");
+        assert!(!pages.first_refusal(), "the ask above was the first, and it has been said");
+        assert_eq!(r.resource_iosurface_id(blob), None);
+        assert!(!pages.first_refusal(), "and it is not said again");
     }
 
     /// a VMM would size a buffer from the first and get nothing back from the second, handing its
