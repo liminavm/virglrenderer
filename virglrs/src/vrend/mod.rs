@@ -16,6 +16,7 @@
 //! unsafe modules of this renderer (CLAUDE.md). Everything above them is safe Rust.
 
 pub mod context;
+pub mod debug;
 pub mod decode;
 pub mod egl;
 pub mod encode;

@@ -29,6 +29,7 @@ use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage};
 use super::transfer::{self, Info};
+use super::{debug, tgsi};
 use crate::guest_mem::{HostSpan, Iov};
 use crate::ids::{CtxId, ResourceHandle};
 use std::collections::BTreeMap;
@@ -131,7 +132,7 @@ impl Host<'_> {
 
 /// Why a context stopped serving. Sticky: the first one is kept and every later submission is
 /// refused with it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Fault {
     Wire(Refused),
     /// No object of the type the command wants under that handle.
@@ -158,6 +159,11 @@ pub enum Fault {
     Shader {
         cmd: Cmd,
         what: &'static str,
+    },
+    /// Shader text the TGSI layer refused.
+    Tgsi {
+        cmd: Cmd,
+        error: tgsi::Refusal,
     },
     /// A vertex format with no GL type.
     IllegalVertexFormat(Format),
@@ -198,6 +204,7 @@ impl fmt::Display for Fault {
             }
             Fault::OutOfRange { cmd, what } => write!(f, "{}: {what} out of range", cmd.name()),
             Fault::Shader { cmd, what } => write!(f, "{}: {what}", cmd.name()),
+            Fault::Tgsi { cmd, error } => write!(f, "{}: {error}", cmd.name()),
             Fault::IllegalVertexFormat(fmt) => {
                 write!(f, "vertex format {} has no GL type", fmt.name())
             }
@@ -216,22 +223,26 @@ impl fmt::Display for Fault {
 
 // ---- objects ----
 
-/// A shader as the guest sent it. Compiled nowhere yet: the TGSI is kept for the translation
-/// that lands with draws.
+/// A shader object: what the guest declared it, and its program once the text is all here.
 pub struct Shader {
     pub stage: ShaderStage,
     pub kind: ShaderKind,
-    pub num_tokens: u32,
-    /// The text so far, dword-padded as sent.
-    pub text: Vec<u8>,
-    /// How long the whole is, in bytes rounded up to a dword.
-    pub total: usize,
+    pub text: ShaderText,
 }
 
-impl Shader {
-    fn complete(&self) -> bool {
-        self.text.len() == self.total
-    }
+/// A shader's text arrives in one command or, past a command's size, in several; the object
+/// exists from the first. Nothing reads a program until it is parsed, so the two are one state
+/// each rather than a buffer and a flag.
+pub enum ShaderText {
+    Arriving {
+        /// The text so far, dword-padded as sent.
+        text: Vec<u8>,
+        /// How long the whole is, in bytes rounded up to a dword.
+        total: usize,
+    },
+    /// Parsed and scanned, as the C does the moment the text completes. Translated nowhere yet:
+    /// the GLSL lands with draws.
+    Parsed(tgsi::Program),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -664,8 +675,8 @@ impl Context {
         Ok(ctx)
     }
 
-    pub fn fault(&self) -> Option<Fault> {
-        self.fault
+    pub fn fault(&self) -> Option<&Fault> {
+        self.fault.as_ref()
     }
 
     /// Whether this context's GL contexts are `Current::Sub(self, ...)`.
@@ -711,8 +722,8 @@ impl Context {
 
     /// Run one batch. A fault stops it and sticks.
     pub fn submit(&mut self, host: &mut Host<'_>, words: &[u32]) -> Result<(), Fault> {
-        if let Some(f) = self.fault {
-            return Err(f);
+        if let Some(f) = &self.fault {
+            return Err(f.clone());
         }
         self.make_current(host);
         let batch = Batch::new(words);
@@ -736,7 +747,7 @@ impl Context {
 
     fn poison(&mut self, f: Fault) -> Result<(), Fault> {
         eprintln!("[virglrs] vrend: context poisoned: {f}");
-        self.fault = Some(f);
+        self.fault = Some(f.clone());
         Err(f)
     }
 
@@ -1307,7 +1318,7 @@ impl Context {
         }
     }
 
-    /// `vrend_create_shader`: the long-shader protocol, with the text kept for later.
+    /// `vrend_create_shader`: the long-shader protocol, and the parse once the text is whole.
     fn create_shader(
         &mut self,
         host: &mut Host<'_>,
@@ -1338,21 +1349,14 @@ impl Context {
                 if total < bytes.len() {
                     return Err(Fault::Shader { cmd, what: "more text than the declared length" });
                 }
-                let shader = Shader {
-                    stage: s.stage,
-                    kind: s.kind,
-                    num_tokens: s.num_tokens,
-                    text: bytes,
-                    total,
-                };
-                let done = shader.complete();
-                if done {
-                    check_terminated(&shader)?;
-                }
-                self.insert_object(host, handle, Object::Shader(shader));
-                if !done {
+                let text = if total == bytes.len() {
+                    ShaderText::Parsed(read_shader(&bytes, s.num_tokens)?)
+                } else {
                     self.sub_mut().long_shader[s.stage.index()] = Some(handle);
-                }
+                    ShaderText::Arriving { text: bytes, total }
+                };
+                let shader = Shader { stage: s.stage, kind: s.kind, text };
+                self.insert_object(host, handle, Object::Shader(shader));
             }
             ShaderChunk::Continuation { offset } => {
                 if in_progress != Some(handle) {
@@ -1363,20 +1367,26 @@ impl Context {
                 let Some(Object::Shader(shader)) = sub.objects.get_mut(&handle) else {
                     return Err(Fault::IllegalHandle { cmd, handle });
                 };
-                let fits = offset as usize == shader.text.len()
-                    && shader.total - shader.text.len() >= bytes.len();
+                let ShaderText::Arriving { text, total } = &mut shader.text else {
+                    return Err(Fault::Shader { cmd, what: "a continuation of a whole shader" });
+                };
+                let fits = offset as usize == text.len() && *total - text.len() >= bytes.len();
                 if !fits {
                     sub.long_shader[s.stage.index()] = None;
                     self.destroy_object(host, handle);
                     return Err(Fault::Shader { cmd, what: "a continuation out of sequence" });
                 }
-                shader.text.extend_from_slice(&bytes);
-                if shader.complete() {
-                    let ok = check_terminated(shader);
+                text.extend_from_slice(&bytes);
+                if text.len() == *total {
+                    // The C measures the whole against the completing command's token count.
+                    let parsed = read_shader(text, s.num_tokens);
                     sub.long_shader[s.stage.index()] = None;
-                    if let Err(e) = ok {
-                        self.destroy_object(host, handle);
-                        return Err(e);
+                    match parsed {
+                        Ok(program) => shader.text = ShaderText::Parsed(program),
+                        Err(e) => {
+                            self.destroy_object(host, handle);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -1582,14 +1592,20 @@ impl Context {
     }
 }
 
-/// A complete shader's text ends in a NUL somewhere in its last dword, as the C requires.
-fn check_terminated(s: &Shader) -> Result<(), Fault> {
-    let tail = &s.text[s.text.len().saturating_sub(4)..];
-    if tail.contains(&0) {
-        Ok(())
-    } else {
-        Err(Fault::Shader { cmd: Cmd::CreateObject, what: "text without a terminator" })
+/// `vrend_shader_assign_tgsi` through `vrend_shader_create`: a complete text -- which ends in
+/// a NUL somewhere in its last dword, as the C requires -- parsed and scanned, and printed on
+/// the way when asked, in the C's format so the two logs diff.
+fn read_shader(text: &[u8], num_tokens: u32) -> Result<tgsi::Program, Fault> {
+    let cmd = Cmd::CreateObject;
+    if text.len() < 4 || !text[text.len() - 4..].contains(&0) {
+        return Err(Fault::Shader { cmd, what: "text without a terminator" });
     }
+    let shader =
+        tgsi::Program::parse(text, num_tokens).map_err(|error| Fault::Tgsi { cmd, error })?;
+    if debug::enabled(debug::Switch::Shader) {
+        eprint!("TGSI received:\n{}\n", tgsi::dump::dump(&shader));
+    }
+    tgsi::Program::scan(shader).map_err(|error| Fault::Tgsi { cmd, error })
 }
 
 fn to_gl_swizzle(s: Swizzle) -> GLenum {
@@ -2860,16 +2876,29 @@ mod tests {
 
     #[test]
     fn a_shader_must_end_in_its_terminator() {
-        let mk = |text: &[u8]| Shader {
-            stage: ShaderStage::Vertex,
-            kind: ShaderKind::Graphics { stream_output: StreamOutput::default() },
-            num_tokens: 1,
-            text: text.to_vec(),
-            total: text.len(),
-        };
-        assert!(check_terminated(&mk(b"VERT\0\0\0\0")).is_ok());
-        assert!(check_terminated(&mk(b"VERT\0")).is_ok());
-        assert!(check_terminated(&mk(b"VERTEXSH")).is_err());
+        assert!(read_shader(b"VERT\0\0\0\0", 2).is_ok());
+        assert!(read_shader(b"VERT\0", 2).is_ok());
+        assert!(matches!(
+            read_shader(b"VERTEXSH", 2),
+            Err(Fault::Shader { what: "text without a terminator", .. })
+        ));
+        assert!(matches!(read_shader(b"VE\0", 2), Err(Fault::Shader { .. })));
+    }
+
+    #[test]
+    fn shader_text_the_tgsi_layer_refuses_is_a_tgsi_fault() {
+        assert!(matches!(
+            read_shader(b"PIXEL\n\0\0", 2),
+            Err(Fault::Tgsi { error: tgsi::Refusal::Text(_), .. })
+        ));
+        // The program fits the guest's count plus the C's allowance of ten, and no more.
+        let text = b"VERT\nDCL IN[0]\nDCL OUT[0], POSITION\n0: MOV OUT[0], IN[0]\n1: END\n\0";
+        assert!(read_shader(text, 1).is_ok());
+        assert!(read_shader(text, 0).is_err());
+        assert!(matches!(
+            read_shader(b"VERT\nDCL IN[80]\n0: END\n\0", 20),
+            Err(Fault::Tgsi { error: tgsi::Refusal::Scan(_), .. })
+        ));
     }
 
     #[test]
