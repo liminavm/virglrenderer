@@ -890,7 +890,7 @@ impl Renderer {
             Err(why) => {
                 if storage.first_refusal() {
                     eprintln!(
-                        "[virglrs] resource {}: presented from pages with no surface -- {why}",
+                        "[virglrs] resource {}: has no surface to present -- {why}",
                         handle.get()
                     );
                 }
