@@ -76,6 +76,13 @@ SABOTAGES = [
         'query_results',
     ),
     (
+        'a scanout of pages says why it has no surface on every frame, not once',
+        'virglrs/src/venus/driver.rs',
+        """            Storage::Linear(p) => !p.it.said.swap(true, std::sync::atomic::Ordering::Relaxed),""",
+        """            Storage::Linear(_) => true,""",
+        'says_so_once',
+    ),
+    (
         'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
         'virglrs/src/venus/context.rs',
         """                if wants_reply {
