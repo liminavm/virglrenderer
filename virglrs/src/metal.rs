@@ -20,13 +20,16 @@
 //! frees storage its owner cannot re-mint. Nothing here stores an id: [`Surface::id`] asks the
 //! live surface every time, and there is no way to name a surface except by holding one.
 //!
-//! Metal is not here yet, and slice by slice may never need to be. The venus scanout path takes
-//! its row pitch from the driver's own `VkSubresourceLayout::rowPitch` rather than from
-//! `minimumLinearTextureAlignmentForPixelFormat:`, so nothing on this path sends an Objective-C
-//! message. When something does, it belongs in this module and nowhere else.
+//! Metal is here for one question: the row pitch a linear Metal texture of a given width takes.
+//! The venus scanout path never asks it -- its pitch is the driver's own
+//! `VkSubresourceLayout::rowPitch` for the image the surface will back -- but a classic scanout
+//! has no `VkImage` to ask, and the importer that will one day lay a linear image over its bytes
+//! computes its pitch from exactly this alignment. That one Objective-C message lives here and
+//! nowhere else.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 use crate::ids::SurfaceId;
 
@@ -88,6 +91,57 @@ unsafe extern "C" {
 /// invalidate the GPU's copy of pixels the guest is still rendering into.
 const LOCK_READ_ONLY: u32 = 1;
 
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> *mut c_void;
+}
+
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    fn sel_registerName(name: *const c_char) -> *const c_void;
+    fn objc_msgSend();
+}
+
+/// The system Metal device, created once and never released, exactly as the C caches it: it is
+/// asked one alignment on the resource-create path and outlives every surface.
+struct Device(NonNull<c_void>);
+
+// SAFETY: an `id<MTLDevice>` is documented thread-safe, and the only message sent to it is a
+// query of a fixed device property.
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
+fn device() -> Option<&'static Device> {
+    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            // SAFETY: a plain C entry point of the Metal framework, returning a +1 reference or
+            // null. The reference is kept for the life of the process.
+            NonNull::new(unsafe { MTLCreateSystemDefaultDevice() }).map(Device)
+        })
+        .as_ref()
+}
+
+/// `[device minimumLinearTextureAlignmentForPixelFormat:]`, or `None` when there is no device
+/// or it answers zero.
+fn linear_alignment(mtl_format: u64) -> Option<u64> {
+    let device = device()?;
+    // SAFETY: `objc_msgSend` is called through a signature matching the selector's -- receiver,
+    // selector, one `MTLPixelFormat` (an `NSUInteger`), returning an `NSUInteger` -- which is
+    // the documented way to send a message from C on arm64. The selector is a literal, the
+    // receiver a live device.
+    let align = unsafe {
+        let send: unsafe extern "C" fn(*mut c_void, *const c_void, u64) -> u64 =
+            core::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        send(
+            device.0.as_ptr(),
+            sel_registerName(c"minimumLinearTextureAlignmentForPixelFormat:".as_ptr()),
+            mtl_format,
+        )
+    };
+    (align != 0).then_some(align)
+}
+
 // ------------------------------------------------------------------- pixels
 
 /// A pixel format a surface can be minted in.
@@ -120,6 +174,25 @@ impl PixelFormat {
         match self {
             PixelFormat::Bgra | PixelFormat::Rgba => 4,
         }
+    }
+
+    /// The `MTLPixelFormat` a linear texture over these bytes would be.
+    fn mtl_format(self) -> u64 {
+        match self {
+            PixelFormat::Bgra => 80, // MTLPixelFormatBGRA8Unorm
+            PixelFormat::Rgba => 70, // MTLPixelFormatRGBA8Unorm
+        }
+    }
+
+    /// The row pitch a linear Metal texture `width` pixels wide takes in this format: the tight
+    /// row, aligned up to what the device demands. `None` when there is no device to ask.
+    ///
+    /// This is the pitch an importer laying a linear `VkImage` over the surface's bytes will
+    /// compute for itself, so a surface minted at any other pitch shears under it.
+    pub fn linear_pitch(self, width: u32) -> Option<u32> {
+        let align = linear_alignment(self.mtl_format())?;
+        let row = u64::from(width) * u64::from(self.bytes_per_element());
+        u32::try_from(row.div_ceil(align) * align).ok()
     }
 }
 
@@ -219,6 +292,37 @@ impl Surface {
         NonNull::new(surface.cast_mut())
             .map(|surface| Surface { surface })
             .ok_or(SurfaceError::Refused)
+    }
+
+    /// Mint a surface for a classic resource, at the pitch a linear Metal texture of its width
+    /// takes.
+    ///
+    /// There is no driver layout to match here -- the resource is a GL texture whose storage
+    /// this surface becomes -- but there will be an importer: a venus context that lays a linear
+    /// image over these bytes computes its pitch from the device's alignment, and this is that
+    /// pitch. IOSurface may still lay the rows out its own way; unlike the venus path, a
+    /// mismatch is not fatal, because refusing the surface would take every shared buffer down
+    /// with it. It is reported instead, once, as the only warning an importer's shear will get.
+    pub fn plain(width: u32, height: u32, format: PixelFormat) -> Result<Surface, SurfaceError> {
+        let pitch = format.linear_pitch(width).ok_or(SurfaceError::NoPitch)?;
+        let surface = Surface::scanout(width, height, format, pitch)?;
+        if surface.bytes_per_row() != pitch {
+            eprintln!(
+                "[virglrs] IOSurface overrode the row pitch (asked {pitch}, got {}) for \
+                 {width}x{height}: a linear importer will shear",
+                surface.bytes_per_row()
+            );
+        }
+        Ok(surface)
+    }
+
+    /// The surface as the `EGLClientBuffer` an EGL image is created from.
+    ///
+    /// The one place a raw reference leaves this module, and it leaves as a pointer for the
+    /// importer's call and nothing else: the importer holds the `Surface` for the whole life of
+    /// its import, which is what makes the pointer good for that long.
+    pub(crate) fn client_buffer(&self) -> *mut c_void {
+        self.surface.as_ptr().cast()
     }
 
     /// The global id another process looks this surface up by.
@@ -523,6 +627,29 @@ mod tests {
             // would fail here and nowhere else, because every other test names only one of them.
             let _guard = MINT.lock().expect("the mint lock");
             Surface::scanout(64, 32, format, 256).expect("the system minted it");
+        }
+    }
+}
+
+#[cfg(test)]
+mod plain_tests {
+    use super::*;
+
+    /// A classic scanout's pitch is the device's answer, not a guess: the tight row aligned up to
+    /// what a linear Metal texture demands, which is what a venus importer laying a linear image
+    /// over the bytes will compute for itself.
+    #[test]
+    fn a_plain_surface_takes_the_linear_texture_pitch() {
+        for format in [PixelFormat::Bgra, PixelFormat::Rgba] {
+            let pitch = format.linear_pitch(1).expect("this host has a Metal device");
+            assert!(pitch >= 4 && pitch.is_multiple_of(4), "one pixel, aligned up: {pitch}");
+            assert!(pitch.is_power_of_two(), "the alignment is one: {pitch}");
+            let wide = format.linear_pitch(1280).expect("a device");
+            assert!(wide >= 1280 * 4 && wide.is_multiple_of(pitch), "{wide}");
+
+            let surface = Surface::plain(48, 48, format).expect("minted");
+            assert_eq!(surface.bytes_per_row(), format.linear_pitch(48).expect("a device"));
+            assert!(surface.alloc_size() >= u64::from(surface.bytes_per_row()) * 48);
         }
     }
 }

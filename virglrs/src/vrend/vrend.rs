@@ -23,6 +23,7 @@ use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::transfer::{self, Info};
 use crate::guest_mem::Iov;
 use crate::ids::{CtxId, ResourceHandle};
+use crate::metal;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -200,9 +201,36 @@ impl Vrend {
     pub fn resource_create(&mut self, handle: ResourceHandle, args: Args) -> Result<(), Refusal> {
         assert!(!self.resources.contains_key(&handle), "the renderer checked the handle was free");
         self.switch_ctx0();
-        let res = Resource::create(&self.gl, &self.features, &self.formats, &self.limits, args)?;
+        let res = Resource::create(
+            &self.gl,
+            &self.winsys,
+            &self.features,
+            &self.formats,
+            &self.limits,
+            args,
+        )?;
         self.resources.insert(handle, res);
         Ok(())
+    }
+
+    /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
+    /// every time: the surface goes with the resource, and there is no other place to hold one.
+    pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&metal::Surface> {
+        self.resources.get(&handle)?.surface()
+    }
+
+    /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
+    /// before the surface is presented, on ctx0. The texture's storage *is* the surface, so
+    /// there is nothing to copy -- only the renders queued into it to complete, since the
+    /// present that follows reads the bytes on another queue. `false` for a resource with no
+    /// surface, which is the caller's cue to read the pixels back instead.
+    pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
+        if self.resource_surface(handle).is_none() {
+            return false;
+        }
+        self.switch_ctx0();
+        self.gl.finish();
+        true
     }
 
     /// Delete the host side of a resource, on ctx0. A handle this renderer never held is

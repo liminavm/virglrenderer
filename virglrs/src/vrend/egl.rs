@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub(crate) use super::gl::types;
 use super::gl::{Gles, ProcAddr};
+use crate::metal::Surface;
 
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
 pub mod proc {
@@ -161,6 +162,49 @@ impl Drop for Context {
         // SAFETY: `ctx` was returned by `eglCreateContext` on this display and has not been
         // destroyed, because only this drop destroys it.
         unsafe { self.shared.egl.eglDestroyContext()(self.shared.display, self.ctx) };
+    }
+}
+
+/// `EGL_IOSURFACE_LIMINA`: the `eglCreateImageKHR` target limina's Mesa accepts an `IOSurfaceRef`
+/// as the client buffer of. The value is the one `egl_dri2.c` defines, and must stay so.
+const EGL_IOSURFACE_LIMINA: EGLenum = 0x3B9A;
+
+/// An EGL image over an IOSurface, which is the surface's bytes seen as a GL texture's storage.
+///
+/// Owns the surface it was made from, so the image cannot outlive what it images: the driver
+/// keeps its own reference to the IOSurface, but ours is what keeps the id the compositor was
+/// handed naming this surface and not a stranger's minted after it.
+pub struct Image {
+    shared: Arc<Shared>,
+    image: EGLImageKHR,
+    surface: Arc<Surface>,
+}
+
+// SAFETY: `image` is an EGL token, for the reason `Shared`'s impl gives, and the surface is
+// `Send + Sync` on its own account.
+unsafe impl Send for Image {}
+// SAFETY: as above -- a shared reference grants only the ability to pass the token to EGL or GL.
+unsafe impl Sync for Image {}
+
+impl Image {
+    /// The surface this images.
+    pub fn surface(&self) -> &Surface {
+        &self.surface
+    }
+
+    /// The token GL binds as texture storage (`GLeglImageOES`). For the GL bindings only, which
+    /// take the `Image` by reference and so cannot hold the token past it.
+    pub(crate) fn raw(&self) -> EGLImageKHR {
+        self.image
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        // SAFETY: `image` was returned by `eglCreateImageKHR` on this display and has not been
+        // destroyed, because only this drop destroys it. The surface is released after, by its
+        // own drop, so the driver's last look at it (if any) precedes ours.
+        unsafe { self.shared.egl.eglDestroyImageKHR()(self.shared.display, self.image) };
     }
 }
 
@@ -358,6 +402,32 @@ impl Winsys {
             return Err(self.shared.error("eglMakeCurrent"));
         }
         Ok(())
+    }
+
+    /// An EGL image whose pixels are `surface`'s, for a texture to take as its storage.
+    ///
+    /// Made against no context: the image belongs to the display, and any context on it may
+    /// bind it. Fails, naming the call, when the driver will not import the surface -- the
+    /// resource then keeps ordinary GL storage, and the caller says so.
+    pub fn image_from_iosurface(&self, surface: Arc<Surface>) -> Result<Image, EglError> {
+        let egl = &self.shared.egl;
+        // SAFETY: the display is initialised; the target is the one limina's Mesa defines for an
+        // `IOSurfaceRef` client buffer, and `surface` is held by the `Image` for as long as the
+        // image exists, so the reference passed here outlives every use the driver makes of it.
+        // No attributes, as `NULL` is the documented empty list.
+        let image = unsafe {
+            egl.eglCreateImageKHR()(
+                self.shared.display,
+                proc::EGL_NO_CONTEXT,
+                EGL_IOSURFACE_LIMINA,
+                surface.client_buffer(),
+                core::ptr::null(),
+            )
+        };
+        if image.is_null() {
+            return Err(self.shared.error("eglCreateImageKHR"));
+        }
+        Ok(Image { shared: Arc::clone(&self.shared), image, surface })
     }
 
     /// The GLES entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the

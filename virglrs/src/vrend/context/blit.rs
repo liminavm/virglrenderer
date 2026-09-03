@@ -112,11 +112,11 @@ fn make_view(
     res: &Resource,
     format: Format,
 ) -> Option<End> {
-    let Storage::Texture { name, target, immutable } = res.storage else {
+    let Storage::Texture { name, target, immutable, .. } = res.storage else {
         return None;
     };
     let base = End { name, target, temporary: false };
-    if res.args.format == format || !features.has(Feature::texture_view) {
+    if res.args.format == format || !features.has(Feature::texture_view) || !res.supports_view() {
         return Some(base);
     }
     let (Some(te), Some(ve)) = (formats.get(res.args.format), formats.get(format)) else {
@@ -191,9 +191,14 @@ impl Context {
         let (dw, dh) = (dst_res.width_at(dst.level) as i32, dst_res.height_at(dst.level) as i32);
         let same_samples = src_res.args.nr_samples == dst_res.args.nr_samples;
         let condition_free = !b.render_condition_enable || self.sub().render_condition.is_none();
+        // A resource that cannot be viewed gets its colourspace conversion from a shader, which
+        // only the blitter has.
+        let eglimage_copy_compatible =
+            !(src_res.needs_srgb_decode(src.format) || dst_res.needs_srgb_encode(dst.format));
         let copy_path = host.has(Feature::copy_image)
             && condition_free
             && copy_compatible(formats, src.format, dst.format, false)
+            && eglimage_copy_compatible
             && !b.scissor_enable
             && b.filter == TexFilter::Nearest
             && !b.alpha_blend
@@ -263,10 +268,14 @@ impl Context {
     fn blit_int(&mut self, host: &mut Host<'_>, b: &Blit) -> Result<(), Fault> {
         let cmd = Cmd::Blit;
         let formats = host.formats;
-        let (src_res, dst_res) = {
+        let (src_res, dst_res, redblue) = {
             let s = host.resource(cmd, b.src.resource)?;
             let d = host.resource(cmd, b.dst.resource)?;
-            ((s.args, s.y_0_top()), (d.args, d.y_0_top()))
+            // `vrend_blit_needs_redblue_swizzle`: one end reads its red and blue swapped and the
+            // other does not, so the blit has to swap them -- which only the blitter can.
+            let redblue =
+                s.needs_redblue_swizzle(b.src.format) != d.needs_redblue_swizzle(b.dst.format);
+            ((s.args, s.y_0_top()), (d.args, d.y_0_top()), redblue)
         };
         let (gl, features) = (host.gl, host.features);
         let src_end =
@@ -292,7 +301,7 @@ impl Context {
         };
         let (dst_y1, dst_y2) = ys(dst_res.1, dst_res.0.height, b.dst.region.y, b.dst.region.height);
         let (src_y1, src_y2) = ys(src_res.1, src_res.0.height, b.src.region.y, b.src.region.height);
-        if needs_swizzle(formats, b.dst.format, b.src.format) {
+        if needs_swizzle(formats, b.dst.format, b.src.format) || redblue {
             can_fbo = false;
         }
         if b.mask & PIPE_MASK_RGBA != 0
@@ -644,7 +653,7 @@ impl Context {
         let colorf = color.map(f32::from_bits);
         let depth = f64::from_bits(color[0] as u64 | (color[1] as u64) << 32);
         let stencil = color[3];
-        self.clear_prepare(host, buffers, colorf, depth, stencil);
+        self.clear_prepare(host, Some((resource, format)), buffers, colorf, depth, stencil)?;
         let mut bits: GLbitfield = 0;
         if buffers & PIPE_CLEAR_COLOR0 != 0 {
             bits |= GL_COLOR_BUFFER_BIT;

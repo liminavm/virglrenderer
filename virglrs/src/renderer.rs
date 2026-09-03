@@ -1007,6 +1007,9 @@ impl Renderer {
     /// window with nothing to say why. The pages know why -- which question the image failed
     /// at allocate -- and say it here, once, the first time they are asked.
     pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
+        if let Some(surface) = self.classic_surface(handle) {
+            return Some(surface.id());
+        }
         let storage = self.resource_storage(handle)?;
         match storage.surface() {
             Ok(surface) => Some(surface.id()),
@@ -1020,6 +1023,13 @@ impl Renderer {
                 None
             }
         }
+    }
+
+    /// The surface a classic resource is presented from, when vrend gave it one. Asked of vrend,
+    /// which owns the resource's host side, rather than mirrored in the table: the surface lives
+    /// and dies with the texture whose storage it is.
+    fn classic_surface(&self, handle: ResourceHandle) -> Option<&crate::metal::Surface> {
+        self.vrend.as_ref()?.resource_surface(handle)
     }
 
     /// The share of storage a resource holds, for the paths that act on the bytes themselves.
@@ -1051,7 +1061,19 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
+        if let Some(surface) = self.classic_surface(handle) {
+            return Some(surface.read_rows(dst, stride, height));
+        }
         Some(self.resource_storage(handle)?.surface().ok()?.read_rows(dst, stride, height))
+    }
+
+    /// Complete a classic scanout's renders before the surface they landed in is presented.
+    ///
+    /// Classic only: a venus scanout renders into its surface on the guest's own timeline and
+    /// must never be synced from here. `false` for a resource that has no surface -- the VMM's
+    /// cue to read its pixels back the slow way.
+    pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
+        self.vrend.as_mut().is_some_and(|v| v.resource_sync_iosurface(handle))
     }
 
     /// Where a blob resource lives in this process, for a VMM about to publish it to the guest.

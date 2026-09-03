@@ -958,9 +958,15 @@ pub extern "C" fn virgl_renderer_resource_read_iosurface(
     })
 }
 
+/// The VMM's `RESOURCE_FLUSH` of a classic scanout: complete what was rendered into the surface
+/// before it is presented. `-EINVAL` for a resource that is not surface-backed, as in the C, which
+/// is the VMM's cue to read the pixels back instead.
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_resource_sync_iosurface(_res_handle: u32) -> c_int {
-    EINVAL
+pub extern "C" fn virgl_renderer_resource_sync_iosurface(res_handle: u32) -> c_int {
+    let Some(handle) = ResourceHandle::new(res_handle) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| if r.resource_sync_iosurface(handle) { 0 } else { EINVAL })
 }
 
 #[unsafe(no_mangle)]

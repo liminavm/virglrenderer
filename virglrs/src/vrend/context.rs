@@ -424,6 +424,14 @@ pub struct SubCtx {
     fb_height: u32,
     fbo_origin_upper_left: bool,
     framebuffer_srgb_enabled: bool,
+    /// Colour buffers whose resource cannot be viewed (`Resource::supports_view`) and whose
+    /// surface format swaps red and blue against it: the fragment shader swaps them on its final
+    /// write, one bit per attachment. Read by the shader key.
+    swizzle_output_rgb_to_bgr: u8,
+    /// Colour buffers whose resource cannot be viewed and whose surface format is sRGB: the
+    /// fragment shader encodes on its final write, one bit per attachment. Read by the shader
+    /// key.
+    needs_manual_srgb_encode: u8,
 
     blend_color: [f32; 4],
     ve: Option<ObjectHandle>,
@@ -479,6 +487,8 @@ impl SubCtx {
             fb_height: 0,
             fbo_origin_upper_left: false,
             framebuffer_srgb_enabled: false,
+            swizzle_output_rgb_to_bgr: 0,
+            needs_manual_srgb_encode: 0,
             blend_color: [0.0; 4],
             ve: None,
             vbos: Vec::new(),
@@ -1384,7 +1394,7 @@ impl Context {
         let entry = formats.get(v.format).ok_or(Fault::IllegalFormat { cmd, format: v.format })?;
         let (is_buffer, tex_name, tex_target, immutable) = match &res.storage {
             Storage::Buffer { .. } => (true, None, GL_TEXTURE_BUFFER, false),
-            Storage::Texture { name, target, immutable } => {
+            Storage::Texture { name, target, immutable, .. } => {
                 (false, Some(*name), *target, *immutable)
             }
             Storage::Guest | Storage::Host(_) => {
@@ -1417,10 +1427,11 @@ impl Context {
                 }
             }
         }
-        let gl_swizzle = swizzle.map(|s| to_gl_swizzle(s) as GLint);
+        let mut gl_swizzle = swizzle.map(|s| to_gl_swizzle(s) as GLint);
         let mut view = None;
         if let Some(tex) = tex_name {
             let res_format = res.args.format;
+            let supports_view = res.supports_view();
             let res_is_ds = res_format.describe().is_some_and(|d| d.is_depth_or_stencil());
             let mut needs_view = target != tex_target;
             let view_format = if res_is_ds { res_format } else { v.format };
@@ -1448,6 +1459,12 @@ impl Context {
                     .gl
                     .internalformat;
                 let name = gl.gen_texture();
+                // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
+                // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
+                // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
+                if !supports_view && resource::is_bgra(v.format) {
+                    gl_swizzle.swap(0, 2);
+                }
                 if !gl.texture_view(
                     name,
                     target,
@@ -1511,7 +1528,7 @@ impl Context {
             ),
         };
         let mut view = None;
-        if let Storage::Texture { name, target, immutable: true } = res.storage
+        if let Storage::Texture { name, target, immutable: true, .. } = res.storage
             && host.features.has(Feature::texture_view)
         {
             let max_layer = res.depth_at(level).saturating_sub(1);
@@ -1520,7 +1537,9 @@ impl Context {
             if !needs_view && s.format != res.args.format {
                 needs_view = true;
             }
-            if needs_view {
+            // A resource that cannot be viewed is rendered to as itself, with the conversion the
+            // view would have done moved into the writes (`set_framebuffer_state`, the clears).
+            if needs_view && res.supports_view() {
                 let entry = host
                     .formats
                     .get(s.format)
@@ -1914,8 +1933,23 @@ impl Context {
                 );
             }
         }
+        // `vrend_hw_emit_framebuffer_state`'s per-attachment half: what a view would have
+        // converted, for the resources that cannot be viewed, becomes work for the writes.
+        let (mut to_bgr, mut encode) = (0u8, 0u8);
+        for (i, s) in new_cbufs.iter().enumerate() {
+            let Some(s) = s else { continue };
+            let res = host.resource(cmd, s.resource)?;
+            if res.needs_redblue_swizzle(s.format) {
+                to_bgr |= 1 << i;
+            }
+            if !res.supports_view() && s.format.describe().is_some_and(|d| d.is_srgb()) {
+                encode |= 1 << i;
+            }
+        }
         let sub = self.sub_mut();
         sub.cbufs = new_cbufs;
+        sub.swizzle_output_rgb_to_bgr = to_bgr;
+        sub.needs_manual_srgb_encode = encode;
         let (height, upper_left) = if sub.cbufs.is_empty() && sub.zsurf.is_none() {
             (0, false)
         } else if sub.cbufs.is_empty() {
@@ -2431,18 +2465,38 @@ fn arb_format(format: Format) -> GLenum {
 
 // ---- clears ----
 
+/// `vrend_color_encode_as_srgb`: one linear channel to sRGB.
+fn encode_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
 impl Context {
     /// `vrend_clear_prepare`: unmask what the clear writes, set the values.
+    ///
+    /// `surf` is the surface the colour lands on: a resource that cannot be viewed as the
+    /// surface's format gets the view's conversion applied to the clear colour instead.
     fn clear_prepare(
         &mut self,
         host: &mut Host<'_>,
+        surf: Option<(ResourceHandle, Format)>,
         buffers: u32,
-        color: [f32; 4],
+        mut color: [f32; 4],
         depth: f64,
         stencil: u32,
-    ) {
+    ) -> Result<(), Fault> {
         let gl = host.gl;
         let indep = host.has(Feature::indep_blend);
+        if let Some((handle, format)) = surf {
+            let res = host.resource(Cmd::Clear, handle)?;
+            if !res.supports_view() && format.describe().is_some_and(|d| d.is_srgb()) {
+                for c in &mut color[..3] {
+                    *c = encode_srgb(*c);
+                }
+            }
+            if res.needs_redblue_swizzle(format) {
+                color.swap(0, 2);
+            }
+        }
         let sub = self.sub_mut();
         if buffers & PIPE_CLEAR_COLOR != 0 {
             gl.clear_color(color);
@@ -2465,6 +2519,7 @@ impl Context {
         if sub.hw_rs.rasterizer_discard {
             gl.disable(GL_RASTERIZER_DISCARD);
         }
+        Ok(())
     }
 
     /// `vrend_clear_finish`: restore the masks the clear lifted.
@@ -2513,7 +2568,12 @@ impl Context {
         gl.use_program_none();
         gl.disable(GL_SCISSOR_TEST);
         let colorf = color.map(f32::from_bits);
-        self.clear_prepare(host, buffers, colorf, depth, stencil);
+        let surf = self.sub().cbufs.first().copied().flatten().map(|s| (s.resource, s.format));
+        if let Err(e) = self.clear_prepare(host, surf, buffers, colorf, depth, stencil) {
+            // A bound surface names a resource that is gone: the C clears on regardless, with
+            // no conversion, and so does this.
+            eprintln!("[virglrs] vrend: clear on a surface whose resource is gone: {e:?}");
+        }
         let sub = self.sub();
         let mut bits: GLbitfield = 0;
         let mask: u32 =
@@ -2559,7 +2619,7 @@ impl Context {
         let entry =
             res.entry(host.formats).ok_or(Fault::IllegalFormat { cmd, format: res.args.format })?;
         let mut bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
-        if transfer::is_bgra(res.args.format.name()) {
+        if res.is_bgra() {
             bytes.swap(0, 2);
         }
         if !host.gl.clear_tex_sub_image(
