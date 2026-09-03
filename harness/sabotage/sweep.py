@@ -163,29 +163,36 @@ SABOTAGES = [
     (
         'an import is billed as though it were fresh storage',
         'virglrs/src/venus/driver.rs',
-        '            Backing::Imported => None,\n        };\n        let charge = match charge.transpose() {',
-        '            Backing::Imported => Some(self.account.try_charge("device memory", size)),\n        };\n        let charge = match charge.transpose() {',
+        """            (Some(bytes), _, _) => Backing::Imported(bytes),""",
+        """            (Some(bytes), _, _) => {
+                std::mem::forget(self.admit("device memory", size)?);
+                Backing::Imported(bytes)
+            }""",
         '',
     ),
     (
         'the cap is consulted and then ignored',
         'virglrs/src/venus/budget.rs',
-        '        if let Some(cap) = self.cap\n            && live.saturating_add(size) > cap\n        {',
-        '        if let Some(cap) = self.cap\n            && false\n        {',
+        """        if let Some(cap) = self.budget.cap
+            && live.saturating_add(size) > cap
+        {""",
+        """        if let Some(cap) = self.budget.cap
+            && false
+        {""",
         '',
     ),
     (
         'a budget refusal leaves the context running',
         'virglrs/src/venus/driver.rs',
-        'return Err(NoMemory::OverBudget { stop: self.account.kills_context() });',
-        'return Err(NoMemory::OverBudget { stop: false });',
+        """            NoMemory::OverBudget { stop: self.account.kills_context() }""",
+        """            NoMemory::OverBudget { stop: false }""",
         '',
     ),
     (
         'a scanout is charged at the size the guest asked for, not the surface it got',
         'virglrs/src/venus/driver.rs',
-        'Backing::Scanout(s) => Some(self.account.try_charge("IOSurface", s.alloc_size())),',
-        'Backing::Scanout(_) => Some(self.account.try_charge("IOSurface", size)),',
+        """                let charge = self.admit("IOSurface", surface.alloc_size())?;""",
+        """                let charge = self.admit("IOSurface", size)?;""",
         '',
     ),
     (
@@ -356,7 +363,6 @@ SABOTAGES = [
         'virglrs/src/venus/context.rs',
         """            if depth > 0 {
                 poison(
-                    fatal,
                     id,
                     &dec,
                     cmd,
@@ -406,11 +412,11 @@ SABOTAGES = [
     (
         'the property query resolves a resource the allocation would not',
         'virglrs/src/venus/context.rs',
-        """        let Some(_) = self.driver.span(&bytes) else {
+        """        let Some(span) = self.driver.span(&bytes) else {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };""",
-        """""",
+        """        let span = self.driver.span(&bytes).unwrap_or((0, 0));""",
         '',
     ),
     (
@@ -448,11 +454,11 @@ SABOTAGES = [
     (
         'an import keeps the address it resolved and drops the share that kept it good',
         'virglrs/src/venus/driver.rs',
-        """            (Some(bytes), _, _) => (Backing::Imported(bytes), None),""",
+        """            (Some(bytes), _, _) => Backing::Imported(bytes),""",
         """            (Some(bytes), _, _) => {
                 let name = crate::venus::ring::Published { memory: id, size };
                 drop(bytes);
-                (Backing::Imported(ResourceBytes::Allocation(name)), None)
+                Backing::Imported(ResourceBytes::Allocation(name))
             }""",
         'an_import_holds_the_storage_it_resolved',
     ),
@@ -466,24 +472,32 @@ SABOTAGES = [
     (
         'a scanout export lends no share, so its storage stays trapped in one context',
         'virglrs/src/venus/driver.rs',
-        """            Backing::Scanout(s) => Some(Storage::Texture(Arc::clone(s))),""",
-        """            Backing::Scanout(_) => None,""",
+        """            Backing::Owned { storage, .. } => Some(storage.clone()),""",
+        """            Backing::Owned { storage: Storage::Linear(s), .. } => Some(Storage::Linear(Arc::clone(s))),
+            Backing::Owned { storage: Storage::Texture(_), .. } => None,""",
         '',
     ),
     (
-        'a shared surface stays billed to the context that minted it, and dies with its slot',
-        'virglrs/src/venus/driver.rs',
-        """                m.charge.share();
-""",
-        """""",
-        '',
-    ),
-    (
-        'the cap stops counting storage the moment it is shared',
+        "a context's destroy uncounts what still outlives it",
         'virglrs/src/venus/budget.rs',
-        """        self.ctxs.values().map(PerCtx::bytes).sum::<u64>() + self.shared.bytes()""",
-        """        self.ctxs.values().map(PerCtx::bytes).sum::<u64>()""",
-        '',
+        """        slot.live.drain_into(&mut ledger.shared);""",
+        """        drop(slot);""",
+        'a_charge_that_outlives_its_context_stays_counted',
+    ),
+    (
+        'the cap stops counting storage the moment its context is gone',
+        'virglrs/src/venus/budget.rs',
+        """        self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>() + self.shared.bytes()""",
+        """        self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>()""",
+        'a_charge_that_outlives_its_context_stays_counted',
+    ),
+    (
+        'a late credit lands on whichever context holds the id now',
+        'virglrs/src/venus/budget.rs',
+        """        self.ctxs.get_mut(&ctx).filter(|s| s.epoch == epoch).map(|s| &mut s.live)""",
+        """        let _ = epoch;
+        self.ctxs.get_mut(&ctx).map(|s| &mut s.live)""",
+        'a_late_credit_never_lands_on_the_next_context_with_the_same_id',
     ),
     (
         'an image the guest shares keeps the opaque tiling it asked for',
@@ -515,11 +529,9 @@ SABOTAGES = [
     (
         'minted pages lend no share, so the buffer stays trapped in one context',
         'virglrs/src/venus/driver.rs',
-        """            Backing::Pages(p) => {
-                p.charge.share();
-                Some(Storage::Linear(Arc::clone(p)))
-            }""",
-        """            Backing::Pages(_) => None,""",
+        """            Backing::Owned { storage, .. } => Some(storage.clone()),""",
+        """            Backing::Owned { storage: Storage::Texture(s), .. } => Some(Storage::Texture(Arc::clone(s))),
+            Backing::Owned { storage: Storage::Linear(_), .. } => None,""",
         '',
     ),
     (
@@ -533,19 +545,11 @@ SABOTAGES = [
         'freeing a descriptor set is refused again, and every GTK client dies a few frames in',
         'virglrs/src/venus/context.rs',
         """    fn vkFreeDescriptorSets(&mut self, args: &mut vn_command_vkFreeDescriptorSets<'_>) {
-        let sets = self.array_or_empty(args.pDescriptorSets());
-        let r = self.driver.free_objects(
-            args.device,
-            |d| d.vkFreeDescriptorSets(),
-            args.descriptorPool,
-            sets,
-        );
-        // The spec's answer is always success, and freeing nothing is not a failure either.
-        args.ret = r.unwrap_or(VkResult::VK_SUCCESS);
-    }
-
-""",
-        """""",
+        let sets = self.array_or_empty(args.pDescriptorSets());""",
+        """    fn vkFreeDescriptorSets(&mut self, args: &mut vn_command_vkFreeDescriptorSets<'_>) {
+        self.unsupported(VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeDescriptorSets_EXT);
+        if true { return; }
+        let sets = self.array_or_empty(args.pDescriptorSets());""",
         '',
     ),
     (
@@ -575,9 +579,8 @@ SABOTAGES = [
         'virglrs/venus-gen/rustgen.py',
         """                hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
                        'let Some(a) = dec.alloc_temp_array::<u8>(n) else { return };',
-                       '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]
-                return self._present(shape[1], var, m, null, hit)""",
-        """                return ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]""",
+                       '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]""",
+        """                hit = ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]""",
         'an_out_blob_is_room',
     ),
     (
@@ -707,7 +710,6 @@ SABOTAGES = [
         'virglrs/src/venus/context.rs',
         """            if depth > 0 {
                 poison(
-                    fatal,
                     id,
                     &dec,
                     cmd,
