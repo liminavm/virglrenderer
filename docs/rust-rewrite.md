@@ -343,8 +343,31 @@ buildable throughout as the A-side reference.
   formality: a build missing all of them scores every corpus clean and puts nothing on
   the screen. What the compositor does varies — it has both exited at startup and stayed
   running with every systemd field healthy — and neither presents a frame, so the state
-  of the process is not the measurement. The frame is (`harness/vm/frame.py`); the C leg
-  on the same guest shows a wallpaper, a top bar and a clock.
+  of the process is not the measurement. The frame is (`harness/vm/frame.py`).
+  **synoik seats on virglrs**: a wallpaper, a top bar and a clock, 59,053 distinct
+  colours against the C leg's 58,808 on the same guest, same dominant colour on the same
+  0.77% of the frame.
+
+  Three things stood between a served transport and that frame, and none of them was in
+  a corpus.
+  The Metal path emulates `VK_KHR_external_memory_fd` and
+  `VK_EXT_external_memory_dma_buf`, and a driver that has neither must still be told it
+  has both — mesa gates its renderer handle type on the second, so advertising only what
+  the driver holds leaves the guest's device four extensions short and its compositor
+  unable to add the primary node.
+  `vkGetMemoryResourcePropertiesMESA` and `vkAllocateMemory` resolved a resource two
+  different ways, so the query refused a scanout buffer the allocation right behind it
+  would have imported; there is one resolution now (`ShmResources::bytes`,
+  `Driver::span`), which is the shape the C's own comment says it learned the hard way.
+  And `virgl_renderer_resource_read_iosurface` was a stub: a venus scanout blob has no
+  CPU transfer path, so the surface's shared storage is the only place the frame exists
+  and a headless boot without that read captures the boot console.
+
+  One thing outside this tree stood there too. synoik took a gbm device on the primary
+  node as mandatory, and gbm needs a gallium driver — which a Vulkan-only host renderer
+  does not provide. It is the *cursor*-plane allocator and nothing else; scanout goes
+  through the renderer's own Vulkan device and a PRIME import. The C leg passed only
+  because it also serves classic virgl. Made optional guest-side.
 
   **A transport wait suspends the batch; it never blocks a handler.** The C sleeps inside
   the handler — a ring thread in its own dispatch, a ring-seqno wait on the virtio-gpu
