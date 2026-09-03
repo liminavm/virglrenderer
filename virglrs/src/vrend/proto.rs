@@ -129,6 +129,14 @@ impl Format {
     pub fn wire(self) -> u32 {
         self.0
     }
+
+    /// A format from a generated table. The generator reads the wire numbering from the same
+    /// header `FORMAT_MAX` is copied from, and the assert runs at compile time in a static
+    /// initialiser, so a table naming a number the wire does not have fails the build.
+    pub(super) const fn table(raw: u32) -> Format {
+        assert!(raw < FORMAT_MAX, "a generated format table names a number past FORMAT_MAX");
+        Format(raw)
+    }
 }
 
 /// A handle in a context's object table: a blend state, a shader, a surface. Guest-chosen,

@@ -308,6 +308,8 @@ class Registry:
             for e in group.findall('enum'):
                 if 'api' in e.attrib and e.attrib['api'] != 'gles2':
                     continue
+                if e.attrib['name'] in self.enums and 'api' not in e.attrib:
+                    continue
                 self.enums[e.attrib['name']] = (e.attrib['value'], e.attrib.get('type', ''))
 
     def requirements(self, api, features, extensions):
@@ -477,9 +479,11 @@ def main():
     (out / 'types.rs').write_text(banner + render_types())
 
     gl = Registry(Path(args.registry) / 'gl.xml')
-    commands, enums = gl.requirements('gles2', GLES_FEATURES, GLES_EXTENSIONS)
+    commands, _ = gl.requirements('gles2', GLES_FEATURES, GLES_EXTENSIONS)
     body = [banner, 'use super::types::*;', 'use core::ffi::CStr;', 'use core::mem::transmute;', '']
-    body += render_consts(gl, enums, 'GL')
+    # Every constant the registry has, not only the chosen features': the format tables name
+    # desktop enums that a GLES driver refuses at the probe, and the probe needs their values.
+    body += render_consts(gl, list(gl.enums), 'GL')
     body.append('')
     body += render_table(gl, 'Gles', commands, 'eglGetProcAddress')
     body += render_census(gl, 'Gles', per_block_commands(gl, 'gles2', GLES_FEATURES + GLES_EXTENSIONS))
