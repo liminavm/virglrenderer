@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "venus-roundtrip"
 path = "src/roundtrip.rs"
 
+[[bin]]
+name = "vrend-roundtrip"
+path = "src/vrend_roundtrip.rs"
+
 # Needs venus-protocol's C renderer encoder built and linked, which the other two do not.
 [[bin]]
 name = "venus-reply-oracle"
