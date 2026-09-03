@@ -374,11 +374,14 @@ buildable throughout as the A-side reference.
   iteration — around three and a half seconds of accumulated sleep, reached by any
   fence, semaphore or seqno wait — re-reads it and calls `abort()` if the host has not
   set it again. It kills the guest; it never hangs it. A cold shader cache or a first
-  frame crosses that threshold routinely, so the stamp is not optional for a seated
-  desktop. The period is the guest's own `maxReportingPeriodMicroseconds` (a zero is
-  fatal), and stamping unconditionally is what the C does — the bit answers "is the
-  renderer still scheduled", not "is this ring advancing", which is what the fatal bit
-  is for.
+  frame crosses that threshold routinely. The bit answers "is the renderer still
+  scheduled", not "is this ring advancing", which is what the fatal bit is for — so
+  `venus/monitor.rs` stamps from a thread that shares no lock with dispatch, and a
+  registry of `Weak<RingStatus>` is what makes a destroyed ring un-register itself.
+  Stamping happens at a third of the requested period above 300ms: the period is an
+  upper bound, and the C tree records the exact-period stamp arriving 489ms late on an
+  idle host even with the thread's QoS pinned. A `maxReportingPeriodMicroseconds` of
+  zero is a guest error and is refused, never defaulted.
 
   *A guest can deadlock the whole device, and the C does not stop it.* The existing
   guard only fires in the ring thread's idle branch, so it misses this: a guest sends
@@ -392,19 +395,17 @@ buildable throughout as the A-side reference.
   sleeping and on every re-check — if the ring is blocked on a seqno past what it has,
   nothing can advance it, and the context is poisoned then and there.
 
-  They also expose an unsound rule in the dispatch loop. An unserved command poisons the
-  context only when the guest set `GENERATE_REPLY`, on the reasoning that a command
-  nobody is waiting on costs the guest one command and no more. That holds for a command
-  whose only product is its answer. It is false for one whose product is a *side effect*,
-  and every seqno wait is exactly that: the guest is not waiting on a reply, it is
-  waiting on the host to have blocked. Dropping it does not lose a command, it returns a
-  lie about synchronisation — and the guest proceeds on work that never completed. The
-  symptom is a generic `VK_ERROR_OUT_OF_HOST_MEMORY` several commands later, from a
-  driver that refused nothing, which is as far from the cause as a report can land.
-  A command the build does not serve must poison whether or not it carries a reply; the
-  reply flag says who is blocked, never whether the command mattered.
-  `vkCmdCopyImageToBuffer` is the ordinary kind of gap, merely absent from the corpora
-  we had; `synoik-vkcube` is the corpus that carries it.
+  They are also why an unserved command poisons the context whether or not it carries a
+  reply. A command whose only product is its answer costs the guest one command when it
+  is dropped; a command whose product is a *side effect* costs it a lie, and every seqno
+  wait is exactly that — the guest is not waiting on a reply, it is waiting on the host
+  to have blocked. The symptom of the dropped wait is a generic
+  `VK_ERROR_OUT_OF_HOST_MEMORY` several commands later, out of a driver that refused
+  nothing, which is as far from the cause as a report can land. The reply flag says who
+  is blocked, never whether the command mattered. Upstream reaches the same rule from
+  the other end: its generated wrapper for a handler-less command sets fatal before it
+  decodes, and reads no flag. `vkCmdCopyImageToBuffer` is the ordinary kind of gap,
+  merely absent from the corpora we had; `synoik-vkcube` is the corpus that carries it.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
