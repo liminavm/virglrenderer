@@ -33,6 +33,8 @@ pub mod gles {
 
 use core::ffi::CStr;
 
+use super::egl::Image;
+
 pub use gles::Gles;
 use gles::*;
 pub use types::*;
@@ -766,6 +768,29 @@ impl Gl {
         unsafe {
             f(view.0, target, tex.0, internalformat, first_level, levels, first_layer, layers)
         };
+        true
+    }
+
+    /// `glEGLImageTargetTexStorageEXT`: the bound texture takes `image` as immutable storage.
+    /// `false` if the driver has none.
+    pub fn egl_image_target_tex_storage(&self, target: GLenum, image: &Image) -> bool {
+        let Some(f) = self.t.try_glEGLImageTargetTexStorageEXT() else {
+            return false;
+        };
+        // SAFETY: `image` is a live EGL image on this display, held by the caller across the
+        // call; a null attribute list is the documented empty one.
+        unsafe { f(target, image.raw(), core::ptr::null()) };
+        true
+    }
+
+    /// `glEGLImageTargetTexture2DOES`: the bound texture takes `image` as (mutable) storage.
+    /// `false` if the driver has none.
+    pub fn egl_image_target_texture_2d(&self, target: GLenum, image: &Image) -> bool {
+        let Some(f) = self.t.try_glEGLImageTargetTexture2DOES() else {
+            return false;
+        };
+        // SAFETY: as above.
+        unsafe { f(target, image.raw()) };
         true
     }
 

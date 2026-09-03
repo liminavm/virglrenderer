@@ -240,11 +240,6 @@ fn flip_rows(data: &mut [u8], l: &Layout) {
     }
 }
 
-/// `vrend_format_is_bgra`: the formats GLES stores as RGBA and swaps on the way through.
-pub fn is_bgra(name: &str) -> bool {
-    matches!(name, "B8G8R8X8_UNORM" | "B8G8R8A8_UNORM" | "B8G8R8X8_SRGB" | "B8G8R8A8_SRGB")
-}
-
 /// `vrend_swizzle_data_bgra`: swap the first and third byte of every four.
 fn swizzle_bgra(data: &mut [u8]) {
     for px in data.as_chunks_mut::<4>().0 {
@@ -368,7 +363,7 @@ pub fn write(
             if invert {
                 flip_rows(&mut data, &l);
             }
-            if is_bgra(format_name) {
+            if res.is_bgra() {
                 swizzle_bgra(&mut data);
             }
             if format_name == "Z24X8_UNORM" {
@@ -439,6 +434,14 @@ pub fn write(
             }
             if err != GL_NO_ERROR {
                 return Err(Error::GlError(err));
+            }
+            // A surface-backed resource has no host copy: the upload above is queued on this
+            // context's queue and the consumer -- a venus context that imported the surface --
+            // submits on its own, and Metal does not order work across queues. The guest's fence
+            // for this transfer signals when this returns, so this is where the upload has to
+            // have landed.
+            if res.surface().is_some() {
+                gl.finish();
             }
             Ok(())
         }
@@ -649,7 +652,7 @@ pub fn read(
                     return readonly();
                 }
             }
-            if is_bgra(format_name) {
+            if res.is_bgra() {
                 swizzle_bgra(&mut data);
             }
             if format_name == "Z24X8_UNORM" {

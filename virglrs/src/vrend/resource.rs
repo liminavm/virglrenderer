@@ -8,13 +8,16 @@
 //! mean anything. Here the backing is an enum, so a transfer or a destroy is one match with no
 //! flag to consult, and a buffer cannot be mistaken for a texture.
 
+use super::egl::{Image, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
 use super::pipe::TextureTarget;
 use super::proto::Format;
+use crate::metal::{PixelFormat, Surface};
 use std::fmt;
+use std::sync::Arc;
 
 /// `VIRGL_BIND_*`: what the guest intends to do with a resource.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -133,6 +136,9 @@ pub enum Refusal {
     NoBufferStorage,
     /// The driver refused the allocation.
     GlError(GLenum),
+    /// An IOSurface was minted for the resource and the driver has no entry point to make it
+    /// a texture's storage.
+    NoEglImage,
 }
 
 impl fmt::Display for Refusal {
@@ -169,6 +175,7 @@ impl fmt::Display for Refusal {
             Refusal::IllegalBufferBind => "illegal buffer binding flags",
             Refusal::NoBufferStorage => "persistent mapping needs GL_EXT_buffer_storage",
             Refusal::GlError(_) => "the driver refused the allocation",
+            Refusal::NoEglImage => "no GL_OES_EGL_image entry point to bind an IOSurface with",
         };
         match self {
             Refusal::GlError(e) => write!(f, "{s} (GL error {e:#x})"),
@@ -230,6 +237,11 @@ pub enum Storage {
         /// 2D array, and a RECT a 2D.
         target: GLenum,
         immutable: bool,
+        /// The EGL image that is the texture's storage, when that storage is an IOSurface: a
+        /// scanout or a shared buffer, rendered into directly and presented from without a copy.
+        /// The image owns the surface, so the surface's id is good exactly as long as the
+        /// texture is.
+        image: Option<Image>,
     },
 }
 
@@ -276,9 +288,52 @@ impl Resource {
         }
     }
 
+    /// The IOSurface this resource is presented from, if its storage is one.
+    pub fn surface(&self) -> Option<&Surface> {
+        match &self.storage {
+            Storage::Texture { image: Some(image), .. } => Some(image.surface()),
+            _ => None,
+        }
+    }
+
+    /// `vrend_format_is_bgra` of the resource's own format.
+    pub fn is_bgra(&self) -> bool {
+        is_bgra(self.args.format)
+    }
+
+    /// `vrend_resource_supports_view`: whether a texture view may be made of this resource.
+    ///
+    /// Not of an IOSurface-backed BGR* one. Its storage is natively BGRA8, where a texture this
+    /// renderer allocates for a BGR* format is RGBA8 with the bytes swapped on the way through,
+    /// and GL has no internal format to name the difference to `glTextureView` -- a view of one
+    /// reads its channels in the wrong order. Such a resource is sampled and rendered as itself,
+    /// with a swizzle where a view would have converted.
+    pub fn supports_view(&self) -> bool {
+        !(self.is_bgra() && self.surface().is_some())
+    }
+
+    /// `vrend_resource_needs_redblue_swizzle`: viewed as `view_format`, this resource's red and
+    /// blue come out swapped and must be swapped back by hand.
+    pub fn needs_redblue_swizzle(&self, view_format: Format) -> bool {
+        !self.supports_view() && self.is_bgra() != is_bgra(view_format)
+    }
+
+    /// `vrend_resource_needs_srgb_decode`: an sRGB resource viewed linearly, with no view to do
+    /// the decoding.
+    pub fn needs_srgb_decode(&self, view_format: Format) -> bool {
+        !self.supports_view() && is_srgb(self.args.format) && !is_srgb(view_format)
+    }
+
+    /// `vrend_resource_needs_srgb_encode`: a linear resource viewed as sRGB, with no view to do
+    /// the encoding.
+    pub fn needs_srgb_encode(&self, view_format: Format) -> bool {
+        !self.supports_view() && !is_srgb(self.args.format) && is_srgb(view_format)
+    }
+
     /// Check the guest's description and allocate on the current context.
     pub fn create(
         gl: &Gl,
+        winsys: &Winsys,
         features: &Features,
         formats: &Table,
         limits: &Limits,
@@ -288,7 +343,7 @@ impl Resource {
         let storage = if args.target == TextureTarget::Buffer {
             alloc_buffer(gl, features, &args)?
         } else {
-            alloc_texture(gl, features, formats, &args)?
+            alloc_texture(gl, winsys, features, formats, &args)?
         };
         Ok(Resource { args, storage })
     }
@@ -303,9 +358,19 @@ impl Resource {
                 }
                 gl.delete_buffer(name)
             }
+            // The image, and the surface it owns, go with the storage the texture was.
             Storage::Texture { name, .. } => gl.delete_texture(name),
         }
     }
+}
+
+/// `vrend_format_is_bgra`: the formats GLES stores as RGBA and swaps on the way through.
+pub fn is_bgra(format: Format) -> bool {
+    matches!(format.name(), "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" | "B8G8R8A8_SRGB" | "B8G8R8X8_SRGB")
+}
+
+fn is_srgb(format: Format) -> bool {
+    format.describe().is_some_and(|d| d.is_srgb())
 }
 
 pub fn minify(v: u32, level: u32) -> u32 {
@@ -526,22 +591,107 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
     }
 }
 
-/// `vrend_resource_alloc_texture`, the plain-allocation half: no EGL image.
+/// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
+///
+/// A scanout is the compositor's framebuffer; a shared buffer is every buffer gbm hands out,
+/// which is what a Vulkan compositor imports into venus for each client window. Both are minted
+/// as surfaces so that the first is presented from without a copy and the second can be
+/// imported at all -- there is no dma-buf to export on this host.
+///
+/// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
+/// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
+/// the system or the driver refuses: the fallback is never removed, only reported.
+fn mint_surface(winsys: &Winsys, a: &Args) -> Option<Image> {
+    let scanout = a.bind.has(Bind::SCANOUT);
+    if !scanout && !a.bind.has(Bind::SHARED) {
+        return None;
+    }
+    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
+    {
+        return None;
+    }
+    let format = match a.format.name() {
+        "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" => PixelFormat::Bgra,
+        "R8G8B8A8_UNORM" | "R8G8B8X8_UNORM" => PixelFormat::Rgba,
+        _ => return None,
+    };
+    let surface = match Surface::plain(a.width, a.height, format) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[virglrs] vrend: no IOSurface for a {}x{} {} resource ({e:?}); it keeps GL storage",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+            return None;
+        }
+    };
+    match winsys.image_from_iosurface(Arc::new(surface)) {
+        Ok(image) => {
+            if scanout {
+                eprintln!(
+                    "[virglrs] vrend: iosurface scanout: {}x{} {} (IOSurface id {}); renders \
+                     land in the surface directly",
+                    a.width,
+                    a.height,
+                    a.format.name(),
+                    image.surface().id().0
+                );
+            }
+            Some(image)
+        }
+        Err(e) => {
+            eprintln!(
+                "[virglrs] vrend: the driver refused an EGL image of a {}x{} {} IOSurface ({e}); \
+                 the resource keeps GL storage",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+            None
+        }
+    }
+}
+
+/// `vrend_resource_alloc_texture`.
 fn alloc_texture(
     gl: &Gl,
+    winsys: &Winsys,
     features: &Features,
     formats: &Table,
     a: &Args,
 ) -> Result<Storage, Refusal> {
     let entry = formats.get(a.format).ok_or(Refusal::UnsupportedFormat)?;
-    let immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
+    let mut immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
     let target = gl_target(a.target, a.nr_samples);
     let (ifmt, glformat, gltype) = (entry.gl.internalformat, entry.gl.glformat, entry.gl.gltype);
     let levels = (a.last_level + 1) as GLsizei;
     let (w, h) = (a.width as GLsizei, a.height as GLsizei);
+    let image = mint_surface(winsys, a);
     let name = gl.gen_texture();
     gl.bind_texture(target, Some(name));
     gl.drain_errors();
+    if let Some(image) = image {
+        // The surface becomes the texture's storage: immutable where the driver can make it so,
+        // else through the older entry point, which leaves the texture mutable.
+        let bound = if immutable && features.has(Feature::egl_image_storage) {
+            gl.egl_image_target_tex_storage(target, &image)
+        } else if features.has(Feature::egl_image) {
+            immutable = false;
+            gl.egl_image_target_texture_2d(target, &image)
+        } else {
+            false
+        };
+        let err = gl.drain_errors();
+        if !bound || err != GL_NO_ERROR {
+            gl.bind_texture(target, None);
+            gl.delete_texture(name);
+            return Err(if bound { Refusal::GlError(err) } else { Refusal::NoEglImage });
+        }
+        gl.bind_texture(target, None);
+        return Ok(Storage::Texture { name, target, immutable, image: Some(image) });
+    }
     match target {
         _ if a.nr_samples > 1 => {
             let samples = a.nr_samples as GLsizei;
@@ -628,7 +778,7 @@ fn alloc_texture(
         gl.tex_parameter_i(target, GL_TEXTURE_MAX_LEVEL, a.last_level as GLint);
     }
     gl.bind_texture(target, None);
-    Ok(Storage::Texture { name, target, immutable })
+    Ok(Storage::Texture { name, target, immutable, image: None })
 }
 
 #[cfg(test)]

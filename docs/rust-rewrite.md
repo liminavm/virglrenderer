@@ -515,15 +515,26 @@ buildable throughout as the A-side reference.
   because that is the leg the goldens were recorded on: a differential against a
   different host profile would be comparing two renderers *and* two drivers. A
   desktop-GL context is its own gated change afterwards, one differential at a time.
-  **Where P3 stands.** Decode, resources, transfers and the context layer are in:
-  sub-contexts with a GL context each, object tables, every state command recorded,
-  the immediate GL the C emits on a bind, framebuffer state, clears, copy-image and
-  framebuffer blits, resource copies through them, queries and streamout. The
-  `vrend-nodraw.score` gate reproduces all 310 readbacks with `submit-errors 0`; the
-  five IOSurface lines are the scanout's, which is next. Not served yet, each counted
-  and named in the log when a stream asks: draws and `LINK_SHADER` (TGSI→GLSL), the
-  shader blitter (a blit whose formats swizzle differently), implicit-multisample
-  surfaces, the resource-copy fallback through guest memory, blob resources, video.
+  **Where P3 stands.** Decode, resources, transfers, the context layer and the IOSurface
+  scanout are in: sub-contexts with a GL context each, object tables, every state
+  command recorded, the immediate GL the C emits on a bind, framebuffer state, clears,
+  copy-image and framebuffer blits, resource copies through them, queries and
+  streamout. A scanout or shared 2D BGRA/RGBA resource is minted as an IOSurface at the
+  pitch a linear Metal texture takes, adopted as the texture's storage through an
+  `EGL_IOSURFACE_LIMINA` image (`egl::Image` owns the surface, so the id the VMM is
+  handed is good exactly as long as the texture), and carries the C's rules for a
+  resource that cannot be viewed: no texture view of an IOSurface-backed BGR* texture,
+  the red/blue and sRGB conversions moved into the sampler swizzle, the clear colour,
+  and the framebuffer bits the shader key reads. The `vrend-nodraw.score` gate is a
+  zero-line diff against the C. Two of the C's EGL-image rules are deliberately not
+  carried: refusing `glCopyImageSubData` between two `B8G8R8X8` textures when one is an
+  EGL image is a Mesa dmabuf quirk (a `GL_RGB8` import) the C's own macOS path says does
+  not apply to an IOSurface, and the `LIMINA_VREND_*IOSURFACE*` environment switches are
+  debugging aids with no reader here. Not served yet, each counted and named in the log
+  when a stream asks: draws and `LINK_SHADER` (TGSI→GLSL), the shader blitter (a blit
+  whose formats swizzle differently, or that swaps red and blue for an IOSurface-backed
+  end), implicit-multisample surfaces, the resource-copy fallback through guest memory,
+  blob resources, video. Next is the first pixel gate, kmscube against the C's frame.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
