@@ -827,8 +827,13 @@ static void write_gm_param(struct bw *w, struct frame_ctx *c, const int32_t *pre
    sub   = ((idx % 3) == 2) ? (1 << prec_bits) : 0;
    mx    = 1 << abs_bits;
 
+   /* 5.9.24: `sub` belongs to the reference alone. The decoder recovers the parameter as
+    * (x << precDiff) + round, so the value coded is x = (param - round) >> precDiff, with
+    * nothing subtracted; subtracting `sub` from it too (as an earlier version did) sends
+    * every diagonal term of a rotzoom or affine model to the range floor, a scale of about
+    * 0.875 where the encoder meant 1.0, and the warped prediction smears. */
    r = (prev[idx] >> prec_diff) - sub;
-   v = ((wmmat[idx] - round) >> prec_diff) - sub;
+   v = (wmmat[idx] - round) >> prec_diff;
 
    /* The syntax cannot express anything outside [-mx, mx]; a descriptor that somehow
     * carries more would otherwise write a symbol the decoder cannot read back. */
