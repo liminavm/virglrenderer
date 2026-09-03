@@ -1620,12 +1620,23 @@ impl Driver {
         );
     }
 
-    /// Plant an allocation that aliases another context's storage -- host-visible like any
+    /// Plant an allocation that aliases storage it resolved elsewhere -- host-visible like any
     /// import, so that what keeps it out of the census is the aliasing and nothing else.
     #[cfg(test)]
-    pub(super) fn plant_imported_allocation(&mut self, id: ObjectId, size: u64) {
-        self.plant_allocation(id, size);
-        self.memory.get_mut(&id).expect("just planted").backing = Backing::Imported;
+    pub(super) fn plant_imported_allocation(&mut self, id: ObjectId, size: u64, of: ResourceBytes) {
+        // Uncharged, like a real one: the bytes are whoever's it resolved to.
+        self.memory.insert(
+            id,
+            Allocated {
+                size,
+                backing: Backing::Imported(of),
+                props: VkMemoryPropertyFlags(
+                    (HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT) as _,
+                ),
+                exported: None,
+                charge: None,
+            },
+        );
     }
 
     /// Plant an allocation backed by a real IOSurface, which is the only way to get one: a
@@ -2549,7 +2560,12 @@ impl Driver {
         // it meant to reach stays where it is. That is wrong for the guest -- it renders into a
         // buffer nobody presents -- but it is the driver's own behaviour for a `pNext` link it
         // does not recognise, and inventing a refusal here would fail allocations the C serves.
-        let alias = import.and_then(|r| self.span(&resource_bytes(r)?));
+        // Held, not merely resolved: the driver is handed an address, and an address is good
+        // only as long as what it points into. The importer's record keeps what it resolved --
+        // a share, or the host's own mapping -- so the bytes outlive the exporter's record and
+        // the resource both, for exactly as long as the driver may still reach them.
+        let alias = import.and_then(resource_bytes);
+        let alias_span = alias.as_ref().and_then(|b| self.span(b));
         let surface = if import.is_some() { None } else { self.scanout_surface(device, &info) };
         // The third shape: memory the guest asked to be able to export, that is not a window
         // buffer. The driver would allocate it and later lend a mapping -- a pointer with the
@@ -2594,7 +2610,7 @@ impl Driver {
             .as_ref()
             .map(|s| (s.host_addr(), s.alloc_size()))
             .or(pages.as_ref().map(|p| (p.host_addr(), p.len() as u64)));
-        if let Some(span) = owned.or(alias) {
+        if let Some(span) = owned.or(alias_span) {
             host_pointer.pHostPointer = span.0 as *mut core::ffi::c_void;
             // Prepended, not spliced in: the guest's chain is the decoder's arena and the round
             // trip re-encodes it, so it is read here and never rewritten.
@@ -2608,9 +2624,10 @@ impl Driver {
         // charged at the surface's own extent, because the surface is the commitment, and the
         // charge goes into the surface rather than beside it: the surface may outlive this
         // allocation and this context, and the bytes are the host's for as long as it does. An
-        // import commits nothing at all.
-        let (backing, charge) = match (import, surface, pages) {
-            (Some(_), _, _) => (Backing::Imported, None),
+        // import commits nothing at all; an import that resolved to nothing is not an import
+        // but the ordinary allocation it fell through to, and is charged as one.
+        let (backing, charge) = match (alias, surface, pages) {
+            (Some(bytes), _, _) => (Backing::Imported(bytes), None),
             (None, Some(surface), _) => {
                 let charge = self.admit("IOSurface", surface.alloc_size())?;
                 (Backing::Scanout(Arc::new(Minted { surface, charge })), None)
@@ -2709,7 +2726,7 @@ impl Driver {
         match &record.backing {
             Backing::Driver => Some((record.exported?, record.size)),
             Backing::Scanout(_) | Backing::Pages(_) => unreachable!("owned storage answered above"),
-            Backing::Imported => None,
+            Backing::Imported(_) => None,
         }
     }
 
@@ -3070,12 +3087,18 @@ enum Backing {
     /// the last share is what releases them. Only for memory the host can address: an export of
     /// a type it cannot would be storage nobody could reach.
     Pages(Arc<Pages>),
-    /// Storage another context owns, which this allocation only aliases.
+    /// Storage another context owns, which this allocation only aliases -- held, so that the
+    /// address the driver was handed stays good for as long as this allocation can use it.
     ///
     /// A guest imports when one context has to reach what another rendered -- a compositor
     /// sampling a client's window. The census must not report it: one buffer under two ids, read
-    /// through a mapping this context has no claim to.
-    Imported,
+    /// through a mapping this context has no claim to. What it holds is what the resource
+    /// resolved to: a share keeps its storage alive, the host's mapping keeps its pages, and a
+    /// published allocation's name keeps nothing -- that one is the same context's own memory,
+    /// and lives or dies with it.
+    Imported(
+        #[expect(dead_code, reason = "held for what it keeps alive, never read")] ResourceBytes,
+    ),
 }
 
 /// What an image was created as, for a scanout surface that has to match it.
@@ -3093,7 +3116,7 @@ impl Allocated {
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
             Backing::Scanout(m) => Some(&m.surface),
-            Backing::Driver | Backing::Pages(_) | Backing::Imported => None,
+            Backing::Driver | Backing::Pages(_) | Backing::Imported(_) => None,
         }
     }
 
@@ -3104,7 +3127,7 @@ impl Allocated {
         match &self.backing {
             Backing::Scanout(m) => Some((m.surface.host_addr(), m.surface.alloc_size())),
             Backing::Pages(p) => Some(p.span()),
-            Backing::Driver | Backing::Imported => None,
+            Backing::Driver | Backing::Imported(_) => None,
         }
     }
 
@@ -3129,7 +3152,7 @@ impl Allocated {
                 p.charge.share();
                 Some(Storage::Linear(Arc::clone(p)))
             }
-            Backing::Driver | Backing::Imported => None,
+            Backing::Driver | Backing::Imported(_) => None,
         }
     }
 
@@ -3144,7 +3167,7 @@ impl Allocated {
         match self.backing {
             Backing::Driver | Backing::Pages(_) => self.exported.is_none(),
             Backing::Scanout(_) => true,
-            Backing::Imported => false,
+            Backing::Imported(_) => false,
         }
     }
 
@@ -3749,7 +3772,11 @@ mod tests {
 
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_allocation(OWNED, SIZE);
-        driver.plant_imported_allocation(BORROWED, SIZE);
+        driver.plant_imported_allocation(
+            BORROWED,
+            SIZE,
+            ResourceBytes::Allocation(crate::venus::ring::Published { memory: OWNED, size: SIZE }),
+        );
 
         let census = driver.memory_census();
         assert_eq!(census.len(), 1, "the borrowed one is the exporter's to report");
@@ -3817,7 +3844,14 @@ mod tests {
             "an allocation nobody has published has no address to lend"
         );
 
-        d.plant_imported_allocation(ObjectId(71), 4096);
+        d.plant_imported_allocation(
+            ObjectId(71),
+            4096,
+            ResourceBytes::Allocation(crate::venus::ring::Published {
+                memory: ObjectId(70),
+                size: 4096,
+            }),
+        );
         assert_eq!(
             d.aliased_span(ObjectId(71)),
             None,
@@ -3841,6 +3875,66 @@ mod tests {
         assert!(shared(71).is_none(), "and an import has nothing of its own to share");
 
         assert_eq!(d.aliased_span(ObjectId(999)), None, "nor does an id that names nothing");
+
+        d.abandon_planted();
+    }
+
+    /// An import keeps what it resolved alive for as long as the driver may reach it.
+    ///
+    /// The driver is handed an address, and keeps it for the life of the importer's memory. The
+    /// storage behind that address is the exporter's record's, or the resource's -- and a guest
+    /// process can drop its handle to the resource while another still has the memory bound. A
+    /// client exiting is the ordinary case: the compositor's next submit still reads the buffer.
+    /// So the importer's record holds the share, and the pages go only when the last holder does.
+    #[test]
+    fn an_import_holds_the_storage_it_resolved() {
+        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        // A whole page, so the mint's rounding does not turn the figure into two numbers.
+        const LEN: u64 = 16384;
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+
+        let storage = Storage::pages_for_test(LEN as usize, &d.account);
+        assert_eq!(d.account.live(), LEN, "the pages are charged from the mint");
+
+        let import = VkImportMemoryResourceInfoMESA {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+            pNext: core::ptr::null(),
+            resourceId: 7,
+        };
+        let info = VkMemoryAllocateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            pNext: (&raw const import).cast(),
+            allocationSize: VkDeviceSize(LEN),
+            memoryTypeIndex: 0,
+        };
+        let resolve = |_| Some(ResourceBytes::Shared(storage.clone()));
+        assert!(d.allocate_memory(DEVICE, ObjectId(80), &info, None, &resolve).is_ok());
+
+        // The exporter's record and the resource both let go: the client is gone.
+        drop(storage);
+        assert_eq!(d.account.live(), LEN, "the import is what keeps the pages now");
+
+        // The importer frees its memory: nothing holds them any more.
+        drop(d.memory.remove(&ObjectId(80)));
+        assert_eq!(d.account.live(), 0, "and the last holder going is what releases them");
 
         d.abandon_planted();
     }
@@ -4333,6 +4427,10 @@ mod tests {
     /// An import aliases bytes another allocation already paid for, so charging it would bill one
     /// buffer twice and refuse work the host has room for. The same rule as the census, which is
     /// why both read the one `Backing` rather than a flag each.
+    ///
+    /// Only an import that resolved, though. One naming a resource with no storage behind it is
+    /// forwarded to the driver as the ordinary allocation it then is, and that is host memory
+    /// like any other: charged, and refused when there is no room.
     #[test]
     fn an_import_is_not_charged_because_its_bytes_are_the_exporters() {
         use super::super::proto::types::VkImportMemoryResourceInfoMESA;
@@ -4372,11 +4470,19 @@ mod tests {
             allocationSize: VkDeviceSize(400),
             memoryTypeIndex: 0,
         };
+        let pages = Storage::pages_for_test(4096, &Account::for_test(None));
+        let resolve = |_| Some(ResourceBytes::Shared(pages.clone()));
         assert!(
-            d.allocate_memory(DEVICE, ObjectId(2), &info, None, &|_| None).is_ok(),
+            d.allocate_memory(DEVICE, ObjectId(2), &info, None, &resolve).is_ok(),
             "an import is admitted with no room left, because it takes none"
         );
         assert_eq!(d.account.live(), 900, "and the ledger did not move");
+
+        assert!(
+            d.allocate_memory(DEVICE, ObjectId(3), &info, None, &|_| None).is_err(),
+            "an import that resolved to nothing is an ordinary allocation, and there is no room"
+        );
+        assert_eq!(d.account.live(), 900, "a refusal costs nothing");
 
         d.abandon_planted();
     }

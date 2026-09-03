@@ -446,6 +446,17 @@ SABOTAGES = [
         'a_context_reaches_the_resources_the_guest_attached_to_it',
     ),
     (
+        'an import keeps the address it resolved and drops the share that kept it good',
+        'virglrs/src/venus/driver.rs',
+        """            (Some(bytes), _, _) => (Backing::Imported(bytes), None),""",
+        """            (Some(bytes), _, _) => {
+                let name = crate::venus::ring::Published { memory: id, size };
+                drop(bytes);
+                (Backing::Imported(ResourceBytes::Allocation(name)), None)
+            }""",
+        'an_import_holds_the_storage_it_resolved',
+    ),
+    (
         'the gate on what the guest attached to a context is dropped',
         'virglrs/src/renderer.rs',
         """        if !res.attached.contains(&ctx) {""",
