@@ -34,10 +34,10 @@ use super::proto::types::{
     vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindPipeline,
     vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
     vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer, vn_command_vkCmdCopyBufferToImage,
-    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw, vn_command_vkCmdEndRenderPass,
-    vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCreateBuffer,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCmdCopyImage, vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdDraw,
+    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport,
+    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
     vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
     vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
     vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
@@ -3166,6 +3166,19 @@ impl Commands for Handlers<'_> {
             args.srcImage,
             args.srcImageLayout,
             args.dstBuffer,
+            regions,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {
+        let regions = args.pRegions();
+        let done = self.driver.cmd_copy_image(
+            args.commandBuffer,
+            args.srcImage,
+            args.srcImageLayout,
+            args.dstImage,
+            args.dstImageLayout,
             regions,
         );
         self.recorded(done);
@@ -10128,9 +10141,10 @@ mod tests {
     fn the_commands_that_write_pixels_hand_the_driver_what_the_guest_sent() {
         use super::super::proto::types::{
             VkClearAttachment, VkClearColorValue, VkClearRect, VkCommandBuffer, VkCommandPool,
-            VkDevice, VkFilter, VkImage, VkImageBlit, VkImageLayout, VkImageSubresourceRange,
-            VkPipelineLayout, VkShaderStageFlags, vn_command_vkCmdBlitImage,
-            vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage,
+            VkDevice, VkFilter, VkImage, VkImageBlit, VkImageCopy, VkImageLayout,
+            VkImageSubresourceRange, VkPipelineLayout, VkShaderStageFlags,
+            vn_command_vkCmdBlitImage, vn_command_vkCmdClearAttachments,
+            vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyImage,
             vn_command_vkCmdPushConstants,
         };
         use std::cell::RefCell;
@@ -10142,6 +10156,7 @@ mod tests {
         #[derive(Default)]
         struct Saw {
             blits: Vec<(u64, u64, u32, i32)>,
+            copies: Vec<(u64, u32, u64, u32, u32)>,
             cleared_image: Vec<(u64, u32, u32)>,
             cleared_attachments: Vec<(u32, u32)>,
             pushed: Vec<(u64, u32, Vec<u8>)>,
@@ -10162,6 +10177,20 @@ mod tests {
             filter: VkFilter,
         ) {
             SAW.with_borrow_mut(|s| s.blits.push((src.0, dst.0, count, filter.0)));
+        }
+
+        unsafe extern "C" fn copy(
+            _cb: VkCommandBuffer,
+            src: VkImage,
+            src_layout: VkImageLayout,
+            dst: VkImage,
+            dst_layout: VkImageLayout,
+            count: u32,
+            _p: *const VkImageCopy,
+        ) {
+            SAW.with_borrow_mut(|s| {
+                s.copies.push((src.0, src_layout.0 as u32, dst.0, dst_layout.0 as u32, count))
+            });
         }
 
         unsafe extern "C" fn clear_color(
@@ -10204,6 +10233,7 @@ mod tests {
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkCmdBlitImage(blit);
+        fns.plant_vkCmdCopyImage(copy);
         fns.plant_vkCmdClearColorImage(clear_color);
         fns.plant_vkCmdClearAttachments(clear_attachments);
         fns.plant_vkCmdPushConstants(push);
@@ -10257,6 +10287,36 @@ mod tests {
                 s.blits,
                 [(0x11, 0x22, 2, VkFilter::VK_FILTER_LINEAR.0)],
                 "source, destination, both regions and the filter, none of them each other"
+            );
+        });
+
+        // The same five values as the blit above with the filter removed, which is the whole
+        // difference between the two: a copy's regions name one extent, so there is nothing to
+        // filter. That makes them the pair a handler is most likely to mirror into each other,
+        // and the two layouts are what catches it -- a blit's stub ignores them, so only asking
+        // for them separately here shows they arrived on the sides the guest put them on.
+        let regions = [VkImageCopy::default(); 3];
+        let mut args = vn_command_vkCmdCopyImage::default();
+        args.commandBuffer = cb;
+        args.srcImage = VkImage(0x66);
+        args.srcImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        args.dstImage = VkImage(0x77);
+        args.dstImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        args.plant_pRegions(&regions);
+        h.vkCmdCopyImage(&mut args);
+        assert!(h.reject.is_none());
+        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.copies,
+                [(
+                    0x66,
+                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.0 as u32,
+                    0x77,
+                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL.0 as u32,
+                    3
+                )],
+                "each image with its own layout, and all three regions"
             );
         });
 
