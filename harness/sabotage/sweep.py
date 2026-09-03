@@ -422,8 +422,14 @@ SABOTAGES = [
     (
         'a published allocation travels without the size of the resource that published it',
         'virglrs/src/renderer.rs',
-        """                        size: desc.size,""",
-        """                        size: 0,""",
+        """                    Some(ResourceBytes::Allocation(Published {
+                        memory: ObjectId(mem.0),
+                        size: desc.size,
+                    }))""",
+        """                    Some(ResourceBytes::Allocation(Published {
+                        memory: ObjectId(mem.0),
+                        size: 0,
+                    }))""",
         '',
     ),
     (
@@ -535,10 +541,39 @@ SABOTAGES = [
         '',
     ),
     (
+        'a borrowed mapping is answered for as long as the resource lives, as the C answers it',
+        'virglrs/src/renderer.rs',
+        """        if !self.venus_context(ctx, |c| c.holds(key))? {
+            return Err(Error::NoAllocation);
+        }
+        Ok(mapping)""",
+        """        let _ = (ctx, key);
+        Ok(mapping)""",
+        'a_borrowed_mapping_dies_with_the_object',
+    ),
+    (
+        'a borrowed mapping is answered for whatever the guest names by the id now',
+        'virglrs/src/renderer.rs',
+        """        if !self.venus_context(ctx, |c| c.holds(key))? {
+            return Err(Error::NoAllocation);
+        }
+        Ok(mapping)""",
+        """        let _ = key;
+        let mem = self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { storage: BlobStorage::Borrowed { mem, .. }, .. } => Some(*mem),
+            _ => None,
+        }).flatten().ok_or(Error::NoResource)?;
+        if self.venus_context(ctx, |c| c.objects().borrow().get(ObjectId(mem.0)).is_none())? {
+            return Err(Error::NoAllocation);
+        }
+        Ok(mapping)""",
+        'a_borrowed_mapping_dies_with_the_object',
+    ),
+    (
         'a resource id resolves to whatever another context filed under the same number',
         'virglrs/src/renderer.rs',
-        """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",
-        """                BlobSource::Exported { mem, .. } => {""",
+        """                BlobStorage::Borrowed { ctx: owner, mem, .. } if *owner == ctx => {""",
+        """                BlobStorage::Borrowed { mem, .. } => {""",
         '',
     ),
     (
