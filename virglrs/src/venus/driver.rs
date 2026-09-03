@@ -24,10 +24,11 @@ use super::proto::types::{
     VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorPool, VkDescriptorSet,
     VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
     VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExtensionProperties,
-    VkExternalMemoryHandleTypeFlagBits, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter,
-    VkFormat, VkFramebuffer, VkImage, VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit,
-    VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties, VkImageLayout,
-    VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageType,
+    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer, VkImage,
+    VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags,
+    VkImageCreateInfo, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
+    VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageType, VkImageUsageFlagBits,
     VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
     VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
     VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
@@ -2647,6 +2648,18 @@ impl Driver {
         let image = dedicated_image(info.pNext)?;
         let facts = *self.images.get(&image)?;
         let format = pixel_format(facts.format)?;
+        // Only a layout the CPU can address has rows to alias. An OPTIMAL image is opaque: the
+        // driver keeps its storage in a private layout of its own choosing, renders there, and
+        // would never write a byte into pages minted here. Asked for its row pitch it answers
+        // with a number that describes nothing, so the pitch checks below are not this test --
+        // they guard against a linear layout the driver reports wrongly, not against a tiled one.
+        if !matches!(
+            facts.tiling,
+            VkImageTiling::VK_IMAGE_TILING_LINEAR
+                | VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        ) {
+            return None;
+        }
 
         let d = self.devices.get(&device)?;
         let layout = {
@@ -2695,6 +2708,7 @@ impl Driver {
                 width: info.extent.width,
                 height: info.extent.height,
                 format: info.format,
+                tiling: info.tiling,
             },
         );
     }
@@ -2968,6 +2982,8 @@ struct ImageFacts {
     width: u32,
     height: u32,
     format: VkFormat,
+    /// As the driver was told to lay it out -- after [`external_images_are_linear`], not before.
+    tiling: VkImageTiling,
 }
 
 impl Allocated {
@@ -3293,6 +3309,54 @@ pub fn chained_mut<T: OutStruct>(head: &mut *mut core::ffi::c_void) -> Option<&m
 unsafe impl OutStruct for VkMemoryResourceAllocationSizePropertiesMESA {
     const TYPE: VkStructureType =
         VkStructureType::VK_STRUCTURE_TYPE_MEMORY_RESOURCE_ALLOCATION_SIZE_PROPERTIES_MESA;
+}
+
+/// The create info the driver is handed for an image, which is the guest's unless the guest
+/// means to share the image and left its tiling to the driver.
+///
+/// Tiling is decided here and nowhere later: an image's layout is fixed at create, and the
+/// surface a shared image is presented from is minted at allocate, when it is too late to ask
+/// for rows. An external-memory image the guest created `OPTIMAL` -- WSI with no modifier lists,
+/// or any application exporting a tiled image itself -- would then get a surface the driver
+/// never writes into, because a tiled plane over host-imported memory is given private storage
+/// of the driver's own and rendered there. So an image with external handle types and no DRM
+/// format modifier is made `LINEAR`. Nothing the guest could rely on is lost: an image shared
+/// outside this device was never going to be read in a layout only this device understands.
+///
+/// The same images lose `INPUT_ATTACHMENT` usage. The driver promotes an input attachment to a
+/// 2D-array texture, and a linear texture over a Metal buffer must be plain 2D -- otherwise
+/// render passes drop every draw while clears still land, which from the screen is
+/// indistinguishable from a dozen other faults. zink sets the bit speculatively, and a buffer
+/// shared for scanout is never fetched from.
+///
+/// A copy, not an edit in place: the decoder's struct is the guest's request, and the round trip
+/// re-encodes it. The `pNext` chain is carried over untouched.
+pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo {
+    let mut info = *info;
+    if info.tiling != VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        && has_external_handle_types(info.pNext)
+    {
+        info.tiling = VkImageTiling::VK_IMAGE_TILING_LINEAR;
+        info.usage.0 &= !(VkImageUsageFlagBits::VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT.0 as u32);
+    }
+    info
+}
+
+/// Whether an image's `pNext` chain says it is for the world outside this guest -- external
+/// memory with at least one handle type. A link naming no handle types shares nothing.
+fn has_external_handle_types(mut node: *const core::ffi::c_void) -> bool {
+    while !node.is_null() {
+        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
+        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
+        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO {
+            // SAFETY: the tag says this link is a `VkExternalMemoryImageCreateInfo`.
+            let ext = unsafe { &*node.cast::<VkExternalMemoryImageCreateInfo>() };
+            return ext.handleTypes.0 != 0;
+        }
+        node = base.pNext.cast();
+    }
+    false
 }
 
 /// Whether an allocation's `pNext` chain says the memory is for the world outside this guest.
@@ -3767,6 +3831,62 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// An image the guest shares outside this device is created with rows the host can address,
+    /// and only that image: the rule keys on external handle types, and leaves alone an image
+    /// that already chose its layout by DRM format modifier.
+    #[test]
+    fn an_image_the_guest_shares_is_created_linear() {
+        use super::super::proto::types::VkExternalMemoryHandleTypeFlags;
+        const INPUT: u32 = VkImageUsageFlagBits::VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT.0 as u32;
+        const SAMPLED: u32 = VkImageUsageFlagBits::VK_IMAGE_USAGE_SAMPLED_BIT.0 as u32;
+
+        let external = VkExternalMemoryImageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            pNext: core::ptr::null(),
+            handleTypes: VkExternalMemoryHandleTypeFlags(1),
+        };
+        let none = VkExternalMemoryImageCreateInfo {
+            handleTypes: VkExternalMemoryHandleTypeFlags(0),
+            ..external
+        };
+        let image = |tiling, chain: *const core::ffi::c_void| VkImageCreateInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            pNext: chain,
+            tiling,
+            usage: VkImageUsageFlags(SAMPLED | INPUT),
+            ..Default::default()
+        };
+
+        let shared = external_images_are_linear(&image(
+            VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+            (&raw const external).cast(),
+        ));
+        assert_eq!(shared.tiling, VkImageTiling::VK_IMAGE_TILING_LINEAR, "made addressable");
+        assert_eq!(shared.usage.0, SAMPLED, "and never an input attachment");
+        assert_eq!(shared.pNext, (&raw const external).cast(), "the chain is the guest's");
+
+        let untouched = |why: &str, info: VkImageCreateInfo| {
+            let out = external_images_are_linear(&info);
+            assert_eq!(out.tiling, info.tiling, "{why}");
+            assert_eq!(out.usage, info.usage, "{why}");
+        };
+        untouched(
+            "an image kept to this device may be as opaque as the driver likes",
+            image(VkImageTiling::VK_IMAGE_TILING_OPTIMAL, core::ptr::null()),
+        );
+        untouched(
+            "external memory naming no handle types shares nothing",
+            image(VkImageTiling::VK_IMAGE_TILING_OPTIMAL, (&raw const none).cast()),
+        );
+        untouched(
+            "an image that chose its layout by modifier has already answered the question",
+            image(
+                VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+                (&raw const external).cast(),
+            ),
+        );
+    }
+
     /// A scanout is charged at the surface's own extent, not at the number in the request.
     ///
     /// The surface is the commitment: IOSurface rounds an allocation up to whole pages, and those
@@ -3841,6 +3961,20 @@ mod tests {
                 sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                 format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
                 extent: VkExtent3D { width: W, height: H, depth: 1 },
+                tiling: VkImageTiling::VK_IMAGE_TILING_LINEAR,
+                ..Default::default()
+            },
+        );
+        // The same image, opaque. The layout stub answers with the same plausible pitch for it,
+        // which is exactly why the refusal below has to come from the tiling and not the pitch.
+        const OPAQUE: VkImage = VkImage(0x4200);
+        d.note_image(
+            OPAQUE,
+            &VkImageCreateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                format: VkFormat::VK_FORMAT_B8G8R8A8_UNORM,
+                extent: VkExtent3D { width: W, height: H, depth: 1 },
+                tiling: VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
                 ..Default::default()
             },
         );
@@ -3867,6 +4001,17 @@ mod tests {
         d.allocate_memory(DEVICE, ObjectId(1), &info, None, &|_| None).expect("no cap");
         assert!(d.memory_surface_id(ObjectId(1)).is_some(), "the premise: this minted a surface");
         assert_eq!(d.account.live(), extent, "charged for the pages, not for the rows");
+
+        let opaque_dedicated = VkMemoryDedicatedAllocateInfo { image: OPAQUE, ..dedicated };
+        let opaque_export =
+            VkExportMemoryAllocateInfo { pNext: (&raw const opaque_dedicated).cast(), ..export };
+        let opaque = VkMemoryAllocateInfo { pNext: (&raw const opaque_export).cast(), ..info };
+        d.allocate_memory(DEVICE, ObjectId(2), &opaque, None, &|_| None).expect("no cap");
+        assert!(
+            d.memory_surface_id(ObjectId(2)).is_none(),
+            "an opaque image has no rows to alias, whatever pitch the driver quotes for it"
+        );
+        d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
 
         d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(1));
         assert_eq!(d.account.live(), 0, "and the surface's pages come back with it");

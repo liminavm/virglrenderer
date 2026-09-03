@@ -440,6 +440,25 @@ SABOTAGES = [
         '',
     ),
     (
+        'an image the guest shares keeps the opaque tiling it asked for',
+        'virglrs/src/venus/driver.rs',
+        """        info.tiling = VkImageTiling::VK_IMAGE_TILING_LINEAR;
+""",
+        """""",
+        '',
+    ),
+    (
+        'an opaque image gets a surface the driver will never write into',
+        'virglrs/src/venus/driver.rs',
+        """        if !matches!(
+            facts.tiling,
+            VkImageTiling::VK_IMAGE_TILING_LINEAR
+                | VkImageTiling::VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+        ) {""",
+        """        if false {""",
+        '',
+    ),
+    (
         'a resource id resolves to whatever another context filed under the same number',
         'virglrs/src/renderer.rs',
         """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",

@@ -1445,10 +1445,13 @@ impl Commands for Handlers<'_> {
     /// scanout surface has to be minted at exactly them.
     fn vkCreateImage(&mut self, args: &mut vn_command_vkCreateImage<'_>) {
         let Some(info) = self.names(args.pCreateInfo) else { return };
+        // An image the guest means to share is created with rows the host can address -- see
+        // `external_images_are_linear`. The facts noted below are of the image the driver made.
+        let info = driver::external_images_are_linear(info);
         let host =
-            self.driver.create_object(args.device, |d| d.vkCreateImage(), info, args.pAllocator);
+            self.driver.create_object(args.device, |d| d.vkCreateImage(), &info, args.pAllocator);
         if let Ok(image) = host {
-            self.driver.note_image(image, info);
+            self.driver.note_image(image, &info);
         }
         args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
         self.plant("vkCreateImage", args.pImage(), args.handle_pImage_mut(), host);
