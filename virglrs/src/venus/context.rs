@@ -3762,21 +3762,35 @@ mod tests {
     }
 
     /// An execute inside an execute is refused, rather than recursing as deep as the guest likes.
+    ///
+    /// Three levels, so the refusal has something to be told apart from: the innermost stream
+    /// answers into the window, and its answer never appearing is what says the second level did
+    /// not run. A nesting test that only checked for poison would pass on a build that recursed
+    /// happily and then died of something else.
     #[test]
     fn an_execute_inside_an_executed_stream_is_refused() {
-        const STREAM: usize = 0x22000;
+        const WINDOW: usize = 0x21000;
+        const B: usize = 0x22000;
+        const C: usize = 0x22800;
 
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
         let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
 
-        let inner = wire_execute(&[stream_at(STREAM, 4)], None);
-        assert!(t.1.copy_in(STREAM, &inner));
+        let innermost = wire_instance_version();
+        assert!(t.1.copy_in(C, &innermost));
+        let middle = wire_execute(&[stream_at(C, innermost.len())], None);
+        assert!(t.1.copy_in(B, &middle));
 
-        let outer = wire_execute(&[stream_at(STREAM, inner.len())], None);
-        assert!(!ctx.submit(&outer, &mut todo, &g, &t).ran(), "nesting is refused");
+        let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+        batch.extend_from_slice(&wire_execute(&[stream_at(B, middle.len())], None));
+        assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "nesting is refused");
         assert!(ctx.fatal());
+
+        let mut got = [0u8; 4];
+        assert!(t.1.copy_out(WINDOW, &mut got));
+        assert_eq!(got, [0; 4], "the stream the nested execute named never ran");
     }
 
     /// Naming no streams at all is refused, and so is asking for reply positions with no window
