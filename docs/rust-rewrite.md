@@ -345,10 +345,22 @@ buildable throughout as the A-side reference.
   `vkExecuteCommandStreamsMESA`, `vkWriteRingExtraMESA`,
   `vkSubmitVirtqueueSeqnoMESA`, `vkWaitVirtqueueSeqnoMESA` and `vkWaitRingSeqnoMESA`.
   None of the five is reachable by replay (`harness/README.md`), which is why the seated
-  boot is a gate and not a formality: a build refusing all five scores every corpus
-  clean while a live Vulkan client segfaults on its first frame. They are a design task
-  — `vkExecuteCommandStreamsMESA` swaps the decoder onto a resource-backed stream, and
-  the seqno waits are what a ring blocks on — not a port-by-rote.
+  boot is a gate and not a formality: a build missing all five scores every corpus clean
+  while the compositor dies before it presents a frame. They are a design task —
+  `vkExecuteCommandStreamsMESA` swaps the decoder onto a resource-backed stream, and the
+  seqno waits are what a ring blocks on — not a port-by-rote.
+
+  They also expose an unsound rule in the dispatch loop. An unserved command poisons the
+  context only when the guest set `GENERATE_REPLY`, on the reasoning that a command
+  nobody is waiting on costs the guest one command and no more. That holds for a command
+  whose only product is its answer. It is false for one whose product is a *side effect*,
+  and every seqno wait is exactly that: the guest is not waiting on a reply, it is
+  waiting on the host to have blocked. Dropping it does not lose a command, it returns a
+  lie about synchronisation — and the guest proceeds on work that never completed. The
+  symptom is a generic `VK_ERROR_OUT_OF_HOST_MEMORY` several commands later, from a
+  driver that refused nothing, which is as far from the cause as a report can land.
+  A command the build does not serve must poison whether or not it carries a reply; the
+  reply flag says who is blocked, never whether the command mattered.
   `vkCmdCopyImageToBuffer` is the ordinary kind of gap, merely absent from the corpora
   we had; `synoik-vkcube` is the corpus that carries it.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
