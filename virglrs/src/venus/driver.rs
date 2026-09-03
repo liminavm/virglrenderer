@@ -23,8 +23,8 @@ use super::proto::types::{
     VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
     VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorPool, VkDescriptorSet,
     VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExtensionProperties,
-    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
+    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
+    VkExtensionProperties, VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
     VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer, VkImage,
     VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags,
     VkImageCreateInfo, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
@@ -956,8 +956,6 @@ impl Driver {
     /// told it has room for. The count comes back either way, and the caller writes it where the
     /// guest can read it.
     ///
-    /// `VK_INCOMPLETE` is the driver having more than the guest asked for. That is the guest's
-    /// business rather than an error: it sized the array and it gets what fits.
     /// A pipeline cache's serialised contents, in Vulkan's count-then-fill shape -- but counted
     /// in bytes, with a `size_t` where the enumerations have a `u32`, and on the device table.
     ///
@@ -1004,6 +1002,19 @@ impl Driver {
         Ok(unsafe { f(device, dst, srcs.len() as u32, srcs.as_ptr()) })
     }
 
+    /// An enumeration, in whichever of Vulkan's two calls the guest asked for.
+    ///
+    /// Generic over what is being enumerated *for* -- a physical device's queue families, an
+    /// instance's device groups -- because the two-call shape is the same and only the handle in
+    /// front of it differs.
+    ///
+    /// `out` is `None` for the count query -- the guest asking how many there are, with no array
+    /// behind it -- and `Some` for the fill, where the slice's own length is what the driver is
+    /// told it has room for. The count comes back either way, and the caller writes it where the
+    /// guest can read it.
+    ///
+    /// `VK_INCOMPLETE` is the driver having more than the guest asked for. That is the guest's
+    /// business rather than an error: it sized the array and it gets what fits.
     pub fn enumerate_into<H, T, R>(
         &self,
         h: H,
@@ -3361,6 +3372,17 @@ pub enum MemoryError {
     NotMappable,
 }
 
+/// How many bytes to mint for an allocation of `size`, as the host counts them.
+///
+/// A size this host cannot hold -- the guest's own number, unbounded -- is answered with the
+/// driver's refusal rather than a mint that wraps; the driver would have refused it too.
+fn size_for_pages(size: u64) -> Result<usize, NoMemory> {
+    usize::try_from(size)
+        .ok()
+        .and_then(crate::guest_mem::page_round)
+        .ok_or(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY))
+}
+
 /// Round a host-visible allocation up to the size of the blob the guest may create from it.
 ///
 /// A guest that maps memory does it by exporting the allocation as a virtio-gpu blob, and a blob
@@ -3370,18 +3392,6 @@ pub enum MemoryError {
 ///
 /// Only host-visible memory, because only host-visible memory is ever mapped; and never an import,
 /// which aliases bytes that already exist at a size the exporter fixed.
-/// How many bytes to mint for an allocation of `size`, as the host counts them.
-///
-/// `None` is a size this host cannot hold: the guest's own number, unbounded, and the driver
-/// would have refused it too. It is answered with the driver's refusal rather than a mint that
-/// wraps.
-fn size_for_pages(size: u64) -> Result<usize, NoMemory> {
-    usize::try_from(size)
-        .ok()
-        .and_then(crate::guest_mem::page_round)
-        .ok_or(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY))
-}
-
 fn pad_for_blob(size: u64, flags: Option<VkMemoryPropertyFlags>, imported: bool) -> u64 {
     /// Blobs are counted in 64 KiB units.
     const BLOB_ALIGN: u64 = 64 * 1024;
@@ -3523,26 +3533,57 @@ pub fn external_images_are_linear(info: &VkImageCreateInfo) -> VkImageCreateInfo
     info
 }
 
-/// Whether an image's `pNext` chain says it is for the world outside this guest -- external
-/// memory with at least one handle type. A link naming no handle types shares nothing.
-fn has_external_handle_types(mut node: *const core::ffi::c_void) -> bool {
+/// A struct that may sit in a `pNext` chain, and the tag it carries there. What lets one walk
+/// serve every question asked of a chain, with the tag and the type it vouches for written
+/// beside each other once instead of at every call site.
+trait Chained: Copy {
+    const S_TYPE: VkStructureType;
+}
+
+impl Chained for VkExternalMemoryImageCreateInfo {
+    const S_TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+}
+impl Chained for VkExportMemoryAllocateInfo {
+    const S_TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+}
+impl Chained for VkMemoryDedicatedAllocateInfo {
+    const S_TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+}
+impl Chained for VkImportMemoryResourceInfoMESA {
+    const S_TYPE: VkStructureType =
+        VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA;
+}
+
+/// The link of type `T` in a `pNext` chain, if there is one -- copied out, so nothing holds a
+/// pointer into the chain past the walk.
+///
+/// The one place a chain is walked, and the one `unsafe` for it: every link is a struct the
+/// decoder allocated in the batch arena, every one begins with the `sType`/`pNext` header
+/// `VkBaseInStructure` names, and the tag says which struct a link is.
+fn chain_find<T: Chained>(mut node: *const core::ffi::c_void) -> Option<T> {
     while !node.is_null() {
-        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
-        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
+        // SAFETY: as above.
         let base = unsafe { &*node.cast::<VkBaseInStructure>() };
-        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO {
-            // SAFETY: the tag says this link is a `VkExternalMemoryImageCreateInfo`.
-            let ext = unsafe { &*node.cast::<VkExternalMemoryImageCreateInfo>() };
-            return ext.handleTypes.0 != 0;
+        if base.sType == T::S_TYPE {
+            // SAFETY: the tag says this link is a `T`.
+            return Some(unsafe { *node.cast::<T>() });
         }
         node = base.pNext.cast();
     }
-    false
+    None
+}
+
+/// Whether an image's `pNext` chain says it is for the world outside this guest -- external
+/// memory with at least one handle type. A link naming no handle types shares nothing.
+fn has_external_handle_types(node: *const core::ffi::c_void) -> bool {
+    chain_find::<VkExternalMemoryImageCreateInfo>(node).is_some_and(|e| e.handleTypes.0 != 0)
 }
 
 /// Whether an allocation's `pNext` chain says the memory is for the world outside this guest.
 fn exports_memory(node: *const core::ffi::c_void) -> bool {
-    chain_has(node, VkStructureType::VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO)
+    chain_find::<VkExportMemoryAllocateInfo>(node).is_some()
 }
 
 /// The image an allocation is dedicated to, if it is dedicated to one.
@@ -3550,19 +3591,9 @@ fn exports_memory(node: *const core::ffi::c_void) -> bool {
 /// A dedicated allocation backs exactly one image, which is what makes it the image whose layout
 /// a scanout surface must match. `VK_NULL_HANDLE` is the legal way to say "a buffer, not an
 /// image", and reads as no image rather than as image zero.
-fn dedicated_image(mut node: *const core::ffi::c_void) -> Option<VkImage> {
-    while !node.is_null() {
-        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
-        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
-        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
-        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO {
-            // SAFETY: the tag says this link is a `VkMemoryDedicatedAllocateInfo`.
-            let ded = unsafe { &*node.cast::<VkMemoryDedicatedAllocateInfo>() };
-            return (ded.image.0 != 0).then_some(ded.image);
-        }
-        node = base.pNext.cast();
-    }
-    None
+fn dedicated_image(node: *const core::ffi::c_void) -> Option<VkImage> {
+    chain_find::<VkMemoryDedicatedAllocateInfo>(node)
+        .and_then(|d| (d.image.0 != 0).then_some(d.image))
 }
 
 /// The IOSurface format a Vulkan format is, for the formats a scanout can be.
@@ -3584,37 +3615,14 @@ fn pixel_format(format: VkFormat) -> Option<PixelFormat> {
     }
 }
 
-/// Whether a `pNext` chain carries a link of this type.
-fn chain_has(mut node: *const core::ffi::c_void, ty: VkStructureType) -> bool {
-    while !node.is_null() {
-        // SAFETY: as `imports_a_resource`.
-        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
-        if base.sType == ty {
-            return true;
-        }
-        node = base.pNext.cast();
-    }
-    false
-}
-
 /// The resource an allocation's `pNext` chain names, when it is aliasing storage rather than
 /// asking for some.
 ///
 /// Walked rather than asked of the guest, because the chain is where the guest put it. Resource
 /// zero is no resource, the same way a null handle is no image.
-fn imported_resource(mut node: *const core::ffi::c_void) -> Option<ResourceHandle> {
-    while !node.is_null() {
-        // SAFETY: every link is a struct the decoder allocated in the batch arena, and every one
-        // of them begins with the `sType`/`pNext` header `VkBaseInStructure` names.
-        let base = unsafe { &*node.cast::<VkBaseInStructure>() };
-        if base.sType == VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA {
-            // SAFETY: the tag says this link is a `VkImportMemoryResourceInfoMESA`.
-            let import = unsafe { &*node.cast::<VkImportMemoryResourceInfoMESA>() };
-            return ResourceHandle::new(import.resourceId);
-        }
-        node = base.pNext.cast();
-    }
-    None
+fn imported_resource(node: *const core::ffi::c_void) -> Option<ResourceHandle> {
+    chain_find::<VkImportMemoryResourceInfoMESA>(node)
+        .and_then(|i| ResourceHandle::new(i.resourceId))
 }
 
 /// Read a Vulkan `const char *const *` array into owned strings.
