@@ -401,6 +401,30 @@ class RustGen:
                 continue
         return out
 
+    def out_blobs(self, ty):
+        """The blobs a command writes for the guest, as `(var, shape)`.
+
+        An out-blob is room the guest offers -- a count with no bytes behind it -- that the reply
+        carries back filled. The decoder allocates the room, and the struct has to remember how
+        much: the length member is the handler's to rewrite with what it wrote, and nothing else
+        would bound the reply against what was allocated.
+        """
+        if ty.category != VkType.COMMAND:
+            return []
+        out = []
+        for var in ty.variables:
+            if not self.gen.is_serializable(var) or not var.is_blob():
+                continue
+            if var.ty.is_const_pointer():
+                continue
+            if self.gen._get_variable_validity(ty, var, 'var_in' in var.attrs) != Gen_INVALID:
+                continue
+            try:
+                out.append((var, self._shape(ty, var)))
+            except self.Unsupported:
+                continue
+        return out
+
     def out_handle_fields(self, ty):
         """The visible members a create writes its *guest ids* into, by field name.
 
@@ -490,6 +514,10 @@ class RustGen:
         for var, shape in self.out_handles(ty):
             f = 'handle_%s' % self.field_name(var.name)
             out.append((f, '*mut %s' % self.base_name(var.ty), shape))
+        # An out-blob's room: how many bytes the decoder allocated for it, which the reply is
+        # held to. The length member beside it says how many the handler wrote.
+        for var, shape in self.out_blobs(ty):
+            out.append(('room_%s' % self.field_name(var.name), 'usize', shape))
         owner = self.create_owner(ty)
         if owner:
             var, shape = owner
@@ -753,6 +781,10 @@ class RustGen:
                 hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
                        'let Some(a) = dec.alloc_temp_array::<u8>(n) else { return };',
                        '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]
+                # A command remembers the room; a struct's partial decode has nowhere to, and
+                # no reply is encoded from one directly.
+                if ty.category == VkType.COMMAND:
+                    hit.append('val.room_%s = n;' % self.field_name(var.name))
                 return self._present(shape[1], var, m, null, hit)
             # Borrowed from the stream, not copied: the arena is for what the guest does not
             # already hold in a contiguous, correctly sized run of wire bytes.
@@ -933,11 +965,32 @@ class RustGen:
                             '    enc.encode_array_size(0); /* out */',
                             '}']
                 return ['size += cs::sizeof_scalar::<u64>(); /* out */']
+            if kind == 'encode' and ty.category == VkType.COMMAND \
+                    and not var.ty.is_const_pointer():
+                # An out-blob in a reply: the length member is what the handler wrote, and the
+                # room is what the decoder allocated. A handler reporting more than it was given
+                # is a host invariant broken -- the driver's total on `VK_INCOMPLETE`, say -- and
+                # is stopped here rather than read past the arena.
+                room = 'val.room_%s' % self.field_name(var.name)
+                return ['if !%s.is_null() {' % m,
+                        '    let n = (%s) as usize;' % n,
+                        '    assert!(n <= %s, "%s wrote {n} bytes of %s into room for {}", %s);'
+                        % (room, ty.name, var.name, room),
+                        '    enc.encode_array_size(n as u64);',
+                        '    // SAFETY: the decoder allocated `room` bytes for the member in the',
+                        '    // arena, and `n` was just held to that.',
+                        '    unsafe {',
+                        '        enc.encode_blob(core::slice::from_raw_parts(%s as *const u8, n));'
+                        % m,
+                        '    }',
+                        '} else {',
+                        '    enc.encode_array_size(0);',
+                        '}']
             if kind == 'encode':
                 return ['if !%s.is_null() {' % m,
                         '    enc.encode_array_size(%s);' % n,
-                        '    // SAFETY: the member points at the run of bytes the decoder borrowed',
-                        '    // or allocated for it; the length member is bounded by that run.',
+                        '    // SAFETY: the member points at the run of wire bytes the decoder',
+                        '    // borrowed for it, which is exactly this long.',
                         '    unsafe {',
                         '        enc.encode_blob(core::slice::from_raw_parts(',
                         '            %s as *const u8, (%s) as usize));' % (m, n),
@@ -1293,12 +1346,15 @@ class RustGen:
 
         if shape[0] == 'blob':
             # An output blob is bytes the host wrote into room the guest offered, so the fill is
-            # the room's worth of distinct bytes -- the length member was planted before it.
+            # the room's worth of distinct bytes -- the length member was planted before it, and
+            # the room is planted to match, as the decoder would have.
+            room = (['    val.room_%s = n;' % self.field_name(var.name)]
+                    if ty.category == VkType.COMMAND else [])
             return (['{',
                      '    let n = (%s) as usize;' % shape[1],
                      '    let s = a.alloc_slice_fill_with(n, |_| f.take() as u8);',
-                     '    %s = s.as_mut_ptr() as _;' % m,
-                     '}'])
+                     '    %s = s.as_mut_ptr() as _;' % m]
+                    + room + ['}'])
 
         # Strings carry their own length rules and no recorded reply exercises one, so they are
         # named gaps rather than a guess. They stay zeroed, which the oracle can still compare --
@@ -1896,8 +1952,14 @@ class RustGen:
                 # Mutability follows the member, with no shadow to consult: a blob carries no
                 # guest ids, so there is nothing to keep out of the reply, and an out-blob is
                 # written where it lies.
-                rows.append((self.field_name(var.name), 'u8', shape[1],
-                             not var.ty.is_const_pointer()))
+                f = self.field_name(var.name)
+                if var.ty.is_const_pointer():
+                    rows.append((f, 'u8', shape[1], False))
+                else:
+                    # An out-blob is sliced by the room the decoder allocated, not by the length
+                    # member: that one is the handler's to rewrite, and a slice sized by it would
+                    # be sized by whatever the handler last said.
+                    rows.append((f, 'u8', '(val.room_%s) as u64' % f, True))
         for f, rs, shape in self.shadows(ty):
             if shape[0] == 'dynamic':
                 mutable = rs.startswith('*mut ')
@@ -2165,6 +2227,8 @@ class RustGen:
             return None
         ct = next((self.field_type(v) for v in ty.variables
                    if self.field_name(v.name) == m.group(1)), None)
+        if ct is None:
+            ct = next((rs for f, rs, _ in self.shadows(ty) if f == m.group(1)), None)
         return (m.group(1), ct) if ct in ('u32', 'u64', 'usize', 'i32') else None
 
     def _handle_fns(self, ty):
