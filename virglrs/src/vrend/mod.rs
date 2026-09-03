@@ -18,7 +18,12 @@
 pub mod decode;
 pub mod egl;
 pub mod encode;
+pub mod features;
 pub mod formats;
 pub mod gl;
 pub mod pipe;
 pub mod proto;
+pub mod resource;
+pub mod transfer;
+#[allow(clippy::module_inception)]
+pub mod vrend;

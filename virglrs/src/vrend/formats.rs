@@ -19,8 +19,9 @@
 //! the wire header assigns numbers gallium never named. Every table here that names a format
 //! names one with a description, and the tests hold it to that.
 
-use super::gl::GLenum;
+use super::features::{Feature, Features};
 use super::gl::gles::*;
+use super::gl::{GLenum, Gl};
 use super::pipe::Swizzle;
 use super::proto::{FORMAT_MAX, Format};
 
@@ -339,6 +340,231 @@ pub struct GlGroup {
     /// does: the extension that names the group is the whole answer.
     pub compressed: bool,
     pub formats: &'static [GlFormat],
+}
+
+/// What the driver said a format can be bound as, from the probe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Bindings {
+    pub sampler_view: bool,
+    pub render_target: bool,
+    pub depth_stencil: bool,
+}
+
+/// A format's host-side entry: the GL triple, and what the driver answered when asked to make a
+/// texture of it -- `vrend_format_table`'s `bindings` and `flags`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Entry {
+    pub gl: GlFormat,
+    pub bindings: Bindings,
+    /// `glTexStorage2D` accepted the internal format.
+    pub can_texture_storage: bool,
+    /// `glReadPixels` will hand the format back as the triple says it is: the transfer path's
+    /// readback is safe to advertise.
+    pub can_readback: bool,
+    pub can_multisample: bool,
+}
+
+impl Entry {
+    /// `VIRGL_TEXTURE_NEED_SWIZZLE`: the triple carries a texture swizzle.
+    pub fn need_swizzle(&self) -> bool {
+        self.gl.swizzle.is_some()
+    }
+
+    /// `vrend_format_can_render`.
+    pub fn can_render(&self) -> bool {
+        self.bindings.render_target
+    }
+
+    /// `vrend_format_is_ds`.
+    pub fn is_ds(&self) -> bool {
+        self.bindings.depth_stencil
+    }
+}
+
+/// The host's format table: every wire format the driver accepts, probed once at init the way
+/// `vrend_add_formats` probes -- a 32×32 texture per triple, attached to a framebuffer, and the
+/// driver's answers recorded. A format not here is one the guest cannot create.
+pub struct Table {
+    entries: Vec<Option<Entry>>,
+}
+
+impl Table {
+    /// Probe every group's rows, in the C's order and under the C's conditions, on the context
+    /// current on this thread.
+    pub fn probe(gl: &Gl, features: &Features) -> Table {
+        let mut t = Table { entries: vec![None; FORMAT_COUNT] };
+        for group in GL_GROUPS {
+            let wanted = match group.when {
+                When::Always => true,
+                When::S3tc => features.has(Feature::s3tc),
+                When::Rgtc => features.has(Feature::rgtc),
+                When::Bptc => features.has(Feature::bptc),
+                When::Astc => features.has(Feature::astc),
+                When::Etc2 => features.has(Feature::etc2),
+                When::SamplerOnly | When::Gles => true,
+                When::DesktopGl => false,
+            };
+            if !wanted {
+                continue;
+            }
+            for row in group.formats {
+                let at = row.format.wire() as usize;
+                if t.entries[at].is_some() {
+                    continue;
+                }
+                if group.compressed || group.when == When::SamplerOnly {
+                    t.entries[at] = Some(Entry {
+                        gl: *row,
+                        bindings: Bindings { sampler_view: true, ..Bindings::default() },
+                        can_texture_storage: false,
+                        can_readback: false,
+                        can_multisample: false,
+                    });
+                    continue;
+                }
+                t.entries[at] = probe_row(gl, features, row);
+            }
+        }
+        for e in t.entries.iter_mut().flatten() {
+            e.can_texture_storage = texture_storage_works(gl, e.gl.internalformat);
+        }
+        if features.has(Feature::multisample) && features.has(Feature::storage_multisample) {
+            for e in t.entries.iter_mut().flatten() {
+                // On GLES a multisample texture is only ever made with `glTexStorage2DMultisample`,
+                // so a format without storage has no multisample form.
+                e.can_multisample =
+                    e.can_texture_storage && multisample_works(gl, e.gl.internalformat);
+            }
+        }
+        t
+    }
+
+    /// A table with no driver behind it, for tests of what a table holds.
+    #[cfg(test)]
+    pub fn empty() -> Table {
+        Table { entries: vec![None; FORMAT_COUNT] }
+    }
+
+    #[cfg(test)]
+    pub fn insert(&mut self, e: Entry) {
+        self.entries[e.gl.format.wire() as usize] = Some(e);
+    }
+
+    pub fn get(&self, format: Format) -> Option<&Entry> {
+        self.entries[format.wire() as usize].as_ref()
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().flatten()
+    }
+}
+
+/// `vrend_add_formats`'s probe of one row. `None` when the driver refused the triple.
+fn probe_row(gl: &Gl, features: &Features, row: &GlFormat) -> Option<Entry> {
+    let tex = gl.gen_texture();
+    let fb = gl.gen_framebuffer();
+    gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+    gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+    gl.drain_errors();
+    gl.tex_image_2d_null(GL_TEXTURE_2D, 0, row.internalformat, 32, 32, row.glformat, row.gltype);
+    let entry = if gl.drain_errors() != GL_NO_ERROR {
+        None
+    } else {
+        let desc = row.format.describe();
+        let is_depth = desc.is_some_and(|d| d.is_depth_or_stencil());
+        if is_depth {
+            let attachment = if desc.is_some_and(|d| d.has_stencil()) {
+                GL_DEPTH_STENCIL_ATTACHMENT
+            } else {
+                GL_DEPTH_ATTACHMENT
+            };
+            gl.framebuffer_texture_2d(attachment, GL_TEXTURE_2D, Some(tex), 0);
+            gl.draw_buffers(&[GL_NONE]);
+        } else {
+            gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(tex), 0);
+            gl.draw_buffers(&[GL_COLOR_ATTACHMENT0]);
+        }
+        let complete = gl.check_framebuffer_status() == GL_FRAMEBUFFER_COMPLETE;
+        let bindings = Bindings {
+            sampler_view: true,
+            render_target: complete && !is_depth,
+            depth_stencil: complete && is_depth,
+        };
+        let can_readback = complete
+            && if is_depth {
+                depth_stencil_can_readback(features, row.format)
+            } else {
+                color_can_readback(gl, features, row)
+            };
+        gl.drain_errors();
+        Some(Entry {
+            gl: *row,
+            bindings,
+            can_texture_storage: false,
+            can_readback,
+            can_multisample: false,
+        })
+    };
+    gl.bind_framebuffer(GL_FRAMEBUFFER, None);
+    gl.bind_texture(GL_TEXTURE_2D, None);
+    gl.delete_framebuffer(fb);
+    gl.delete_texture(tex);
+    entry
+}
+
+/// `color_format_can_readback`: whether `glReadPixels` on GLES hands this colour format back in
+/// its own triple. Asked with the probe framebuffer bound, which is what the implementation
+/// read format/type answer for.
+fn color_can_readback(gl: &Gl, features: &Features, row: &GlFormat) -> bool {
+    match row.format.name() {
+        "R8G8B8A8_UNORM" => true,
+        "R32G32B32A32_SINT" | "R32G32B32A32_UINT" if features.gles_version >= 30 => true,
+        "R32G32B32A32_FLOAT" if features.has(Feature::color_buffer_float) => true,
+        "B10G10R10A2_UNORM" | "B10G10R10X2_UNORM" => false,
+        _ => {
+            gl.get_integer(GL_IMPLEMENTATION_COLOR_READ_TYPE) as GLenum == row.gltype
+                && gl.get_integer(GL_IMPLEMENTATION_COLOR_READ_FORMAT) as GLenum == row.glformat
+        }
+    }
+}
+
+/// `depth_stencil_formats_can_readback`: GLES reads depth and stencil back only through the NV
+/// extensions.
+fn depth_stencil_can_readback(features: &Features, format: Format) -> bool {
+    match format.name() {
+        "Z16_UNORM" | "Z32_UNORM" | "Z32_FLOAT" | "Z24X8_UNORM" => {
+            features.has(Feature::nv_read_depth)
+        }
+        "Z24_UNORM_S8_UINT" | "S8_UINT_Z24_UNORM" | "Z32_FLOAT_S8X24_UINT" => {
+            features.has(Feature::nv_read_depth_stencil)
+        }
+        "X24S8_UINT" | "S8X24_UINT" | "S8_UINT" => features.has(Feature::nv_read_stencil),
+        _ => false,
+    }
+}
+
+/// `vrend_check_texture_storage`, for one internal format.
+fn texture_storage_works(gl: &Gl, internalformat: GLenum) -> bool {
+    let tex = gl.gen_texture();
+    gl.bind_texture(GL_TEXTURE_2D, Some(tex));
+    gl.drain_errors();
+    gl.tex_storage_2d(GL_TEXTURE_2D, 1, internalformat, 32, 32);
+    let ok = gl.drain_errors() == GL_NO_ERROR;
+    gl.bind_texture(GL_TEXTURE_2D, None);
+    gl.delete_texture(tex);
+    ok
+}
+
+/// `vrend_check_texture_multisample`, for one internal format.
+fn multisample_works(gl: &Gl, internalformat: GLenum) -> bool {
+    let tex = gl.gen_texture();
+    gl.bind_texture(GL_TEXTURE_2D_MULTISAMPLE, Some(tex));
+    gl.drain_errors();
+    gl.tex_storage_2d_multisample(GL_TEXTURE_2D_MULTISAMPLE, 2, internalformat, 32, 32);
+    let ok = gl.drain_errors() == GL_NO_ERROR;
+    gl.bind_texture(GL_TEXTURE_2D_MULTISAMPLE, None);
+    gl.delete_texture(tex);
+    ok
 }
 
 #[cfg(test)]
