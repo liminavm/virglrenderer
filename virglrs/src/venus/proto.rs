@@ -330,15 +330,15 @@ mod tests {
                 let offered = *args.pDataSize_mut().expect("the size pointer was sent");
                 self.saw.push((args.has_pData(), offered));
                 args.ret = VkResult::VK_SUCCESS;
-                match args.pData_mut() {
+                if !args.has_pData() {
                     // The count call: say how much there is.
-                    None => *args.pDataSize_mut().unwrap() = 5,
+                    *args.pDataSize_mut().unwrap() = 5;
+                } else {
                     // The data call: fill what fits and say how much that was.
-                    Some(room) => {
-                        let n = room.len().min(5);
-                        room[..n].copy_from_slice(&b"cache"[..n]);
-                        *args.pDataSize_mut().unwrap() = n;
-                    }
+                    let room = args.pData_mut().expect("offered");
+                    let n = room.len().min(5);
+                    room[..n].copy_from_slice(&b"cache"[..n]);
+                    *args.pDataSize_mut().unwrap() = n;
                 }
                 let size = vn_sizeof_vkGetPipelineCacheData_reply(&AllOfIt, args);
                 self.reply = vec![0u8; size];
@@ -418,6 +418,64 @@ mod tests {
             assert_eq!(size, w.len() + 8, "the header the caller consumed is the encoder\'s");
             assert_eq!(enc.written()[8..], w[..]);
         }
+    }
+
+    /// The room an out-blob was given is the decoder's fact, not the length member's.
+    ///
+    /// The length member is the handler's to rewrite with what it wrote, so a slice sized by it
+    /// would be sized by whatever the handler last said -- and the reply, encoding that many
+    /// bytes from the arena, would read past the room on the first handler that reports the
+    /// driver's total instead of what fit. The room is recorded once, at decode, and both the
+    /// slice and the reply are held to it.
+    #[test]
+    fn an_out_blob_is_bounded_by_the_room_it_was_given_and_not_by_its_length_member() {
+        #[derive(Default)]
+        struct Overreport {
+            rooms: Vec<usize>,
+        }
+        impl Commands for Overreport {
+            fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
+                panic!("{cmd:?} was refused");
+            }
+            fn vkGetPipelineCacheData(&mut self, args: &mut vn_command_vkGetPipelineCacheData) {
+                self.rooms.push(args.pData_mut().expect("room was offered").len());
+                // The driver's total, not what fit: the mistake a handler makes on
+                // `VK_INCOMPLETE`.
+                *args.pDataSize_mut().unwrap() = 1000;
+                self.rooms.push(args.pData_mut().expect("room was offered").len());
+                args.ret = VkResult::VK_INCOMPLETE;
+            }
+        }
+
+        let w = wire(&[
+            &1u64.to_le_bytes(),
+            &2u64.to_le_bytes(),
+            &1u64.to_le_bytes(),
+            &8usize.to_le_bytes(),
+            &8u64.to_le_bytes(),
+        ]);
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut h = Overreport::default();
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        let mut args = vn_command_vkGetPipelineCacheData::default();
+        vn_decode_vkGetPipelineCacheData_args_temp(&mut dec, &mut args);
+        assert!(!dec.fatal());
+        h.vkGetPipelineCacheData(&mut args);
+        assert_eq!(h.rooms, [8, 8], "the slice is the room, whatever the length member says");
+
+        let size = vn_sizeof_vkGetPipelineCacheData_reply(&AllOfIt, &args);
+        let mut buf = vec![0u8; size.max(1024)];
+        let mut enc = Encoder::new(&mut buf, &AllOfIt);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vn_encode_vkGetPipelineCacheData_reply(&mut enc, &args);
+        }));
+        let msg = caught.expect_err("a reply of more than the room is a host invariant broken");
+        let msg = msg.downcast_ref::<String>().map(String::as_str).unwrap_or("");
+        assert!(
+            msg.contains("wrote 1000 bytes of pData into room for 8"),
+            "the assert names the command, the member, and both figures: {msg:?}"
+        );
     }
 
     /// The capset hands the guest a bitmask indexed by extension number, and the guest reads it

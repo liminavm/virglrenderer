@@ -579,6 +579,21 @@ SABOTAGES = [
         'an_out_blob_is_room',
     ),
     (
+        "an out blob's slice is sized by the length member the handler rewrites, not the room",
+        'virglrs/venus-gen/rustgen.py',
+        """                    rows.append((f, 'u8', '(val.room_%s) as u64' % f, True))""",
+        """                    rows.append((f, 'u8', shape[1], True))""",
+        'an_out_blob_is_bounded_by_the_room',
+    ),
+    (
+        'a reply encodes as many out-blob bytes as the handler claims, past the room',
+        'virglrs/venus-gen/rustgen.py',
+        """                        '    assert!(n <= %s, "%s wrote {n} bytes of %s into room for {}", %s);'
+                        % (room, ty.name, var.name, room),""",
+        """                        '    let _ = %s;' % room,""",
+        'an_out_blob_is_bounded_by_the_room',
+    ),
+    (
         'the fill call of the pipeline cache data reports the room offered, not the bytes written',
         'virglrs/src/venus/context.rs',
         """        let asked = self.driver.pipeline_cache_data(device, cache, Some(out));
