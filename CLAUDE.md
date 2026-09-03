@@ -102,5 +102,17 @@ it. Fix the template.
   carries workarounds whose comments assert things that are no longer true; porting one
   faithfully carries the folklore forward and hides that the real bug was fixed elsewhere.
   Reproduce it against a pinned score first, then port it or delete it.
+- **Proxies lie, and they lie towards success.** `graphical-session.target` reads `active` while
+  the compositor is exiting 101 behind it. `vulkaninfo` reports a healthy venus device from an
+  SSH shell that never touches the display. A renderer log shows contexts created and torn down
+  cleanly, which is also what a compositor that died at startup produces. Each is a true signal
+  about something; none of them is a pixel. A claim about what is on the screen is only ever
+  settled by what is on the screen.
+- **For a load-bearing claim, look at it.** Not a status field, not a count, not a hash — the
+  frame. `harness/vm/frame.py` prints facts about a captured frame and deliberately renders no
+  verdict, because a script concluding "looks seated" is a new proxy and would be trusted faster
+  for sounding like it looked. The frame is written only by a headless boot (limina refuses
+  `--display-capture` alongside a window) and holds the *last presented* frame, so it must be
+  read while the workload runs; read after shutdown it shows the teardown console.
 - Commit as work finishes. Never `git add -A` — this tree has untracked local files that must
   not be committed. Never push without asking.
