@@ -309,12 +309,12 @@ buildable throughout as the A-side reference.
 - **P2 — venus.** Fork venus-protocol's generator to emit Rust; gate the decoder on a
   byte-identical wire round trip over both corpora. Then vkr: instance/device/queue/memory/
   image/buffer/descriptor/command-buffer, rings, budget, the Metal + IOSurface
-  helpers. Eight commands are deferred inside that work rather than before it: those with
-  `need_blob_encode` — `vkGetPipelineCacheData`, `vkGetQueryPoolResults` and friends — have a
-  stubbed *request* decoder, so a guest sending one poisons its ring today. Their storage is
-  an offset into a reply the renderer has not built yet, so the decoder and the reply encoder
-  have to be designed against each other; they land with the first reply-bearing handler, and
-  before the seated-GNOME gate. Neither corpus contains one, so nothing else will notice.
+  helpers. An output blob — `vkGetPipelineCacheData`, `vkGetQueryPoolResults` and the six
+  others venus-protocol marks `need_blob_encode` — is room the guest offers as a count with no
+  bytes behind it; the decoder allocates that room in the arena, bounded like every other
+  array, and the reply copies what the handler wrote. The C writes into the reply buffer in
+  place instead, which saves one copy of a pipeline cache and couples the decoder to an
+  encoder that does not exist yet when it runs; the copy is the price of keeping them apart.
   Two pieces of the budget land after the ledger itself: `VK_EXT_memory_budget`, which is the
   only backpressure that reaches a guest at all and needs
   `vkGetPhysicalDeviceMemoryProperties2` intercepted rather than forwarded; and the HostShm

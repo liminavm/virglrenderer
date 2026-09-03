@@ -746,7 +746,14 @@ class RustGen:
 
         if shape[0] == 'blob':
             if validity == Gen_INVALID:
-                return ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]
+                # An output blob: the guest sends the room it offers and no bytes, and the reply
+                # carries what the host wrote. The room is arena storage sized by the wire count,
+                # which `decode_array_size` has already held to the length member and the arena
+                # bounds -- a guest naming a gigabyte of room is poisoned, never served.
+                hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
+                       'let Some(a) = dec.alloc_temp_array::<u8>(n) else { return };',
+                       '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]
+                return self._present(shape[1], var, m, null, hit)
             # Borrowed from the stream, not copied: the arena is for what the guest does not
             # already hold in a contiguous, correctly sized run of wire bytes.
             hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
@@ -916,13 +923,21 @@ class RustGen:
         if shape[0] == 'blob':
             n = shape[1]
             if validity == Gen_INVALID:
-                return ['enc.encode_array_size(%s); /* out */' % n] if kind == 'encode' \
-                    else ['size += cs::sizeof_scalar::<u64>(); /* out */']
+                # The driver sends the room only when it sent a pointer: a null out blob rides as
+                # a zero count whatever the length member says, and the length member is allowed
+                # to say anything then -- a count call leaves it uninitialised.
+                if kind == 'encode':
+                    return ['if !%s.is_null() {' % m,
+                            '    enc.encode_array_size(%s); /* out */' % n,
+                            '} else {',
+                            '    enc.encode_array_size(0); /* out */',
+                            '}']
+                return ['size += cs::sizeof_scalar::<u64>(); /* out */']
             if kind == 'encode':
                 return ['if !%s.is_null() {' % m,
                         '    enc.encode_array_size(%s);' % n,
-                        '    // SAFETY: the member points at the run of wire bytes the decoder',
-                        '    // borrowed for it, which is exactly this long.',
+                        '    // SAFETY: the member points at the run of bytes the decoder borrowed',
+                        '    // or allocated for it; the length member is bounded by that run.',
                         '    unsafe {',
                         '        enc.encode_blob(core::slice::from_raw_parts(',
                         '            %s as *const u8, (%s) as usize));' % (m, n),
@@ -1276,9 +1291,18 @@ class RustGen:
                        '    %s = s.as_mut_ptr();' % m,
                        '}'])
 
-        # Blobs and strings carry their own length rules and no recorded reply exercises one, so
-        # they are named gaps rather than a guess. They stay zeroed, which the oracle can still
-        # compare -- it just cannot tell those bytes apart.
+        if shape[0] == 'blob':
+            # An output blob is bytes the host wrote into room the guest offered, so the fill is
+            # the room's worth of distinct bytes -- the length member was planted before it.
+            return (['{',
+                     '    let n = (%s) as usize;' % shape[1],
+                     '    let s = a.alloc_slice_fill_with(n, |_| f.take() as u8);',
+                     '    %s = s.as_mut_ptr() as _;' % m,
+                     '}'])
+
+        # Strings carry their own length rules and no recorded reply exercises one, so they are
+        # named gaps rather than a guess. They stay zeroed, which the oracle can still compare --
+        # it just cannot tell those bytes apart.
         gaps.append('%s.%s: fill %s' % (ty.name, var.name, shape[0]))
         return ['/* gap: fill %s */' % shape[0]]
 
@@ -2338,11 +2362,6 @@ class RustGen:
 
         def request(kind):
             def go():
-                if 'need_blob_encode' in ty.attrs:
-                    # The reply carries the blob, so its storage is an offset into the encoder the
-                    # renderer has not built yet. Nothing here needs it; the round trip does not
-                    # reach it, and vkr will want the offset plumbing rather than this shape.
-                    raise self.Unsupported('%s: blob storage rides the reply' % n)
                 out = ['let mut size = 0usize;'] if kind == 'sizeof' else []
                 if kind == 'decode':
                     out += ['/* the header is the caller\'s: it chose this arm with it */']

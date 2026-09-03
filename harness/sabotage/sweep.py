@@ -514,6 +514,25 @@ SABOTAGES = [
         '',
     ),
     (
+        'an out blob the guest offers room for is decoded as absent, and its handler writes nowhere',
+        'virglrs/venus-gen/rustgen.py',
+        """                hit = ['let n = dec.decode_array_size(%s) as usize;' % shape[1],
+                       'let Some(a) = dec.alloc_temp_array::<u8>(n) else { return };',
+                       '%s = a.as_mut_ptr() as %s _;' % (m, ptr)]
+                return self._present(shape[1], var, m, null, hit)""",
+        """                return ['dec.decode_array_size(%s);' % shape[1], '%s = %s;' % (m, null)]""",
+        'an_out_blob_is_room',
+    ),
+    (
+        'the count call of an out blob is held to the garbage size beside it, and every count call is poisoned',
+        'virglrs/venus-gen/rustgen.py',
+        """        if count is not None and not var.is_optional() and var.can_validate():
+            miss = ['dec.decode_array_size(%s);' % count]""",
+        """        if count is not None:
+            miss = ['dec.decode_array_size(%s);' % count]""",
+        'an_out_blob_is_room',
+    ),
+    (
         'the fill call of the pipeline cache data reports the room offered, not the bytes written',
         'virglrs/src/venus/context.rs',
         """        let asked = self.driver.pipeline_cache_data(device, cache, Some(out));
