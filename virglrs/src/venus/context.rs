@@ -337,22 +337,19 @@ impl Context {
             let answer = enc.pos();
             dispatched += 1;
 
-            // No handler ran: the command was counted for the census and nothing else. That is a
-            // fine outcome for a command the guest is not waiting on -- it loses one command. It
-            // is not fine here, because the generator encoded a reply regardless, out of arguments
-            // no handler ever filled in, and a zeroed reply is shaped exactly like a successful
-            // one. There is no field in which to say "we did not do this", so the context dies
-            // saying it rather than answering with a fiction the guest cannot tell from an answer.
+            // No handler ran: the command was counted for the census and nothing else. There is
+            // no version of that which is safe to continue from. When the guest wanted a reply,
+            // the generator encoded one regardless, out of arguments no handler ever filled in,
+            // and a zeroed reply is shaped exactly like a successful one -- there is no field in
+            // which to say "we did not do this". When it wanted none, the guest is not waiting,
+            // but it does go on believing the host did the thing; the divergence surfaces later,
+            // somewhere that cannot name this command. Either way the context dies here, saying
+            // which command it was. This is also what upstream does: its generated wrapper for a
+            // command with no handler sets fatal before decoding, whatever the reply flag says.
             // Not counted in `unhandled`: the census above already owns the tally of commands
             // no handler served, and a second count of the same fact is one that can disagree.
-            if core::mem::take(&mut h.unserved) && wants_reply {
-                poison(
-                    fatal,
-                    id,
-                    &dec,
-                    cmd,
-                    "is not a command this build serves, and wants an answer",
-                );
+            if core::mem::take(&mut h.unserved) {
+                poison(fatal, id, &dec, cmd, "is not a command this build serves");
                 break;
             }
             // A handler that found the command itself unusable -- an id the guest cannot have, a
@@ -5135,16 +5132,18 @@ mod tests {
         buf
     }
 
-    /// A command this build does not serve is counted, never answered.
+    /// A command this build does not serve is counted, and then stops the context.
     ///
     /// The generated dispatch encodes a reply for every command it decodes, run or not, out of the
     /// argument struct as it stands -- and for an unserved command that struct is still all zeros.
     /// Committing it would hand the guest a well-formed `VK_SUCCESS` for work no handler ever did,
     /// which is indistinguishable from a real answer and is the precise failure this renderer
-    /// exists to stop making. Losing the command is fine while nobody is waiting; once someone is,
-    /// there is no field left in which to say "we did not do this", so the context stops instead.
+    /// exists to stop making. The reply flag does not soften it: a guest that asked for no answer
+    /// still goes on believing the host did the thing, and that divergence surfaces later,
+    /// somewhere with no way left to name the command that caused it. So the loop covers both
+    /// flags and expects the same verdict from each.
     #[test]
-    fn an_unserved_command_is_never_answered_with_a_fiction() {
+    fn an_unserved_command_stops_the_context_either_way() {
         const WINDOW: usize = 0x21000;
 
         for reply_wanted in [false, true] {
@@ -5156,9 +5155,8 @@ mod tests {
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
 
-            assert_eq!(
-                ctx.submit(&batch, &mut todo, &g, &t),
-                !reply_wanted,
+            assert!(
+                !ctx.submit(&batch, &mut todo, &g, &t),
                 "an unserved command, reply wanted: {reply_wanted}"
             );
 
