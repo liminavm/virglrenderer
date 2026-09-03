@@ -426,8 +426,26 @@ impl Renderer {
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
         let host = HostShm::for_blob(handle, &desc)?;
-        if let BlobSource::Exported { ctx, mem } = desc.source {
-            self.venus_memory_export(ctx, mem, desc.size)?;
+        if let BlobSource::Exported { ctx, mem } = desc.source
+            && let Err(e) = self.venus_memory_export(ctx, mem, desc.size)
+        {
+            // Two failures, one errno at the ABI, and they want opposite investigations. The
+            // memory not being there says the command that would have allocated it never
+            // reached us -- the transport is what to look at, and the allocation is innocent.
+            // The memory being there and the export refusing it says the opposite. The guest
+            // kernel treats CREATE_BLOB as fire-and-forget, so this line is the only account
+            // anyone gets of either; one line covering both sends the next reader to the
+            // wrong half of the renderer.
+            let half = match e {
+                Error::NoAllocation | Error::NoContext => "no such allocation",
+                _ => "the allocation is there, and the export of it refused",
+            };
+            eprintln!(
+                "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
+                 {} bytes: {half}: {e}",
+                desc.size,
+            );
+            return Err(e);
         }
         self.insert(handle, Backing::Blob { desc, host }, iov);
         Ok(())
