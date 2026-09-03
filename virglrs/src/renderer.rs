@@ -321,19 +321,21 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
             eprintln!("[virglrs] ctx {}: resource {handle:?} is not in the table", ctx.get());
             return None;
         };
-        if let Some(map) = res.shm() {
-            return Some(ResourceBytes::Host(Arc::clone(map)));
-        }
         // What the guest kernel attached, which is the decision virtio-gpu already made about
         // who may reach this resource. Gating on it delegates that decision rather than inventing
         // a second one; gating on who *created* the resource invents a rule the protocol has not
-        // got, and a compositor importing a client's buffer trips over it.
+        // got, and a compositor importing a client's buffer trips over it. Every kind of backing
+        // is behind it, a ring's shared memory included: a ring is the one resource a context
+        // reads *from*, and the one it must least be able to reach by guessing a handle.
         if !res.attached.contains(&ctx) {
             eprintln!(
                 "[virglrs] ctx {}: resource {handle:?} is not attached to this context",
                 ctx.get(),
             );
             return None;
+        }
+        if let Some(map) = res.shm() {
+            return Some(ResourceBytes::Host(Arc::clone(map)));
         }
         // A share resolves for anyone holding it, so it is answered before anything that has to
         // ask a particular context's table.
@@ -1100,6 +1102,40 @@ mod tests {
         assert!(
             table.bytes(one, ResourceHandle::new(2).unwrap()).is_none(),
             "a resource that is not here is not reachable by anyone"
+        );
+
+        // Shared memory -- what a ring lives in -- is behind the same gate. It is the resource a
+        // context reads commands from, so a context reaching one it was never attached to would
+        // be reading another guest process's ring.
+        let shm = ResourceHandle::new(4).unwrap();
+        let map = Arc::new(crate::guest_mem::GuestMap::anonymous(4096).expect("minted"));
+        table.insert(
+            shm,
+            Resource {
+                handle: shm,
+                backing: Backing::Imported {
+                    desc: ImportDesc {
+                        blob_mem: BlobMem::Host3d,
+                        fd_type: FdType::Shm,
+                        size: 4096,
+                    },
+                    fd: crate::guest_mem::anonymous_shm(4096, "virglrs-attach-test")
+                        .expect("minted")
+                        .0,
+                    map: Some(Arc::clone(&map)),
+                },
+                iov: Vec::new(),
+                priv_: VmmPtr(core::ptr::null_mut()),
+                attached: vec![one],
+            },
+        );
+        assert!(
+            matches!(table.bytes(one, shm), Some(ResourceBytes::Host(m)) if Arc::ptr_eq(&m, &map)),
+            "the context it is attached to reaches the shared memory"
+        );
+        assert!(
+            table.bytes(two, shm).is_none(),
+            "a context the guest never attached it to reaches no shared memory either"
         );
 
         // A blob the host minted and never mapped publishes no storage either: there is memory
