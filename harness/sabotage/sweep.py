@@ -394,6 +394,27 @@ SABOTAGES = [
         '',
     ),
     (
+        'only the fd half of the emulated external memory is advertised',
+        'virglrs/src/venus/driver.rs',
+        """            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));""",
+        """            out.extend(
+                EMULATED_ON_THE_HOST
+                    .iter()
+                    .take(1)
+                    .filter_map(|n| extension_properties(n)),
+            );""",
+        '',
+    ),
+    (
+        'the emulated external memory is advertised on drivers that emulate nothing',
+        'virglrs/src/venus/driver.rs',
+        """        if self.supports(pd, "VK_EXT_external_memory_metal")
+            && !self.supports(pd, "VK_KHR_external_memory_fd")
+        {""",
+        """        {""",
+        '',
+    ),
+    (
         'a transport wait inside an executed stream suspends a batch it cannot resume',
         'virglrs/src/venus/context.rs',
         """            if depth > 0 {

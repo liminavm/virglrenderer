@@ -568,7 +568,30 @@ impl Driver {
         let Some(names) = self.physical_device_exts.get(&pd) else {
             return Vec::new();
         };
-        names.iter().filter_map(|name| extension_properties(name)).collect()
+        let mut out: Vec<VkExtensionProperties> =
+            names.iter().filter_map(|name| extension_properties(name)).collect();
+
+        // The two the Metal path provides, advertised even though the driver has neither.
+        //
+        // A venus guest reads this list to decide what external memory it has, and the two
+        // answers are not independent: mesa sets its renderer handle type only under
+        // `VK_EXT_external_memory_dma_buf` (`vn_physical_device.c`), so advertising the fd
+        // extension alone leaves it zero and the guest concludes the renderer exposes no
+        // external memory at all. A compositor then finds no dma-buf, falls back to a dumb
+        // buffer, and never exports a scanout -- which is a black screen behind a process that
+        // looks entirely healthy. Both, or neither.
+        //
+        // They go in only when the driver has the Metal interop that emulates them and lacks the
+        // real thing, which is the condition under which the emulation is both needed and
+        // available. `EMULATED_ON_THE_HOST` is the other half of the same decision: advertised
+        // here, and stripped from the list the device is created with, because the driver would
+        // fail `vkCreateDevice` outright for an extension it does not have.
+        if self.supports(pd, "VK_EXT_external_memory_metal")
+            && !self.supports(pd, "VK_KHR_external_memory_fd")
+        {
+            out.extend(EMULATED_ON_THE_HOST.iter().filter_map(|n| extension_properties(n)));
+        }
+        out
     }
 
     fn supports(&self, pd: VkPhysicalDevice, name: &str) -> bool {
@@ -3196,6 +3219,64 @@ mod tests {
     use super::super::cs::HostHandle;
     use super::super::proto::types::{VkCommandBuffer, VkCommandPool};
     use super::*;
+
+    /// The name of an advertised extension, as the guest reads it back.
+    fn names(props: &[VkExtensionProperties]) -> Vec<String> {
+        props
+            .iter()
+            .map(|p| {
+                p.extensionName.iter().take_while(|c| **c != 0).map(|c| *c as u8 as char).collect()
+            })
+            .collect()
+    }
+
+    /// The two extensions the Metal path emulates are advertised together, and only where the
+    /// emulation exists.
+    ///
+    /// Together is the whole of it. Mesa derives its renderer handle type from
+    /// `VK_EXT_external_memory_dma_buf` alone, so a guest told only about the fd extension
+    /// concludes there is no external memory at all -- and a compositor then exports no scanout
+    /// and presents nothing, with every process still reporting itself healthy. Measured against
+    /// KosmicKrisp: with neither advertised the synoik guest never leaves the boot console.
+    #[test]
+    fn the_extensions_the_metal_path_emulates_are_advertised_in_pairs() {
+        const METAL: VkPhysicalDevice = VkPhysicalDevice(1);
+        const NATIVE: VkPhysicalDevice = VkPhysicalDevice(2);
+        const NEITHER: VkPhysicalDevice = VkPhysicalDevice(3);
+
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_extensions(METAL, &["VK_EXT_external_memory_metal"]);
+        // A driver with the real thing needs no emulation, and must not be told about it twice.
+        driver.plant_extensions(
+            NATIVE,
+            &["VK_EXT_external_memory_metal", "VK_KHR_external_memory_fd"],
+        );
+        driver.plant_extensions(NEITHER, &["VK_KHR_external_fence_fd"]);
+
+        let advertised = names(&driver.advertised_extensions(METAL));
+        for want in EMULATED_ON_THE_HOST {
+            assert_eq!(
+                advertised.iter().filter(|n| *n == want).count(),
+                1,
+                "{want} is what the Metal path provides, and the guest is told so exactly once",
+            );
+        }
+
+        let native = names(&driver.advertised_extensions(NATIVE));
+        assert_eq!(
+            native.iter().filter(|n| *n == "VK_KHR_external_memory_fd").count(),
+            1,
+            "a driver that has it natively is not also injected with it",
+        );
+
+        let neither = names(&driver.advertised_extensions(NEITHER));
+        for want in EMULATED_ON_THE_HOST {
+            assert!(
+                !neither.contains(&want.to_string()),
+                "{want} is not claimed where nothing emulates it",
+            );
+        }
+    }
 
     /// A guest chains what it wants onto an answer's `pNext`, in whatever order it likes, and
     /// the struct a handler is after is rarely the first link. A walk that stops at the head
