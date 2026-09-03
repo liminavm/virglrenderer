@@ -39,7 +39,6 @@
 //! because the caller always has one, and there is nothing for a second caller to get wrong.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ids::CtxId;
@@ -67,23 +66,43 @@ pub struct Budget {
 
 /// Everything charged, by who is answerable for it.
 ///
-/// A context's slot is retired with the context. The shared bucket is not: it holds the charges
-/// for storage a resource has taken a share of, which by design outlives the context that minted
-/// it -- a compositor still sampling a client that has exited. Those bytes are live, and the cap
-/// has to count them; what changes at the share is only who they are attributed to, so the
-/// context's own slot goes on meaning "what this context alone is holding", which is the only
-/// reading under which a residual at its destroy is a leak.
+/// A charge is attributed to the context that made it for as long as that context lives: its
+/// slot is what a per-context leak reads off, and what `VK_EXT_memory_budget` answers from. The
+/// slot is retired with the context, and whatever is still charged to it then -- storage a
+/// resource holds a share of and a compositor is still sampling, or a charge this renderer
+/// failed to drop -- moves to the shared bucket rather than out of the total. Those bytes are
+/// resident either way, and the cap is enforced against what is resident.
 #[derive(Default)]
 struct Ledger {
-    ctxs: BTreeMap<CtxId, PerCtx>,
+    ctxs: BTreeMap<CtxId, Slot>,
+    /// What outlived the context it was charged to.
     shared: PerCtx,
+    /// The next slot's epoch. See [`Slot::epoch`].
+    epochs: u64,
 }
 
 impl Ledger {
     /// Total live bytes, whoever holds them. This is the number the cap is enforced against.
     fn bytes(&self) -> u64 {
-        self.ctxs.values().map(PerCtx::bytes).sum::<u64>() + self.shared.bytes()
+        self.ctxs.values().map(|s| s.live.bytes()).sum::<u64>() + self.shared.bytes()
     }
+
+    /// The slot a charge was made against, if it is still that slot.
+    fn slot_of(&mut self, ctx: CtxId, epoch: u64) -> Option<&mut PerCtx> {
+        self.ctxs.get_mut(&ctx).filter(|s| s.epoch == epoch).map(|s| &mut s.live)
+    }
+}
+
+/// One context's slot in the ledger.
+struct Slot {
+    /// Which opening of this context id the slot belongs to. A guest reuses context ids, and a
+    /// charge made under one context can be credited after the next one with the same id has
+    /// opened -- a surface a compositor released after the client that minted it was gone. The
+    /// epoch is what keeps that credit off the new occupant's slot: a charge names the slot it
+    /// was made against, not merely the id, and a slot that is gone is credited to the shared
+    /// bucket the retire moved it into.
+    epoch: u64,
+    live: PerCtx,
 }
 
 /// One context's live allocations, by what they are and how big.
@@ -102,18 +121,25 @@ impl PerCtx {
         self.live.iter().map(|((_, size), n)| size * u64::from(*n)).sum()
     }
 
+    /// Move everything here into `other`. What a retire does with a slot's residue.
+    fn drain_into(&mut self, other: &mut PerCtx) {
+        for ((what, size), n) in std::mem::take(&mut self.live) {
+            *other.live.entry((what, size)).or_insert(0) += n;
+        }
+    }
+
     fn take(&mut self, what: &'static str, size: u64) {
         *self.live.entry((what, size)).or_insert(0) += 1;
     }
 
-    /// Credit one charge. Absent is not an error here: the slot may have been retired around a
-    /// charge that outlived it, and that residual was reported at the retire.
+    /// Credit one charge. Every charge was taken against the bucket it is credited to -- a slot
+    /// by its epoch, or the shared bucket a retire drained that slot into -- so an absent entry
+    /// is a ledger that has lost count, and says so.
     fn credit(&mut self, what: &'static str, size: u64) {
-        if let Some(n) = self.live.get_mut(&(what, size)) {
-            *n -= 1;
-            if *n == 0 {
-                self.live.remove(&(what, size));
-            }
+        let n = self.live.get_mut(&(what, size)).expect("a charge is credited where it was taken");
+        *n -= 1;
+        if *n == 0 {
+            self.live.remove(&(what, size));
         }
     }
 
@@ -128,41 +154,21 @@ impl PerCtx {
 /// A charge against the ledger, which credits itself when it is dropped.
 ///
 /// Held by the record of whatever it paid for. Never constructed except by
-/// [`Budget::try_charge`], so a charge that exists was admitted, and a charge that is gone has
-/// been credited -- there is no third state and nothing to keep in step.
+/// [`Account::try_charge`], so a charge that exists was admitted, and a charge that is gone has
+/// been credited -- there is no third state and nothing to keep in step. Who it is charged to is
+/// fixed when it is made and never changes: where the credit lands when the context is already
+/// gone is the ledger's decision, not the charge's.
 pub struct Charge {
     budget: Arc<Budget>,
     ctx: CtxId,
+    epoch: u64,
     what: &'static str,
     size: u64,
-    /// Whether this has moved to the ledger's shared bucket -- see [`Self::share`]. Only ever
-    /// read or written under the ledger's lock, so it cannot disagree with which bucket holds
-    /// the count; it is atomic only because the charge travels inside an `Arc`.
-    shared: AtomicBool,
 }
 
 impl Charge {
     pub fn size(&self) -> u64 {
         self.size
-    }
-
-    /// Move this charge from its context's slot to the shared bucket, because a resource has
-    /// taken a share of what it paid for and may keep it after the context is gone.
-    ///
-    /// The total does not move: the bytes were live before and are live after. What moves is the
-    /// attribution, so that the context's own slot holds only what it alone is holding, and a
-    /// residual there at its destroy still names a leak rather than a share.
-    ///
-    /// Idempotent. A share cloned twice is one storage charged once.
-    pub fn share(&self) {
-        let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
-        if self.shared.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        if let Some(per) = ledger.ctxs.get_mut(&self.ctx) {
-            per.credit(self.what, self.size);
-        }
-        ledger.shared.take(self.what, self.size);
     }
 }
 
@@ -177,10 +183,11 @@ impl std::fmt::Debug for Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
-        if self.shared.load(Ordering::Relaxed) {
-            ledger.shared.credit(self.what, self.size);
-        } else if let Some(per) = ledger.ctxs.get_mut(&self.ctx) {
-            per.credit(self.what, self.size);
+        // The slot this was taken against, or -- if that context has since retired -- the shared
+        // bucket the retire drained it into. Never the slot of a later context with the same id.
+        match ledger.slot_of(self.ctx, self.epoch) {
+            Some(per) => per.credit(self.what, self.size),
+            None => ledger.shared.credit(self.what, self.size),
         }
     }
 }
@@ -189,21 +196,51 @@ impl Drop for Charge {
 ///
 /// Charges are made through this and never against the [`Budget`] directly, which is what makes
 /// attribution structural: there is no context argument for a caller to pass wrongly, because the
-/// only handle a context can reach is its own. It is also what retires the context's slot --
-/// dropping the account is the destroy, so no teardown path has to remember to say so.
+/// only handle a context can reach is its own. Opening it opens the context's slot, and dropping
+/// it retires the slot -- dropping the account is the destroy, so no teardown path has to
+/// remember to say so.
 pub struct Account {
     budget: Arc<Budget>,
     ctx: CtxId,
+    epoch: u64,
 }
 
 impl Account {
+    /// Open `ctx`'s slot. One at a time per id: a second opening while the first stands is not a
+    /// guest's doing -- the VMM names contexts -- but this renderer holding two accounts for one.
     pub fn open(budget: &Arc<Budget>, ctx: CtxId) -> Account {
-        Account { budget: Arc::clone(budget), ctx }
+        let mut ledger = budget.ledger.lock().expect("the budget ledger");
+        let epoch = ledger.epochs;
+        ledger.epochs += 1;
+        let prev = ledger.ctxs.insert(ctx, Slot { epoch, live: PerCtx::default() });
+        assert!(prev.is_none(), "ctx {} opened a second budget account", ctx.get());
+        Account { budget: Arc::clone(budget), ctx, epoch }
     }
 
-    /// Take `size` bytes for this context, or say why not. See [`Budget::try_charge`].
+    /// Take `size` bytes for this context, or say why not.
+    ///
+    /// Admission and charge are one step on purpose. As two -- ask, then take -- they are two
+    /// values that must agree, and ring threads allocate concurrently, so between the two
+    /// another context can take the room this one was told it had.
     pub fn try_charge(&self, what: &'static str, size: u64) -> Result<Charge, Refused> {
-        self.budget.try_charge(self.ctx, what, size)
+        let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
+        let live = ledger.bytes();
+        if let Some(cap) = self.budget.cap
+            && live.saturating_add(size) > cap
+        {
+            return Err(Refused { wanted: size, live, cap });
+        }
+        ledger
+            .slot_of(self.ctx, self.epoch)
+            .expect("an account's slot stands for as long as the account does")
+            .take(what, size);
+        Ok(Charge {
+            budget: Arc::clone(&self.budget),
+            ctx: self.ctx,
+            epoch: self.epoch,
+            what,
+            size,
+        })
     }
 
     /// Whether a refusal should stop this context. See the module doc for why it must, by default.
@@ -242,7 +279,7 @@ impl Account {
 
 impl Drop for Account {
     fn drop(&mut self) {
-        self.budget.retire(self.ctx);
+        self.budget.retire(self.ctx, self.epoch);
     }
 }
 
@@ -294,66 +331,51 @@ impl Budget {
         !self.soft
     }
 
-    /// Take `size` bytes for `ctx`, or say why not.
-    ///
-    /// Admission and charge are one step on purpose. As two -- ask, then take -- they are two
-    /// values that must agree, and ring threads allocate concurrently, so between the two
-    /// another context can take the room this one was told it had.
-    pub fn try_charge(
-        self: &Arc<Self>,
-        ctx: CtxId,
-        what: &'static str,
-        size: u64,
-    ) -> Result<Charge, Refused> {
-        let mut ledger = self.ledger.lock().expect("the budget ledger");
-        let live = ledger.bytes();
-        if let Some(cap) = self.cap
-            && live.saturating_add(size) > cap
-        {
-            return Err(Refused { wanted: size, live, cap });
-        }
-        ledger.ctxs.entry(ctx).or_default().take(what, size);
-        Ok(Charge { budget: Arc::clone(self), ctx, what, size, shared: AtomicBool::new(false) })
-    }
-
     /// Total live bytes across every context.
     pub fn live(&self) -> u64 {
         self.ledger.lock().expect("the budget ledger").bytes()
     }
 
-    /// What is held by shares rather than by any one context. See [`Charge::share`].
+    /// What outlived the context it was charged to, and is still resident.
     pub fn shared(&self) -> u64 {
         self.ledger.lock().expect("the budget ledger").shared.bytes()
     }
 
     /// What one context holds.
     pub fn live_for(&self, ctx: CtxId) -> u64 {
-        self.ledger.lock().expect("the budget ledger").ctxs.get(&ctx).map_or(0, PerCtx::bytes)
+        self.ledger.lock().expect("the budget ledger").ctxs.get(&ctx).map_or(0, |s| s.live.bytes())
     }
 
-    /// Drop a context's slot, because the context is gone.
+    /// Retire a context's slot, because the context is gone.
     ///
-    /// A guest reuses context ids, so a slot left behind bills a dead context's bytes to whoever
-    /// takes its number next. Anything still live here is a [`Charge`] this renderer failed to
-    /// drop -- our leak, not the guest's, since a guest cannot hold one open. It is logged and
-    /// not asserted: the process is being torn down around it, and taking the VM with us to
-    /// report a leak is worse than reporting it.
-    pub fn retire(&self, ctx: CtxId) {
-        let Some(per) = self.ledger.lock().expect("the budget ledger").ctxs.remove(&ctx) else {
+    /// A guest reuses context ids, so a slot left behind would bill a dead context's bytes to
+    /// whoever takes its number next. What is still charged to it is not uncounted, though: the
+    /// bytes are resident -- storage a resource holds a share of that a compositor is still
+    /// sampling, which is the ordinary case, or a [`Charge`] this renderer failed to drop, which
+    /// is a leak -- and the two cannot be told apart here. Both move to the shared bucket, where
+    /// the cap goes on seeing them and the report names them, and each is credited from there
+    /// when its holder lets go.
+    fn retire(&self, ctx: CtxId, epoch: u64) {
+        let mut ledger = self.ledger.lock().expect("the budget ledger");
+        // Only this account's slot: `open` refuses a second account for a live id, so a slot
+        // under another epoch here is one a later account owns, and stays.
+        if ledger.ctxs.get(&ctx).is_none_or(|s| s.epoch != epoch) {
             return;
-        };
-        let residual = per.bytes();
+        }
+        let mut slot = ledger.ctxs.remove(&ctx).expect("just found");
+        let residual = slot.live.bytes();
         if residual != 0 {
             eprintln!(
-                "[virglrs] ctx {}: destroyed holding {} still charged -- a charge this \
-                 renderer did not drop, not the guest's doing",
+                "[virglrs] ctx {}: destroyed with {} still charged, now counted as shared -- \
+                 storage a resource still holds a share of, or a charge this renderer did not drop",
                 ctx.get(),
                 mib(residual)
             );
-            for (what, size, n) in per.worst() {
+            for (what, size, n) in slot.live.worst() {
                 eprintln!("[virglrs]   {n} x {} {what}", mib(size));
             }
         }
+        slot.live.drain_into(&mut ledger.shared);
     }
 
     /// Say what everything holds, biggest first. What makes a leak name itself.
@@ -361,14 +383,14 @@ impl Budget {
         let ledger = self.ledger.lock().expect("the budget ledger");
         let cap = self.cap.map_or(String::from("no cap"), mib);
         eprintln!("[virglrs] {reason}: {} live of {cap}", mib(ledger.bytes()));
-        for (ctx, per) in ledger.ctxs.iter() {
-            eprintln!("[virglrs]   ctx {}: {}", ctx.get(), mib(per.bytes()));
-            for (what, size, n) in per.worst() {
+        for (ctx, slot) in ledger.ctxs.iter() {
+            eprintln!("[virglrs]   ctx {}: {}", ctx.get(), mib(slot.live.bytes()));
+            for (what, size, n) in slot.live.worst() {
                 eprintln!("[virglrs]     {n} x {} {what}", mib(size));
             }
         }
         if ledger.shared.bytes() != 0 {
-            eprintln!("[virglrs]   shared with resources: {}", mib(ledger.shared.bytes()));
+            eprintln!("[virglrs]   outliving their contexts: {}", mib(ledger.shared.bytes()));
             for (what, size, n) in ledger.shared.worst() {
                 eprintln!("[virglrs]     {n} x {} {what}", mib(size));
             }
@@ -394,40 +416,56 @@ mod tests {
         CtxId::new(n).expect("not zero")
     }
 
-    /// A charge a resource has taken a share of outlives the context that made it, and the ledger
-    /// goes on counting it for as long as it stands -- attributed to nobody, and reported at the
-    /// context's destroy as nothing, because it is not that context's leak.
+    /// A charge outlives the context that made it, and the ledger goes on counting it for as
+    /// long as it stands -- attributed to the context while the context lives, and to nobody
+    /// after, but never uncounted.
     ///
     /// This is a compositor still sampling a client's last frame after the client has exited:
     /// the client's context is gone, its surface is not, and the cap has to know.
     #[test]
-    fn a_shared_charge_outlives_its_context_and_is_not_its_leak() {
+    fn a_charge_that_outlives_its_context_stays_counted() {
         let budget = Budget::with_cap(Some(8192), false);
         let account = Account::open(&budget, ctx(1));
         let charge = account.try_charge("IOSurface", 4096).expect("under the cap");
-        assert_eq!(budget.live_for(ctx(1)), 4096, "the context's own, until it is shared");
-
-        charge.share();
-        assert_eq!(budget.live_for(ctx(1)), 0, "shared storage is nobody's alone");
-        assert_eq!(budget.shared(), 4096);
-        assert_eq!(budget.live(), 4096, "and is still live: the cap counts it");
-
-        // The context is destroyed while the share is still held. Its slot held nothing, so
-        // there is no residual to call a leak -- and the total does not move.
-        drop(account);
-        assert_eq!(budget.live(), 4096, "a context's destroy does not uncount what outlives it");
-        let other = budget.try_charge(ctx(2), "device memory", 4096).expect("exactly at the cap");
-        assert!(
-            budget.try_charge(ctx(2), "device memory", 1).is_err(),
-            "the cap saw the shared bytes, not just ctx 2's own"
-        );
-        drop(other);
-
-        charge.share();
-        assert_eq!(budget.shared(), 4096, "sharing twice is one storage charged once");
-        drop(charge);
+        assert_eq!(budget.live_for(ctx(1)), 4096, "the context's own, for as long as it lives");
         assert_eq!(budget.shared(), 0);
-        assert_eq!(budget.live(), 0, "the last holder going is what credits it");
+
+        // The context is destroyed while the surface is still held.
+        drop(account);
+        assert_eq!(budget.live_for(ctx(1)), 0, "the slot is gone with the context");
+        assert_eq!(budget.shared(), 4096, "what it held is nobody's now, and still resident");
+        assert_eq!(budget.live(), 4096, "a context's destroy does not uncount what outlives it");
+        let other = Account::open(&budget, ctx(2));
+        let _at_cap = other.try_charge("device memory", 4096).expect("exactly at the cap");
+        assert!(
+            other.try_charge("device memory", 1).is_err(),
+            "the cap saw the outliving bytes, not just ctx 2's own"
+        );
+
+        drop(charge);
+        assert_eq!(budget.shared(), 0, "the last holder going is what credits it");
+        assert_eq!(budget.live(), 4096, "and ctx 2's own is untouched");
+    }
+
+    /// A guest reuses context ids. A charge made under one opening of an id and credited after
+    /// the next opening has to credit what it was taken against -- the shared bucket the retire
+    /// moved it into -- and not the new occupant's slot, which never took it.
+    #[test]
+    fn a_late_credit_never_lands_on_the_next_context_with_the_same_id() {
+        let budget = Budget::with_cap(None, false);
+        let first = Account::open(&budget, ctx(8));
+        let held = first.try_charge("IOSurface", 600).expect("no cap");
+        drop(first);
+        assert_eq!(budget.shared(), 600);
+
+        let second = Account::open(&budget, ctx(8));
+        let _own = second.try_charge("device memory", 900).expect("no cap");
+        assert_eq!(budget.live_for(ctx(8)), 900, "the next generation starts clean");
+
+        drop(held);
+        assert_eq!(budget.live_for(ctx(8)), 900, "the survivor's own charge is untouched");
+        assert_eq!(budget.shared(), 0, "the old one was credited where it had gone");
+        assert_eq!(budget.live(), 900);
     }
 
     /// A charge is credited by being dropped, and by nothing else. That is the whole design: the
@@ -438,8 +476,9 @@ mod tests {
         let budget = Budget::with_cap(None, false);
         assert_eq!(budget.live(), 0);
 
-        let a = budget.try_charge(ctx(1), "device memory", 4096).expect("no cap");
-        let b = budget.try_charge(ctx(1), "device memory", 4096).expect("no cap");
+        let account = Account::open(&budget, ctx(1));
+        let a = account.try_charge("device memory", 4096).expect("no cap");
+        let b = account.try_charge("device memory", 4096).expect("no cap");
         assert_eq!(budget.live(), 8192, "two of the same size are two, not one");
 
         drop(a);
@@ -453,43 +492,45 @@ mod tests {
     #[test]
     fn the_cap_is_what_every_context_holds_together() {
         let budget = Budget::with_cap(Some(1000), false);
-        let held = budget.try_charge(ctx(1), "device memory", 800).expect("fits");
+        let one = Account::open(&budget, ctx(1));
+        let two = Account::open(&budget, ctx(2));
+        let held = one.try_charge("device memory", 800).expect("fits");
 
-        let refused = budget.try_charge(ctx(2), "device memory", 300).expect_err("does not fit");
+        let refused = two.try_charge("device memory", 300).expect_err("does not fit");
         assert_eq!(refused, Refused { wanted: 300, live: 800, cap: 1000 });
 
         // Bound, not dropped on the spot: a charge that goes out of scope at the end of the
         // statement that made it is credited before the next line reads the ledger.
-        let _exact = budget
-            .try_charge(ctx(2), "device memory", 200)
-            .expect("exactly the room left is room enough");
+        let _exact =
+            two.try_charge("device memory", 200).expect("exactly the room left is room enough");
 
         drop(held);
-        let _reused = budget
-            .try_charge(ctx(1), "device memory", 800)
+        let _reused = one
+            .try_charge("device memory", 800)
             .expect("freeing reopens the headroom it was using");
         assert_eq!(budget.live(), 1000, "and the ledger is at the cap, not over it");
     }
 
-    /// A guest reuses context ids. A slot left behind after a destroy bills a dead context's
-    /// bytes to whoever takes its number next -- which is exactly the shape the venus corpus has,
-    /// running three generations of ctx 8.
+    /// Retiring a context takes its slot, and the residue goes to the shared bucket rather than
+    /// out of the total: the bytes are still resident, and the cap is on what is resident. The
+    /// next generation of the same id starts with a clean slot, and with the room that is
+    /// actually there.
     #[test]
-    fn retiring_a_context_takes_its_bytes_with_it() {
+    fn retiring_a_context_takes_its_slot_and_not_its_bytes() {
         let budget = Budget::with_cap(Some(1000), false);
-        let charge = budget.try_charge(ctx(8), "device memory", 600).expect("fits");
+        let first = Account::open(&budget, ctx(8));
+        let charge = first.try_charge("device memory", 600).expect("fits");
 
-        budget.retire(ctx(8));
+        drop(first);
         assert_eq!(budget.live_for(ctx(8)), 0, "the slot is gone with the context");
-        let _next = budget
-            .try_charge(ctx(8), "device memory", 900)
-            .expect("the next generation of ctx 8 gets the room, not the debt");
-
-        // The leaked charge still credits when it goes, against a slot that no longer exists.
-        // Crediting must not resurrect it -- a slot conjured here would outlive every context
-        // and never be retired by anything.
+        assert_eq!(budget.live(), 600, "the bytes are not: something still holds them");
+        let next = Account::open(&budget, ctx(8));
+        assert!(
+            next.try_charge("device memory", 900).is_err(),
+            "the room is what is actually free, not what the new context alone is using"
+        );
         drop(charge);
-        assert_eq!(budget.live_for(ctx(8)), 900, "the survivor's own charge is untouched");
+        let _fits = next.try_charge("device memory", 900).expect("and now it is free");
     }
 
     /// Accounting is always on and enforcement is not. Without a cap nothing is ever refused --
@@ -498,8 +539,9 @@ mod tests {
     #[test]
     fn without_a_cap_nothing_is_refused_and_everything_is_counted() {
         let budget = Budget::with_cap(None, false);
-        let _huge = budget.try_charge(ctx(1), "device memory", u64::MAX / 2).expect("no cap");
-        let _more = budget.try_charge(ctx(1), "IOSurface", u64::MAX / 2).expect("still no cap");
+        let account = Account::open(&budget, ctx(1));
+        let _huge = account.try_charge("device memory", u64::MAX / 2).expect("no cap");
+        let _more = account.try_charge("IOSurface", u64::MAX / 2).expect("still no cap");
         assert_eq!(budget.live(), u64::MAX - 1, "counted, both of them");
         assert!(budget.kills_context(), "and a refusal would still stop the context");
     }

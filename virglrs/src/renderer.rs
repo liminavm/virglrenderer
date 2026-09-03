@@ -853,7 +853,7 @@ impl Renderer {
     /// A resource whose surface has gone answers `None` because there is no longer a surface to
     /// ask, which is the same thing said once instead of purged at each destroy site.
     pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
-        self.resource_storage(handle)?.surface_id()
+        Some(self.resource_storage(handle)?.surface()?.id())
     }
 
     /// The share of storage a resource holds, for the paths that act on the bytes themselves.
@@ -883,7 +883,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
-        self.resource_storage(handle)?.read_rows(dst, stride, height)
+        Some(self.resource_storage(handle)?.surface()?.read_rows(dst, stride, height))
     }
 
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {

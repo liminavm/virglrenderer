@@ -148,9 +148,10 @@ impl Vkr {
     /// Replacing the entry would drop a live context -- its rings and every host handle in it --
     /// and return as though a context had been created.
     pub fn context_create(&mut self, id: CtxId) {
-        let displaced =
-            self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id, &self.budget))));
-        assert!(displaced.is_none(), "{id:?} already had a venus context, which this just dropped");
+        // Checked before the new context is built: building it opens the id's budget account,
+        // which is one per live id too.
+        assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
+        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id, &self.budget))));
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is

@@ -1631,15 +1631,14 @@ impl Driver {
     #[cfg(test)]
     pub(super) fn plant_allocation_of(&mut self, id: ObjectId, size: u64, props: u32) {
         // Charged like a real one, so a test's ledger says what a guest's would.
-        let charge = self.account.try_charge("device memory", size).ok();
+        let charge =
+            self.account.try_charge("device memory", size).expect("a test ledger has no cap");
         self.memory.insert(
             id,
             Allocated {
                 size,
-                backing: Backing::Driver,
+                backing: Backing::Driver { charge, mapped: None },
                 props: VkMemoryPropertyFlags(props as _),
-                exported: None,
-                charge,
             },
         );
     }
@@ -1657,8 +1656,6 @@ impl Driver {
                 props: VkMemoryPropertyFlags(
                     (HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT) as _,
                 ),
-                exported: None,
-                charge: None,
             },
         );
     }
@@ -1668,12 +1665,23 @@ impl Driver {
     /// did with it.
     #[cfg(test)]
     pub(super) fn plant_scanout_allocation(&mut self, id: ObjectId, surface: Surface) {
-        let size = surface.alloc_size();
-        self.plant_allocation(id, size);
-        let planted = self.memory.get_mut(&id).expect("just planted");
-        // The surface carries the charge; the record's own is for driver memory only.
-        let charge = planted.charge.take().expect("a test ledger has no cap");
-        planted.backing = Backing::Scanout(Arc::new(Minted { surface, charge }));
+        let charge = self
+            .account
+            .try_charge("IOSurface", surface.alloc_size())
+            .expect("a test ledger has no cap");
+        self.memory.insert(
+            id,
+            Allocated {
+                size: surface.alloc_size(),
+                backing: Backing::Owned {
+                    storage: Storage::Texture(Arc::new(Charged { it: surface, charge })),
+                    published: false,
+                },
+                props: VkMemoryPropertyFlags(
+                    (HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT) as _,
+                ),
+            },
+        );
     }
 
     /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
@@ -2575,9 +2583,8 @@ impl Driver {
         info.allocationSize =
             VkDeviceSize(pad_for_blob(info.allocationSize.0, props, import.is_some()));
 
-        // Whichever of the two this allocation is, it comes out as one host address the driver is
-        // handed instead of memory of its own. They are mutually exclusive by construction: an
-        // import names storage that exists, and a scanout is storage being made.
+        // An import and a scanout are mutually exclusive by construction: an import names
+        // storage that exists, and a scanout is storage being made.
         //
         // An import that resolves to nothing falls through to an ordinary allocation, which is
         // what this did before anything resolved at all: the guest gets memory, and the storage
@@ -2603,18 +2610,60 @@ impl Driver {
             && exports_memory(info.pNext)
             && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)
         {
-            match GuestMap::anonymous(size_for_pages(info.allocationSize.0)?) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    eprintln!(
-                        "[virglrs] cannot mint {} bytes to export: {e}",
-                        info.allocationSize.0
-                    );
-                    return Err(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY));
-                }
-            }
+            Some(size_for_pages(info.allocationSize.0)?)
         } else {
             None
+        };
+        // What the census reports and what the guest maps: the guest's own figure, padded. A
+        // surface's page-rounded extent is a fact about how IOSurface rounds, and telling the
+        // guest that number would be answering a question it did not ask.
+        let size = info.allocationSize.0;
+
+        // What the bytes are decides both how they are freed and what they cost, so it is settled
+        // once, here. Charged before anything is minted or the driver is asked, so a refusal
+        // costs no host memory -- and credited by the charge going out of scope if the driver
+        // then refuses. A scanout is charged at the surface's own extent, because the surface is
+        // the commitment, and the charge goes into the storage rather than beside it: the storage
+        // may outlive this allocation and this context, and the bytes are the host's for as long
+        // as it does. An import commits nothing at all; an import that resolved to nothing is not
+        // an import but the ordinary allocation it fell through to, and is charged as one.
+        let backing = match (alias, surface, pages) {
+            (Some(bytes), _, _) => Backing::Imported(bytes),
+            (None, Some(surface), _) => {
+                let charge = self.admit("IOSurface", surface.alloc_size())?;
+                Backing::Owned {
+                    storage: Storage::Texture(Arc::new(Charged { it: surface, charge })),
+                    published: false,
+                }
+            }
+            (None, None, Some(len)) => {
+                let charge = self.admit("exported pages", len as u64)?;
+                let map = match GuestMap::anonymous(len) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        eprintln!("[virglrs] cannot mint {len} bytes to export: {e}");
+                        return Err(NoMemory::Driver(VkResult::VK_ERROR_OUT_OF_HOST_MEMORY));
+                    }
+                };
+                Backing::Owned {
+                    storage: Storage::Linear(Arc::new(Charged { it: map, charge })),
+                    published: false,
+                }
+            }
+            (None, None, None) => {
+                Backing::Driver { charge: self.admit("device memory", size)?, mapped: None }
+            }
+        };
+
+        // Whichever it is, it comes out as one host address the driver is handed instead of
+        // memory of its own. The storage backs exactly this much, whoever owns
+        // it: the guest's figure is its own image's size, and a request larger than the backing
+        // would let the driver address past the end of it -- the one place a guest's arithmetic
+        // could reach outside the host's.
+        let span = match &backing {
+            Backing::Owned { storage, .. } => Some(storage.span()),
+            Backing::Imported(_) => alias_span,
+            Backing::Driver { .. } => None,
         };
         let mut host_pointer = VkImportMemoryHostPointerInfoEXT {
             sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -2623,45 +2672,13 @@ impl Driver {
                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
             pHostPointer: core::ptr::null_mut(),
         };
-        // What the census reports and what the guest maps: the guest's own figure, padded. A
-        // surface's page-rounded extent is a fact about how IOSurface rounds, and telling the
-        // guest that number would be answering a question it did not ask.
-        let size = info.allocationSize.0;
-        // The pages back exactly this much, whoever owns them. The guest's figure is its own
-        // image's size, and a request larger than the backing would let the driver address past
-        // the end of it -- the one place a guest's arithmetic could reach outside the host's.
-        let owned = surface
-            .as_ref()
-            .map(|s| (s.host_addr(), s.alloc_size()))
-            .or(pages.as_ref().map(|p| (p.host_addr(), p.len() as u64)));
-        if let Some(span) = owned.or(alias_span) {
+        if let Some(span) = span {
             host_pointer.pHostPointer = span.0 as *mut core::ffi::c_void;
             // Prepended, not spliced in: the guest's chain is the decoder's arena and the round
             // trip re-encodes it, so it is read here and never rewritten.
             info.pNext = (&raw const host_pointer).cast();
             info.allocationSize = VkDeviceSize(info.allocationSize.0.min(span.1));
         }
-
-        // What the bytes are decides both how they are freed and what they cost, so it is settled
-        // once, here. Charged before the driver is asked, so a refusal costs no host memory --
-        // and credited by the charge going out of scope if the driver then refuses. A scanout is
-        // charged at the surface's own extent, because the surface is the commitment, and the
-        // charge goes into the surface rather than beside it: the surface may outlive this
-        // allocation and this context, and the bytes are the host's for as long as it does. An
-        // import commits nothing at all; an import that resolved to nothing is not an import
-        // but the ordinary allocation it fell through to, and is charged as one.
-        let (backing, charge) = match (alias, surface, pages) {
-            (Some(bytes), _, _) => (Backing::Imported(bytes), None),
-            (None, Some(surface), _) => {
-                let charge = self.admit("IOSurface", surface.alloc_size())?;
-                (Backing::Scanout(Arc::new(Minted { surface, charge })), None)
-            }
-            (None, None, Some(map)) => {
-                let charge = self.admit("exported pages", map.len() as u64)?;
-                (Backing::Pages(Arc::new(Pages { map, charge })), None)
-            }
-            (None, None, None) => (Backing::Driver, Some(self.admit("device memory", size)?)),
-        };
 
         // `d` was borrowed before the surface was minted, which needed `&mut self`.
         let d = self.devices.get(&device).expect("the device was here a moment ago");
@@ -2677,7 +2694,7 @@ impl Driver {
         // the fallback describes memory that cannot exist -- and describes it as addressable by
         // nothing, which is the safe reading.
         let props = props.unwrap_or(VkMemoryPropertyFlags(0));
-        self.memory.insert(id, Allocated { size, backing, props, exported: None, charge });
+        self.memory.insert(id, Allocated { size, backing, props });
         Ok(out)
     }
 
@@ -2744,12 +2761,9 @@ impl Driver {
     /// because the resource it names is the blob that publishing made.
     fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
         let record = self.memory.get(&id)?;
-        if let Some(span) = record.owned_span() {
-            return Some(span);
-        }
         match &record.backing {
-            Backing::Driver => Some((record.exported?, record.size)),
-            Backing::Scanout(_) | Backing::Pages(_) => unreachable!("owned storage answered above"),
+            Backing::Driver { mapped, .. } => Some(((*mapped)?, record.size)),
+            Backing::Owned { storage, .. } => Some(storage.span()),
             Backing::Imported(_) => None,
         }
     }
@@ -2868,7 +2882,7 @@ impl Driver {
         // `vkMapMemory` never did.
         if was
             .as_ref()
-            .is_some_and(|a| a.exported.is_some() && matches!(a.backing, Backing::Driver))
+            .is_some_and(|a| matches!(a.backing, Backing::Driver { mapped: Some(_), .. }))
         {
             // SAFETY: the mapping this driver made in `memory_export` and has not released, on the
             // device that owns it. The record is out of the map, so it cannot be unmapped twice.
@@ -2920,20 +2934,25 @@ impl Driver {
         let Some(record) = self.memory.get(&id) else {
             return Err(ExportError::NoSuchAllocation);
         };
-        if record.exported.is_some() {
+        if record.exported() {
             return Err(ExportError::AlreadyExported);
         }
-        if let Some((addr, len)) = record.owned_span() {
+        if let Backing::Owned { storage, .. } = &record.backing {
             // Storage this renderer minted -- a surface or pages -- is published as what it
             // already is. There is nothing to map: the driver imported these pages, and the
             // address is the one every other holder of the share reads the same bytes through.
+            let (addr, len) = storage.span();
             if blob_size > len {
                 return Err(ExportError::LargerThanAllocation);
             }
             let write_back = record.write_back();
+            let share = record.shared();
             let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
-            record.exported = Some(addr);
-            return Ok((Exported { addr, write_back }, record.shared()));
+            let Backing::Owned { published, .. } = &mut record.backing else {
+                unreachable!("the backing was owned a moment ago");
+            };
+            *published = true;
+            return Ok((Exported { addr, write_back }, share));
         }
         if !record.host_visible() {
             return Err(ExportError::NotHostVisible);
@@ -2965,12 +2984,15 @@ impl Driver {
             return Err(ExportError::NotMappable);
         }
         let addr = ptr as usize;
-        // Written back only now: until the map succeeds there is nothing to mark, and a mark
-        // without an address is the disagreement `exported` exists to make impossible.
+        // Written back only now: until the map succeeds there is nothing to mark, and the mark
+        // *is* the address, so there is no mark without one.
         let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
-        record.exported = Some(addr);
+        let Backing::Driver { mapped, .. } = &mut record.backing else {
+            unreachable!("an owned or imported backing was answered above");
+        };
+        *mapped = Some(addr);
         // Ordinary device memory has no share to give: see [`Allocated::shared`].
-        Ok((Exported { addr, write_back: record.write_back() }, record.shared()))
+        Ok((Exported { addr, write_back: record.write_back() }, None))
     }
 
     /// Where an allocation was exported to, if it has been.
@@ -2980,7 +3002,12 @@ impl Driver {
     /// so memory the guest has freed has no address to give.
     pub fn memory_exported_at(&self, id: ObjectId) -> Option<Exported> {
         let a = self.memory.get(&id)?;
-        Some(Exported { addr: a.exported?, write_back: a.write_back() })
+        let addr = match &a.backing {
+            Backing::Driver { mapped, .. } => (*mapped)?,
+            Backing::Owned { storage, published: true } => storage.span().0,
+            Backing::Owned { published: false, .. } | Backing::Imported(_) => return None,
+        };
+        Some(Exported { addr, write_back: a.write_back() })
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -3009,9 +3036,9 @@ impl Driver {
         let size = record.size;
         // Minted pages are host memory this renderer owns, coherent like any anonymous page, and
         // there is nothing for `vkMapMemory` to map -- the driver imported them.
-        if let Backing::Pages(p) = &record.backing {
+        if let Backing::Owned { storage: Storage::Linear(p), .. } = &record.backing {
             let n = buf.len().min(size as usize);
-            assert!(p.map.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
+            assert!(p.it.copy_out(0, &mut buf[..n]), "the census reads within pages it minted");
             return Ok(n);
         }
         let Some(d) = self.devices.get(&device) else {
@@ -3050,7 +3077,8 @@ impl Driver {
 struct Allocated {
     /// Its size, padded to the blob the guest may map it as -- see [`pad_for_blob`].
     size: u64,
-    /// What the bytes actually are. See [`Backing`].
+    /// What the bytes actually are, what they cost, and whether they have been published. See
+    /// [`Backing`].
     backing: Backing,
     /// The properties of the memory type it was allocated from.
     ///
@@ -3058,59 +3086,44 @@ struct Allocated {
     /// the host cannot address, and the VMM must be told how the guest may cache it. Two answers
     /// derived from one recorded fact cannot drift apart the way two recorded booleans can.
     props: VkMemoryPropertyFlags,
-    /// The host address this allocation was published to the VMM at, if it has been.
-    ///
-    /// `Some` *is* the export mark: one value, not a flag beside an address that could disagree
-    /// with it. Where the address came from is [`Backing`]'s to say, and that is what decides
-    /// whether freeing owes an unmap -- so nothing has to guess.
-    ///
-    /// The record owns whatever the address names, so retiring it on [`Driver::free_memory`] is
-    /// the same act as making the address unreachable: there is no second place to purge, and
-    /// nothing can hand the VMM a pointer into memory the guest has freed.
-    exported: Option<usize>,
-    /// What this allocation cost the host, held so that retiring the record credits it back.
-    ///
-    /// Never read, and that is the design: the charge is a value whose only job is to be dropped,
-    /// so there is no release call for a future destroy path to forget.
-    ///
-    /// `None` for an import, which costs nothing: its bytes are the exporter's, charged where
-    /// they were made. The same rule as [`Allocated::censused`], for the same reason -- storage
-    /// is accounted once, at whoever owns it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "held for its Drop -- crediting the ledger is this field going away"
-        )
-    )]
-    charge: Option<Charge>,
 }
 
-/// What an allocation's bytes are, which decides how it is published, read and freed.
+/// What an allocation's bytes are, which decides how it is published, read, freed and charged.
 ///
-/// One value rather than a bool per question. "Is it an import", "does it have a surface" and
-/// "does freeing owe an unmap" are three readings of one fact, and as three fields two of them
-/// could disagree about the same allocation.
+/// One value rather than a bool per question. "Is it an import", "does it have a surface", "does
+/// freeing owe an unmap", "has it been exported" and "what did it cost" are readings of one
+/// fact, and as separate fields any two of them could disagree about the same allocation -- a
+/// driver record with no charge, or an export mark on storage that was never mapped. Each arm
+/// carries exactly the state its kind of bytes has.
 enum Backing {
-    /// Memory the driver allocated for this guest. Publishing it maps it, so freeing a published
-    /// one owes the unmap.
-    Driver,
-    /// An IOSurface this renderer minted: the allocation is a host-pointer import of the
-    /// surface's own pages, so the memory *is* the surface.
+    /// Memory the driver allocated for this guest, and what it cost the host.
     ///
-    /// Publishing hands out the surface's base address, which the surface owns -- there is
-    /// nothing to unmap, and dropping this record is what releases it. Reading goes through
-    /// [`crate::metal::Surface::read_into`], because a surface read without its lock sees
-    /// whatever the CPU's view last held rather than what the GPU wrote.
-    Scanout(Arc<Minted>),
-    /// Pages this renderer minted because the guest asked for memory it could export: the
-    /// allocation is a host-pointer import of them, so the memory *is* the pages, and the pages
-    /// are what a resource holds a share of.
+    /// Publishing it maps it, and `mapped` is where: `Some` *is* the export mark, one value
+    /// rather than a flag beside an address that could disagree with it, and it is what says
+    /// freeing owes an unmap. The record owns the mapping, so retiring it on
+    /// [`Driver::free_memory`] is the same act as making the address unreachable: nothing can
+    /// hand the VMM a pointer into memory the guest has freed.
     ///
-    /// Publishing hands out the pages' address, which they own -- nothing to unmap, and dropping
-    /// the last share is what releases them. Only for memory the host can address: an export of
-    /// a type it cannot would be storage nobody could reach.
-    Pages(Arc<Pages>),
+    /// The charge is never read, and that is the design: it is a value whose only job is to be
+    /// dropped with the record, so there is no release call for a future destroy path to forget.
+    Driver {
+        #[expect(
+            dead_code,
+            reason = "held for its Drop -- crediting the ledger is this going away"
+        )]
+        charge: Charge,
+        mapped: Option<usize>,
+    },
+    /// Storage this renderer minted -- an IOSurface, or pages -- that the allocation is a
+    /// host-pointer import of, so the memory *is* the storage. The storage carries its own
+    /// charge, because a resource holding a share keeps it alive past this record and past the
+    /// context, and the bytes are the host's to count for as long as anyone does.
+    ///
+    /// Publishing hands out the storage's own address -- there is nothing to unmap, and the last
+    /// holder going is what releases it -- so the mark is all that `published` has to carry. A
+    /// surface is read through [`crate::metal::Surface::read_into`], because a surface read
+    /// without its lock sees whatever the CPU's view last held rather than what the GPU wrote.
+    Owned { storage: Storage, published: bool },
     /// Storage another context owns, which this allocation only aliases -- held, so that the
     /// address the driver was handed stays good for as long as this allocation can use it.
     ///
@@ -3139,19 +3152,18 @@ impl Allocated {
     /// The surface behind it, for the one backing that has one.
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
-            Backing::Scanout(m) => Some(&m.surface),
-            Backing::Driver | Backing::Pages(_) | Backing::Imported(_) => None,
+            Backing::Owned { storage, .. } => storage.surface(),
+            Backing::Driver { .. } | Backing::Imported(_) => None,
         }
     }
 
-    /// Where storage this record *owns* lives, before anyone has asked to publish it: a surface's
-    /// pages or minted pages. Driver memory has no address until it is mapped, and an import's
-    /// address is someone else's.
-    fn owned_span(&self) -> Option<(usize, u64)> {
+    /// Whether it has been published to the VMM -- which a second export must refuse, because
+    /// two resources over one storage is a state neither holder could detect afterwards.
+    fn exported(&self) -> bool {
         match &self.backing {
-            Backing::Scanout(m) => Some((m.surface.host_addr(), m.surface.alloc_size())),
-            Backing::Pages(p) => Some(p.span()),
-            Backing::Driver | Backing::Imported(_) => None,
+            Backing::Driver { mapped, .. } => mapped.is_some(),
+            Backing::Owned { published, .. } => *published,
+            Backing::Imported(_) => false,
         }
     }
 
@@ -3165,18 +3177,9 @@ impl Allocated {
     /// alive. That is only ever memory the guest exported without having asked, at allocation,
     /// for memory it could export.
     fn shared(&self) -> Option<Storage> {
-        // From here the storage may outlive this context, so its charge stops being this
-        // context's alone. See [`Charge::share`].
         match &self.backing {
-            Backing::Scanout(m) => {
-                m.charge.share();
-                Some(Storage::Texture(Arc::clone(m)))
-            }
-            Backing::Pages(p) => {
-                p.charge.share();
-                Some(Storage::Linear(Arc::clone(p)))
-            }
-            Backing::Driver | Backing::Imported(_) => None,
+            Backing::Owned { storage, .. } => Some(storage.clone()),
+            Backing::Driver { .. } | Backing::Imported(_) => None,
         }
     }
 
@@ -3188,9 +3191,10 @@ impl Allocated {
     /// without its lock is not a read of what the GPU wrote -- this is the only place that can
     /// take that lock.
     fn censused(&self) -> bool {
-        match self.backing {
-            Backing::Driver | Backing::Pages(_) => self.exported.is_none(),
-            Backing::Scanout(_) => true,
+        match &self.backing {
+            Backing::Driver { mapped, .. } => mapped.is_none(),
+            Backing::Owned { storage: Storage::Linear(_), published } => !published,
+            Backing::Owned { storage: Storage::Texture(_), .. } => true,
             Backing::Imported(_) => false,
         }
     }
@@ -3248,35 +3252,22 @@ pub enum Storage {
     /// An IOSurface this renderer minted. The pages are the surface's, and the surface outlives
     /// every Vulkan object that ever imported them -- it depends on no device, no instance and no
     /// object table, so nothing cascades from holding one.
-    Texture(Arc<Minted>),
+    Texture(Arc<Charged<Surface>>),
     /// Pages this renderer minted for an allocation the guest meant to share, and handed the
     /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
     /// fences are the only barrier over them, as they are for any host-visible allocation.
-    Linear(Arc<Pages>),
+    Linear(Arc<Charged<GuestMap>>),
 }
 
-/// Pages this renderer minted for a shareable allocation, and what they cost -- one value, for
-/// the same reason as [`Minted`]: a resource holding a share keeps them alive past the
-/// allocation and the context, and they are the host's to count for as long as it does.
-pub struct Pages {
-    map: GuestMap,
-    charge: Charge,
-}
-
-impl Pages {
-    fn span(&self) -> (usize, u64) {
-        (self.map.host_addr(), self.map.len() as u64)
-    }
-}
-
-/// A surface this renderer minted, and what it cost -- one value, because they have one lifetime.
+/// Storage this renderer minted, and what it cost -- one value, because they have one lifetime.
 ///
-/// The charge lives here rather than on the allocation record so that it is credited when the
-/// *surface* goes, not when the allocation does. A resource holding a share keeps the surface
-/// alive past the context that made it, and those bytes are still the host's to count; a charge
-/// on the record would have been credited at the context's destroy while the memory stood.
-pub struct Minted {
-    surface: Surface,
+/// The charge lives with the storage rather than on the allocation record so that it is credited
+/// when the *storage* goes, not when the allocation does. A resource holding a share keeps the
+/// storage alive past the context that made it, and those bytes are still the host's to count; a
+/// charge on the record would have been credited at the context's destroy while the memory stood.
+pub struct Charged<T> {
+    it: T,
+    #[expect(dead_code, reason = "held for its Drop -- crediting the ledger is this going away")]
     charge: Charge,
 }
 
@@ -3285,7 +3276,7 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
         let charge = account.try_charge("IOSurface", surface.alloc_size()).expect("no cap");
-        Storage::Texture(Arc::new(Minted { surface, charge }))
+        Storage::Texture(Arc::new(Charged { it: surface, charge }))
     }
 
     /// A share over pages this renderer minted, charged to `account`, for the same tests.
@@ -3293,7 +3284,7 @@ impl Storage {
     pub(crate) fn pages_for_test(len: usize, account: &Account) -> Storage {
         let map = GuestMap::anonymous(len).expect("the host has pages");
         let charge = account.try_charge("exported pages", map.len() as u64).expect("no cap");
-        Storage::Linear(Arc::new(Pages { map, charge }))
+        Storage::Linear(Arc::new(Charged { it: map, charge }))
     }
 }
 
@@ -3317,8 +3308,8 @@ impl Eq for Storage {}
 impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface.id()).finish(),
-            Storage::Linear(p) => f.debug_tuple("Linear").field(&p.map.len()).finish(),
+            Storage::Texture(m) => f.debug_tuple("Texture").field(&m.it.id()).finish(),
+            Storage::Linear(p) => f.debug_tuple("Linear").field(&p.it.len()).finish(),
         }
     }
 }
@@ -3327,27 +3318,17 @@ impl Storage {
     /// Where the bytes are and how far they run, as the one pair anything can act on.
     pub fn span(&self) -> (usize, u64) {
         match self {
-            Storage::Texture(m) => (m.surface.host_addr(), m.surface.alloc_size()),
-            Storage::Linear(p) => p.span(),
+            Storage::Texture(m) => (m.it.host_addr(), m.it.alloc_size()),
+            Storage::Linear(p) => (p.it.host_addr(), p.it.len() as u64),
         }
     }
 
-    /// The surface's id, for the presentation path that publishes one. Pages have none: a
-    /// buffer presented from them is read back rather than adopted.
-    pub fn surface_id(&self) -> Option<SurfaceId> {
+    /// The surface, for storage that is one. Pages are not: a buffer presented from them has
+    /// nothing to adopt and no presented pixels to read, and the one question -- "is this a
+    /// surface" -- is answered here once rather than per thing a caller wants from it.
+    pub fn surface(&self) -> Option<&Surface> {
         match self {
-            Storage::Texture(m) => Some(m.surface.id()),
-            Storage::Linear(_) => None,
-        }
-    }
-
-    /// Copy the presented pixels out, `stride` bytes per row, under the surface's own lock.
-    ///
-    /// `None` for storage that is not a surface -- there is nothing to read *presented* pixels
-    /// from, which is a different answer from a surface that read nothing.
-    pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> Option<u32> {
-        match self {
-            Storage::Texture(m) => Some(m.surface.read_rows(dst, stride, height)),
+            Storage::Texture(m) => Some(&m.it),
             Storage::Linear(_) => None,
         }
     }
@@ -3833,12 +3814,22 @@ mod tests {
 
         let share =
             d.memory.get(&ObjectId(66)).expect("planted").shared().expect("a scanout lends");
-        assert_eq!(budget.live_for(one), 0, "once shared, the context alone holds none of it");
-        assert_eq!(budget.live(), extent, "but the surface is as live as it was");
+        assert_eq!(budget.live_for(one), extent, "shared, and still the minting context's");
 
         // The allocation goes -- a free, or the context's whole memory table at its destroy.
         drop(d.memory.remove(&ObjectId(66)));
         assert_eq!(budget.live(), extent, "the share is what keeps it counted now");
+        assert_eq!(
+            budget.live_for(one),
+            extent,
+            "attributed to the context for as long as it lives"
+        );
+
+        // The context goes: the surface outlives it, and the ledger knows that too.
+        drop(d);
+        assert_eq!(budget.live(), extent, "a context's destroy does not uncount what outlives it");
+        assert_eq!(budget.live_for(one), 0);
+        assert_eq!(budget.shared(), extent);
 
         drop(share);
         assert_eq!(budget.live(), 0, "and the last share going is what credits it");
@@ -4287,7 +4278,7 @@ mod tests {
         let share = share.expect("pages lend a share");
         assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
         assert_eq!(share.span(), span, "resolving to exactly what the driver was handed");
-        assert_eq!(budget.live_for(one), 0, "shared, so no longer this context's alone");
+        assert_eq!(budget.live_for(one), span.1, "shared, and still this context's while it lives");
 
         // The census reads the pages themselves -- coherent host memory -- not a driver mapping.
         let mut buf = vec![0u8; 16];
