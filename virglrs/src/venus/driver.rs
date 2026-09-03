@@ -40,6 +40,8 @@ use super::proto::types::{
     VkStructureType, VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkViewport,
     VkWriteDescriptorSet,
 };
+use std::sync::Arc;
+
 use super::ring::ResourceBytes;
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
@@ -1580,7 +1582,8 @@ impl Driver {
     pub(super) fn plant_scanout_allocation(&mut self, id: ObjectId, surface: Surface) {
         let size = surface.alloc_size();
         self.plant_allocation(id, size);
-        self.memory.get_mut(&id).expect("just planted").backing = Backing::Scanout(surface);
+        self.memory.get_mut(&id).expect("just planted").backing =
+            Backing::Scanout(Arc::new(surface));
     }
 
     /// Plant a live allocation the host can address, cache and see coherently -- what MoltenVK's
@@ -2519,7 +2522,7 @@ impl Driver {
         // once, here, and read twice.
         let backing = match (import, surface) {
             (Some(_), _) => Backing::Imported,
-            (None, Some(s)) => Backing::Scanout(s),
+            (None, Some(s)) => Backing::Scanout(Arc::new(s)),
             (None, None) => Backing::Driver,
         };
         // Charged before the driver is asked, so a refusal costs no host memory -- and credited
@@ -2593,6 +2596,9 @@ impl Driver {
     pub fn span(&self, bytes: &ResourceBytes) -> Option<(usize, u64)> {
         match bytes {
             ResourceBytes::Host(map) => Some((map.host_addr(), map.len() as u64)),
+            // Resolved from the share itself. No table is consulted, so it answers the same for
+            // the context that made the storage and for any other the guest attached it to.
+            ResourceBytes::Shared(storage) => Some(storage.span()),
             ResourceBytes::Allocation(published) => self.aliased_span(published.memory),
         }
     }
@@ -2765,7 +2771,7 @@ impl Driver {
         handle: VkDeviceMemory,
         id: ObjectId,
         blob_size: u64,
-    ) -> Result<Exported, ExportError> {
+    ) -> Result<(Exported, Option<Storage>), ExportError> {
         let Some(record) = self.memory.get(&id) else {
             return Err(ExportError::NoSuchAllocation);
         };
@@ -2781,9 +2787,9 @@ impl Driver {
             }
             let addr = surface.host_addr();
             let write_back = record.write_back();
-            self.memory.get_mut(&id).expect("the record was here a moment ago").exported =
-                Some(addr);
-            return Ok(Exported { addr, write_back });
+            let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
+            record.exported = Some(addr);
+            return Ok((Exported { addr, write_back }, record.shared()));
         }
         if !record.host_visible() {
             return Err(ExportError::NotHostVisible);
@@ -2819,7 +2825,8 @@ impl Driver {
         // without an address is the disagreement `exported` exists to make impossible.
         let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
         record.exported = Some(addr);
-        Ok(Exported { addr, write_back: record.write_back() })
+        // Ordinary device memory has no share to give: see [`Allocated::shared`].
+        Ok((Exported { addr, write_back: record.write_back() }, record.shared()))
     }
 
     /// Where an allocation was exported to, if it has been.
@@ -2941,7 +2948,7 @@ enum Backing {
     /// nothing to unmap, and dropping this record is what releases it. Reading goes through
     /// [`crate::metal::Surface::read_into`], because a surface read without its lock sees
     /// whatever the CPU's view last held rather than what the GPU wrote.
-    Scanout(Surface),
+    Scanout(Arc<Surface>),
     /// Storage another context owns, which this allocation only aliases.
     ///
     /// A guest imports when one context has to reach what another rendered -- a compositor
@@ -2962,7 +2969,21 @@ impl Allocated {
     /// The surface behind it, for the one backing that has one.
     fn surface(&self) -> Option<&Surface> {
         match &self.backing {
-            Backing::Scanout(s) => Some(s),
+            Backing::Scanout(s) => Some(&**s),
+            Backing::Driver | Backing::Imported => None,
+        }
+    }
+
+    /// A share of the storage behind it, for a resource that must go on naming these bytes after
+    /// the context that allocated them is gone.
+    ///
+    /// Only a surface can be shared today. Ordinary device memory is published as a borrowed
+    /// `vkMapMemory` pointer whose lifetime is the device's, and handing that to another context
+    /// would be exactly the dangling the resource's share exists to prevent -- so it answers
+    /// `None`, and the caller refuses rather than sharing something it cannot keep alive.
+    fn shared(&self) -> Option<Storage> {
+        match &self.backing {
+            Backing::Scanout(s) => Some(Storage::Texture(Arc::clone(s))),
             Backing::Driver | Backing::Imported => None,
         }
     }
@@ -3018,6 +3039,69 @@ pub enum NoSyncFd {
     /// substitute: a semaphore whose payload cannot be moved is one the guest's next submit waits
     /// on forever, so saying so is better than pretending it worked.
     Unsupported,
+}
+
+/// A share of the storage behind a published allocation, held by whoever needs those bytes.
+///
+/// A resource keeps one of these rather than the *name* of an allocation, because a name is only
+/// meaningful in the context that chose it and stops resolving the moment that context is torn
+/// down. A share resolves for anyone holding it, for as long as they hold it -- which is what a
+/// compositor sampling a client's last frame after the client has exited requires.
+///
+/// Deliberately not a raw address: an address would outlive the storage the first time a guest
+/// freed it, which is the lifetime bug the whole late-resolution scheme was built to avoid. This
+/// keeps the storage *alive* instead of describing where it used to be.
+#[derive(Clone)]
+pub enum Storage {
+    /// An IOSurface this renderer minted. The pages are the surface's, and the surface outlives
+    /// every Vulkan object that ever imported them -- it depends on no device, no instance and no
+    /// object table, so nothing cascades from holding one.
+    Texture(Arc<Surface>),
+}
+
+/// Two shares are the same share when they name the same storage -- not when they describe
+/// storage that happens to look alike. Identity is the question every caller is actually asking.
+impl PartialEq for Storage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Storage::Texture(a), Storage::Texture(b)) => Arc::ptr_eq(a, b),
+        }
+    }
+}
+
+impl Eq for Storage {}
+
+/// The surface's id and nothing else. An `IOSurfaceRef` printed as a pointer would be a lifetime
+/// nobody can see, which is the whole reason `metal.rs` owns these.
+impl core::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Storage::Texture(s) => f.debug_tuple("Texture").field(&s.id()).finish(),
+        }
+    }
+}
+
+impl Storage {
+    /// Where the bytes are and how far they run, as the one pair anything can act on.
+    pub fn span(&self) -> (usize, u64) {
+        match self {
+            Storage::Texture(s) => (s.host_addr(), s.alloc_size()),
+        }
+    }
+
+    /// The surface's id, for the presentation path that publishes one.
+    pub fn surface_id(&self) -> Option<SurfaceId> {
+        match self {
+            Storage::Texture(s) => Some(s.id()),
+        }
+    }
+
+    /// Copy the presented pixels out, `stride` bytes per row, under the surface's own lock.
+    pub fn read_rows(&self, dst: &mut [u8], stride: usize, height: u32) -> u32 {
+        match self {
+            Storage::Texture(s) => s.read_rows(dst, stride, height),
+        }
+    }
 }
 
 /// An allocation the guest published as a blob, as the VMM has to see it: one address, and how
@@ -3449,6 +3533,22 @@ mod tests {
             "and an import lends nothing: the storage is not its to offer twice"
         );
 
+        // The same three backings, asked for the *share* a resource keeps rather than the span
+        // this driver resolves. Only the scanout has one: a surface outlives the device, the
+        // instance and the context, so it is the only storage that can be lent to a resource
+        // that will still be standing after the context which made it is gone.
+        let shared = |id| d.memory.get(&ObjectId(id)).expect("planted").shared();
+        assert_eq!(
+            shared(66).map(|s| s.span()),
+            Some((addr, extent)),
+            "a scanout's share resolves to the surface's own pages, consulting no table at all"
+        );
+        assert!(
+            shared(70).is_none(),
+            "ordinary device memory is published as a borrowed mapping, and lends no share"
+        );
+        assert!(shared(71).is_none(), "and an import has nothing of its own to share");
+
         assert_eq!(d.aliased_span(ObjectId(999)), None, "nor does an id that names nothing");
 
         d.abandon_planted();
@@ -3840,7 +3940,7 @@ mod tests {
 
         // The export itself. Coherent and cached on the host, so the guest may map it cached.
         let published = Exported { addr: ADDR, write_back: true };
-        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok(published));
+        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok((published, None)));
         MAPS.with_borrow(|n| assert_eq!(*n, 1));
         UNMAPS.with_borrow(|n| assert_eq!(*n, 0, "the mapping is the VMM's now and stays up"));
         assert_eq!(driver.memory_exported_at(MEM), Some(published), "asked again, not remembered");
@@ -3852,7 +3952,7 @@ mod tests {
         driver.plant_allocation_of(UNCACHED, SIZE, HOST_VISIBLE_BIT | HOST_COHERENT_BIT);
         assert_eq!(
             driver.memory_export(DEVICE, handle, UNCACHED, SIZE),
-            Ok(Exported { addr: ADDR, write_back: false })
+            Ok((Exported { addr: ADDR, write_back: false }, None))
         );
         driver.free_memory(DEVICE, handle, UNCACHED);
         MAPS.with_borrow(|n| assert_eq!(*n, 2));

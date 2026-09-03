@@ -411,6 +411,20 @@ SABOTAGES = [
         '',
     ),
     (
+        'the gate on what the guest attached to a context is dropped',
+        'virglrs/src/renderer.rs',
+        """        if !res.attached.contains(&ctx) {""",
+        """        if false {""",
+        '',
+    ),
+    (
+        'a scanout export lends no share, so its storage stays trapped in one context',
+        'virglrs/src/venus/driver.rs',
+        """            Backing::Scanout(s) => Some(Storage::Texture(Arc::clone(s))),""",
+        """            Backing::Scanout(_) => None,""",
+        '',
+    ),
+    (
         'a resource id resolves to whatever another context filed under the same number',
         'virglrs/src/renderer.rs',
         """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",

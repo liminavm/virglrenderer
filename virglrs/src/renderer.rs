@@ -17,7 +17,7 @@ use crate::ids::{
 use crate::venus;
 use crate::venus::context::Submitted;
 use crate::venus::cs::ObjectId;
-use crate::venus::driver::{Allocation, Exported, MemoryError};
+use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
 use crate::venus::ring::{Published, ResourceBytes};
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -267,7 +267,13 @@ pub enum Backing {
     ///
     /// `host` is the memory this renderer minted for the blob, present exactly when the guest
     /// asked for one the host has to supply -- see [`HostShm`] and the one place that builds it.
-    Blob { desc: BlobDesc, host: Option<HostShm> },
+    ///
+    /// `storage` is the share the publishing allocation handed over, present exactly when the
+    /// storage behind it is the kind that can be shared. Holding it is what makes the resource
+    /// resolvable from any context the guest attached it to, and what keeps those bytes alive
+    /// for as long as the resource stands -- including after the context that minted them has
+    /// been torn down.
+    Blob { desc: BlobDesc, host: Option<HostShm>, storage: Option<Storage> },
     /// Imported from a descriptor the VMM opened and handed over. The resource owns it now, and
     /// closing it is what dropping this does.
     ///
@@ -318,6 +324,22 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
         if let Some(map) = res.shm() {
             return Some(ResourceBytes::Host(Arc::clone(map)));
         }
+        // What the guest kernel attached, which is the decision virtio-gpu already made about
+        // who may reach this resource. Gating on it delegates that decision rather than inventing
+        // a second one; gating on who *created* the resource invents a rule the protocol has not
+        // got, and a compositor importing a client's buffer trips over it.
+        if !res.attached.contains(&ctx) {
+            eprintln!(
+                "[virglrs] ctx {}: resource {handle:?} is not attached to this context",
+                ctx.get(),
+            );
+            return None;
+        }
+        // A share resolves for anyone holding it, so it is answered before anything that has to
+        // ask a particular context's table.
+        if let Backing::Blob { storage: Some(storage), .. } = &res.backing {
+            return Some(ResourceBytes::Shared(storage.clone()));
+        }
         match res.backing {
             Backing::Blob { ref desc, .. } => match desc.source {
                 BlobSource::Exported { ctx: owner, mem } if owner == ctx => {
@@ -328,10 +350,15 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
                 }
                 // Named by the wrong context. Not a mistake the guest made in this command: it is
                 // one context reaching for another's export, which the ids cannot express.
+                // Attached, so the guest is entitled to it -- but its storage is a borrowed
+                // `vkMapMemory` pointer into ctx `owner`'s device, and this renderer cannot keep
+                // that alive for anyone else. Refused loudly rather than shared: handing it over
+                // would dangle the moment `owner` freed the memory or went away.
                 BlobSource::Exported { ctx: owner, .. } => {
                     eprintln!(
-                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, and a resource \
-                         id means nothing outside the context that chose it",
+                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, and ordinary \
+                         device memory is published as a borrowed mapping this renderer cannot \
+                         share across contexts",
                         ctx.get(),
                         owner.get(),
                     );
@@ -468,28 +495,32 @@ impl Renderer {
     ) -> Result<(), Error> {
         self.free_handle(handle)?;
         let host = HostShm::for_blob(handle, &desc)?;
-        if let BlobSource::Exported { ctx, mem } = desc.source
-            && let Err(e) = self.venus_memory_export(ctx, mem, desc.size)
-        {
-            // Two failures, one errno at the ABI, and they want opposite investigations. The
-            // memory not being there says the command that would have allocated it never
-            // reached us -- the transport is what to look at, and the allocation is innocent.
-            // The memory being there and the export refusing it says the opposite. The guest
-            // kernel treats CREATE_BLOB as fire-and-forget, so this line is the only account
-            // anyone gets of either; one line covering both sends the next reader to the
-            // wrong half of the renderer.
-            let half = match e {
-                Error::NoAllocation | Error::NoContext => "no such allocation",
-                _ => "the allocation is there, and the export of it refused",
-            };
-            eprintln!(
-                "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
-                 {} bytes: {half}: {e}",
-                desc.size,
-            );
-            return Err(e);
+        let mut storage = None;
+        if let BlobSource::Exported { ctx, mem } = desc.source {
+            match self.venus_memory_export(ctx, mem, desc.size) {
+                Ok((_, share)) => storage = share,
+                Err(e) => {
+                    // Two failures, one errno at the ABI, and they want opposite
+                    // investigations. The memory not being there says the command that would
+                    // have allocated it never reached us -- the transport is what to look at,
+                    // and the allocation is innocent. The memory being there and the export
+                    // refusing it says the opposite. The guest kernel treats CREATE_BLOB as
+                    // fire-and-forget, so this line is the only account anyone gets of either;
+                    // one line covering both sends the next reader to the wrong half.
+                    let half = match e {
+                        Error::NoAllocation | Error::NoContext => "no such allocation",
+                        _ => "the allocation is there, and the export of it refused",
+                    };
+                    eprintln!(
+                        "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
+                         {} bytes: {half}: {e}",
+                        desc.size,
+                    );
+                    return Err(e);
+                }
+            }
         }
-        self.insert(handle, Backing::Blob { desc, host }, iov);
+        self.insert(handle, Backing::Blob { desc, host, storage }, iov);
         Ok(())
     }
 
@@ -795,7 +826,7 @@ impl Renderer {
         ctx_id: CtxId,
         mem: BlobId,
         blob_size: u64,
-    ) -> Result<Exported, Error> {
+    ) -> Result<(Exported, Option<Storage>), Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
         v.with_context_mut(ctx_id, |ctx| ctx.memory_export(ObjectId(mem.0), blob_size))
             .ok_or(Error::NoContext)?
@@ -820,8 +851,20 @@ impl Renderer {
     /// A resource whose surface has gone answers `None` because there is no longer a surface to
     /// ask, which is the same thing said once instead of purged at each destroy site.
     pub fn resource_iosurface_id(&self, handle: ResourceHandle) -> Option<SurfaceId> {
-        let (ctx, mem) = self.published_allocation(handle)?;
-        self.venus_context(ctx, |c| c.driver().memory_surface_id(ObjectId(mem.0))).ok()?
+        self.resource_storage(handle)?.surface_id()
+    }
+
+    /// The share of storage a resource holds, for the paths that act on the bytes themselves.
+    ///
+    /// One resolution, so the id a frame is published under and the pixels read out of it cannot
+    /// come from two different surfaces. The share is cloned out and the resource lock released
+    /// before anything is done with it: holding a read lock across work that may reach a context
+    /// is how a ring thread ends up waiting on us while we wait on it.
+    fn resource_storage(&self, handle: ResourceHandle) -> Option<Storage> {
+        self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { storage, .. } => storage.clone(),
+            Backing::Classic(_) | Backing::Imported { .. } => None,
+        })?
     }
 
     /// Copy a scanout resource's presented pixels into a caller's buffer, `stride` bytes per row.
@@ -838,28 +881,7 @@ impl Renderer {
         stride: usize,
         height: u32,
     ) -> Option<u32> {
-        let (ctx, mem) = self.published_allocation(handle)?;
-        self.venus_context(ctx, |c| {
-            c.driver().memory_read_surface(ObjectId(mem.0), dst, stride, height)
-        })
-        .ok()?
-    }
-
-    /// The allocation a resource publishes, and the context that published it.
-    ///
-    /// One resolution for everything that reaches through a resource to the memory behind it, so
-    /// two callers cannot disagree about which allocation a handle names.
-    ///
-    /// The resource lock is released before venus is asked anything: a read lock held across a
-    /// call into a context deadlocks against that context's own ring thread.
-    fn published_allocation(&self, handle: ResourceHandle) -> Option<(CtxId, BlobId)> {
-        self.with_resource(handle, |r| match &r.backing {
-            Backing::Blob { desc, .. } => match desc.source {
-                BlobSource::Exported { ctx, mem } => Some((ctx, mem)),
-                BlobSource::HostMinted => None,
-            },
-            Backing::Classic(_) | Backing::Imported { .. } => None,
-        })?
+        Some(self.resource_storage(handle)?.read_rows(dst, stride, height))
     }
 
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
@@ -880,7 +902,7 @@ impl Renderer {
                         caching: Caching::Cached,
                     }))
                 }
-                Backing::Blob { desc, host: None } => match desc.source {
+                Backing::Blob { desc, host: None, storage: _ } => match desc.source {
                     BlobSource::Exported { ctx, mem } => Some(Err((ctx, mem, desc.size))),
                     BlobSource::HostMinted => None,
                 },
@@ -1016,60 +1038,72 @@ mod tests {
         );
     }
 
-    /// A guest importing a resource into a second allocation is naming storage the *same* guest
-    /// exported, and the number it names is a guest id -- unique only inside one context.
+    /// What a context may reach is what the guest kernel attached to it, and nothing else.
     ///
-    /// So the answer is scoped to the asker. Another context's export under the same id is a
-    /// different allocation entirely, and answering with it would alias one guest's window buffer
-    /// onto whatever the other happened to file under that number. No corpus can reach this: the
-    /// captures are one guest, and every id in them belongs to the context that asked.
+    /// Resource ids are device-wide -- the C keeps one table for the whole device -- so "which
+    /// context created it" is not a permission, and a compositor sampling a client's window is
+    /// the ordinary case rather than an error. `CTX_ATTACH_RESOURCE` is where that decision is
+    /// actually made, so this gate delegates it instead of inventing a second one.
+    ///
+    /// No corpus can reach this: the captures are one guest, replayed one context at a time.
     #[test]
-    fn an_export_is_only_findable_by_the_context_that_made_it() {
+    fn a_context_reaches_the_resources_the_guest_attached_to_it() {
         use crate::venus::ring::ShmResources;
 
         let one = CtxId::new(1).unwrap();
         let two = CtxId::new(2).unwrap();
         let blob = ResourceHandle::new(1).unwrap();
 
-        let mut table = BTreeMap::new();
-        table.insert(
-            blob,
-            Resource {
-                handle: blob,
-                backing: Backing::Blob {
-                    desc: BlobDesc {
-                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
-                        blob_flags: 1,
-                        source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
-                        size: 4128768,
-                    },
-                    host: None,
+        let borrowed = |attached: Vec<CtxId>| Resource {
+            handle: blob,
+            backing: Backing::Blob {
+                desc: BlobDesc {
+                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                    blob_flags: 1,
+                    source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                    size: 4128768,
                 },
-                iov: Vec::new(),
-                priv_: VmmPtr(core::ptr::null_mut()),
-                attached: Vec::new(),
+                host: None,
+                // Ordinary device memory: published as a borrowed `vkMapMemory` pointer, which
+                // is storage this renderer cannot keep alive on anyone else's behalf.
+                storage: None,
             },
-        );
+            iov: Vec::new(),
+            priv_: VmmPtr(core::ptr::null_mut()),
+            attached,
+        };
 
+        let mut table = BTreeMap::new();
+        table.insert(blob, borrowed(vec![one]));
         assert_eq!(
             match table.bytes(one, blob) {
                 Some(ResourceBytes::Allocation(published)) => Some(published),
                 _ => None,
             },
             Some(Published { memory: ObjectId(66), size: 4128768 }),
-            "the context that exported it finds its own allocation, at the size the resource has"
+            "the context it is attached to finds the allocation, at the size the resource has"
         );
         assert!(
             table.bytes(two, blob).is_none(),
-            "and another context finds nothing, rather than its own id 66"
-        );
-        assert!(
-            table.bytes(one, ResourceHandle::new(2).unwrap()).is_none(),
-            "a resource that is not here is not an export either"
+            "a context the guest never attached it to reaches nothing, whoever exported it"
         );
 
-        // A blob the host minted and never mapped publishes no allocation either: there is
-        // storage somewhere, but nothing here can say where, and saying so would be inventing it.
+        // Attached to both, and still refused for the second -- but for a reason about the
+        // storage rather than about who owns the name. A borrowed mapping into ctx one's device
+        // would dangle for ctx two the moment ctx one freed it or went away.
+        table.insert(blob, borrowed(vec![one, two]));
+        assert!(
+            table.bytes(two, blob).is_none(),
+            "attached is not enough when the storage behind it cannot be shared"
+        );
+
+        assert!(
+            table.bytes(one, ResourceHandle::new(2).unwrap()).is_none(),
+            "a resource that is not here is not reachable by anyone"
+        );
+
+        // A blob the host minted and never mapped publishes no storage either: there is memory
+        // somewhere, but nothing here can say where, and saying so would be inventing it.
         let minted = ResourceHandle::new(3).unwrap();
         table.insert(
             minted,
@@ -1083,15 +1117,79 @@ mod tests {
                         size: 4096,
                     },
                     host: None,
+                    storage: None,
                 },
                 iov: Vec::new(),
                 priv_: VmmPtr(core::ptr::null_mut()),
-                attached: Vec::new(),
+                attached: vec![one],
             },
         );
         assert!(
             table.bytes(one, minted).is_none(),
             "a host-minted blob with no mapping resolves to nothing"
+        );
+    }
+
+    /// Storage a resource holds a *share* of resolves for every context the guest attached it to,
+    /// and resolves to the same bytes for each.
+    ///
+    /// This is the whole point of holding a share rather than a name: a name is only meaningful
+    /// in the context that chose it, so a compositor could never reach a client's buffer. The
+    /// surface here is a real one, because a share whose storage is faked proves nothing about
+    /// whether the pages are actually there.
+    #[test]
+    fn a_share_resolves_for_every_context_the_resource_is_attached_to() {
+        use crate::venus::driver::Storage;
+        use crate::venus::ring::ShmResources;
+
+        let one = CtxId::new(1).unwrap();
+        let two = CtxId::new(2).unwrap();
+        let three = CtxId::new(3).unwrap();
+        let blob = ResourceHandle::new(1).unwrap();
+
+        let surface = crate::metal::Surface::scanout(64, 8, crate::metal::PixelFormat::Bgra, 256)
+            .expect("the system minted a surface");
+        let share = Storage::Texture(Arc::new(surface));
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            blob,
+            Resource {
+                handle: blob,
+                backing: Backing::Blob {
+                    desc: BlobDesc {
+                        blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                        blob_flags: 1,
+                        source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                        size: 2048,
+                    },
+                    host: None,
+                    storage: Some(share.clone()),
+                },
+                iov: Vec::new(),
+                priv_: VmmPtr(core::ptr::null_mut()),
+                attached: vec![one, two],
+            },
+        );
+
+        let reached = |ctx| match table.bytes(ctx, blob) {
+            Some(ResourceBytes::Shared(s)) => Some(s),
+            _ => None,
+        };
+        assert_eq!(
+            reached(one).as_ref(),
+            Some(&share),
+            "the context that exported it reaches the storage it published"
+        );
+        assert_eq!(
+            reached(two).as_ref(),
+            Some(&share),
+            "and so does the other context the guest attached it to -- the same storage, not a \
+             lookup of id 66 in ctx two's own table"
+        );
+        assert!(
+            table.bytes(three, blob).is_none(),
+            "a context the guest never attached it to still reaches nothing"
         );
     }
 
