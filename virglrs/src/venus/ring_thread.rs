@@ -748,6 +748,38 @@ mod tests {
         (t, fatal, wait_ring)
     }
 
+    /// "Blocked" and "blocked on something it cannot get" are different states, and only the
+    /// second one is a deadlock.
+    ///
+    /// A ring is briefly in the first state every time it is released: the submit raises the
+    /// seqno and signals, and the woken thread clears `blocked_on_vq` a moment later. A waiter
+    /// reading the two fields separately can land in that gap, see a block, see a seqno it does
+    /// not re-read, and poison a context that was about to make progress on its own. So the pair
+    /// is one question under one lock, and this is the state that says which answer is right.
+    ///
+    /// Deterministic where the race is not: the gap is microseconds wide in practice, and a test
+    /// that tried to hit it would pass by luck. The property is what is checked instead.
+    #[test]
+    fn a_ring_blocked_on_a_seqno_it_already_has_is_not_stalled() {
+        let park = Park::default();
+        {
+            let mut state = park.state.lock().expect("fresh");
+            state.blocked_on_vq = Some(5);
+            state.vq_seqno = 4;
+        }
+        assert_eq!(park.stalled_on(), Some(5), "blocked on a seqno that has not arrived");
+
+        park.state.lock().expect("fresh").vq_seqno = 5;
+        assert_eq!(
+            park.stalled_on(),
+            None,
+            "the seqno arrived; this ring is waking, not stuck, and poisoning it would be wrong"
+        );
+
+        park.state.lock().expect("fresh").blocked_on_vq = None;
+        assert_eq!(park.stalled_on(), None, "and a ring that is not blocked at all is not stuck");
+    }
+
     /// The loop's whole job: what the guest put in the buffer reaches the seam, and the head moves
     /// only once it has.
     #[test]
