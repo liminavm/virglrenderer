@@ -34,6 +34,7 @@ fn main() {
     assert!(status.success(), "venus-gen failed");
 
     gl_bindings(&manifest);
+    vrend_formats(&manifest);
     link_vulkan_loader();
     link_egl();
 
@@ -54,6 +55,37 @@ fn gl_bindings(manifest: &std::path::Path) {
         .status()
         .expect("python3 must be on PATH to build the GL bindings");
     assert!(status.success(), "gl-gen failed");
+}
+
+/// Run the classic renderer's format generator into `OUT_DIR/vrend`.
+///
+/// The wire numbering is read from `src/virgl_hw.h`, the header the guest's copy is a copy of,
+/// and the format descriptions from the gallium `u_format.yaml` the C's own table is generated
+/// from -- one copy of each (`vrend-gen/README.md`).
+fn vrend_formats(manifest: &std::path::Path) {
+    let generator = manifest.join("vrend-gen");
+    let tree = manifest.parent().unwrap();
+    let virgl_hw = tree.join("src/virgl_hw.h");
+    let gallium = tree.join("src/gallium/auxiliary/util");
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("vrend");
+    for dep in ["gen.py", "gl_formats.py"] {
+        println!("cargo::rerun-if-changed={}", generator.join(dep).display());
+    }
+    println!("cargo::rerun-if-changed={}", virgl_hw.display());
+    for dep in ["u_format.yaml", "u_format_parse.py"] {
+        println!("cargo::rerun-if-changed={}", gallium.join(dep).display());
+    }
+    let status = Command::new("python3")
+        .arg(generator.join("gen.py"))
+        .arg("--outdir")
+        .arg(&out)
+        .arg("--virgl-hw")
+        .arg(&virgl_hw)
+        .arg("--gallium")
+        .arg(&gallium)
+        .status()
+        .expect("python3 must be on PATH to build the format tables");
+    assert!(status.success(), "vrend-gen failed");
 }
 
 /// Link Mesa's libEGL, for the same reason the Vulkan loader is linked rather than dlopened.
