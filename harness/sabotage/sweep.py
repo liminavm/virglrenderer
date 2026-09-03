@@ -48,11 +48,17 @@ SABOTAGES = [
     (
         'a ghost absorbs a command the guest is waiting on, and the guest reads a stale reply slot as its answer',
         'virglrs/src/venus/context.rs',
-        """        if wants_reply && answer == 0 {
-            poison(id, &dec, cmd, "wanted a reply, and names an object the host refused");
-            break;
-        }""",
-        '',
+        """                if wants_reply {
+                    poison(
+                        id,
+                        &dec,
+                        cmd,
+                        &format!("wanted a reply, and names object {} the host refused", ghost.0),
+                    );
+                    break;
+                }
+                continue;""",
+        '                continue;',
         'a_ghost_absorbs_a_command',
     ),
     (
