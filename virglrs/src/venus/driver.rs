@@ -1501,23 +1501,28 @@ impl Driver {
     /// Whether a pool-allocated object is still live -- its pool undestroyed and it unfreed.
     ///
     /// Free a run of objects back to the pool they came from.
-    pub fn free_objects<P: PoolOf>(
+    /// Free a run of pool children, handing back whatever the driver's free returns.
+    ///
+    /// `R` is `()` for `vkFreeCommandBuffers` and `VkResult` for `vkFreeDescriptorSets` -- the
+    /// one free in Vulkan with a return, which the spec says is always `VK_SUCCESS`. `None` is
+    /// nothing to free: an empty run, a pool that is not open, a device this driver has no table
+    /// for. None of those is an error, and none reached the driver.
+    pub fn free_objects<P: PoolOf, R>(
         &mut self,
         device: VkDevice,
-        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const P::Child),
+        proc: impl FnOnce(&DeviceFns) -> unsafe extern "C" fn(VkDevice, P, u32, *const P::Child) -> R,
         pool: P,
         objects: &[P::Child],
-    ) {
-        let Some(d) = self.devices.get(&device) else {
-            return;
-        };
+    ) -> Option<R> {
+        let d = self.devices.get(&device)?;
         if objects.is_empty() || !self.pools.is_open(pool) {
-            return;
+            return None;
         }
         // SAFETY: handles this context allocated, and the count Vulkan is given is the slice's own
         // length. The generated lifecycle hook removes the ids from the object table exactly once.
-        unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
+        let r = unsafe { proc(&d.fns)(device, pool, objects.len() as u32, objects.as_ptr()) };
         self.pools.release(objects.iter().copied());
+        Some(r)
     }
 
     /// Register a device with a hand-built proc table, as `create_device` would have.

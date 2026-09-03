@@ -484,6 +484,25 @@ SABOTAGES = [
         '',
     ),
     (
+        'freeing a descriptor set is refused again, and every GTK client dies a few frames in',
+        'virglrs/src/venus/context.rs',
+        """    fn vkFreeDescriptorSets(&mut self, args: &mut vn_command_vkFreeDescriptorSets<'_>) {
+        let sets = self.array_or_empty(args.pDescriptorSets());
+        let r = self.driver.free_objects(
+            args.device,
+            |d| d.vkFreeDescriptorSets(),
+            args.descriptorPool,
+            sets,
+        );
+        // The spec's answer is always success, and freeing nothing is not a failure either.
+        args.ret = r.unwrap_or(VkResult::VK_SUCCESS);
+    }
+
+""",
+        """""",
+        '',
+    ),
+    (
         'the image copy the overview blur asks for is refused again',
         'virglrs/src/venus/context.rs',
         """    fn vkCmdCopyImage(&mut self, args: &mut vn_command_vkCmdCopyImage<'_>) {

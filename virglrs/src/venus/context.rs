@@ -55,11 +55,11 @@ use super::proto::types::{
     vn_command_vkEnumerateInstanceExtensionProperties, vn_command_vkEnumerateInstanceVersion,
     vn_command_vkEnumeratePhysicalDeviceGroups, vn_command_vkEnumeratePhysicalDevices,
     vn_command_vkExecuteCommandStreamsMESA, vn_command_vkFlushMappedMemoryRanges,
-    vn_command_vkFreeCommandBuffers, vn_command_vkFreeMemory, vn_command_vkGetBufferDeviceAddress,
-    vn_command_vkGetBufferMemoryRequirements, vn_command_vkGetBufferMemoryRequirements2,
-    vn_command_vkGetBufferOpaqueCaptureAddress, vn_command_vkGetDescriptorSetLayoutSupport,
-    vn_command_vkGetDeviceBufferMemoryRequirements, vn_command_vkGetDeviceGroupPeerMemoryFeatures,
-    vn_command_vkGetDeviceImageMemoryRequirements,
+    vn_command_vkFreeCommandBuffers, vn_command_vkFreeDescriptorSets, vn_command_vkFreeMemory,
+    vn_command_vkGetBufferDeviceAddress, vn_command_vkGetBufferMemoryRequirements,
+    vn_command_vkGetBufferMemoryRequirements2, vn_command_vkGetBufferOpaqueCaptureAddress,
+    vn_command_vkGetDescriptorSetLayoutSupport, vn_command_vkGetDeviceBufferMemoryRequirements,
+    vn_command_vkGetDeviceGroupPeerMemoryFeatures, vn_command_vkGetDeviceImageMemoryRequirements,
     vn_command_vkGetDeviceImageSparseMemoryRequirements,
     vn_command_vkGetDeviceImageSubresourceLayout, vn_command_vkGetDeviceMemoryCommitment,
     vn_command_vkGetDeviceMemoryOpaqueCaptureAddress, vn_command_vkGetDeviceQueue2,
@@ -1614,6 +1614,18 @@ impl Commands for Handlers<'_> {
             args.commandPool,
             buffers,
         );
+    }
+
+    fn vkFreeDescriptorSets(&mut self, args: &mut vn_command_vkFreeDescriptorSets<'_>) {
+        let sets = self.array_or_empty(args.pDescriptorSets());
+        let r = self.driver.free_objects(
+            args.device,
+            |d| d.vkFreeDescriptorSets(),
+            args.descriptorPool,
+            sets,
+        );
+        // The spec's answer is always success, and freeing nothing is not a failure either.
+        args.ret = r.unwrap_or(VkResult::VK_SUCCESS);
     }
 
     fn vkAllocateDescriptorSets(&mut self, args: &mut vn_command_vkAllocateDescriptorSets<'_>) {
@@ -8424,6 +8436,114 @@ mod tests {
         REACHED.with_borrow(|r| {
             assert_eq!(r.as_slice(), &["vkCmdPushConstants", "vkCreateShaderModule"]);
         });
+
+        h.driver.abandon_planted();
+    }
+
+    /// Freeing descriptor sets one at a time is served: the run reaches the driver under its
+    /// pool, the pool stops holding the sets, and the guest is answered `VK_SUCCESS`.
+    ///
+    /// GTK's Vulkan renderer frees sets individually rather than resetting the pool, so a build
+    /// that refuses this poisons every GTK client a few frames in -- the client sees
+    /// `VK_ERROR_DEVICE_LOST`, then aborts on the garbage size a failed pipeline-cache query hands
+    /// it. The object-table half is the generated lifecycle hook's, as for every `vkFree*`; what is
+    /// pinned here is the driver call and the pool's bookkeeping.
+    #[test]
+    fn freeing_descriptor_sets_releases_them_from_their_pool() {
+        use super::super::proto::types::{
+            VkDescriptorPool, VkDescriptorSet, VkDevice, vn_command_vkFreeDescriptorSets,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const SETS: [(u64, u64); 2] = [(0x300, 30), (0x400, 40)];
+
+        thread_local! {
+            /// `(pool, the sets)` the driver was told to free.
+            static SAW: RefCell<Vec<(u64, Vec<u64>)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn free(
+            _d: VkDevice,
+            pool: VkDescriptorPool,
+            n: u32,
+            sets: *const VkDescriptorSet,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes the slice's own pointer and length.
+            let sets = unsafe { core::slice::from_raw_parts(sets, n as usize) };
+            SAW.with_borrow_mut(|w| w.push((pool.0, sets.iter().map(|s| s.0).collect())));
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkFreeDescriptorSets(free);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkDescriptorPool(POOL),
+            &[
+                (VkDescriptorSet(SETS[0].0), ObjectId(SETS[0].1)),
+                (VkDescriptorSet(SETS[1].0), ObjectId(SETS[1].1)),
+            ],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: CtxId::new(1).expect("1 is not zero"),
+            reject: None,
+            unserved: false,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+        };
+
+        // Only the first: GTK frees a set at a time, and the second has to survive it.
+        let one = [VkDescriptorSet(SETS[0].0)];
+        let mut args = vn_command_vkFreeDescriptorSets::default();
+        args.device = VkDevice(DEVICE);
+        args.descriptorPool = VkDescriptorPool(POOL);
+        args.plant_pDescriptorSets(&one);
+        h.vkFreeDescriptorSets(&mut args);
+        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        assert!(h.reject.is_none());
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|w| assert_eq!(w, &[(POOL, vec![SETS[0].0])], "that set, under its pool"));
+        assert_eq!(
+            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[0].0)),
+            None,
+            "the pool no longer holds what was freed"
+        );
+        assert_eq!(
+            h.driver.pool_child_id(VkDescriptorPool(POOL), VkDescriptorSet(SETS[1].0)),
+            Some(ObjectId(SETS[1].1)),
+            "and still holds what was not"
+        );
+
+        // Freeing nothing is not a failure, and does not reach the driver.
+        let none: [VkDescriptorSet; 0] = [];
+        let mut args = vn_command_vkFreeDescriptorSets::default();
+        args.device = VkDevice(DEVICE);
+        args.descriptorPool = VkDescriptorPool(POOL);
+        args.plant_pDescriptorSets(&none);
+        h.vkFreeDescriptorSets(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|w| assert_eq!(w.len(), 1, "an empty run is answered without a call"));
 
         h.driver.abandon_planted();
     }
