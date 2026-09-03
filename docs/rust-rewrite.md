@@ -453,6 +453,44 @@ buildable throughout as the A-side reference.
   the other end: its generated wrapper for a handler-less command sets fatal before it
   decodes, and reads no flag. `vkCmdCopyImageToBuffer` is the ordinary kind of gap,
   merely absent from the corpora we had; `synoik-vkcube` is the corpus that carries it.
+
+  **What venus still owes, carried into P3 rather than blocking it.** Each is a shape
+  `CLAUDE.md` names, present in code that works, listed so vrend does not copy it and so
+  the next venus pass starts here. Two vrend-facing items head the list because vrend
+  consumes them on the first seated GL desktop.
+  - *The cross-import, both directions.* A Vulkan client under a GL compositor is
+    venus→vrend: `Storage::Texture` adopts the IOSurface as an EGLImage, zero-copy;
+    `Storage::Linear` uploads into a placeholder texture, re-read per batch, zeroed on
+    failure, and never `EINVAL` on a non-dmabuf fd type (that poisons the compositor's
+    context). A GL compositor's buffer reaching a venus client is vrend→venus, the
+    fd-less IOSurface attach of a classic resource. `Storage` is the currency for both;
+    there is deliberately no venus-side presentation of `Linear` pages, whose consumer
+    is vrend.
+  - *Facts keyed by host handle are a second container.* `Driver::images` and
+    `Driver::query_pools` each hold facts the object table already vouches for, keyed by
+    a handle the driver may recycle, dropped at two destroy sites with a per-kind match
+    in `empty_device` that a third recorded kind must extend. Safe today by discipline:
+    every recorded object enters through its create and leaves through the table. The
+    structural shape is one `records` map keyed by `HostHandle`, removed by
+    `destroy_object` and by every doomed handle at teardown with no type match.
+  - *A handler's refusal is still a second channel.* `vn_dispatch_command` returns one
+    `Dispatched` verdict, and `Handlers::reject` beside it is what the handler could not
+    say through it. The shape is `Dispatched::Refused(why)`, with the generator asking
+    the handler for its verdict after the call.
+  - *`NoSurface::NotExported` is representable in pages that can never carry it*, and
+    `NoSurface::Layout` folds six distinct failures. `scanout_surface` wants
+    `Option<Result<Surface, NoSurface>>` -- `None` for "not a scanout question" -- and
+    a reason per question.
+  - *`Storage::first_refusal` is a latch shaped like a predicate*, ordered after
+    `surface()` by convention; `read_scanout_rows` is a second asker that never says why.
+    One call, returning the refusal with its unsaid reason.
+  - *`Decoder::verdict()` is called for its side effect* in the two oracle generators.
+  - *`#[allow(clippy::too_many_arguments)]`* on the query read-backs stands where
+    `first, count, stride, flags` is one value decoded once and measured once.
+  - *Kept as designs, not built:* the bind-time surface link as a query over the image
+    table (only zink-as-a-venus-client reaches it, and that configuration is dropped);
+    the linear-vs-optimal tiling rule, adopted from the C for parity and unmeasured; the
+    `-22` root cause, a diagnostic gap.
 - **P3 — vrend.** TGSI parser, `u_format` generator, the GL state machine,
   TGSI→GLSL, blitter, EGL/GLES winsys, IOSurface scanout. Ends at accelerated GL for
   stock guests.
