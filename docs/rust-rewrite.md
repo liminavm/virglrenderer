@@ -354,6 +354,44 @@ buildable throughout as the A-side reference.
   `vkExecuteCommandStreamsMESA` swaps the decoder onto a resource-backed stream, and the
   seqno waits are what a ring blocks on — not a port-by-rote.
 
+  Three facts about the transport, established against the C and the guest mesa rather
+  than inferred, because each one changes a design:
+
+  *The dispatch origin has three classes, not two.* Context-only (`vkCreateRingMESA`,
+  `vkDestroyRingMESA`, `vkNotifyRingMESA`, `vkWriteRingExtraMESA`,
+  `vkSubmitVirtqueueSeqnoMESA`, `vkWaitRingSeqnoMESA` — they reach the context's ring
+  table or its pending wait); ring-only (`vkWaitVirtqueueSeqnoMESA` — it blocks the ring
+  it was found from); and either (the reply-stream pair, `vkExecuteCommandStreamsMESA`,
+  and every ordinary Vulkan command, each acting on whichever dispatch it arrived on).
+  A two-state typestate would therefore be a lie. The shape that stays true is a
+  `Dispatch` trait both origins implement, with the context-only class bounded by a
+  capability the ring type lacks and the ring-only class by one the context lacks — and
+  the generator emitting the bound per command from a three-valued attribute. Commands
+  nested inside an execute inherit the outer origin.
+
+  *The guest aborts if the host stops stamping a liveness bit.* The guest's wait loop
+  clears `VK_RING_STATUS_ALIVE_BIT` on the instance ring, and at the first warn
+  iteration — around three and a half seconds of accumulated sleep, reached by any
+  fence, semaphore or seqno wait — re-reads it and calls `abort()` if the host has not
+  set it again. It kills the guest; it never hangs it. A cold shader cache or a first
+  frame crosses that threshold routinely, so the stamp is not optional for a seated
+  desktop. The period is the guest's own `maxReportingPeriodMicroseconds` (a zero is
+  fatal), and stamping unconditionally is what the C does — the bit answers "is the
+  renderer still scheduled", not "is this ring advancing", which is what the fatal bit
+  is for.
+
+  *A guest can deadlock the whole device, and the C does not stop it.* The existing
+  guard only fires in the ring thread's idle branch, so it misses this: a guest sends
+  `vkWaitVirtqueueSeqnoMESA` on a ring with no submit behind it, blocking that ring
+  inside a dispatch, then `vkWaitRingSeqnoMESA` on the virtqueue for a head the blocked
+  ring can no longer advance. The only producer of the virtqueue seqno is the thread now
+  asleep. Nothing times out, and the control queue is shared, so every context's submits,
+  every scanout flush and every fence stop with it. A buggy guest reaches it as easily as
+  a hostile one. The fix is not a timeout: the two blockers can see each other, so a ring
+  carries what virtqueue seqno it is blocked on, and a context wait checks that before
+  sleeping and on every re-check — if the ring is blocked on a seqno past what it has,
+  nothing can advance it, and the context is poisoned then and there.
+
   They also expose an unsound rule in the dispatch loop. An unserved command poisons the
   context only when the guest set `GENERATE_REPLY`, on the reasoning that a command
   nobody is waiting on costs the guest one command and no more. That holds for a command
