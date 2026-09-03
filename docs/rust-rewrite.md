@@ -337,10 +337,8 @@ buildable throughout as the A-side reference.
   Recording scanout geometry beside the ring stream lands here too — it is what turns
   the venus IOSurface score from a count into a frame hash, and a zero-copy blob has no
   other CPU-readable copy of its pixels.
-  The remaining gap is the ring transport. The C dispatches ten transport commands
-  (`src/venus/vkr_transport.c`); this tree serves nine, and the outstanding one is
-  `vkExecuteCommandStreamsMESA`, which swaps the decoder onto a resource-backed stream
-  and is how every command-buffer recording arrives. None of the ten is reachable by
+  The ring transport is served: all ten of the C's transport commands
+  (`src/venus/vkr_transport.c`). None of the ten is reachable by
   replay (`harness/README.md`), which is why the seated boot is a gate and not a
   formality: a build missing all of them scores every corpus clean and puts nothing on
   the screen. What the compositor does varies — it has both exited at startup and stayed
@@ -359,6 +357,21 @@ buildable throughout as the A-side reference.
   wait command is deliberately not consumed, so the resume re-decodes it, which is what
   makes a reply-carrying wait truthful with no special case: the answer is encoded on the
   pass that proceeds.
+
+  **A recorded command stream is copied out one at a time, and a wait inside one is
+  refused.** `vkExecuteCommandStreamsMESA` is how every recorded `vkCmd*` arrives: mesa
+  fills a resource and names it rather than sending the commands inline. `streamCount` is
+  bounded only by what fits in a batch and each descriptor may name a whole resource, so
+  the descriptors are recorded and the bytes copied per stream, after the bounds check —
+  peak cost is the largest single stream. The C points its one decoder into guest memory
+  and saves and restores its state around the nested run; each level here builds its own
+  decoder, arena and reply scratch, so the outer decode is untouched by construction.
+
+  A transport wait inside an executed stream is refused, which the C allows. A suspension
+  unwinds to `ffi.rs` carrying a position in the *outer* stream, and that position cannot
+  name a byte of the copy the wait came from. Mesa records `vkCmd*` work into these
+  streams and never transport waits — a hypothesis, held by a poison that names the
+  command if a boot ever proves it wrong.
 
   Three facts about the transport, established against the C and the guest mesa rather
   than inferred, because each one changes a design:
