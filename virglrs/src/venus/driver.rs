@@ -2995,21 +2995,6 @@ impl Driver {
         Ok((Exported { addr, write_back: record.write_back() }, None))
     }
 
-    /// Where an allocation was exported to, if it has been.
-    ///
-    /// The VMM asks for this again after the create -- the C caches it on the resource, which is
-    /// how a mapping outlives the memory it points into. Resolved through the live record instead,
-    /// so memory the guest has freed has no address to give.
-    pub fn memory_exported_at(&self, id: ObjectId) -> Option<Exported> {
-        let a = self.memory.get(&id)?;
-        let addr = match &a.backing {
-            Backing::Driver { mapped, .. } => (*mapped)?,
-            Backing::Owned { storage, published: true } => storage.span().0,
-            Backing::Owned { published: false, .. } | Backing::Imported(_) => return None,
-        };
-        Some(Exported { addr, write_back: a.write_back() })
-    }
-
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
     ///
     /// Short buffers are the caller's business, not an error: the census reports whole sizes and
@@ -4579,7 +4564,12 @@ mod tests {
         assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok((published, None)));
         MAPS.with_borrow(|n| assert_eq!(*n, 1));
         UNMAPS.with_borrow(|n| assert_eq!(*n, 0, "the mapping is the VMM's now and stays up"));
-        assert_eq!(driver.memory_exported_at(MEM), Some(published), "asked again, not remembered");
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, MEM, SIZE),
+            Err(ExportError::AlreadyExported),
+            "the mapping is the mark: exporting twice would give two resources one storage"
+        );
+        MAPS.with_borrow(|n| assert_eq!(*n, 1, "and the refusal mapped nothing"));
 
         // Memory the host reaches through a cache it has to flush is memory the guest must not
         // map cached, and the answer comes from the type it was allocated from -- not from a
@@ -4612,7 +4602,11 @@ mod tests {
         // address is gone, so this is the last moment it could be unmapped at all.
         driver.free_memory(DEVICE, handle, MEM);
         UNMAPS.with_borrow(|n| assert_eq!(*n, 1, "the export's mapping went with the allocation"));
-        assert_eq!(driver.memory_exported_at(MEM), None, "and there is no address left to give");
+        assert_eq!(
+            driver.memory_export(DEVICE, handle, MEM, SIZE),
+            Err(ExportError::NoSuchAllocation),
+            "and there is no allocation left to export"
+        );
 
         // The unexported one was never mapped, so freeing it must not unmap anything.
         driver.free_memory(DEVICE, handle, LOCAL);

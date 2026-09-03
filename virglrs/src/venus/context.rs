@@ -22,7 +22,7 @@ use super::cs::{AllOfIt, Decoder, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
 use super::monitor::Monitor;
-use super::objects::Shared;
+use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
     VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeviceMemory, VkFlags,
@@ -563,17 +563,29 @@ impl Context {
         &mut self,
         id: ObjectId,
         blob_size: u64,
-    ) -> Result<(Exported, Option<driver::Storage>), ExportError> {
-        let (handle, device) = {
+    ) -> Result<(Exported, Option<driver::Storage>, ObjectKey), ExportError> {
+        let (handle, device, key) = {
             let objects = self.objects.borrow();
             let handle = objects
                 .get(id)
                 .filter(|o| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY)
                 .map(|o| VkDeviceMemory::from_host(o.handle))
                 .ok_or(ExportError::NoSuchAllocation)?;
-            (handle, objects.device_of(id).ok_or(ExportError::NoSuchAllocation)?)
+            (
+                handle,
+                objects.device_of(id).ok_or(ExportError::NoSuchAllocation)?,
+                objects.key_of(id).ok_or(ExportError::NoSuchAllocation)?,
+            )
         };
-        self.driver.memory_export(device, handle, id, blob_size)
+        let (exported, share) = self.driver.memory_export(device, handle, id, blob_size)?;
+        Ok((exported, share, key))
+    }
+
+    /// Whether the object a key was taken for still stands. What a resource that borrowed an
+    /// allocation's mapping asks before handing the address on: the id may name a fresh object
+    /// by now, and the key will not.
+    pub fn holds(&self, key: ObjectKey) -> bool {
+        self.objects.borrow().holds(key)
     }
 }
 

@@ -55,6 +55,12 @@ pub struct Object {
     parent: Option<Key>,
 }
 
+/// A [`Key`] as something outside this module may hold: opaque, and answered only by
+/// [`Table::holds`]. What a record keeps when it has to know, later, whether the object it was
+/// made from is still the same object -- rather than whether the id still names *something*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ObjectKey(Key);
+
 /// Where an object lives in the [`Arena`], and which occupant of that place it is.
 ///
 /// The generation is the whole mechanism. A key names a slot *and* the object that was in it when
@@ -371,6 +377,19 @@ impl Table {
 
     pub fn get(&self, id: ObjectId) -> Option<&Object> {
         self.arena.get(self.slots.get(&id)?.key()?)
+    }
+
+    /// The key of the object `id` names right now, for a holder that has to know later whether
+    /// it is still *that* object. A key outlives nothing: once the object is destroyed it
+    /// resolves to nothing, whatever the guest has since named by the same id.
+    pub fn key_of(&self, id: ObjectId) -> Option<ObjectKey> {
+        let key = self.slots.get(&id)?.key()?;
+        self.arena.get(key).map(|_| ObjectKey(key))
+    }
+
+    /// Whether the object a key was taken for is still here.
+    pub fn holds(&self, key: ObjectKey) -> bool {
+        self.arena.get(key.0).is_some()
     }
 
     pub fn len(&self) -> usize {
