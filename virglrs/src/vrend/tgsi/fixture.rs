@@ -14,8 +14,6 @@ const LOG: &str = include_str!("../../../../harness/replay/fixtures/vrend-shader
 /// One shader of the log: its TGSI dump and its GLSL.
 pub struct Block {
     pub tgsi: &'static str,
-    /// Read by the translator's test, once there is a translator.
-    #[expect(dead_code)]
     pub glsl: &'static str,
 }
 

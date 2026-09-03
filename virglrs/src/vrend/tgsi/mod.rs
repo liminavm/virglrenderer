@@ -17,7 +17,7 @@
 //! ([`scan`]), which is where the C's `tgsi_scan_shader` says no.
 
 pub mod dump;
-mod fixture;
+pub(crate) mod fixture;
 pub mod info;
 pub mod scan;
 pub mod text;
@@ -283,6 +283,27 @@ named! {
         TrianglesAdjacency = "TRIANGLES_ADJACENCY",
         TriangleStripAdjacency = "TRIANGLE_STRIP_ADJACENCY",
         Patches = "PATCHES",
+    }
+}
+
+impl Default for Semantic {
+    /// The C's zero.
+    fn default() -> Semantic {
+        Semantic::Position
+    }
+}
+
+impl Default for Interpolate {
+    /// The C's zero.
+    fn default() -> Interpolate {
+        Interpolate::Constant
+    }
+}
+
+impl Default for Location {
+    /// The C's zero.
+    fn default() -> Location {
+        Location::Center
     }
 }
 

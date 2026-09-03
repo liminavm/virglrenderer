@@ -26,6 +26,7 @@ pub mod gl;
 pub mod pipe;
 pub mod proto;
 pub mod resource;
+pub mod shader;
 pub mod tgsi;
 pub mod transfer;
 #[allow(clippy::module_inception)]
