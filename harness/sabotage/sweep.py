@@ -425,6 +425,21 @@ SABOTAGES = [
         '',
     ),
     (
+        'a shared surface stays billed to the context that minted it, and dies with its slot',
+        'virglrs/src/venus/driver.rs',
+        """                m.charge.share();
+""",
+        """""",
+        '',
+    ),
+    (
+        'the cap stops counting storage the moment it is shared',
+        'virglrs/src/venus/budget.rs',
+        """        self.ctxs.values().map(PerCtx::bytes).sum::<u64>() + self.shared.bytes()""",
+        """        self.ctxs.values().map(PerCtx::bytes).sum::<u64>()""",
+        '',
+    ),
+    (
         'a resource id resolves to whatever another context filed under the same number',
         'virglrs/src/renderer.rs',
         """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",

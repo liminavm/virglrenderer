@@ -39,6 +39,7 @@
 //! because the caller always has one, and there is nothing for a second caller to get wrong.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ids::CtxId;
@@ -61,7 +62,28 @@ pub struct Budget {
     /// handle to memory that does not exist, and poisons its ring on the next use anyway -- the
     /// same context death, with the reason several commands in the past.
     soft: bool,
-    ledger: Mutex<BTreeMap<CtxId, PerCtx>>,
+    ledger: Mutex<Ledger>,
+}
+
+/// Everything charged, by who is answerable for it.
+///
+/// A context's slot is retired with the context. The shared bucket is not: it holds the charges
+/// for storage a resource has taken a share of, which by design outlives the context that minted
+/// it -- a compositor still sampling a client that has exited. Those bytes are live, and the cap
+/// has to count them; what changes at the share is only who they are attributed to, so the
+/// context's own slot goes on meaning "what this context alone is holding", which is the only
+/// reading under which a residual at its destroy is a leak.
+#[derive(Default)]
+struct Ledger {
+    ctxs: BTreeMap<CtxId, PerCtx>,
+    shared: PerCtx,
+}
+
+impl Ledger {
+    /// Total live bytes, whoever holds them. This is the number the cap is enforced against.
+    fn bytes(&self) -> u64 {
+        self.ctxs.values().map(PerCtx::bytes).sum::<u64>() + self.shared.bytes()
+    }
 }
 
 /// One context's live allocations, by what they are and how big.
@@ -78,6 +100,21 @@ struct PerCtx {
 impl PerCtx {
     fn bytes(&self) -> u64 {
         self.live.iter().map(|((_, size), n)| size * u64::from(*n)).sum()
+    }
+
+    fn take(&mut self, what: &'static str, size: u64) {
+        *self.live.entry((what, size)).or_insert(0) += 1;
+    }
+
+    /// Credit one charge. Absent is not an error here: the slot may have been retired around a
+    /// charge that outlived it, and that residual was reported at the retire.
+    fn credit(&mut self, what: &'static str, size: u64) {
+        if let Some(n) = self.live.get_mut(&(what, size)) {
+            *n -= 1;
+            if *n == 0 {
+                self.live.remove(&(what, size));
+            }
+        }
     }
 
     /// The biggest buckets first, which is what names a leak.
@@ -98,11 +135,34 @@ pub struct Charge {
     ctx: CtxId,
     what: &'static str,
     size: u64,
+    /// Whether this has moved to the ledger's shared bucket -- see [`Self::share`]. Only ever
+    /// read or written under the ledger's lock, so it cannot disagree with which bucket holds
+    /// the count; it is atomic only because the charge travels inside an `Arc`.
+    shared: AtomicBool,
 }
 
 impl Charge {
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Move this charge from its context's slot to the shared bucket, because a resource has
+    /// taken a share of what it paid for and may keep it after the context is gone.
+    ///
+    /// The total does not move: the bytes were live before and are live after. What moves is the
+    /// attribution, so that the context's own slot holds only what it alone is holding, and a
+    /// residual there at its destroy still names a leak rather than a share.
+    ///
+    /// Idempotent. A share cloned twice is one storage charged once.
+    pub fn share(&self) {
+        let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
+        if self.shared.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Some(per) = ledger.ctxs.get_mut(&self.ctx) {
+            per.credit(self.what, self.size);
+        }
+        ledger.shared.take(self.what, self.size);
     }
 }
 
@@ -117,14 +177,10 @@ impl std::fmt::Debug for Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         let mut ledger = self.budget.ledger.lock().expect("the budget ledger");
-        let Some(per) = ledger.get_mut(&self.ctx) else {
-            return;
-        };
-        if let Some(n) = per.live.get_mut(&(self.what, self.size)) {
-            *n -= 1;
-            if *n == 0 {
-                per.live.remove(&(self.what, self.size));
-            }
+        if self.shared.load(Ordering::Relaxed) {
+            ledger.shared.credit(self.what, self.size);
+        } else if let Some(per) = ledger.ctxs.get_mut(&self.ctx) {
+            per.credit(self.what, self.size);
         }
     }
 }
@@ -230,7 +286,7 @@ impl Budget {
     /// A budget with the cap given rather than the one configured. The tests' way in: reading the
     /// environment from a test would make every other test in the process depend on it.
     pub fn with_cap(cap: Option<u64>, soft: bool) -> Arc<Budget> {
-        Arc::new(Budget { cap, soft, ledger: Mutex::new(BTreeMap::new()) })
+        Arc::new(Budget { cap, soft, ledger: Mutex::new(Ledger::default()) })
     }
 
     /// Whether a refusal should stop the context. See the module doc for why it must, by default.
@@ -250,24 +306,29 @@ impl Budget {
         size: u64,
     ) -> Result<Charge, Refused> {
         let mut ledger = self.ledger.lock().expect("the budget ledger");
-        let live: u64 = ledger.values().map(PerCtx::bytes).sum();
+        let live = ledger.bytes();
         if let Some(cap) = self.cap
             && live.saturating_add(size) > cap
         {
             return Err(Refused { wanted: size, live, cap });
         }
-        *ledger.entry(ctx).or_default().live.entry((what, size)).or_insert(0) += 1;
-        Ok(Charge { budget: Arc::clone(self), ctx, what, size })
+        ledger.ctxs.entry(ctx).or_default().take(what, size);
+        Ok(Charge { budget: Arc::clone(self), ctx, what, size, shared: AtomicBool::new(false) })
     }
 
     /// Total live bytes across every context.
     pub fn live(&self) -> u64 {
-        self.ledger.lock().expect("the budget ledger").values().map(PerCtx::bytes).sum()
+        self.ledger.lock().expect("the budget ledger").bytes()
+    }
+
+    /// What is held by shares rather than by any one context. See [`Charge::share`].
+    pub fn shared(&self) -> u64 {
+        self.ledger.lock().expect("the budget ledger").shared.bytes()
     }
 
     /// What one context holds.
     pub fn live_for(&self, ctx: CtxId) -> u64 {
-        self.ledger.lock().expect("the budget ledger").get(&ctx).map_or(0, PerCtx::bytes)
+        self.ledger.lock().expect("the budget ledger").ctxs.get(&ctx).map_or(0, PerCtx::bytes)
     }
 
     /// Drop a context's slot, because the context is gone.
@@ -278,7 +339,7 @@ impl Budget {
     /// not asserted: the process is being torn down around it, and taking the VM with us to
     /// report a leak is worse than reporting it.
     pub fn retire(&self, ctx: CtxId) {
-        let Some(per) = self.ledger.lock().expect("the budget ledger").remove(&ctx) else {
+        let Some(per) = self.ledger.lock().expect("the budget ledger").ctxs.remove(&ctx) else {
             return;
         };
         let residual = per.bytes();
@@ -298,12 +359,17 @@ impl Budget {
     /// Say what everything holds, biggest first. What makes a leak name itself.
     pub fn report(&self, reason: &str) {
         let ledger = self.ledger.lock().expect("the budget ledger");
-        let live: u64 = ledger.values().map(PerCtx::bytes).sum();
         let cap = self.cap.map_or(String::from("no cap"), mib);
-        eprintln!("[virglrs] {reason}: {} live of {cap}", mib(live));
-        for (ctx, per) in ledger.iter() {
+        eprintln!("[virglrs] {reason}: {} live of {cap}", mib(ledger.bytes()));
+        for (ctx, per) in ledger.ctxs.iter() {
             eprintln!("[virglrs]   ctx {}: {}", ctx.get(), mib(per.bytes()));
             for (what, size, n) in per.worst() {
+                eprintln!("[virglrs]     {n} x {} {what}", mib(size));
+            }
+        }
+        if ledger.shared.bytes() != 0 {
+            eprintln!("[virglrs]   shared with resources: {}", mib(ledger.shared.bytes()));
+            for (what, size, n) in ledger.shared.worst() {
                 eprintln!("[virglrs]     {n} x {} {what}", mib(size));
             }
         }
@@ -326,6 +392,42 @@ mod tests {
 
     fn ctx(n: u32) -> CtxId {
         CtxId::new(n).expect("not zero")
+    }
+
+    /// A charge a resource has taken a share of outlives the context that made it, and the ledger
+    /// goes on counting it for as long as it stands -- attributed to nobody, and reported at the
+    /// context's destroy as nothing, because it is not that context's leak.
+    ///
+    /// This is a compositor still sampling a client's last frame after the client has exited:
+    /// the client's context is gone, its surface is not, and the cap has to know.
+    #[test]
+    fn a_shared_charge_outlives_its_context_and_is_not_its_leak() {
+        let budget = Budget::with_cap(Some(8192), false);
+        let account = Account::open(&budget, ctx(1));
+        let charge = account.try_charge("IOSurface", 4096).expect("under the cap");
+        assert_eq!(budget.live_for(ctx(1)), 4096, "the context's own, until it is shared");
+
+        charge.share();
+        assert_eq!(budget.live_for(ctx(1)), 0, "shared storage is nobody's alone");
+        assert_eq!(budget.shared(), 4096);
+        assert_eq!(budget.live(), 4096, "and is still live: the cap counts it");
+
+        // The context is destroyed while the share is still held. Its slot held nothing, so
+        // there is no residual to call a leak -- and the total does not move.
+        drop(account);
+        assert_eq!(budget.live(), 4096, "a context's destroy does not uncount what outlives it");
+        let other = budget.try_charge(ctx(2), "device memory", 4096).expect("exactly at the cap");
+        assert!(
+            budget.try_charge(ctx(2), "device memory", 1).is_err(),
+            "the cap saw the shared bytes, not just ctx 2's own"
+        );
+        drop(other);
+
+        charge.share();
+        assert_eq!(budget.shared(), 4096, "sharing twice is one storage charged once");
+        drop(charge);
+        assert_eq!(budget.shared(), 0);
+        assert_eq!(budget.live(), 0, "the last holder going is what credits it");
     }
 
     /// A charge is credited by being dropped, and by nothing else. That is the whole design: the
