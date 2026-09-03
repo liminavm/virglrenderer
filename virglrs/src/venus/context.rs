@@ -18,7 +18,7 @@ use crate::ids::{CtxId, ResourceHandle, RingId};
 
 use super::budget::{Account, Budget};
 use super::cs::Handle;
-use super::cs::{AllOfIt, Decoder, Encoder};
+use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
 use super::monitor::Monitor;
@@ -380,7 +380,6 @@ impl Context {
             global,
             ctx: id,
             reject: None,
-            unserved: false,
             resources,
             rings: &mut self.rings,
             monitor: &mut self.monitor,
@@ -684,8 +683,6 @@ fn run_batch(
     let mut suspended = None;
 
     while dec.has_command() {
-        dec.clear_soft_fatal();
-
         let at = dec.pos();
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let flags = dec.decode_scalar::<VkFlags>();
@@ -716,55 +713,49 @@ fn run_batch(
         }
 
         let mut enc = Encoder::growing(&mut scratch, &proto);
-        if vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut *h).is_none() {
-            // A command type this protocol does not define. We cannot even skip it: its length
-            // is only knowable by decoding it.
-            poison(id, &dec, cmd, "is not a command type this protocol defines");
-            break;
-        }
+        let verdict = vn_dispatch_command(&mut dec, wants_reply.then_some(&mut enc), cmd, &mut *h);
         // How much answer there is. Read here so the encoder's borrow of the scratch ends
         // before the commit below reads it back.
         let answer = enc.pos();
         counts.dispatched += 1;
 
-        // No handler ran: the command was counted for the census and nothing else. There is
-        // no version of that which is safe to continue from. When the guest wanted a reply,
-        // the generator encoded one regardless, out of arguments no handler ever filled in,
-        // and a zeroed reply is shaped exactly like a successful one -- there is no field in
-        // which to say "we did not do this". When it wanted none, the guest is not waiting,
-        // but it does go on believing the host did the thing; the divergence surfaces later,
-        // somewhere that cannot name this command. Either way the context dies here, saying
-        // which command it was. This is also what upstream does: its generated wrapper for a
-        // command with no handler sets fatal before decoding, whatever the reply flag says.
-        // Not counted in `unhandled`: the census above already owns the tally of commands
-        // no handler served, and a second count of the same fact is one that can disagree.
-        if core::mem::take(&mut h.unserved) {
-            poison(id, &dec, cmd, "is not a command this build serves");
-            break;
+        match verdict {
+            Dispatched::Served => {}
+            // A malformed argument, or a shape the generator has no decoder for. Either way
+            // the command is what a reader needs, because without it a gap reaches a user as
+            // a hung guest.
+            Dispatched::Undecodable => {
+                poison(id, &dec, cmd, "did not decode");
+                break;
+            }
+            // The wrapper skipped it as containment asks -- and containment is for commands
+            // the guest is not waiting on. When it is waiting, a reply the host never wrote is
+            // whatever the slot held before, shaped exactly like success, so the batch stops
+            // instead.
+            Dispatched::Ghosted(ghost) => {
+                if wants_reply {
+                    poison(
+                        id,
+                        &dec,
+                        cmd,
+                        &format!("wanted a reply, and names object {} the host refused", ghost.0),
+                    );
+                    break;
+                }
+                continue;
+            }
+            Dispatched::Undefined => {
+                poison(id, &dec, cmd, "is not a command type this protocol defines");
+                break;
+            }
         }
-        // A handler that found the command itself unusable -- an id the guest cannot have, a
-        // length that would send the driver off the end of what was decoded. The handler has
-        // no decoder to say so with; this is where its verdict lands.
+
+        // The handler's own verdict: the command itself was unusable -- an id the guest cannot
+        // have, a length that would send the driver off the end of what was decoded -- or no
+        // handler exists for it. The handler has no decoder to say so with; this is where it
+        // lands.
         if let Some(why) = h.reject.take() {
             poison(id, &dec, cmd, why);
-            break;
-        }
-
-        if fatal.load(Ordering::Acquire) {
-            // The decoder poisoned itself inside the command: a malformed argument, or a
-            // shape the generator has no decoder for. Either way the command is what a
-            // reader needs, because without it a gap reaches a user as a hung guest.
-            poison(id, &dec, cmd, "did not decode");
-            break;
-        }
-
-        // The command named a ghost, so the wrapper skipped it as containment asks -- and
-        // containment is for commands the guest is not waiting on. This one it is, and a reply
-        // the host never wrote is whatever the slot held before, shaped exactly like success.
-        // Every reply-carrying command has, by here, been answered or has stopped the batch:
-        // this is the one path that is neither, and it becomes the latter.
-        if wants_reply && answer == 0 {
-            poison(id, &dec, cmd, "wanted a reply, and names an object the host refused");
             break;
         }
 
@@ -946,11 +937,6 @@ pub struct Handlers<'a> {
     /// Why the handler refused the command, if it did. It cannot be reported from here -- the
     /// handler has no decoder -- so the loop reads it back and poisons with this as the reason.
     reject: Option<&'static str>,
-    /// Whether the command that just ran reached no handler at all, and was only counted.
-    ///
-    /// Read back and cleared every command, for the same reason as `reject`: the census is a
-    /// tally, and the loop needs the per-command answer.
-    unserved: bool,
     /// The renderer's resource table, for the commands that name guest memory.
     resources: &'a dyn ShmResources,
     /// Which context this is, for the resource questions whose answer is only meaningful within
@@ -1277,9 +1263,19 @@ fn cap_api_version(version: u32) -> u32 {
 }
 
 impl Commands for Handlers<'_> {
+    /// No handler ran: the command is counted for the census and nothing else. There is no
+    /// version of that which is safe to continue from. When the guest wanted a reply, the
+    /// generator encoded one regardless, out of arguments no handler ever filled in, and a
+    /// zeroed reply is shaped exactly like a successful one -- there is no field in which to
+    /// say "we did not do this". When it wanted none, the guest is not waiting, but it does go
+    /// on believing the host did the thing; the divergence surfaces later, somewhere that cannot
+    /// name this command. Either way the context dies, saying which command it was, the way it
+    /// does for any command a handler refuses. This is also what upstream does: its generated
+    /// wrapper for a command with no handler sets fatal before decoding, whatever the reply flag
+    /// says.
     fn unsupported(&mut self, cmd: VkCommandTypeEXT) {
         *self.todo.seen.entry(cmd.0).or_default() += 1;
-        self.unserved = true;
+        self.reject = Some("is not a command this build serves");
     }
 
     fn object_created(
@@ -4442,7 +4438,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -5233,7 +5228,6 @@ mod tests {
                     global: &global,
                     ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
-                    unserved: false,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
@@ -5317,7 +5311,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -5375,7 +5368,6 @@ mod tests {
                     global: &global,
                     ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
-                    unserved: false,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
@@ -5480,7 +5472,6 @@ mod tests {
                     global: &global,
                     ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
-                    unserved: false,
                     resources: &t,
                     rings: &mut rings,
                     monitor: &mut monitor,
@@ -5578,7 +5569,6 @@ mod tests {
                     global: &global,
                     ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
-                    unserved: false,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
@@ -5698,7 +5688,6 @@ mod tests {
                     global: &global,
                     ctx: CtxId::new(1).expect("1 is not zero"),
                     reject: None,
-                    unserved: false,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
                     monitor: &mut monitor,
@@ -6005,7 +5994,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6122,7 +6110,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6631,7 +6618,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6686,7 +6672,6 @@ mod tests {
                 global: &global,
                 ctx: CtxId::new(1).expect("1 is not zero"),
                 reject: None,
-                unserved: false,
                 resources: &t,
                 rings: &mut rings,
                 monitor: &mut monitor,
@@ -6730,7 +6715,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6770,7 +6754,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6842,7 +6825,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6886,7 +6868,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -6980,7 +6961,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7051,7 +7031,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7088,7 +7067,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &t,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7211,7 +7189,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7308,7 +7285,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7358,7 +7334,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7415,7 +7390,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7447,7 +7421,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7535,7 +7508,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7574,7 +7546,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7717,7 +7688,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7792,7 +7762,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7825,7 +7794,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7882,7 +7850,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7929,7 +7896,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -7960,7 +7926,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8044,7 +8009,7 @@ mod tests {
             let mut dec = Decoder::new(wire, &temp, objects, &hard);
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let _flags = dec.decode_scalar::<VkFlags>();
-            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, h), Some(()));
+            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, h), Dispatched::Served);
             assert!(!dec.fatal(), "the command must decode");
             assert_eq!(dec.pos(), wire.len(), "the command must be fully consumed");
         }
@@ -8134,7 +8099,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8169,7 +8133,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
 
         assert_eq!(
@@ -8216,7 +8180,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8241,7 +8204,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
 
         for id in IDS {
@@ -8354,7 +8317,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8379,7 +8341,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal());
 
         // The two the driver had are real objects under the guest's own ids, each holding the
@@ -8529,7 +8491,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8689,7 +8650,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8708,7 +8668,7 @@ mod tests {
             args.pipelineCache = VkPipelineCache(CACHE);
             args.plant_pDataSize(&mut size);
             h.vkGetPipelineCacheData(&mut args);
-            assert!(!h.unserved, "served now; a build that still refuses it fails here");
+            assert!(h.reject.is_none(), "served now; a build that still refuses it fails here");
             assert!(h.reject.is_none());
             assert_eq!(args.ret, VkResult::VK_SUCCESS);
         }
@@ -8752,7 +8712,7 @@ mod tests {
         args.dstCache = VkPipelineCache(CACHE);
         args.plant_pSrcCaches(&srcs);
         h.vkMergePipelineCaches(&mut args);
-        assert!(!h.unserved);
+        assert!(h.reject.is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w.merged, [(CACHE, vec![0x501, 0x502])]));
 
@@ -8766,7 +8726,7 @@ mod tests {
         args.plant_pYcbcrConversion(&mut wire);
         args.plant_handle_pYcbcrConversion(&mut shadow);
         h.vkCreateSamplerYcbcrConversion(&mut args);
-        assert!(!h.unserved);
+        assert!(h.reject.is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         assert_eq!(shadow, VkSamplerYcbcrConversion(0x9c));
         assert_eq!(wire, VkSamplerYcbcrConversion(77), "the guest's id on the wire is left alone");
@@ -8837,7 +8797,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -8855,7 +8814,10 @@ mod tests {
         args.descriptorPool = VkDescriptorPool(POOL);
         args.plant_pDescriptorSets(&one);
         h.vkFreeDescriptorSets(&mut args);
-        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        assert!(
+            h.reject.is_none(),
+            "the command is served now; a build that still refuses it fails here"
+        );
         assert!(h.reject.is_none());
         assert_eq!(args.ret, VkResult::VK_SUCCESS);
         SAW.with_borrow(|w| assert_eq!(w, &[(POOL, vec![SETS[0].0])], "that set, under its pool"));
@@ -9036,7 +8998,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9179,7 +9140,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9265,7 +9225,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9293,7 +9252,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "a refusal is the driver's answer, not a protocol error");
         assert!(h.reject.is_none(), "a refused create is not a protocol violation");
 
@@ -9329,7 +9288,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9459,8 +9417,13 @@ mod tests {
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let _flags = dec.decode_scalar::<VkFlags>();
             let mut h = Recorder::default();
-            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
-            (h.saw, dec.fatal())
+            let verdict = vn_dispatch_command(&mut dec, None, cmd, &mut h);
+            assert_eq!(
+                verdict == Dispatched::Undecodable,
+                dec.fatal(),
+                "the verdict and the poison flag are one fact"
+            );
+            (h.saw, verdict == Dispatched::Undecodable)
         }
 
         let objects = Shared::new();
@@ -9516,7 +9479,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9573,7 +9535,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9669,8 +9630,13 @@ mod tests {
             let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
             let _flags = dec.decode_scalar::<VkFlags>();
             let mut h = Recorder::default();
-            assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
-            (h.saw, dec.fatal())
+            let verdict = vn_dispatch_command(&mut dec, None, cmd, &mut h);
+            assert_eq!(
+                verdict == Dispatched::Undecodable,
+                dec.fatal(),
+                "the verdict and the poison flag are one fact"
+            );
+            (h.saw, verdict == Dispatched::Undecodable)
         }
 
         let objects = Shared::new();
@@ -9765,7 +9731,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9902,7 +9867,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -9921,7 +9885,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
 
         SAW.with_borrow(|s| {
             assert_eq!(s.calls.first(), Some(&("wait", 0)), "nothing may be destroyed while busy");
@@ -10057,7 +10021,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10076,7 +10039,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "the destroy must decode");
 
         assert_eq!(objects.borrow().len(), 0, "the instance was the root of everything");
@@ -10143,7 +10106,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10166,7 +10128,7 @@ mod tests {
         let mut dec = Decoder::new(&w, &temp, &objects, &hard);
         let cmd = dec.decode_scalar::<VkCommandTypeEXT>();
         let _flags = dec.decode_scalar::<VkFlags>();
-        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, cmd, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "the destroy must decode");
 
         assert_eq!(
@@ -10302,7 +10264,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10456,7 +10417,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10596,7 +10556,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10617,7 +10576,10 @@ mod tests {
         h.vkCmdCopyImageToBuffer(&mut args);
 
         assert!(h.reject.is_none(), "a served command does not reject");
-        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        assert!(
+            h.reject.is_none(),
+            "the command is served now; a build that still refuses it fails here"
+        );
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.as_slice(),
@@ -10753,7 +10715,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,
@@ -10799,7 +10760,10 @@ mod tests {
         args.plant_pRegions(&regions);
         h.vkCmdCopyImage(&mut args);
         assert!(h.reject.is_none());
-        assert!(!h.unserved, "the command is served now; a build that still refuses it fails here");
+        assert!(
+            h.reject.is_none(),
+            "the command is served now; a build that still refuses it fails here"
+        );
         SAW.with_borrow(|s| {
             assert_eq!(
                 s.copies,
@@ -10976,7 +10940,6 @@ mod tests {
             global: &global,
             ctx: CtxId::new(1).expect("1 is not zero"),
             reject: None,
-            unserved: false,
             resources: &NO_RESOURCES,
             rings: &mut rings,
             monitor: &mut monitor,

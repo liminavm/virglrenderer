@@ -1422,6 +1422,7 @@ class RustGen:
                 '            let mut args = vn_command_%s::default();' % n,
                 '            vn_decode_%s_args_temp(dec, &mut args);' % n,
                 '            if dec.fatal() {',
+                '                dec.verdict();',
                 '                return Some(0);',
                 '            }',
                 '            vn_fill_%s_outs(a, f, &mut args);' % n,
@@ -2496,6 +2497,7 @@ class RustGen:
                 '            let mut args = vn_command_%s::default();' % n,
                 '            vn_decode_%s_args_temp(dec, &mut args);' % n,
                 '            if dec.fatal() {',
+                '                dec.verdict();',
                 '                return Some(0);',
                 '            }',
                 '            let size = vn_sizeof_%s_args(enc.protocol(), &args);' % n,
@@ -2639,14 +2641,14 @@ class RustGen:
                 '/// `enc` is `Some` exactly when the command header carried the reply flag. Replay',
                 '/// strips that flag, which is why a replayed stream needs no reply buffer at all.',
                 '///',
-                '/// `None` is a command type this protocol does not define -- a stream naming one',
-                '/// is a stream we cannot follow, and the caller poisons the ring.',
+                '/// The verdict is the decoder\'s: what stopped the command before its handler, if',
+                '/// anything did. What the handler made of it is the handler\'s own to report.',
                 'pub fn vn_dispatch_command(',
                 '    dec: &mut Decoder<\'_>,',
                 '    enc: Option<&mut Encoder<\'_>>,',
                 '    cmd: VkCommandTypeEXT,',
                 '    h: &mut dyn Commands,',
-                ') -> Option<()> {',
+                ') -> cs::Dispatched {',
                 '    match cmd {']
         for ty in commands:
             n = ty.name
@@ -2656,7 +2658,7 @@ class RustGen:
                 '            let mut args = vn_command_%s::default();' % n,
                 '            vn_decode_%s_args_temp(dec, &mut args);' % n,
                 '            if dec.fatal() {',
-                '                return Some(());',
+                '                return dec.verdict();',
                 '            }',
                 '            h.%s(&mut args);' % n,
             ] + (['            let val = &args;']
@@ -2664,10 +2666,10 @@ class RustGen:
                 '            if let Some(enc) = enc {',
                 '                vn_encode_%s_reply(enc, &args);' % n,
                 '            }',
-                '            Some(())',
+                '            cs::Dispatched::Served',
                 '        }',
             ]
-        out += ['        _ => None,', '    }', '}', '']
+        out += ['        _ => cs::Dispatched::Undefined,', '    }', '}', '']
         return out
 
     def _chain_fns(self, ty, gaps, v=''):

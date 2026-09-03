@@ -221,8 +221,29 @@ pub struct Decoder<'a> {
     objects: &'a dyn Objects,
     /// Shared with the ring loop, which stops when it is set.
     hard: &'a AtomicBool,
-    /// Per-command: this command named a ghost and must be dropped.
-    soft: Cell<bool>,
+    /// The ghost this command named, if it named one. Per-command: the dispatch that skips
+    /// the command takes it, and says which object it was.
+    ghost: Cell<Option<ObjectId>>,
+}
+
+/// What became of one command, as the generated dispatch reports it.
+///
+/// One verdict, read in one place. The ring loop used to learn the same four things from four
+/// channels -- an `Option`, the decoder's poison flag, a per-command soft flag, and the reply
+/// encoder's byte count -- and reading "skipped" off a byte count is how a ghost the guest was
+/// waiting on went unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatched {
+    /// The handler ran; when a reply was asked for, it is in the encoder.
+    Served,
+    /// The arguments did not decode. The stream is poisoned and no handler ran.
+    Undecodable,
+    /// The command named this ghost -- an object whose create the host refused -- and was skipped
+    /// whole, as containment asks: no handler ran and nothing was encoded.
+    Ghosted(ObjectId),
+    /// Not a command type this protocol defines. It cannot even be skipped: its length is only
+    /// knowable by decoding it.
+    Undefined,
 }
 
 impl<'a> Decoder<'a> {
@@ -239,7 +260,7 @@ impl<'a> Decoder<'a> {
             temp_used: Cell::new(0),
             objects,
             hard,
-            soft: Cell::new(false),
+            ghost: Cell::new(None),
         }
     }
 
@@ -259,25 +280,32 @@ impl<'a> Decoder<'a> {
         self.hard.store(true, Ordering::Release);
     }
 
-    /// Poison this command only -- it named an object the host never created.
-    pub fn set_soft_fatal(&self) {
-        self.soft.set(true);
+    /// Whether this command can go no further: the stream is poisoned, or the command named a
+    /// ghost and is to be skipped. The generated dispatch asks this and then [`verdict`] for
+    /// which; a test asks it alone.
+    ///
+    /// [`verdict`]: Decoder::verdict
+    pub fn fatal(&self) -> bool {
+        self.hard.load(Ordering::Acquire) || self.ghost.get().is_some()
     }
 
-    /// What the generated dispatch wrappers ask: should this command be skipped? Both flavours say
-    /// yes, and that identity is the containment mechanism.
-    pub fn fatal(&self) -> bool {
-        self.hard.load(Ordering::Acquire) || self.soft.get()
+    /// Why the command cannot run, taking the ghost with it so it does not outlive the command.
+    /// A stream poison outranks a ghost: a command that both named a ghost and failed to decode
+    /// is a stream we cannot follow, whatever it named.
+    pub fn verdict(&self) -> Dispatched {
+        let ghost = self.ghost.take();
+        if self.hard.load(Ordering::Acquire) {
+            Dispatched::Undecodable
+        } else if let Some(id) = ghost {
+            Dispatched::Ghosted(id)
+        } else {
+            Dispatched::Served
+        }
     }
 
     /// What the ring loop asks: is the stream itself unusable?
     pub fn hard_fatal(&self) -> bool {
         self.hard.load(Ordering::Acquire)
-    }
-
-    /// End of a command: the soft poison does not outlive it.
-    pub fn clear_soft_fatal(&self) {
-        self.soft.set(false);
     }
 
     /// The next `n` bytes without consuming them, or `None` (having poisoned the stream) if the
@@ -365,7 +393,7 @@ impl<'a> Decoder<'a> {
         match self.objects.lookup(id, ty) {
             Lookup::Found(handle) => handle,
             Lookup::Ghost => {
-                self.set_soft_fatal();
+                self.ghost.set(Some(id));
                 HostHandle(0)
             }
             Lookup::Missing => {
@@ -941,8 +969,8 @@ mod tests {
         assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
         assert!(dec.fatal());
         assert!(!dec.hard_fatal());
-        dec.clear_soft_fatal();
-        assert!(!dec.fatal());
+        assert_eq!(dec.verdict(), Dispatched::Ghosted(ObjectId(42)), "and the verdict names it");
+        assert!(!dec.fatal(), "a ghost does not outlive its command");
     }
 
     /// `VK_NULL_HANDLE` is an ordinary value, not a missing object: Vulkan spells "no object" as
@@ -979,7 +1007,7 @@ mod tests {
         let dec = Decoder::new(&buf, &temp, &Nothing, &hard);
         assert_eq!(dec.lookup_object(ObjectId(42), 0), HostHandle(0));
         assert!(dec.hard_fatal());
-        dec.clear_soft_fatal();
+        assert_eq!(dec.verdict(), Dispatched::Undecodable);
         assert!(dec.fatal(), "a hard poison does not clear with the command");
     }
 

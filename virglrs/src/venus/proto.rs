@@ -160,7 +160,7 @@ mod witness {
 mod tests {
     use super::serialize::*;
     use super::types::*;
-    use crate::venus::cs::{AllOfIt, Decoder, Encoder, IdentityObjects};
+    use crate::venus::cs::{AllOfIt, Decoder, Dispatched, Encoder, IdentityObjects};
     use bumpalo::Bump;
     use std::sync::atomic::AtomicBool;
 
@@ -290,7 +290,7 @@ mod tests {
             VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT,
             &mut h,
         );
-        assert_eq!(hit, Some(()));
+        assert_eq!(hit, Dispatched::Served);
         assert!(!dec.fatal());
         assert!(!h.saw_create);
         assert_eq!(h.unsupported, [VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT]);
@@ -299,7 +299,7 @@ mod tests {
         let mut dec = Decoder::new(&[], &temp, &IdentityObjects, &hard);
         assert_eq!(
             vn_dispatch_command(&mut dec, None, VkCommandTypeEXT(0x7fff_ffff), &mut h),
-            None
+            Dispatched::Undefined
         );
     }
 
@@ -375,7 +375,7 @@ mod tests {
         // The count call, as GTK sends it: the size is garbage and the blob is absent.
         let w = call(GARBAGE, 0);
         let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
-        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Dispatched::Served);
         assert!(!dec.fatal(), "a garbage size beside an absent blob is what every count call is");
         assert_eq!(dec.pos(), w.len());
         assert_eq!(h.saw, [(false, GARBAGE)]);
@@ -384,7 +384,7 @@ mod tests {
         // The data call: the room is the count, and the blob comes back padded to the word.
         let w = call(8, 8);
         let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
-        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
+        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Dispatched::Served);
         assert!(!dec.fatal());
         assert_eq!(dec.pos(), w.len());
         assert_eq!(h.saw, [(false, GARBAGE), (true, 8)]);
@@ -393,8 +393,11 @@ mod tests {
         // A guest that disagrees with itself about the room is not served.
         let w = call(8, 4);
         let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
-        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
-        assert!(dec.fatal(), "the count and the length member are one value");
+        assert_eq!(
+            vn_dispatch_command(&mut dec, None, CMD, &mut h),
+            Dispatched::Undecodable,
+            "the count and the length member are one value"
+        );
         assert_eq!(h.saw.len(), 2, "a poisoned decode reaches no handler");
 
         // Nor is one that offers more room than the arena will ever hold.
@@ -402,8 +405,11 @@ mod tests {
         let huge = crate::venus::cs::TEMP_POOL_MAX + 1;
         let w = call(huge, huge as u64);
         let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
-        assert_eq!(vn_dispatch_command(&mut dec, None, CMD, &mut h), Some(()));
-        assert!(dec.fatal(), "the room is bounded at the trust boundary, not by malloc");
+        assert_eq!(
+            vn_dispatch_command(&mut dec, None, CMD, &mut h),
+            Dispatched::Undecodable,
+            "the room is bounded at the trust boundary, not by malloc"
+        );
         assert_eq!(h.saw.len(), 2);
 
         // And the round trip reproduces both calls byte for byte, garbage included.
