@@ -459,6 +459,24 @@ SABOTAGES = [
         '',
     ),
     (
+        'memory the guest asked to export is the driver\'s own again, lent by a mapping',
+        'virglrs/src/venus/driver.rs',
+        """            && exports_memory(info.pNext)
+            && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)""",
+        """            && false""",
+        '',
+    ),
+    (
+        'minted pages lend no share, so the buffer stays trapped in one context',
+        'virglrs/src/venus/driver.rs',
+        """            Backing::Pages(p) => {
+                p.charge.share();
+                Some(Storage::Linear(Arc::clone(p)))
+            }""",
+        """            Backing::Pages(_) => None,""",
+        '',
+    ),
+    (
         'a resource id resolves to whatever another context filed under the same number',
         'virglrs/src/renderer.rs',
         """                BlobSource::Exported { ctx: owner, mem } if owner == ctx => {""",
