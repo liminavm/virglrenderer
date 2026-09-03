@@ -479,6 +479,55 @@ mod tests {
         buf
     }
 
+    /// `vkExecuteCommandStreamsMESA`, naming one stream elsewhere in the same resource.
+    fn wire_execute(offset: usize, size: usize) -> Vec<u8> {
+        use crate::venus::proto::serialize::{
+            vn_encode_vkExecuteCommandStreamsMESA_args, vn_sizeof_vkExecuteCommandStreamsMESA_args,
+        };
+        use crate::venus::proto::types::{
+            VkCommandStreamDescriptionMESA, vn_command_vkExecuteCommandStreamsMESA as Args,
+        };
+
+        let streams = [VkCommandStreamDescriptionMESA { resourceId: RES.get(), offset, size }];
+        let mut args = Args::default();
+        args.plant_pStreams(&streams);
+        let proto = crate::venus::cs::AllOfIt;
+        let mut buf = vec![0u8; vn_sizeof_vkExecuteCommandStreamsMESA_args(&proto, &args)];
+        let mut enc = crate::venus::cs::Encoder::new(&mut buf, &proto);
+        vn_encode_vkExecuteCommandStreamsMESA_args(&mut enc, VkFlags(0), &args);
+        buf
+    }
+
+    /// A transport wait inside an executed stream is refused, rather than suspending a batch that
+    /// has nowhere to resume from.
+    ///
+    /// A deviation from the C, which blocks inside the handler and so does not care where the
+    /// wait was. Ours unwinds to the caller with a position in the *outer* stream, and a position
+    /// in the outer stream cannot name a byte of the copy this command came from. Mesa records
+    /// `vkCmd*` work into execute streams and never transport waits, so nothing real should reach
+    /// this -- and if something ever does, the poison names the command and says the guess was
+    /// wrong.
+    #[test]
+    fn a_wait_inside_an_executed_stream_is_refused() {
+        const STREAM: usize = 0x22000;
+
+        let (mut v, map) = vkr();
+        assert!(
+            v.submit(ctx_id(), &wire_create_ring(7, &ring_info())).expect("created").ran(),
+            "the ring was created"
+        );
+
+        // A seqno nothing will ever publish: reached, this would suspend the ring's batch.
+        let inner = wire_wait_vq(9);
+        assert!(map.copy_in(STREAM, &inner), "the stream is inside the mapping");
+        guest_writes(&map, &wire_execute(STREAM, inner.len()));
+
+        until("the ring to refuse the wait", || {
+            v.submit(ctx_id(), &wire_submit_vq(7, 1)) == Ok(Submitted::Poisoned)
+        });
+        v.context_destroy(ctx_id());
+    }
+
     /// Perform a ring-seqno wait on its own thread, and fail rather than hang if it never ends.
     ///
     /// The deadline is the assertion. Every guard these waits carry exists because its absence
