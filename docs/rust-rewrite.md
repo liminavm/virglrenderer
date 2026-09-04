@@ -562,7 +562,13 @@ buildable throughout as the A-side reference.
   of the reference before a difference is charged to the port. That session, wallpaper
   included, is now the classic corpus: `vrend.bin` and the `vrend.score` pinned from it.
 
-  **Blob resources are what P3 owes next, and they are a blocker rather than a gap.**
+  **The cross-import is served, both halves of virglrs in one frame.** A `vkcube` window
+  composited into the enhanced guest's GNOME overview, the client's pixels rendered through
+  venus and sampled by a classic-virgl compositor through the IOSurface it exported, with no
+  copy between them. Read from two samples with the cube at different angles, which is what
+  separates a live desktop from the last frame a dead one left behind.
+
+  **Blob resources were what P3 owed, and they were a blocker rather than a gap.**
   `PipeResourceSetType` is where a blob becomes a typed image: it carries the format, bind,
   extent, modifier and per-plane stride and offset that the blob's own creation does not. The
   decoder reads all of it; only the dispatch refuses, and the refusal poisons the context that
@@ -572,11 +578,20 @@ buildable throughout as the A-side reference.
   its pixel gate passes; both images render through vrend, so serving this has to leave the
   one that works untouched.
 
-  It is also the whole of the cross-import gap. The venus half already works on a real
-  workload: a client's swapchain is exported, held as a share, and survives the death of the
-  context that made it. There is exactly one refusal in the chain and it is vrend's -- so this
-  is one consumer to build, not a pipeline. `Storage` is the currency, `image_from_iosurface`
-  the adoption point, and the boot is the gate, because replay cannot reach any of it.
+  It was also the whole of the cross-import gap: one consumer to build, not a pipeline. A
+  handle now names a resource or storage nothing has typed yet, `SET_TYPE` is the upgrade that
+  converts the second into the first, and it consumes what it converts, so nothing can type a
+  handle and leave the old entry standing. The surface is adopted, never minted -- a surface
+  minted at the upgrade would be a second copy of the frame the client is presenting, and the
+  guest would composite the one nobody draws into.
+
+  Three outcomes there, each answering to whoever caused it, because conflating them is how a
+  host bug ends up wearing a guest's clothes. Arguments describing no image are the guest's
+  error and refuse its own context. A blob whose share is not a surface, or a host that adopts
+  none, is nobody's error: a blank texture, zeroed because `glTexStorage` leaves contents
+  undefined and undefined is another context's memory read as pixels. A driver that said it
+  imports IOSurfaces and then refuses one aborts, because degrading there hides our own defect
+  behind a window that merely renders something else.
 
   **Ported as the C has it, and owed a redesign.** What lands here is a workaround, adopted
   deliberately so the desktop runs; three things under it are wrong, and all three are this

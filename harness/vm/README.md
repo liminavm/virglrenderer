@@ -62,6 +62,14 @@ frame**, rewritten as frames arrive: read it while the workload runs and it is t
 read it after shutdown and it is the teardown console. The `*-frame.png` files a capture leaves
 behind are therefore poweroff screens and evidence of nothing.
 
+Which makes one frame insufficient on its own: a compositor whose context died leaves the last
+frame it presented sitting in the surface, and that frame looks exactly like a seated desktop.
+**Two samples, and something in them that has to move.** The clock is the obvious candidate and
+a poor one -- it changes once a minute, so two samples inside the same minute prove nothing.
+Anything animating is better: a rotating `vkcube` in the frame settles both liveness and its own
+import at once, since a cube at a different angle in the second sample is a client still drawing
+and a compositor still sampling it.
+
 `--renderer c|rust` picks which build to boot, and picks the bundle with it: `Limina.app` holds
 the C, `Limina-rust.app` holds virglrs. Only the C records — the recorder is a C-tree feature, so a
 virglrs boot yields no corpus and the two legs divide accordingly: the C leg captures, the Rust leg
