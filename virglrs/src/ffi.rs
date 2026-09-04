@@ -60,6 +60,7 @@ fn config_of(flags: c_int) -> Config {
         venus: flags & abi::VENUS != 0,
         vrend: flags & abi::NO_VIRGL == 0,
         guest_vram: flags & abi::USE_GUEST_VRAM != 0,
+        video: flags & abi::USE_VIDEO != 0,
     }
 }
 
@@ -1758,21 +1759,29 @@ mod tests {
     /// `NO_VIRGL` is spelled inside out, and an inverted read of it is invisible: it changes a
     /// startup log line and, in P3, whether vrend exists at all. `guest_vram` is worse -- it
     /// reaches the guest through the capset, which decides where the guest allocates from, and no
-    /// gate here reads a capset.
+    /// gate here reads a capset. `video` is the same shape of miss: it decides whether the host
+    /// advertises a decoder, and a guest reads that long before it sends a command.
     ///
     /// `venus` is the one bit a corpus would catch, since the replay needs the renderer to exist.
     #[test]
     fn the_init_flags_decode_into_the_configuration_they_name() {
-        assert_eq!(config_of(0), Config { venus: false, vrend: true, guest_vram: false });
+        assert_eq!(
+            config_of(0),
+            Config { venus: false, vrend: true, guest_vram: false, video: false }
+        );
 
         // Every flag that means something, and one that does not, to show it changes nothing.
-        let all = abi::VENUS | abi::NO_VIRGL | abi::USE_GUEST_VRAM | abi::USE_EGL;
-        assert_eq!(config_of(all), Config { venus: true, vrend: false, guest_vram: true });
+        let all = abi::VENUS | abi::NO_VIRGL | abi::USE_GUEST_VRAM | abi::USE_VIDEO | abi::USE_EGL;
+        assert_eq!(
+            config_of(all),
+            Config { venus: true, vrend: false, guest_vram: true, video: true }
+        );
 
         // One at a time, so a bit read for the wrong field cannot hide behind another.
         assert!(config_of(abi::VENUS).venus);
         assert!(!config_of(abi::NO_VIRGL).vrend, "NO_VIRGL means vrend is absent");
         assert!(config_of(abi::USE_GUEST_VRAM).guest_vram);
+        assert!(config_of(abi::USE_VIDEO).video);
         assert_eq!(config_of(abi::USE_EGL), config_of(0), "a winsys flag reaches the renderer");
     }
 

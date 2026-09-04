@@ -494,7 +494,7 @@ impl Renderer {
         // thread needs the table long after the call that created its ring returned, and it must
         // not need the renderer to get it.
         let resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>> = Arc::default();
-        let vrend = if config.vrend { Some(vrend::vrend::Vrend::new()?) } else { None };
+        let vrend = if config.vrend { Some(vrend::vrend::Vrend::new(config)?) } else { None };
         Ok(Renderer {
             config,
             resources: Arc::clone(&resources),
