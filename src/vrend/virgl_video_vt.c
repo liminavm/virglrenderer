@@ -780,7 +780,13 @@ static int ensure_session(struct virgl_video_codec *codec,
     CFNumberRef pixel_format_num;
     VTDecompressionOutputCallbackRecord callback;
     const bool av1 = codec->profile == PIPE_VIDEO_PROFILE_AV1_MAIN;
-    enum pipe_format target_format = target ? target->format : PIPE_FORMAT_NV12;
+    /* A unit with no target is decoded for its reference value alone: for the DPB, or into a
+     * destination that was destroyed. It expresses no opinion about the pixel layout, so the
+     * session keeps the one it has -- rebuilding it around a default would tear down a live
+     * session mid-stream on any format but NV12. */
+    enum pipe_format target_format = target ? target->format
+                                    : codec->session ? codec->session_target_format
+                                                     : PIPE_FORMAT_NV12;
     int32_t pixel_format = cv_format_for(target_format);
     OSStatus status;
 
@@ -1814,12 +1820,13 @@ static int av1_flush_held(struct virgl_video_codec *codec,
                           const struct virgl_av1_picture_desc *desc)
 {
     struct virgl_video_buffer *target = codec->held_target;
+    bool discard = false;
     ssize_t n;
 
     if (!ensure_unit(codec, virgl_av1_held_bound(&codec->av1) + VIRGL_AV1_UNIT_OVERHEAD))
         return -1;
 
-    n = virgl_av1_flush_held(&codec->av1, desc, codec->unit, codec->unit_cap);
+    n = virgl_av1_flush_held(&codec->av1, desc, codec->unit, codec->unit_cap, &discard);
     if (n < 0) {
         virgl_error("video: could not serialize the held AV1 frame\n");
         return -1;
@@ -1828,7 +1835,12 @@ static int av1_flush_held(struct virgl_video_codec *codec,
         return 0;
 
     codec->held_target = NULL;
-    VT_TRACE("av1: flushing the held frame, %zd bytes\n", n);
+    /* This frame's picture was delivered when it went out; the copy exists only to reach
+     * the DPB, and its target may since have been recycled for a different frame. */
+    if (discard)
+        target = NULL;
+    VT_TRACE("av1: flushing the held frame, %zd bytes%s\n", n,
+             discard ? " (DPB only, picture discarded)" : "");
     /* Never a full refresh: a key frame resets the model and is never held. */
     return av1_route_unit(codec, codec->unit, (size_t)n, target, false);
 }
