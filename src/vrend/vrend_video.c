@@ -950,7 +950,7 @@ static void destroy_video_buffer(struct vrend_video_buffer *buf)
 
         glDeleteTextures(1, &plane->texture);
         glDeleteFramebuffers(1, &plane->framebuffer);
-        if (plane->egl_image == EGL_NO_IMAGE_KHR)
+        if (plane->egl_image != EGL_NO_IMAGE_KHR)
             eglDestroyImageKHR(eglGetCurrentDisplay(), plane->egl_image);
     }
 
