@@ -435,6 +435,38 @@ pub struct Context {
     pub last_fence: BTreeMap<RingIdx, FenceId>,
 }
 
+/// One capset, as the guest reads it: which one decides both its layout and the version a
+/// caller may ask for.
+// A capset is built once per request and copied straight out to the caller's buffer; the size
+// difference between the sets is the sets' own, not an indirection worth adding.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy, Debug)]
+pub enum Capset {
+    Venus(venus::capset::Capset),
+    Virgl(vrend::caps::CapsV1),
+    Virgl2(vrend::caps::CapsV2),
+}
+
+impl Capset {
+    /// The newest version of this capset the build fills: what `get_cap_set` reports, and the
+    /// most a `fill_caps` may ask for.
+    pub fn version(&self) -> u32 {
+        match self {
+            Capset::Venus(_) => venus::capset::VERSION,
+            Capset::Virgl(_) => vrend::caps::VIRGL_VERSION,
+            Capset::Virgl2(_) => vrend::caps::VIRGL2_VERSION,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Capset::Venus(c) => c.as_bytes(),
+            Capset::Virgl(c) => c.as_bytes(),
+            Capset::Virgl2(c) => c.as_bytes(),
+        }
+    }
+}
+
 pub struct Renderer {
     pub config: Config,
     /// Shared with every ring thread, which reads it to resolve a reply stream's resource while
@@ -483,10 +515,14 @@ impl Renderer {
     /// to hand the image to a guest asks for the bytes at that moment -- which is the only point
     /// at which the layout matters, and is never here. The version a C caller names is checked at
     /// the shim, where a requested version is a thing that exists.
-    pub fn capset(&self, set: CapsetId) -> Option<venus::capset::Capset> {
+    pub fn capset(&self, set: CapsetId) -> Option<Capset> {
         match set {
-            CapsetId::Venus => self.venus.as_ref().map(|_| venus::capset::Capset::new(self.config)),
-            _ => None,
+            CapsetId::Venus => {
+                self.venus.as_ref().map(|_| Capset::Venus(venus::capset::Capset::new(self.config)))
+            }
+            CapsetId::Virgl => self.vrend.as_ref().map(|v| Capset::Virgl(v.caps().v1())),
+            CapsetId::Virgl2 => self.vrend.as_ref().map(|v| Capset::Virgl2(*v.caps())),
+            CapsetId::Unknown(_) => None,
         }
     }
 
@@ -497,7 +533,7 @@ impl Renderer {
     /// other read whether the renderer existed -- and a VMM that sized a buffer from the first and
     /// got nothing from the second would hand its guest an uninitialised capset.
     pub fn capset_max(&self, set: CapsetId) -> Option<(u32, u32)> {
-        self.capset(set).map(|_| (venus::capset::VERSION, venus::capset::size()))
+        self.capset(set).map(|c| (c.version(), c.as_bytes().len() as u32))
     }
 
     // ---- resources ----
@@ -1722,7 +1758,9 @@ mod tests {
     #[test]
     fn the_capset_a_caller_receives_carries_the_configuration() {
         let on = Config { venus: true, guest_vram: true, ..Config::default() };
-        let c = renderer(on).capset(CapsetId::Venus).expect("venus is served");
+        let Some(Capset::Venus(c)) = renderer(on).capset(CapsetId::Venus) else {
+            panic!("venus is served");
+        };
         assert_eq!(c.use_guest_vram, 1, "a field, read as a field");
         assert_eq!(c.as_bytes().len(), venus::capset::size() as usize);
     }

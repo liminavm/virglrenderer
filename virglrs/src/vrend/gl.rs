@@ -177,6 +177,37 @@ impl Gl {
         v
     }
 
+    /// `glGetIntegeri_v`: one integer of an indexed state.
+    pub fn get_integer_i(&self, name: GLenum, index: GLuint) -> GLint {
+        let mut v: GLint = 0;
+        // SAFETY: every indexed name this crate asks for writes exactly one integer.
+        unsafe { self.t.glGetIntegeri_v()(name, index, &mut v) };
+        v
+    }
+
+    pub fn get_float(&self, name: GLenum) -> GLfloat {
+        let mut v: GLfloat = 0.0;
+        // SAFETY: every name this crate asks for through here writes exactly one float.
+        unsafe { self.t.glGetFloatv()(name, &mut v) };
+        v
+    }
+
+    /// `glGetFloatv` for a two-float range (`GL_ALIASED_POINT_SIZE_RANGE` and its kin).
+    pub fn get_float_range(&self, name: GLenum) -> [GLfloat; 2] {
+        let mut v: [GLfloat; 2] = [0.0; 2];
+        // SAFETY: every name this crate asks for through here writes exactly two floats.
+        unsafe { self.t.glGetFloatv()(name, v.as_mut_ptr()) };
+        v
+    }
+
+    /// `glGetMultisamplefv(GL_SAMPLE_POSITION, index)`: where a sample sits in its pixel.
+    pub fn get_sample_position(&self, index: GLuint) -> [GLfloat; 2] {
+        let mut v: [GLfloat; 2] = [0.0; 2];
+        // SAFETY: `GL_SAMPLE_POSITION` writes exactly two floats.
+        unsafe { self.t.glGetMultisamplefv()(GL_SAMPLE_POSITION, index, v.as_mut_ptr()) };
+        v
+    }
+
     pub fn get_string(&self, name: GLenum) -> String {
         // SAFETY: `glGetString` returns null or a NUL-terminated string owned by the driver, live
         // while the context is; it is copied out immediately.
