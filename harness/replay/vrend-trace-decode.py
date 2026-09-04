@@ -369,8 +369,10 @@ def main():
                 ref(dw[2], r[0], name + " src")
             elif name == "CREATE_OBJECT" and len(dw) > 2:
                 kind = (dw[0] >> 8) & 0xFF
-                if kind in (3, 8):   # sampler view, surface -- both name a resource
-                    ref(dw[2], r[0], "CREATE_OBJECT %s" % ("sampler_view" if kind == 3 else "surface"))
+                # VIRGL_OBJECT_SAMPLER_VIEW is 6 and VIRGL_OBJECT_SURFACE 8 -- both name a
+                # resource in dword 2. Kind 3 is the DSA state, whose dword 2 is a state word.
+                if kind in (6, 8):
+                    ref(dw[2], r[0], "CREATE_OBJECT %s" % ("sampler_view" if kind == 6 else "surface"))
 
         missing, late = [], []
         for h, uses in refs.items():
