@@ -283,6 +283,17 @@ wire_enum!(
 );
 
 wire_enum!(
+    /// `PIPE_IMAGE_ACCESS_*`, the ways a shader may touch a bound image. Zero is no access,
+    /// which the C refuses at the draw with the rest of the stage's images abandoned; a refusal
+    /// here keeps it from being bound at all.
+    ImageAccess {
+        Read = 1,
+        Write = 2,
+        ReadWrite = 3,
+    }
+);
+
+wire_enum!(
     /// `pipe_render_cond_flag`.
     RenderCondMode {
         Wait = 0,

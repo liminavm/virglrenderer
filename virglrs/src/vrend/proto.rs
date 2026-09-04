@@ -311,13 +311,34 @@ pub struct RasterizerState {
     pub offset_clamp: f32,
 }
 
+/// The transform-feedback buffer an output lands in: the index into `StreamOutput::stride`.
+/// The wire gives it three bits and the table has four entries, so it is parsed, not cast.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SoBuffer(u8);
+
+impl SoBuffer {
+    pub const COUNT: usize = 4;
+
+    pub fn from_wire(raw: u32) -> Option<SoBuffer> {
+        (raw < Self::COUNT as u32).then_some(SoBuffer(raw as u8))
+    }
+
+    pub fn wire(self) -> u32 {
+        u32::from(self.0)
+    }
+
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
 /// One transform-feedback output, as `pipe_stream_output`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SoOutput {
     pub register_index: u8,
     pub start_component: u8,
     pub num_components: u8,
-    pub output_buffer: u8,
+    pub output_buffer: SoBuffer,
     pub dst_offset: u16,
     pub stream: u8,
 }
@@ -326,7 +347,7 @@ pub struct SoOutput {
 /// with none, the strides are not on the wire either.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct StreamOutput {
-    pub stride: [u32; 4],
+    pub stride: [u32; SoBuffer::COUNT],
     pub outputs: Vec<SoOutput>,
 }
 
@@ -474,10 +495,43 @@ pub struct VertexBuffer {
     pub resource: Option<ResourceHandle>,
 }
 
+/// The width of one index, as the wire carries it: its size in bytes. Three widths exist; the
+/// C draws with `GL_UNSIGNED_INT` for any other value while sizing its bounds check by the
+/// value as sent, so a width of 3 passed the check for a draw that read a third more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexType {
+    U8,
+    U16,
+    U32,
+}
+
+impl IndexType {
+    pub fn from_wire(raw: u32) -> Option<IndexType> {
+        match raw {
+            1 => Some(IndexType::U8),
+            2 => Some(IndexType::U16),
+            4 => Some(IndexType::U32),
+            _ => None,
+        }
+    }
+
+    pub fn bytes(self) -> u32 {
+        match self {
+            IndexType::U8 => 1,
+            IndexType::U16 => 2,
+            IndexType::U32 => 4,
+        }
+    }
+
+    pub fn wire(self) -> u32 {
+        self.bytes()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IndexBuffer {
     pub resource: ResourceHandle,
-    pub index_size: u32,
+    pub index_type: IndexType,
     pub offset: u32,
 }
 
@@ -544,13 +598,15 @@ pub struct ShaderBuffer {
     pub resource: Option<ResourceHandle>,
 }
 
+/// A bound shader image. An entry that unbinds its slot is `None` on the wire as five zero
+/// dwords, and only a bound one has an access to parse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShaderImage {
     pub format: Format,
-    pub access: u32,
+    pub access: ImageAccess,
     pub layer_offset: u32,
     pub level_size: u32,
-    pub resource: Option<ResourceHandle>,
+    pub resource: ResourceHandle,
 }
 
 /// Which way a `COPY_TRANSFER3D` moves bytes between a resource and a staging buffer.
@@ -694,7 +750,7 @@ pub enum Command<'a> {
     SetShaderImages {
         stage: ShaderStage,
         start_slot: u32,
-        images: Vec<ShaderImage>,
+        images: Vec<Option<ShaderImage>>,
     },
     MemoryBarrier(u32),
     LaunchGrid {

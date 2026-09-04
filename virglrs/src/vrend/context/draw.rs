@@ -289,7 +289,7 @@ fn set_stream_out_varyings(gl: &Gl, program: ProgramName, info: &shader::Info) {
     let mut last_buffer = 0usize;
     let mut buf_offset = 0i32;
     for (i, out) in so.outputs.iter().enumerate() {
-        let buffer = out.output_buffer as usize;
+        let buffer = out.output_buffer.index();
         if last_buffer != buffer {
             let mut skip = so.stride[last_buffer] as i32 - buf_offset;
             while skip != 0 && varyings.len() < MAX {
@@ -672,6 +672,9 @@ impl Context {
         }
         let same = sub.program().is_some_and(|p| p.stages == ids && p.dual_src_linked == dual_src);
         if same {
+            // The selection is settled either way; a flag left standing here would run the
+            // nine key passes again on every draw of this program.
+            self.sub_mut().shader_dirty = false;
             return Ok(false);
         }
         let found = sub
@@ -1150,13 +1153,9 @@ impl Context {
                 _ => continue,
             };
             let access = match iview.access {
-                1 => GL_READ_ONLY,
-                2 => GL_WRITE_ONLY,
-                3 => GL_READ_WRITE,
-                _ => {
-                    eprintln!("[virglrs] vrend: invalid image access specified");
-                    return;
-                }
+                ImageAccess::Read => GL_READ_ONLY,
+                ImageAccess::Write => GL_WRITE_ONLY,
+                ImageAccess::ReadWrite => GL_READ_WRITE,
             };
             gl.bind_image_texture(
                 image_unit,
@@ -1350,7 +1349,8 @@ impl Context {
             };
             let res = host.resource(cmd, ib.resource)?;
             if indirect.is_none() {
-                let expected = ib.index_size as u64 * draw.count as u64 + ib.offset as u64;
+                let expected =
+                    ib.index_type.bytes() as u64 * draw.count as u64 + ib.offset as u64;
                 if expected > res.args.width as u64 {
                     eprintln!(
                         "[virglrs] vrend: indexed array buffer ({}) not large enough for draw operation (req. {expected})",
@@ -1363,10 +1363,10 @@ impl Context {
                 return Err(Fault::IllegalResource { cmd, handle: ib.resource });
             };
             gl.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, Some(name));
-            index_type = match ib.index_size {
-                1 => GL_UNSIGNED_BYTE,
-                2 => GL_UNSIGNED_SHORT,
-                _ => GL_UNSIGNED_INT,
+            index_type = match ib.index_type {
+                IndexType::U8 => GL_UNSIGNED_BYTE,
+                IndexType::U16 => GL_UNSIGNED_SHORT,
+                IndexType::U32 => GL_UNSIGNED_INT,
             };
             ib_offset = ib.offset;
         } else {

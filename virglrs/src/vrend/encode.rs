@@ -163,7 +163,7 @@ impl Enc<'_> {
             Command::SetIndexBuffer(None) => self.u(0),
             Command::SetIndexBuffer(Some(ib)) => {
                 self.u(ib.resource.get());
-                self.u(ib.index_size);
+                self.u(ib.index_type.wire());
                 self.u(ib.offset);
             }
             Command::SetConstantBuffer { stage, index, data } => {
@@ -281,11 +281,16 @@ impl Enc<'_> {
                 self.u(stage.wire());
                 self.u(*start_slot);
                 for i in images {
-                    self.u(i.format.wire());
-                    self.u(i.access);
-                    self.u(i.layer_offset);
-                    self.u(i.level_size);
-                    self.u(res(i.resource));
+                    match i {
+                        Some(i) => {
+                            self.u(i.format.wire());
+                            self.u(i.access.wire());
+                            self.u(i.layer_offset);
+                            self.u(i.level_size);
+                            self.u(i.resource.get());
+                        }
+                        None => self.words(&[0; 5]),
+                    }
                 }
             }
             Command::LaunchGrid { block, grid, indirect, indirect_offset } => {
@@ -576,7 +581,7 @@ impl Enc<'_> {
                                 self.u(u32::from(o.register_index)
                                     | (u32::from(o.start_component) << 8)
                                     | (u32::from(o.num_components) << 10)
-                                    | (u32::from(o.output_buffer) << 13)
+                                    | (o.output_buffer.wire() << 13)
                                     | (u32::from(o.dst_offset) << 16));
                                 self.u(u32::from(o.stream));
                             }
