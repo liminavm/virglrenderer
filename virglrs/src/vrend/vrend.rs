@@ -68,7 +68,7 @@ pub struct Vrend {
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
     current: Current,
-    resources: BTreeMap<ResourceHandle, Resource>,
+    resources: BTreeMap<ResourceHandle, resource::Slot>,
     contexts: BTreeMap<ContextId, Context>,
     pub todo: Todo,
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
@@ -247,14 +247,14 @@ impl Vrend {
             &self.limits,
             args,
         )?;
-        self.resources.insert(handle, res);
+        self.resources.insert(handle, resource::Slot::Resource(res));
         Ok(())
     }
 
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
     /// every time: the surface goes with the resource, and there is no other place to hold one.
     pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&metal::Surface> {
-        self.resources.get(&handle)?.surface()
+        self.resources.get(&handle)?.resource()?.surface()
     }
 
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
@@ -289,7 +289,9 @@ impl Vrend {
     /// Delete the host side of a resource, on ctx0. A handle this renderer never held is
     /// nothing to delete: the renderer's table also holds resources vrend has no side of.
     pub fn resource_destroy(&mut self, handle: ResourceHandle) {
-        if let Some(res) = self.resources.remove(&handle) {
+        // An untyped slot owns only a share of someone else's storage: dropping it is the
+        // whole of its teardown, and it needs no GL context to do it.
+        if let Some(resource::Slot::Resource(res)) = self.resources.remove(&handle) {
             self.switch_ctx0();
             if let Some(still_attached) = res.destroy(&self.gl) {
                 self.doomed.push(still_attached);
@@ -312,14 +314,14 @@ impl Vrend {
     }
 
     pub fn resource(&self, handle: ResourceHandle) -> Option<&Resource> {
-        self.resources.get(&handle)
+        self.resources.get(&handle)?.resource()
     }
 
     /// The guest attached pages to a resource: a host-memory buffer pushes its contents into
     /// them (`vrend_pipe_resource_attach_iov`).
     pub fn resource_attached(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
         if let Some(Resource { storage: resource::Storage::Host(buf), .. }) =
-            self.resources.get(&handle)
+            self.resources.get(&handle).and_then(resource::Slot::resource)
             && !pages.copy_in(0, buf)
         {
             eprintln!(
@@ -332,7 +334,7 @@ impl Vrend {
     /// (`vrend_pipe_resource_detach_iov`).
     pub fn resource_detaching(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
         if let Some(Resource { storage: resource::Storage::Host(buf), .. }) =
-            self.resources.get_mut(&handle)
+            self.resources.get_mut(&handle).and_then(resource::Slot::resource_mut)
             && !pages.copy_out(0, buf)
         {
             eprintln!(
@@ -371,7 +373,11 @@ impl Vrend {
         if pages.is_empty() {
             return Err(transfer::Error::NoPages);
         }
-        let res = self.resources.get_mut(&handle).ok_or(transfer::Error::NoPages)?;
+        let res = self
+            .resources
+            .get_mut(&handle)
+            .and_then(resource::Slot::resource_mut)
+            .ok_or(transfer::Error::NoPages)?;
         if to_host {
             transfer::write(&self.gl, &self.formats, res, own, pages, info)
         } else {
