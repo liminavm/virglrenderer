@@ -519,6 +519,9 @@ pub enum Configuration {
     H264 { sps: Vec<u8>, pps: Vec<u8> },
     /// An HEVC VPS, SPS and PPS, as NAL units without framing.
     Hevc { vps: Vec<u8>, sps: Vec<u8>, pps: Vec<u8> },
+    /// An AV1 codec configuration record, an `av1C` box. Variable length: it carries the
+    /// sequence header OBU after its four-byte header.
+    Av1c(Vec<u8>),
 }
 
 impl Configuration {
@@ -552,13 +555,18 @@ impl Configuration {
         Configuration::Hevc { vps, sps, pps }
     }
 
+    /// The AV1 record for a stream this `av1C` box describes.
+    pub fn av1c(box_: Vec<u8>) -> Configuration {
+        Configuration::Av1c(box_)
+    }
+
     /// Whether this configuration is carried as parameter set NALs rather than as an atom.
     ///
     /// The two are not interchangeable and only the parameter-set kind can be swapped under a
     /// live session, so the distinction is asked for by name rather than inferred from a codec.
     pub fn is_parameter_sets(&self) -> bool {
         match self {
-            Configuration::Vpcc(_) => false,
+            Configuration::Vpcc(_) | Configuration::Av1c(_) => false,
             Configuration::H264 { .. } | Configuration::Hevc { .. } => true,
         }
     }
@@ -573,6 +581,13 @@ impl Configuration {
                 c"vpcC",
                 bytes,
                 Codec::Vp9 as CmVideoCodecType,
+                width,
+                height,
+            ),
+            Configuration::Av1c(bytes) => Configuration::atom_format(
+                c"av1C",
+                bytes,
+                Codec::Av1 as CmVideoCodecType,
                 width,
                 height,
             ),
@@ -821,6 +836,15 @@ impl Session {
         // SAFETY: VTDecompressionSessionCreate returns a reference the caller owns.
         let session = unsafe { Owned::from_created(session) }.ok_or(Status(-1))?;
         Ok(Session { session, format, key, parked })
+    }
+
+    /// The pixel layout this session was built to produce.
+    ///
+    /// Asked for by a unit that has no target of its own and so no opinion about the layout:
+    /// rebuilding the session around a default would tear a live one down mid-stream on any
+    /// layout but NV12.
+    pub fn pixels(&self) -> PixelFormat {
+        self.key.pixels
     }
 
     /// Whether this session decodes frames of that shape, or a new one is needed.

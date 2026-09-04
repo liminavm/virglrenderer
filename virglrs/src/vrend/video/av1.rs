@@ -722,7 +722,33 @@ pub struct FrameDesc {
     pub slices: Vec<Slice>,
 }
 
+/// How much of an AV1 picture descriptor is read: through `slice_count`, the last field the
+/// serializer consults, which is two bytes.
+pub const DESCRIPTOR_BYTES: usize = at::SLICE_COUNT + 2;
+
+/// A descriptor that reads as a valid Main frame of that size, for tests that need one.
+///
+/// Everything else zero, which is a shown-nothing key frame -- the least a descriptor can say
+/// and still be one.
+#[cfg(test)]
+pub fn test_descriptor(width: u16, height: u16) -> Vec<u8> {
+    let mut blob = vec![0u8; DESCRIPTOR_BYTES];
+    blob[at::MAX_WIDTH..][..2].copy_from_slice(&width.to_le_bytes());
+    blob[at::MAX_HEIGHT..][..2].copy_from_slice(&height.to_le_bytes());
+    blob[at::FRAME_WIDTH..][..2].copy_from_slice(&width.to_le_bytes());
+    blob[at::FRAME_HEIGHT..][..2].copy_from_slice(&height.to_le_bytes());
+    blob
+}
+
 impl FrameDesc {
+    /// Whether this frame re-seeds every reference slot.
+    ///
+    /// A *shown* key frame, and only that. The frame gate asks it, and the model's replay
+    /// history can start again there rather than growing for the life of the stream.
+    pub fn starts_dpb(&self) -> bool {
+        self.frame_type == FRAME_KEY && self.show_frame
+    }
+
     /// Read a descriptor the guest wrote.
     ///
     /// Every count that indexes a fixed array is reconciled with it here, and a count the array
@@ -2093,6 +2119,25 @@ impl ObuState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key frame re-seeds every slot only if it is shown. A hidden one refreshes nothing the
+    /// gate can rely on, and an inter frame never does.
+    #[test]
+    fn only_a_shown_key_frame_starts_the_reference_slots() {
+        let mut blob = test_descriptor(640, 360);
+        let mut desc = FrameDesc::read(&blob).expect("a Main frame");
+        assert_eq!(desc.frame_type, FRAME_KEY);
+        assert!(!desc.show_frame);
+        assert!(!desc.starts_dpb());
+
+        blob[at::PIC_SHOW_FRAME.at] |= 1 << at::PIC_SHOW_FRAME.shift;
+        desc = FrameDesc::read(&blob).expect("still a Main frame");
+        assert!(desc.show_frame);
+        assert!(desc.starts_dpb());
+
+        desc.frame_type = FRAME_INTER;
+        assert!(!desc.starts_dpb());
+    }
 
     #[test]
     fn leb128_grows_a_byte_every_seven_bits() {
