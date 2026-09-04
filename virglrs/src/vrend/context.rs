@@ -34,7 +34,7 @@ use super::pipe::slots::{
 };
 use super::pipe::*;
 use super::proto::{self, *};
-use super::resource::{self, Limits, Resource, Storage};
+use super::resource::{self, Limits, Resource, Storage, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi};
 use crate::guest_mem::{HostSpan, Iov};
@@ -328,7 +328,10 @@ pub struct Surf {
     pub first_layer: u32,
     pub last_layer: u32,
     pub nr_samples: u32,
-    pub view: Option<TextureName>,
+    /// Which of the resource's views this surface renders through, when it does not render
+    /// through the resource's own texture. The name is the resource's; this is the key to it, so
+    /// destroying the surface takes nothing the framebuffer is still using with it.
+    pub view: Option<ViewKey>,
 }
 
 impl Surf {
@@ -389,11 +392,21 @@ impl Object {
 /// keeps a reference to. Resolved against the resource when bound; the handle is kept so a
 /// later bind of the same object is a no-op.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A surface as the framebuffer keeps it: everything attaching it needs, and nothing that has to
+/// be looked up again.
+///
+/// It holds no object handle. The guest may destroy a bound surface, and a slot naming a freed
+/// handle is both a dangling lookup and -- once the handle is reused -- a false "already bound".
+/// A surface is immutable once created, so the description here cannot drift from the object it
+/// was read off, and comparing descriptions is the identity a re-attach actually turns on: two
+/// surfaces that describe the same thing attach the same texture the same way.
 pub struct BoundSurface {
-    pub handle: ObjectHandle,
     pub resource: ResourceHandle,
     pub format: Format,
     pub level: u32,
+    /// The layer to attach, or `None` for every layer (the C's -1).
+    pub layer: Option<GLint>,
+    pub view: Option<ViewKey>,
     pub nr_samples: u32,
     pub tex_height: u32,
     pub y_0_top: bool,
@@ -677,27 +690,6 @@ fn evict_view(
     held
 }
 
-/// Empty every framebuffer slot naming `handle`: whether the depth slot held it, and the colour
-/// slots that did. The attachments they name are the ones to detach.
-fn evict_surface(
-    zsurf: &mut Option<BoundSurface>,
-    cbufs: &mut [Option<BoundSurface>],
-    handle: ObjectHandle,
-) -> (bool, Vec<usize>) {
-    let held_z = zsurf.is_some_and(|s| s.handle == handle);
-    if held_z {
-        *zsurf = None;
-    }
-    let mut colours = Vec::new();
-    for (i, slot) in cbufs.iter_mut().enumerate() {
-        if slot.is_some_and(|s| s.handle == handle) {
-            *slot = None;
-            colours.push(i);
-        }
-    }
-    (held_z, colours)
-}
-
 /// Release an object's GL side. The sub-context that made it is current.
 fn release(gl: &Gl, obj: Object) {
     match obj {
@@ -718,11 +710,9 @@ fn release(gl: &Gl, obj: Object) {
                 }
             }
         }
-        Object::Surface(s) => {
-            if let Some(t) = s.view {
-                gl.delete_texture(t);
-            }
-        }
+        // A surface owns nothing: its view belongs to the resource, which is what lets the
+        // framebuffer keep drawing through one the guest has destroyed.
+        Object::Surface(_) => {}
         Object::Query(q) => gl.delete_query(q.id),
         Object::Shader(_) => unreachable!("a shader leaves through draw::release_shader"),
         Object::Blend(_) | Object::Rasterizer(_) | Object::Dsa(_) | Object::StreamoutTarget(_) => {}
@@ -1250,45 +1240,10 @@ impl Context {
                     *stage = rebuilt;
                 }
             }
-            Object::Surface(_) => {
-                // A DEVIATION FROM THE C, which holds a reference from the framebuffer, so a
-                // surface destroyed while attached keeps taking pixels until the next
-                // SET_FRAMEBUFFER_STATE. Here the surface's view texture is deleted with it,
-                // and an attachment naming a deleted texture is detached by GL only if that
-                // framebuffer happens to be the bound one -- so the C's behaviour would be
-                // reproduced by luck, and the slot's value copy would compare equal to an
-                // identical later bind and skip re-attaching what GL had quietly dropped.
-                // The attachment and the slot are emptied together instead, which costs one
-                // detach for a guest that destroys a bound surface before rebinding.
-                let fb = self.sub().fb;
-                let sub = self.sub_mut();
-                let (held_z, colours) = evict_surface(&mut sub.zsurf, &mut sub.cbufs, handle);
-                for i in &colours {
-                    sub.swizzle_output_rgb_to_bgr &= !(1 << i);
-                    sub.needs_manual_srgb_encode &= !(1 << i);
-                }
-                if held_z || !colours.is_empty() {
-                    gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
-                    if held_z {
-                        gl.framebuffer_texture_2d(
-                            GL_DEPTH_STENCIL_ATTACHMENT,
-                            GL_TEXTURE_2D,
-                            None,
-                            0,
-                        );
-                    }
-                    for i in colours {
-                        gl.framebuffer_texture_2d(
-                            GL_COLOR_ATTACHMENT0 + i as GLenum,
-                            GL_TEXTURE_2D,
-                            None,
-                            0,
-                        );
-                    }
-                    sub.shader_dirty = true;
-                    sub.blend_dirty = true;
-                }
-            }
+            // The framebuffer holds its own copy of every surface it attached, so a destroy
+            // is invisible to it: it goes on taking pixels until the next
+            // SET_FRAMEBUFFER_STATE, as the C's reference from the framebuffer makes it.
+            Object::Surface(_) => {}
             Object::StreamoutTarget(_) => {
                 let sub = self.sub_mut();
                 let mut i = 0;
@@ -1803,7 +1758,7 @@ impl Context {
             ),
         };
         let mut view = None;
-        if let Storage::Texture { name, target, immutable: true, .. } = res.storage
+        if let Storage::Texture { target, immutable: true, .. } = res.storage
             && host.features.has(Feature::texture_view)
         {
             let max_layer = res.depth_at(level).saturating_sub(1);
@@ -1815,10 +1770,12 @@ impl Context {
             // A resource that cannot be viewed is rendered to as itself, with the conversion the
             // view would have done moved into the writes (`set_framebuffer_state`, the clears).
             if needs_view && res.supports_view() {
-                let entry = host
+                let internalformat = host
                     .formats
                     .get(s.format)
-                    .ok_or(Fault::IllegalFormat { cmd, format: s.format })?;
+                    .ok_or(Fault::IllegalFormat { cmd, format: s.format })?
+                    .gl
+                    .internalformat;
                 let (mut fl, mut ll) = (first_layer, last_layer);
                 if target == GL_TEXTURE_CUBE_MAP && fl == ll {
                     fl = 0;
@@ -1828,18 +1785,11 @@ impl Context {
                 if layers <= 0 {
                     return Err(Fault::OutOfRange { cmd, what: "surface layers" });
                 }
-                let v = gl.gen_texture();
-                gl.texture_view(
-                    v,
-                    target,
-                    name,
-                    entry.gl.internalformat,
-                    0,
-                    res.args.last_level + 1,
-                    fl,
-                    layers as GLuint,
-                );
-                view = Some(v);
+                let key = ViewKey { format: s.format, first_layer: fl, layers: layers as u32 };
+                // Minted now rather than at the first attach, so a driver that refuses the view
+                // is a fault on the command that asked for it.
+                host.resource_mut(cmd, s.resource)?.view(gl, key, internalformat);
+                view = Some(key);
             }
         }
         Ok(Surf {
@@ -2178,7 +2128,7 @@ impl Context {
                 None => {
                     gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0)
                 }
-                Some(_) => self.attach_surface(host, cmd, zsurf.expect("bound"), 0)?,
+                Some(z) => self.attach_surface(host, cmd, &z, 0)?,
             }
             self.sub_mut().zsurf = new_z;
         }
@@ -2191,14 +2141,14 @@ impl Context {
             };
             let had = self.sub().cbufs.get(i).copied().flatten();
             if had != want {
-                match h {
+                match &want {
                     None => gl.framebuffer_texture_2d(
                         GL_COLOR_ATTACHMENT0 + i as GLenum,
                         GL_TEXTURE_2D,
                         None,
                         0,
                     ),
-                    Some(h) => self.attach_surface(host, cmd, *h, i as u32)?,
+                    Some(s) => self.attach_surface(host, cmd, s, i as u32)?,
                 }
             }
             new_cbufs.push(want);
@@ -2287,39 +2237,44 @@ impl Context {
         let s = self.sub().surface(cmd, h)?;
         let res = host.resource(cmd, s.resource)?;
         Ok(BoundSurface {
-            handle: h,
             resource: s.resource,
             format: s.format,
             level: s.level,
+            layer: s.layer(),
+            view: s.view,
             nr_samples: s.nr_samples,
             tex_height: res.args.height,
             y_0_top: res.y_0_top(),
         })
     }
 
-    /// `vrend_fb_bind_texture_id` for a surface object, on the bound framebuffer.
+    /// `vrend_fb_bind_texture_id`, on the bound framebuffer.
     fn attach_surface(
         &self,
         host: &mut Host<'_>,
         cmd: Cmd,
-        h: ObjectHandle,
+        s: &BoundSurface,
         idx: u32,
     ) -> Result<(), Fault> {
-        let s = self.sub().surface(cmd, h)?;
-        let res = host.resource(cmd, s.resource)?;
         if s.nr_samples > 0 {
             host.todo.note("implicit multisample surfaces");
             return Err(Fault::Unimplemented { cmd, what: "a multisampled surface" });
         }
-        let (name, target) = match (&res.storage, s.view) {
-            (Storage::Texture { target, .. }, Some(v)) => (v, *target),
-            (Storage::Texture { name, target, .. }, None) => (*name, *target),
-            _ => return Err(Fault::IllegalResource { cmd, handle: s.resource }),
+        let res = host.resource(cmd, s.resource)?;
+        let Storage::Texture { name, target, .. } = res.storage else {
+            return Err(Fault::IllegalResource { cmd, handle: s.resource });
         };
         let mut attachment = transfer::attachment_for(res, host.formats);
         if attachment == GL_COLOR_ATTACHMENT0 {
             attachment += idx;
         }
+        // The view was minted when the surface was created, so this only reads it back.
+        let name = match s.view {
+            None => name,
+            Some(key) => {
+                res.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: s.resource })?
+            }
+        };
         transfer::attach_texture(
             host.gl,
             host.features,
@@ -2327,7 +2282,7 @@ impl Context {
             name,
             attachment,
             s.level as GLint,
-            s.layer(),
+            s.layer,
         )
         .map_err(|feature| Fault::NoFeature { cmd, feature })
     }
@@ -3241,12 +3196,13 @@ mod tests {
         assert!(!evict_view(&mut views, &mut dirty, h(9)));
     }
 
-    fn bound(handle: u32) -> BoundSurface {
+    fn bound(view: Option<ViewKey>) -> BoundSurface {
         BoundSurface {
-            handle: ObjectHandle::new(handle).unwrap(),
             resource: ResourceHandle::new(1).unwrap(),
             format: format("B8G8R8A8_UNORM"),
             level: 0,
+            layer: None,
+            view,
             nr_samples: 0,
             tex_height: 16,
             y_0_top: false,
@@ -3254,18 +3210,16 @@ mod tests {
     }
 
     #[test]
-    fn a_destroyed_surface_leaves_every_attachment_it_held() {
-        let h = ObjectHandle::new(9).unwrap();
-        let mut zsurf = Some(bound(9));
-        let mut cbufs = vec![Some(bound(4)), None, Some(bound(9)), Some(bound(9))];
-        let (held_z, colours) = evict_surface(&mut zsurf, &mut cbufs, h);
-        assert!(held_z && zsurf.is_none());
-        assert_eq!(colours, vec![2, 3]);
-        assert_eq!(cbufs, vec![Some(bound(4)), None, None, None]);
-        // The handle the guest frees is reused by its next create, so a slot left holding it
-        // would answer "already bound" to a different surface.
-        let (held_z, colours) = evict_surface(&mut zsurf, &mut cbufs, h);
-        assert!(!held_z && colours.is_empty());
+    fn a_bound_surface_is_told_apart_by_what_it_attaches() {
+        let key =
+            |first_layer| ViewKey { format: format("B8G8R8X8_UNORM"), first_layer, layers: 1 };
+        // The framebuffer skips re-attaching a slot whose description is unchanged, so the
+        // description has to name every difference that changes the attachment. A surface the
+        // guest destroyed and recreated under the same handle is the same attachment only if it
+        // describes the same thing -- which is why the slot holds no handle to compare instead.
+        assert_eq!(bound(Some(key(0))), bound(Some(key(0))));
+        assert_ne!(bound(Some(key(0))), bound(Some(key(1))));
+        assert_ne!(bound(Some(key(0))), bound(None));
     }
 
     #[test]

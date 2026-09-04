@@ -761,10 +761,14 @@ impl Context {
         let fb0 = self.sub().blit_fbs[0];
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb0));
         let res = host.resource(cmd, resource)?;
-        let (name, target) = match (&res.storage, view) {
-            (Storage::Texture { target, .. }, Some(v)) => (v, *target),
-            (Storage::Texture { name, target, .. }, None) => (*name, *target),
-            _ => return Err(Fault::IllegalResource { cmd, handle: resource }),
+        let Storage::Texture { name, target, .. } = res.storage else {
+            return Err(Fault::IllegalResource { cmd, handle: resource });
+        };
+        let name = match view {
+            None => name,
+            Some(key) => {
+                res.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: resource })?
+            }
         };
         let end = End { name, target, temporary: false };
         bind_fb_texture(host, cmd, res, &end, level as GLint, layer)?;
