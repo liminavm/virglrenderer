@@ -21,8 +21,10 @@
 # visible from both ends.
 import sys, zlib
 
-from corpus import (Corpus, cmd0, f32, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW, BIND_VERTEX_BUFFER,
+from corpus import (Corpus, cmd0, f32, BIND_DEPTH_STENCIL, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW,
+                    BIND_VERTEX_BUFFER, PIPE_MASK_Z,
                     B8G8R8A8_UNORM, B8G8R8X8_UNORM, R32G32B32A32_FLOAT,
+                    Z32_FLOAT, Z24X8_UNORM,
                     OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_VERTEX_ELEMENTS,
                     STAGE_VERTEX, STAGE_FRAGMENT,
                     SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W,
@@ -67,6 +69,17 @@ def pattern(tag, w, h):
         for x in range(w):
             px += bytes(((x * 3 + tag * 37) & 0xFF, (y * 5 + tag * 11) & 0xFF,
                          ((x ^ y) * 7 + tag * 53) & 0xFF, (0x30 + x + y + tag) & 0xFF))
+    return bytes(px)
+
+
+def depth_pattern(w, h):
+    """A depth ramp with no symmetry in x or y, written as Z24X8_UNORM: the depth is the high 24
+    bits and the low byte is padding."""
+    px = bytearray()
+    for y in range(h):
+        for x in range(w):
+            d = ((x * 977 + y * 4093) & 0xFFFFFF)
+            px += bytes((0, d & 0xFF, (d >> 8) & 0xFF, (d >> 16) & 0xFF))
     return bytes(px)
 
 
@@ -191,6 +204,19 @@ def build():
     SAMP_READ_BEFORE, SAMP_READ_AFTER = 52, 53
     SAMP_VIEW_SWIZZLE = (SWIZZLE_Z, SWIZZLE_Y, SWIZZLE_X, SWIZZLE_W)   # red and blue swapped
 
+    # --- the depth-writing blit ---
+    # A blit whose destination is depth takes the blitter's OTHER fragment shader, which writes
+    # gl_FragDepth instead of a colour, and attaches its destination to the depth attachment
+    # rather than to colour. Two different depth formats force it there: a framebuffer blit
+    # cannot serve a depth pair whose formats disagree (`vrend_renderer_prepare_blit`), and the
+    # Z mask keeps it off the copy path, which takes only a full RGBA mask.
+    #
+    # The sweep skips depth and reads only colour, so the destination is scored the way the array
+    # is: sampled in a draw. The SOURCE is sampled too, through the same shader and the same view
+    # shape, so a wrong number in the destination cannot be blamed on the depth sampling path.
+    DEPTH_SRC, DEPTH_DST = 60, 61
+    DEPTH_READ_SRC, DEPTH_READ_DST = 62, 63
+
     c.submit()
     c.create(ARR_SRC, B8G8R8X8_UNORM, tex, SIDE)
     c.create(ARR_DST, B8G8R8A8_UNORM, tex, SIDE, array=LAYERS, target=TARGET_2D_ARRAY)
@@ -203,6 +229,10 @@ def build():
     c.create(SAMP_BLIT_DST, B8G8R8A8_UNORM, tex, SIDE)
     c.create(SAMP_READ_BEFORE, B8G8R8A8_UNORM, tex, SIDE)
     c.create(SAMP_READ_AFTER, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(DEPTH_SRC, Z24X8_UNORM, BIND_DEPTH_STENCIL | BIND_SAMPLER_VIEW, SIDE)
+    c.create(DEPTH_DST, Z32_FLOAT, BIND_DEPTH_STENCIL | BIND_SAMPLER_VIEW, SIDE)
+    c.create(DEPTH_READ_SRC, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(DEPTH_READ_DST, B8G8R8A8_UNORM, tex, SIDE)
 
     rig = Rig(c)
 
@@ -214,6 +244,7 @@ def build():
     for slice_ in range(SLICES):
         c.inline_write(VOL_SRC, pattern(20 + slice_, SIDE, SIDE), SIDE, SIDE, SIDE * 4, z=slice_)
     c.inline_write(SAMP_SRC, pattern(30, SIDE, SIDE), SIDE, SIDE, SIDE * 4)
+    c.inline_write(DEPTH_SRC, depth_pattern(SIDE, SIDE), SIDE, SIDE, SIDE * 4)
 
     c.blit(ARR_SRC, B8G8R8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
            ARR_DST, B8G8R8A8_UNORM, (0, 0, BLIT_LAYER, SIDE, SIDE, 1))
@@ -238,11 +269,19 @@ def build():
     c.blit(SAMP_SRC, B8G8R8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
            SAMP_BLIT_DST, B8G8R8A8_UNORM, (0, 0, 0, SIDE, SIDE, 1))
     rig.sample(samp_view, TARGET_2D, 0, SAMP_READ_AFTER, B8G8R8A8_UNORM, SIDE)
+
+    c.blit(DEPTH_SRC, Z24X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
+           DEPTH_DST, Z32_FLOAT, (0, 0, 0, SIDE, SIDE, 1), mask=PIPE_MASK_Z)
+    rig.sample(rig.view(DEPTH_SRC, Z24X8_UNORM, TARGET_2D), TARGET_2D, 0,
+               DEPTH_READ_SRC, B8G8R8A8_UNORM, SIDE)
+    rig.sample(rig.view(DEPTH_DST, Z32_FLOAT, TARGET_2D), TARGET_2D, 0,
+               DEPTH_READ_DST, B8G8R8A8_UNORM, SIDE)
     c.submit()
 
     # The sweep reads each scored offscreen AT its unref, so everything it scores is unref'd.
     for h in (ARR_SRC, ARR_READ_2, ARR_READ_0, VOL_READ_5, VOL_READ_1,
-              SAMP_BLIT_DST, SAMP_READ_BEFORE, SAMP_READ_AFTER):
+              SAMP_BLIT_DST, SAMP_READ_BEFORE, SAMP_READ_AFTER,
+              DEPTH_READ_SRC, DEPTH_READ_DST):
         c.unref(h)
     c.submit()
     return c

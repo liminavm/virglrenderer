@@ -541,12 +541,18 @@ buildable throughout as the A-side reference.
   debugging aids with no reader here. Not served yet, each counted and named in the log
   when a stream asks: tessellation without a control shader (the C's injected TCS),
   advanced blend equations, a layered image bound as a subset of its levels or layers,
-  the C's bridge of UBO 0 into the constant array, the shader blitter's depth path,
+  the C's bridge of UBO 0 into the constant array,
   implicit-multisample surfaces, the resource-copy fallback through guest memory, blob
-  resources, video. The shader blitter's colour path is in: a blit whose ends disagree
+  resources, video. The shader blitter is in, both paths: a blit whose ends disagree
   about their swizzle, that swaps red and blue for an IOSurface-backed end, or that has
   to convert a colourspace by hand, runs as a textured quad in the blitter's own shared
-  GL context, and `blit.score` pins five such blits against the C. The first pixel gate has passed: the stock guest's GNOME session,
+  GL context, and `blit.score` pins five such blits against the C. A blit whose two ends
+  both carry depth runs the blitter's other shader, writing `gl_FragDepth` and hanging its
+  destination off the depth attachment; `sampled.score` pins one against the C, scored by
+  sampling the blitted depth into a colour target because the sweep reads neither depth nor
+  anything but a plain 2D colour offscreen. Two branches of the blitter have no fixture and
+  are faithful by reading only: its multisample resolves, and the depth shader's 1D and
+  multisample spellings. The first pixel gate has passed: the stock guest's GNOME session,
   booted headless on virglrs and on the C and read from the presented frame, is
   bit-identical between the two but for the clock's digits. (kmscube was the planned
   workload; the stock guest autologs into GNOME, which holds DRM master, so the desktop

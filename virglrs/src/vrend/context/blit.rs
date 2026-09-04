@@ -375,18 +375,15 @@ impl Context {
         redblue: bool,
     ) -> Result<(), Fault> {
         let cmd = Cmd::Blit;
-        // Depth-writing blits need the blitter's other shader, which is not here. They are the
-        // one shape of blit the harness cannot score -- the score reads colour offscreens -- so
-        // porting them would ship code no fixture measures.
+        // `blit_depth`: both ends carry depth and the guest asked for the Z channel, so this
+        // blit writes `gl_FragDepth` and hangs its destination off the depth attachment. None of
+        // the colour work below applies to it -- the swizzle, the sRGB pair -- and the C skips
+        // computing any of it too.
         let src_desc = b.src.format.describe();
         let dst_desc = b.dst.format.describe();
-        if src_desc.is_some_and(|d| d.has_depth())
+        let color = !(src_desc.is_some_and(|d| d.has_depth())
             && dst_desc.is_some_and(|d| d.has_depth())
-            && b.mask & PIPE_MASK_Z != 0
-        {
-            host.todo.note("the shader blitter's depth path");
-            return Ok(());
-        }
+            && b.mask & PIPE_MASK_Z != 0);
         let formats = host.formats;
         let src_res = host.resource(cmd, b.src.resource)?;
         let dst_res = host.resource(cmd, b.dst.resource)?;
@@ -432,7 +429,9 @@ impl Context {
             src_depth: b.src.region.depth,
             src_texture_depth: src_res.depth_at(b.src.level),
             dst: dst_end.name,
+            color,
             dst_gl_target: dst_end.target,
+            dst_attachment: transfer::attachment_for(dst_res, formats),
             dst_target: dst_res.args.target,
             dst_w: dst_res.width_at(b.dst.level),
             dst_h: dst_res.height_at(b.dst.level),

@@ -78,11 +78,9 @@ const SRGB_ENCODE: &str = "cvec4 srgb_encode(cvec4 col) {\n\
 /// silently start aliasing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ProgKey {
-    /// The C's `is_color`, and always true here: a blit that would write depth is refused by
-    /// the caller, because the score reads colour offscreens and could not tell a depth blit
-    /// that works from one that does not. Kept in the key so the depth path, when it arrives,
-    /// cannot collide with a colour program.
-    #[allow(dead_code)]
+    /// Whether this blit writes a colour. A depth-writing blit is a different program with a
+    /// different output -- `gl_FragDepth` rather than a draw buffer -- so it is the first thing
+    /// the key distinguishes, and none of the colour fields below say anything when it is false.
     color: bool,
     manual_srgb_decode: bool,
     manual_srgb_encode: bool,
@@ -158,8 +156,17 @@ pub struct Job {
     /// makes a sub-range blit sample the wrong slices.
     pub src_texture_depth: u32,
 
+    /// Whether this blit writes a colour. The C's `blit_depth`, negated: both ends of the blit
+    /// carry depth and the guest asked for the Z channel. It decides the program, and it is a
+    /// separate fact from `dst_attachment` -- one is about the formats the BLIT names, the other
+    /// about the format the destination RESOURCE was made with.
+    pub color: bool,
     pub dst: TextureName,
     pub dst_gl_target: GLenum,
+    /// Where the destination hangs on the blitter's framebuffer: colour, depth, or both. The C
+    /// reads it off the destination resource inside `vrend_fb_bind_texture_id`; the blitter here
+    /// holds no resources, so the caller resolves it once and passes the answer.
+    pub dst_attachment: GLenum,
     /// The destination's gallium target, which decides whether the attached layer is the one the
     /// guest named or this pass's slice.
     pub dst_target: TextureTarget,
@@ -277,7 +284,7 @@ impl Blitter {
     /// [`Job`]; this touches nothing the caller owns but the two textures the job names.
     pub fn run(&mut self, gl: &Gl, features: &Features, job: &Job) -> Result<(), Unserved> {
         let key = ProgKey {
-            color: true,
+            color: job.color,
             manual_srgb_decode: job.manual_srgb_decode,
             manual_srgb_encode: job.manual_srgb_encode,
             target: job.src_target,
@@ -339,7 +346,7 @@ impl Blitter {
                 features,
                 job.dst_gl_target,
                 job.dst,
-                GL_COLOR_ATTACHMENT0,
+                job.dst_attachment,
                 job.dst_level as GLint,
                 Some(layer),
             )
@@ -429,9 +436,17 @@ fn tgsi_texture(target: TextureTarget, num_samples: u32) -> tgsi::Texture {
 /// `blit_get_swizzle`, GLES leg without depth: the components of `tc` the fetch takes, and the
 /// integer coordinate type a `texelFetch` needs. The bool is whether that type is an array one,
 /// which is the only thing that decides which GLES header the shader gets.
-fn coord_swizzle_and_type(target: tgsi::Texture, msaa: bool) -> (&'static str, &'static str, bool) {
+fn coord_swizzle_and_type(
+    target: tgsi::Texture,
+    msaa: bool,
+    depth: bool,
+) -> (&'static str, &'static str, bool) {
     use tgsi::Texture::*;
     match target {
+        // `BLIT_USE_GLES | BLIT_USE_DEPTH`: GLES has no 1D sampler, so a depth 1D blit samples
+        // the 2D one the shader declared and needs the second coordinate the colour path fakes
+        // inline. This is the only thing depth changes about the coordinates.
+        D1 if depth => (".xy", "", false),
         Buffer | D1 => (".x", "", false),
         Msaa2d if msaa => (".xy", "ivec2", false),
         Msaa2d => (".xy", "", false),
@@ -502,15 +517,47 @@ pub fn dest_swizzle_snippet(swizzle: [Swizzle; 4]) -> String {
 
 /// The fragment shader for a key, as the C's `blit_build_frag_tex_col` prints it -- GLES leg,
 /// which is the only one this tree has a host for.
+/// `blit_build_frag_depth`: the fragment shader a depth-writing blit runs.
+///
+/// None of the colour shader's machinery applies -- no return-type conversion, no destination
+/// swizzle, no sRGB -- because the one channel that exists goes to `gl_FragDepth`, and a depth
+/// has no colourspace. The header is the C's plain `HEADER_GLES`, which differs from the colour
+/// path's `FS_HEADER_GLES` only in the extension line this shader never needs.
+fn depth_fragment_source(tex: tgsi::Texture, msaa: bool) -> String {
+    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, true);
+    let sampler = sampler_type_conv(tex).unwrap_or("2D");
+    let header = if msaa && is_array {
+        "#version 310 es\n// Blitter\n#extension GL_OES_texture_storage_multisample_2d_array: \
+         require\nprecision mediump float;\n"
+    } else {
+        "#version 310 es\n// Blitter\nprecision mediump float;\n"
+    };
+    // A multisample source has no `texture`, so the C reads sample 0 and does not average the
+    // way the colour path does: a depth is a position, and the mean of two positions is a third
+    // one that neither sample saw.
+    let body = if msaa {
+        format!(
+            "void main() {{\n   gl_FragDepth = float(texelFetch(samp, \
+             {fetch_type}(tc{coord}), 0).x);\n}}\n"
+        )
+    } else {
+        format!("void main() {{\n   gl_FragDepth = float(texture(samp, tc{coord}).x);\n}}\n")
+    };
+    format!("{header}uniform mediump sampler{sampler} samp;\nin vec4 tc;\n{body}")
+}
+
 pub fn fragment_source(key: ProgKey) -> String {
     let tex = tgsi_texture(key.target, key.num_samples);
-    let ret = return_type_for(key.src_format);
     let msaa = key.num_samples > 1;
+    if !key.color {
+        return depth_fragment_source(tex, msaa);
+    }
+    let ret = return_type_for(key.src_format);
     // The C loops over every sample only where averaging them means something: an integer format
     // has no meaningful average, so it reads one.
     let loop_samples =
         if msaa && ret == tgsi::ReturnType::Unorm { key.num_samples } else { u32::from(msaa) };
-    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa);
+    let (coord, fetch_type, is_array) = coord_swizzle_and_type(tex, msaa, false);
     let sampler = sampler_type_conv(tex).unwrap_or("2D");
     let prefix = sampler_return_conv(ret);
     let cvec4 = vec4_type(ret);
@@ -711,5 +758,33 @@ mod tests {
         let p1 = Point { x: 32, y: 64 };
         assert_eq!(texcoords(true, 64, 64, p0, p1), [0.0, 0.0, 0.5, 1.0]);
         assert_eq!(texcoords(false, 64, 64, p0, p1), [0.0, 0.0, 32.0, 64.0]);
+    }
+
+    #[test]
+    fn a_depth_blit_writes_the_fragment_depth_and_nothing_else() {
+        let src = depth_fragment_source(tgsi::Texture::D2, false);
+        assert!(src.contains("gl_FragDepth = float(texture(samp, tc.xy).x);"), "{src}");
+        // The colour shader's whole apparatus is absent, not merely unused: a depth has no
+        // colourspace and no destination channels to reorder.
+        for absent in ["FragColor", "srgb", "cvec4", "#define"] {
+            assert!(!src.contains(absent), "{absent} in {src}");
+        }
+    }
+
+    #[test]
+    fn a_1d_depth_source_needs_the_second_coordinate_a_colour_one_fakes() {
+        // GLES has no 1D sampler. The colour path declares a 2D one and writes the missing
+        // coordinate into the call; the depth path takes it from the vertex instead, and this is
+        // the only thing `BLIT_USE_DEPTH` changes about the coordinates.
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, true).0, ".xy");
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D1, false, false).0, ".x");
+        assert_eq!(coord_swizzle_and_type(tgsi::Texture::D2, false, true).0, ".xy");
+    }
+
+    #[test]
+    fn a_multisample_depth_source_reads_one_sample_rather_than_averaging() {
+        let src = depth_fragment_source(tgsi::Texture::Msaa2d, true);
+        assert!(src.contains("texelFetch(samp, ivec2(tc.xy), 0)"), "{src}");
+        assert!(!src.contains("num_samples"), "{src}");
     }
 }

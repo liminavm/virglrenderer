@@ -229,6 +229,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   trade worth making, and a permanently red line is a gate nobody reads. The deviation is in
   `docs/rust-rewrite.md`; every other line of this fixture, and every other fixture in the tree,
   is still pinned from the C.
+  The last two lines are the depth-writing blit, which takes the blitter's other fragment
+  shader — `gl_FragDepth` instead of a colour, and the depth attachment instead of colour
+  attachment 0. Two disagreeing depth formats force it off `glBlitFramebuffer`, and the Z mask
+  keeps it off the copy path. The blitted depth is sampled into a colour target, and so is the
+  blit's SOURCE through the same shader and the same view shape, so a wrong number in the
+  destination cannot be blamed on the depth sampling path.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
