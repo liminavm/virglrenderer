@@ -38,6 +38,9 @@
 //
 // Run it through vrend-replay.sh, which supplies the KosmicKrisp/zink environment the worker uses.
 //
+/* USE_VIDEO lives behind this guard in the header, and limina passes it, so the replay has to
+ * see it too. */
+#define VIRGL_RENDERER_UNSTABLE_APIS
 #include "virglrenderer.h"
 #include "virgl_hw.h"
 
@@ -559,7 +562,13 @@ int main(int argc, char **argv)
       printf("replay: no --ctx given, picking ctx %d (%u commands)\n", want_ctx, count[best]);
    }
 
-   int flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS | VIRGL_RENDERER_USE_GLES;
+   /* USE_VIDEO is in the flag word limina passes, and it is load-bearing here rather than
+    * decorative: virgl_video_init is what calls VTRegisterSupplementalVideoDecoderIfAvailable,
+    * and VP9 and AV1 arrive as supplemental decoders, so without it every
+    * VTDecompressionSessionCreate in a replay fails with kVTCouldNotFindVideoDecoderErr and a
+    * decode corpus scores its targets empty. */
+   int flags = VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_SURFACELESS | VIRGL_RENDERER_USE_GLES
+             | VIRGL_RENDERER_USE_VIDEO;
    /* The cookie must be non-NULL: virglrenderer rejects the vrend path outright with "invalid
     * renderer vrend callbacks" when it is null, whatever the callbacks contain. It is opaque to
     * the library and only handed back to our callbacks, so any live address will do. */
