@@ -330,6 +330,16 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
       for (size_t i = 0; i < need; i++) { hash ^= sp[i]; hash *= 1099511628211ull; }
       score_addf("iosurface res=%u %ux%u sync=%d hash=%016llx ink=%zu/%zu\n",
                  handle, w, h, sr, (unsigned long long)hash, ink, need / 4);
+      /* The surface's pixels, for the same reason the texture readback dumps: a hash says
+       * two frames differ, and only the frame says where. */
+      const char *dir = getenv("REPLAY_DUMP_DIR");
+      const char *only = getenv("REPLAY_DUMP_W");
+      if (dir && (!only || w == (uint32_t)atoi(only))) {
+         char fn[512];
+         snprintf(fn, sizeof fn, "%s/iosurface-res%u_%ux%u.rgba", dir, handle, w, h);
+         FILE *f = fopen(fn, "wb");
+         if (f) { fwrite(sp, 1, need, f); fclose(f); }
+      }
    } else {
       score_addf("iosurface res=%u %ux%u sync=%d read-failed=%d\n", handle, w, h, sr, ir);
    }
@@ -405,6 +415,11 @@ int main(int argc, char **argv)
    bool smoke = false;
    bool sweep = false;
    uint64_t draws_from = 0;
+   /* --until stops the stream after a sequence number and scores what is on the surfaces THEN.
+    * The end-of-run score sees only the last frame each scanout received; a frame that differs
+    * between two arms may have gone wrong many frames earlier, and this is how the point where
+    * they part is bisected. */
+   uint64_t until = 0;
    uint32_t sweep_w = 0;
 
    bool no_unref = getenv("REPLAY_NO_UNREF") != NULL;
@@ -417,6 +432,8 @@ int main(int argc, char **argv)
          sweep_w = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--draws-from") && i + 1 < argc)
          draws_from = strtoull(argv[++i], NULL, 10);
+      else if (!strcmp(argv[i], "--until") && i + 1 < argc)
+         until = strtoull(argv[++i], NULL, 10);
       else if (!strcmp(argv[i], "--loops") && i + 1 < argc) loops = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
@@ -425,7 +442,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
       else if (argv[i][0] != '-') path = argv[i];
    }
-   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N] [--loops N] [--nodraw]\n"); return 2; }
+   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N] [--loops N] [--nodraw] [--draws-from SEQ] [--until SEQ]\n"); return 2; }
 
    FILE *f = fopen(path, "rb");
    if (!f) { perror(path); return 2; }
@@ -507,6 +524,7 @@ int main(int argc, char **argv)
          const uint8_t *pay = blob + p + sizeof h + (size_t)h.aux_count * 4;
 
          if (h.ctx_id != (uint16_t)want_ctx) { p += h.total_len; continue; }
+         if (until && h.seq > until) break;
 
          switch (h.type) {
          case T_SUBMIT:
@@ -700,6 +718,24 @@ int main(int argc, char **argv)
 
    for (uint32_t i = 0; i < iosurf_n; i++)
       score_iosurface(iosurf_res[i].handle, iosurf_res[i].w, iosurf_res[i].h);
+
+   /* A --readback resource that is still alive at the end of the stream is read back THEN, from
+    * its texture. For a scanout this is the second leg of the IOSurface question: the surface
+    * line above reads the display storage, this reads the texture rendered into it, and the two
+    * disagreeing says which side a fault is on. */
+   if (readback_res) {
+      const struct res_ev *born = NULL;
+      bool alive = false;
+      for (uint32_t k = 0; k < res_n; k++) {
+         if (res[k].handle != readback_res)
+            continue;
+         if (res[k].kind == RES_UNREF)
+            alive = false;
+         else { born = &res[k]; alive = true; }
+      }
+      if (born && alive)
+         score_resource(born);
+   }
 
    if (!scored)
       fprintf(stderr, "nothing was read back: no scored resource was unref'd in the trace\n");
