@@ -19,6 +19,13 @@
 
 #include "virgl_video_bitstream.h"
 
+/*
+ * The serializers say why they refused a stream through this. The tests read the refusal, not the
+ * reason -- both sides must reject the same inputs, and only one of them writes English -- so it
+ * goes nowhere.
+ */
+void virgl_error(const char *fmt, ...) { (void)fmt; }
+
 /* A script for the bit writer, so one call can exercise an arbitrary sequence: the Rust side
  * sends the same script to its own writer and the two buffers are compared. Each op is a tag
  * and a payload, which keeps the wire between the two sides trivially checkable. */

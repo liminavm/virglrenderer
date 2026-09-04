@@ -193,6 +193,18 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// One NAL unit, and the stream from where it starts.
+///
+/// The two views begin at the same byte and are both wanted: framing a NAL needs to know where it
+/// ends, and parsing a slice header does not -- emulation prevention keeps a start code out of a
+/// payload, so within a well-formed stream reading to either bound reads the same bytes.
+pub struct Nal<'a> {
+    /// The unit itself, ending where the next start code begins.
+    pub unit: &'a [u8],
+    /// The unit and everything after it, to the end of the stream.
+    pub onward: &'a [u8],
+}
+
 /// The NAL units of an Annex-B stream, in order.
 ///
 /// A NAL runs from just past its start code to the byte before the next one, trailing zeros
@@ -215,20 +227,21 @@ impl<'a> NalUnits<'a> {
 }
 
 impl<'a> Iterator for NalUnits<'a> {
-    type Item = &'a [u8];
+    type Item = Nal<'a>;
 
-    fn next(&mut self) -> Option<&'a [u8]> {
+    fn next(&mut self) -> Option<Nal<'a>> {
         loop {
             if self.rest.is_empty() {
                 return None;
             }
-            let (nal, after) = match split_at_start_code(self.rest) {
+            let onward = self.rest;
+            let (unit, after) = match split_at_start_code(onward) {
                 Some((before, after)) => (before, after),
-                None => (self.rest, &self.rest[self.rest.len()..]),
+                None => (onward, &onward[onward.len()..]),
             };
             self.rest = after;
-            if !nal.is_empty() {
-                return Some(nal);
+            if !unit.is_empty() {
+                return Some(Nal { unit, onward });
             }
         }
     }
@@ -320,23 +333,31 @@ mod tests {
     }
 
     #[test]
+    fn a_units_onward_view_reaches_the_end_of_the_stream() {
+        let stream = [0, 0, 1, 0x67, 0xaa, 0, 0, 1, 0x68];
+        let first = NalUnits::new(&stream).unwrap().next().unwrap();
+        assert_eq!(first.unit, &[0x67, 0xaa]);
+        assert_eq!(first.onward, &stream[3..]);
+    }
+
+    #[test]
     fn a_nal_runs_to_the_next_start_code_trailing_zeros_and_all() {
         // The scan takes the earliest start code, so the four-byte form claims its own leading
         // zero and a fifth zero before it stays in the NAL. Trailing zeros belong to the payload
         // wherever the framing does not need them.
         let stream = [0, 0, 1, 0x67, 0xaa, 0, 0, 0, 0, 1, 0x68, 0xbb];
-        let nals: Vec<_> = NalUnits::new(&stream).unwrap().collect();
+        let nals: Vec<_> = NalUnits::new(&stream).unwrap().map(|n| n.unit).collect();
         assert_eq!(nals, vec![&[0x67u8, 0xaa, 0][..], &[0x68, 0xbb][..]]);
 
         let stream = [0, 0, 0, 1, 0x67, 0xaa, 0, 0, 1, 0x68];
-        let nals: Vec<_> = NalUnits::new(&stream).unwrap().collect();
+        let nals: Vec<_> = NalUnits::new(&stream).unwrap().map(|n| n.unit).collect();
         assert_eq!(nals, vec![&[0x67u8, 0xaa][..], &[0x68][..]]);
     }
 
     #[test]
     fn back_to_back_start_codes_frame_nothing_and_are_skipped() {
         let stream = [0, 0, 1, 0, 0, 1, 0x65];
-        let nals: Vec<_> = NalUnits::new(&stream).unwrap().collect();
+        let nals: Vec<_> = NalUnits::new(&stream).unwrap().map(|n| n.unit).collect();
         assert_eq!(nals, vec![&[0x65u8][..]]);
     }
 
