@@ -479,8 +479,10 @@ pub struct SubCtx {
     blend_color: [f32; 4],
     ve: Option<ObjectHandle>,
     vbos: Vec<VertexBuffer>,
-    /// How many vertex buffers the last draw bound, so a shorter set unbinds the rest.
-    old_num_vbos: usize,
+    /// How many vertex buffers the hardware holds, written by the bind that put them there --
+    /// so a shorter set unbinds exactly the ones still bound, however many state-sets went by
+    /// without a draw between them.
+    hw_num_vbos: usize,
     vbo_dirty: bool,
     ib: Option<IndexBuffer>,
     consts: [Vec<u32>; ShaderStage::COUNT],
@@ -558,7 +560,7 @@ impl SubCtx {
             blend_color: [0.0; 4],
             ve: None,
             vbos: Vec::new(),
-            old_num_vbos: 0,
+            hw_num_vbos: 0,
             vbo_dirty: false,
             ib: None,
             consts: Default::default(),
@@ -2277,7 +2279,6 @@ impl Context {
         if sub.vbos != vbos {
             sub.vbo_dirty = true;
         }
-        sub.old_num_vbos = sub.vbos.len();
         sub.vbos = vbos;
         Ok(())
     }
