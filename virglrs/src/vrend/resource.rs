@@ -15,7 +15,7 @@ use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
 use super::pipe::TextureTarget;
 use super::proto::Format;
-use crate::metal::{PixelFormat, Surface};
+use crate::metal::{Held, PixelFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -215,6 +215,67 @@ impl Limits {
                 0
             },
         }
+    }
+}
+
+/// What a handle names in vrend's table.
+///
+/// The wire lets a resource exist before anything says what it is: the VMM creates a blob and
+/// attaches it, and only a later `SET_TYPE` in the command stream gives it a shape and a format.
+/// That window is the protocol's, not ours -- attach precedes the command stream by ordering --
+/// so it is represented rather than wished away, and it is a state with one owner rather than a
+/// side table of handles waiting to be typed.
+///
+/// The distinction is the whole point of the type: a handle in [`Slot::Untyped`] is reachable
+/// only by the upgrade, by detach and by unref. Every other command faults on it, and says which
+/// of the two it is -- attached-but-untyped, or never attached at all. The C conflates them, and
+/// its own comment records the cost: "indistinguishable from an attach that never happened".
+pub enum Slot {
+    /// Storage, and nothing yet that says what it is.
+    Untyped(Untyped),
+    /// Shape, format and host storage all decided.
+    Resource(Resource),
+}
+
+impl Slot {
+    /// The resource this names, or `None` while nothing has typed it.
+    pub fn resource(&self) -> Option<&Resource> {
+        match self {
+            Slot::Resource(r) => Some(r),
+            Slot::Untyped(_) => None,
+        }
+    }
+
+    pub fn resource_mut(&mut self) -> Option<&mut Resource> {
+        match self {
+            Slot::Resource(r) => Some(r),
+            Slot::Untyped(_) => None,
+        }
+    }
+}
+
+/// A resource attached to a context before anything has said what it is.
+///
+/// It holds the exporter's storage and no opinion about it. Whether those bytes are a surface
+/// this can adopt was decided by whoever minted them, and the *reason* they are not stays with
+/// them -- venus latches it beside its pages and says it once -- so nothing is re-derived or
+/// guessed here.
+pub struct Untyped {
+    /// A share of the exporter's surface, when the storage is one. The share rather than an id:
+    /// an id stops naming this surface the moment the surface dies, and the whole point of
+    /// holding storage across contexts is that it cannot.
+    surface: Option<Arc<dyn Held>>,
+}
+
+impl Untyped {
+    /// Attached, with whatever the exporter published as its storage.
+    pub fn new(surface: Option<Arc<dyn Held>>) -> Untyped {
+        Untyped { surface }
+    }
+
+    /// A share of the surface these bytes are, if they are one.
+    pub fn surface(&self) -> Option<&Arc<dyn Held>> {
+        self.surface.as_ref()
     }
 }
 

@@ -883,7 +883,8 @@ impl Context {
             mask &= mask - 1;
             if update.contains(i)
                 && let Some(cb) = sub.ubos[s].get(&i)
-                && let Some(res) = host.resources.get(&cb.resource)
+                && let Some(res) =
+                    host.resources.get(&cb.resource).and_then(resource::Slot::resource)
                 && let Storage::Buffer { name, .. } = res.storage
             {
                 gl.bind_buffer_range(
@@ -960,7 +961,7 @@ impl Context {
                 if let Some(loc) = sampler_locs[sampler_index] {
                     gl.uniform_1i(loc, next_sampler_id.uniform_value());
                 }
-                let res = host.resources.get(&view.resource);
+                let res = host.resources.get(&view.resource).and_then(resource::Slot::resource);
                 if shadow_mask & (1 << i) != 0 {
                     // A depth texture read through a shadow sampler compares, and the
                     // luminance-style swizzles must not apply: the texture goes back to
@@ -1060,7 +1061,7 @@ impl Context {
             if i as usize >= MAX_SHADER_BUFFERS || prog_mask & (1 << i) == 0 {
                 continue;
             }
-            if let Some(res) = host.resources.get(&ssbo.resource)
+            if let Some(res) = host.resources.get(&ssbo.resource).and_then(resource::Slot::resource)
                 && let Storage::Buffer { name, .. } = res.storage
             {
                 gl.bind_buffer_range(
@@ -1081,7 +1082,7 @@ impl Context {
             return;
         }
         for (&i, abo) in &self.sub().abos {
-            if let Some(res) = host.resources.get(&abo.resource)
+            if let Some(res) = host.resources.get(&abo.resource).and_then(resource::Slot::resource)
                 && let Storage::Buffer { name, .. } = res.storage
             {
                 gl.bind_buffer_range(
@@ -1119,7 +1120,9 @@ impl Context {
             if prog.img_locs[s].get(i as usize).copied().flatten().is_none() {
                 continue;
             }
-            let Some(res) = host.resources.get_mut(&iview.resource) else {
+            let Some(res) =
+                host.resources.get_mut(&iview.resource).and_then(resource::Slot::resource_mut)
+            else {
                 continue;
             };
             let Some(entry) = formats.get(iview.format) else {
@@ -1257,12 +1260,14 @@ impl Context {
             return;
         }
         for (i, vbo) in sub.vbos.iter().enumerate() {
-            let name = vbo.resource.and_then(|r| host.resources.get(&r)).and_then(|res| match res
-                .storage
-            {
-                Storage::Buffer { name, .. } => Some(name),
-                _ => None,
-            });
+            let name = vbo
+                .resource
+                .and_then(|r| host.resources.get(&r))
+                .and_then(resource::Slot::resource)
+                .and_then(|res| match res.storage {
+                    Storage::Buffer { name, .. } => Some(name),
+                    _ => None,
+                });
             match name {
                 Some(name) => {
                     gl.bind_vertex_buffer(i as GLuint, Some(name), vbo.offset, vbo.stride)

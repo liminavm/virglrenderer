@@ -112,7 +112,7 @@ pub struct Host<'a> {
     pub formats: &'a Table,
     pub limits: &'a Limits,
     pub shader_cfg: &'a shader::Config,
-    pub resources: &'a mut BTreeMap<ResourceHandle, Resource>,
+    pub resources: &'a mut BTreeMap<ResourceHandle, resource::Slot>,
     pub guest: &'a dyn Guest,
     pub ctx: ContextId,
     pub current: &'a mut Current,
@@ -134,6 +134,13 @@ impl Host<'_> {
 
     /// A resource the context may reach, with vrend's side of it.
     fn resource(&self, cmd: Cmd, handle: ResourceHandle) -> Result<&Resource, Fault> {
+        let slot = self.slot(cmd, handle)?;
+        slot.resource().ok_or(Fault::UntypedResource { cmd, handle })
+    }
+
+    /// What the handle names, typed or not. Only the upgrade wants this; everything else wants
+    /// [`Host::resource`], which is the same lookup with the untyped case turned into a fault.
+    fn slot(&self, cmd: Cmd, handle: ResourceHandle) -> Result<&resource::Slot, Fault> {
         if !self.guest.attached(self.ctx, handle) {
             return Err(Fault::IllegalResource { cmd, handle });
         }
@@ -144,7 +151,11 @@ impl Host<'_> {
         if !self.guest.attached(self.ctx, handle) {
             return Err(Fault::IllegalResource { cmd, handle });
         }
-        self.resources.get_mut(&handle).ok_or(Fault::IllegalResource { cmd, handle })
+        self.resources
+            .get_mut(&handle)
+            .ok_or(Fault::IllegalResource { cmd, handle })?
+            .resource_mut()
+            .ok_or(Fault::UntypedResource { cmd, handle })
     }
 
     fn has(&self, f: Feature) -> bool {
@@ -164,6 +175,13 @@ pub enum Fault {
     },
     /// No resource the context may reach under that handle.
     IllegalResource {
+        cmd: Cmd,
+        handle: ResourceHandle,
+    },
+    /// A handle that is attached and carries storage, but that nothing has typed yet. Distinct
+    /// from [`Fault::IllegalResource`] on purpose: the guest is owed the difference between a
+    /// resource it never attached and one it attached and has not described.
+    UntypedResource {
         cmd: Cmd,
         handle: ResourceHandle,
     },
@@ -226,6 +244,9 @@ impl fmt::Display for Fault {
             }
             Fault::IllegalResource { cmd, handle } => {
                 write!(f, "{}: no such resource {handle}", cmd.name())
+            }
+            Fault::UntypedResource { cmd, handle } => {
+                write!(f, "{}: resource {handle} is attached but nothing has typed it", cmd.name())
             }
             Fault::IllegalFormat { cmd, format } => {
                 write!(f, "{}: format {} is not served", cmd.name(), format.name())
