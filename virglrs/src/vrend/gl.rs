@@ -69,6 +69,21 @@ pub struct QueryName(GLuint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ShaderName(GLuint);
 
+/// A program object the driver handed out. Never zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ProgramName(GLuint);
+
+impl ShaderName {
+    pub fn raw(self) -> GLuint {
+        self.0
+    }
+}
+
+/// The C's `GLvoid const *` offset into a bound buffer, as the draw and indirect calls spell it.
+fn offset_ptr(offset: u32) -> *const core::ffi::c_void {
+    offset as usize as *const core::ffi::c_void
+}
+
 impl TextureName {
     pub fn raw(self) -> GLuint {
         self.0
@@ -1369,6 +1384,521 @@ impl Gl {
         };
         log.truncate(written.max(0) as usize);
         Err(String::from_utf8_lossy(&log).into_owned())
+    }
+
+    // ---- programs ----
+
+    pub fn create_program(&self) -> Option<ProgramName> {
+        // SAFETY: no arguments.
+        let id = unsafe { self.t.glCreateProgram()() };
+        (id != 0).then_some(ProgramName(id))
+    }
+
+    pub fn delete_program(&self, program: ProgramName) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDeleteProgram()(program.0) };
+    }
+
+    pub fn attach_shader(&self, program: ProgramName, shader: ShaderName) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glAttachShader()(program.0, shader.0) };
+    }
+
+    /// `glLinkProgram`, and the driver's log when the link failed.
+    pub fn link_program(&self, program: ProgramName) -> Result<(), String> {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glLinkProgram()(program.0) };
+        let mut status: GLint = 0;
+        // SAFETY: `GL_LINK_STATUS` writes exactly one integer.
+        unsafe { self.t.glGetProgramiv()(program.0, GL_LINK_STATUS, &mut status) };
+        if status != 0 {
+            return Ok(());
+        }
+        let mut log = vec![0u8; 65536];
+        let mut written: GLsizei = 0;
+        // SAFETY: the driver writes at most the capacity given, NUL included, and reports how
+        // many bytes it wrote without the NUL.
+        unsafe {
+            self.t.glGetProgramInfoLog()(
+                program.0,
+                log.len() as GLsizei,
+                &mut written,
+                log.as_mut_ptr().cast::<GLchar>(),
+            )
+        };
+        log.truncate(written.max(0) as usize);
+        Err(String::from_utf8_lossy(&log).into_owned())
+    }
+
+    pub fn use_program(&self, program: Option<ProgramName>) {
+        // SAFETY: plain scalar; zero is "no program".
+        unsafe { self.t.glUseProgram()(program.map_or(0, |p| p.0)) };
+    }
+
+    /// `glGetUniformLocation`; -1 when the program has no such uniform.
+    pub fn get_uniform_location(&self, program: ProgramName, name: &str) -> GLint {
+        let name = std::ffi::CString::new(name).expect("a uniform name has no NUL");
+        // SAFETY: a NUL-terminated string, live for the call.
+        unsafe { self.t.glGetUniformLocation()(program.0, name.as_ptr().cast::<GLchar>()) }
+    }
+
+    /// `glGetUniformBlockIndex`; `None` when the program has no such block.
+    pub fn get_uniform_block_index(&self, program: ProgramName, name: &str) -> Option<GLuint> {
+        let name = std::ffi::CString::new(name).expect("a block name has no NUL");
+        // SAFETY: a NUL-terminated string, live for the call.
+        let i =
+            unsafe { self.t.glGetUniformBlockIndex()(program.0, name.as_ptr().cast::<GLchar>()) };
+        (i != GL_INVALID_INDEX).then_some(i)
+    }
+
+    pub fn uniform_block_binding(&self, program: ProgramName, block: GLuint, binding: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glUniformBlockBinding()(program.0, block, binding) };
+    }
+
+    /// `GL_UNIFORM_BLOCK_DATA_SIZE` of a block.
+    pub fn uniform_block_data_size(&self, program: ProgramName, block: GLuint) -> GLint {
+        let mut v: GLint = 0;
+        // SAFETY: the query writes exactly one integer.
+        unsafe {
+            self.t.glGetActiveUniformBlockiv()(program.0, block, GL_UNIFORM_BLOCK_DATA_SIZE, &mut v)
+        };
+        v
+    }
+
+    pub fn bind_attrib_location(&self, program: ProgramName, index: GLuint, name: &str) {
+        let name = std::ffi::CString::new(name).expect("an attribute name has no NUL");
+        // SAFETY: a NUL-terminated string, live for the call.
+        unsafe { self.t.glBindAttribLocation()(program.0, index, name.as_ptr().cast::<GLchar>()) };
+    }
+
+    /// `glTransformFeedbackVaryings`, interleaved.
+    pub fn transform_feedback_varyings(&self, program: ProgramName, varyings: &[String]) {
+        let owned: Vec<std::ffi::CString> = varyings
+            .iter()
+            .map(|v| std::ffi::CString::new(v.as_str()).expect("a varying name has no NUL"))
+            .collect();
+        let ptrs: Vec<*const GLchar> = owned.iter().map(|c| c.as_ptr().cast::<GLchar>()).collect();
+        let count = GLsizei::try_from(ptrs.len()).expect("a varying count fits a GLsizei");
+        // SAFETY: `count` NUL-terminated strings, all live for the call.
+        unsafe {
+            self.t.glTransformFeedbackVaryings()(
+                program.0,
+                count,
+                ptrs.as_ptr(),
+                GL_INTERLEAVED_ATTRIBS,
+            )
+        };
+    }
+
+    /// `glBindFragDataLocationIndexedEXT`. `false` if the driver has no spelling.
+    pub fn bind_frag_data_location_indexed(
+        &self,
+        program: ProgramName,
+        color: GLuint,
+        index: GLuint,
+        name: &str,
+    ) -> bool {
+        let Some(f) = self.t.try_glBindFragDataLocationIndexedEXT() else {
+            return false;
+        };
+        let name = std::ffi::CString::new(name).expect("an output name has no NUL");
+        // SAFETY: a NUL-terminated string, live for the call.
+        unsafe { f(program.0, color, index, name.as_ptr().cast::<GLchar>()) };
+        true
+    }
+
+    pub fn uniform_1i(&self, location: GLint, v: GLint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glUniform1i()(location, v) };
+    }
+
+    pub fn uniform_1iv(&self, location: GLint, v: &[GLint]) {
+        let count = GLsizei::try_from(v.len()).expect("a uniform count fits a GLsizei");
+        // SAFETY: the driver reads `count` integers from a slice of that length.
+        unsafe { self.t.glUniform1iv()(location, count, v.as_ptr()) };
+    }
+
+    pub fn uniform_4f(&self, location: GLint, v: [f32; 4]) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glUniform4f()(location, v[0], v[1], v[2], v[3]) };
+    }
+
+    /// `glUniform4uiv` over `v`, which holds `count` vectors of four.
+    pub fn uniform_4uiv(&self, location: GLint, v: &[u32]) {
+        let count = GLsizei::try_from(v.len() / 4).expect("a uniform count fits a GLsizei");
+        // SAFETY: the driver reads `count` vectors of four, which the slice holds.
+        unsafe { self.t.glUniform4uiv()(location, count, v.as_ptr()) };
+    }
+
+    pub fn active_texture(&self, unit: GLuint) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glActiveTexture()(GL_TEXTURE0 + unit) };
+    }
+
+    pub fn bind_sampler(&self, unit: GLuint, sampler: Option<SamplerName>) {
+        // SAFETY: plain scalars; zero is "no sampler".
+        unsafe { self.t.glBindSampler()(unit, sampler.map_or(0, |s| s.0)) };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_image_texture(
+        &self,
+        unit: GLuint,
+        texture: TextureName,
+        level: GLint,
+        layered: bool,
+        layer: GLint,
+        access: GLenum,
+        format: GLenum,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe {
+            self.t.glBindImageTexture()(
+                unit,
+                texture.0,
+                level,
+                layered as GLboolean,
+                layer,
+                access,
+                format,
+            )
+        };
+    }
+
+    pub fn bind_vertex_buffer(
+        &self,
+        binding: GLuint,
+        buf: Option<BufferName>,
+        offset: u32,
+        stride: u32,
+    ) {
+        // SAFETY: plain scalars; zero is "no buffer".
+        unsafe {
+            self.t.glBindVertexBuffer()(
+                binding,
+                buf.map_or(0, |b| b.0),
+                offset as GLintptr,
+                stride as GLsizei,
+            )
+        };
+    }
+
+    // ---- blending ----
+
+    pub fn blend_func_separate(
+        &self,
+        src_rgb: GLenum,
+        dst_rgb: GLenum,
+        src_a: GLenum,
+        dst_a: GLenum,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBlendFuncSeparate()(src_rgb, dst_rgb, src_a, dst_a) };
+    }
+
+    pub fn blend_equation_separate(&self, rgb: GLenum, alpha: GLenum) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBlendEquationSeparate()(rgb, alpha) };
+    }
+
+    pub fn blend_equation(&self, mode: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glBlendEquation()(mode) };
+    }
+
+    /// `glBlendFuncSeparatei` in whichever spelling the driver exports. `false` if none.
+    pub fn blend_func_separate_i(
+        &self,
+        buf: GLuint,
+        src_rgb: GLenum,
+        dst_rgb: GLenum,
+        src_a: GLenum,
+        dst_a: GLenum,
+    ) -> bool {
+        let f = self
+            .t
+            .try_glBlendFuncSeparatei()
+            .or_else(|| self.t.try_glBlendFuncSeparateiEXT())
+            .or_else(|| self.t.try_glBlendFuncSeparateiOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(buf, src_rgb, dst_rgb, src_a, dst_a) };
+        true
+    }
+
+    /// `glBlendEquationSeparatei` in whichever spelling the driver exports. `false` if none.
+    pub fn blend_equation_separate_i(&self, buf: GLuint, rgb: GLenum, alpha: GLenum) -> bool {
+        let f = self
+            .t
+            .try_glBlendEquationSeparatei()
+            .or_else(|| self.t.try_glBlendEquationSeparateiEXT())
+            .or_else(|| self.t.try_glBlendEquationSeparateiOES());
+        let Some(f) = f else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(buf, rgb, alpha) };
+        true
+    }
+
+    /// `glEnablei`/`glDisablei` in whichever spelling the driver exports. `false` if none.
+    pub fn set_enabled_i(&self, cap: GLenum, index: GLuint, on: bool) -> bool {
+        if on {
+            let f = self
+                .t
+                .try_glEnablei()
+                .or_else(|| self.t.try_glEnableiEXT())
+                .or_else(|| self.t.try_glEnableiOES());
+            let Some(f) = f else {
+                return false;
+            };
+            // SAFETY: plain scalars.
+            unsafe { f(cap, index) };
+        } else {
+            let f = self
+                .t
+                .try_glDisablei()
+                .or_else(|| self.t.try_glDisableiEXT())
+                .or_else(|| self.t.try_glDisableiOES());
+            let Some(f) = f else {
+                return false;
+            };
+            // SAFETY: plain scalars.
+            unsafe { f(cap, index) };
+        }
+        true
+    }
+
+    // ---- draws ----
+
+    pub fn draw_arrays(&self, mode: GLenum, first: GLint, count: GLsizei) {
+        // SAFETY: plain scalars; the driver reads the bound arrays, which it bounds itself.
+        unsafe { self.t.glDrawArrays()(mode, first, count) };
+    }
+
+    pub fn draw_arrays_instanced(
+        &self,
+        mode: GLenum,
+        first: GLint,
+        count: GLsizei,
+        instances: GLsizei,
+    ) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glDrawArraysInstanced()(mode, first, count, instances) };
+    }
+
+    /// `false` if the driver has no spelling.
+    pub fn draw_arrays_instanced_base_instance(
+        &self,
+        mode: GLenum,
+        first: GLint,
+        count: GLsizei,
+        instances: GLsizei,
+        base_instance: GLuint,
+    ) -> bool {
+        let Some(f) = self.t.try_glDrawArraysInstancedBaseInstanceEXT() else {
+            return false;
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(mode, first, count, instances, base_instance) };
+        true
+    }
+
+    /// `glDrawElements` with the indices at `offset` into the bound element buffer.
+    pub fn draw_elements(&self, mode: GLenum, count: GLsizei, ty: GLenum, offset: u32) {
+        // SAFETY: an offset into the bound element array buffer, which the driver bounds.
+        unsafe { self.t.glDrawElements()(mode, count, ty, offset_ptr(offset)) };
+    }
+
+    pub fn draw_range_elements(
+        &self,
+        mode: GLenum,
+        start: GLuint,
+        end: GLuint,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+    ) {
+        // SAFETY: as `draw_elements`.
+        unsafe { self.t.glDrawRangeElements()(mode, start, end, count, ty, offset_ptr(offset)) };
+    }
+
+    pub fn draw_elements_base_vertex(
+        &self,
+        mode: GLenum,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        base_vertex: GLint,
+    ) {
+        // SAFETY: as `draw_elements`.
+        unsafe {
+            self.t.glDrawElementsBaseVertex()(mode, count, ty, offset_ptr(offset), base_vertex)
+        };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_range_elements_base_vertex(
+        &self,
+        mode: GLenum,
+        start: GLuint,
+        end: GLuint,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        base_vertex: GLint,
+    ) {
+        // SAFETY: as `draw_elements`.
+        unsafe {
+            self.t.glDrawRangeElementsBaseVertex()(
+                mode,
+                start,
+                end,
+                count,
+                ty,
+                offset_ptr(offset),
+                base_vertex,
+            )
+        };
+    }
+
+    pub fn draw_elements_instanced(
+        &self,
+        mode: GLenum,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        instances: GLsizei,
+    ) {
+        // SAFETY: as `draw_elements`.
+        unsafe { self.t.glDrawElementsInstanced()(mode, count, ty, offset_ptr(offset), instances) };
+    }
+
+    pub fn draw_elements_instanced_base_vertex(
+        &self,
+        mode: GLenum,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        instances: GLsizei,
+        base_vertex: GLint,
+    ) {
+        // SAFETY: as `draw_elements`.
+        unsafe {
+            self.t.glDrawElementsInstancedBaseVertex()(
+                mode,
+                count,
+                ty,
+                offset_ptr(offset),
+                instances,
+                base_vertex,
+            )
+        };
+    }
+
+    /// `false` if the driver has no spelling.
+    pub fn draw_elements_instanced_base_instance(
+        &self,
+        mode: GLenum,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        instances: GLsizei,
+        base_instance: GLuint,
+    ) -> bool {
+        let Some(f) = self.t.try_glDrawElementsInstancedBaseInstanceEXT() else {
+            return false;
+        };
+        // SAFETY: as `draw_elements`.
+        unsafe { f(mode, count, ty, offset_ptr(offset), instances, base_instance) };
+        true
+    }
+
+    /// `false` if the driver has no spelling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_elements_instanced_base_vertex_base_instance(
+        &self,
+        mode: GLenum,
+        count: GLsizei,
+        ty: GLenum,
+        offset: u32,
+        instances: GLsizei,
+        base_vertex: GLint,
+        base_instance: GLuint,
+    ) -> bool {
+        let Some(f) = self.t.try_glDrawElementsInstancedBaseVertexBaseInstanceEXT() else {
+            return false;
+        };
+        // SAFETY: as `draw_elements`.
+        unsafe { f(mode, count, ty, offset_ptr(offset), instances, base_vertex, base_instance) };
+        true
+    }
+
+    /// `glDrawArraysIndirect` with the command at `offset` into the bound indirect buffer.
+    pub fn draw_arrays_indirect(&self, mode: GLenum, offset: u32) {
+        // SAFETY: an offset into the bound indirect buffer, which the driver bounds.
+        unsafe { self.t.glDrawArraysIndirect()(mode, offset_ptr(offset)) };
+    }
+
+    pub fn draw_elements_indirect(&self, mode: GLenum, ty: GLenum, offset: u32) {
+        // SAFETY: as `draw_arrays_indirect`.
+        unsafe { self.t.glDrawElementsIndirect()(mode, ty, offset_ptr(offset)) };
+    }
+
+    /// `false` if the driver has no spelling.
+    pub fn multi_draw_arrays_indirect(
+        &self,
+        mode: GLenum,
+        offset: u32,
+        draw_count: GLsizei,
+        stride: GLsizei,
+    ) -> bool {
+        let Some(f) = self.t.try_glMultiDrawArraysIndirectEXT() else {
+            return false;
+        };
+        // SAFETY: as `draw_arrays_indirect`.
+        unsafe { f(mode, offset_ptr(offset), draw_count, stride) };
+        true
+    }
+
+    /// `false` if the driver has no spelling.
+    pub fn multi_draw_elements_indirect(
+        &self,
+        mode: GLenum,
+        ty: GLenum,
+        offset: u32,
+        draw_count: GLsizei,
+        stride: GLsizei,
+    ) -> bool {
+        let Some(f) = self.t.try_glMultiDrawElementsIndirectEXT() else {
+            return false;
+        };
+        // SAFETY: as `draw_arrays_indirect`.
+        unsafe { f(mode, ty, offset_ptr(offset), draw_count, stride) };
+        true
+    }
+
+    pub fn patch_parameter_i(&self, name: GLenum, value: GLint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glPatchParameteri()(name, value) };
+    }
+
+    pub fn begin_transform_feedback(&self, mode: GLenum) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glBeginTransformFeedback()(mode) };
+    }
+
+    pub fn pause_transform_feedback(&self) {
+        // SAFETY: no arguments.
+        unsafe { self.t.glPauseTransformFeedback()() };
+    }
+
+    pub fn resume_transform_feedback(&self) {
+        // SAFETY: no arguments.
+        unsafe { self.t.glResumeTransformFeedback()() };
     }
 
     // ---- misc ----

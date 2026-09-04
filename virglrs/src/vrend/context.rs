@@ -22,8 +22,8 @@ use super::features::{Feature, Features};
 use super::formats::{Desc, Table};
 use super::gl::gles::*;
 use super::gl::{
-    FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, QueryName, SamplerName,
-    ShaderName, TextureName, TransformFeedbackName, VertexArrayName,
+    BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, ProgramName,
+    QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, VertexArrayName,
 };
 use super::pipe::*;
 use super::proto::{self, *};
@@ -37,9 +37,12 @@ use std::fmt;
 
 #[path = "context/blit.rs"]
 mod blit;
+#[path = "context/draw.rs"]
+mod draw;
 #[path = "context/select.rs"]
 mod select;
 
+pub use draw::{HwBlend, LinkedProgram, Sysval, Xfb};
 pub use select::{Bound, Program, Variant};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
@@ -286,6 +289,8 @@ pub struct View {
     /// A rectangle view served by a 2D texture, GLES having no rectangle target: the shader
     /// scales the coordinates.
     pub emulated_rect: bool,
+    /// A linear view of an sRGB texture: sampled through the sampler that skips decoding.
+    pub skip_srgb_decode: bool,
     /// A texture view of the resource, when one was needed and could be made.
     pub view: Option<TextureName>,
     pub first_layer: u32,
@@ -332,6 +337,7 @@ pub struct Query {
 pub struct Streamout {
     pub id: TransformFeedbackName,
     pub targets: Vec<Option<ObjectHandle>>,
+    pub xfb: Xfb,
 }
 
 pub enum Object {
@@ -433,10 +439,10 @@ pub struct SubCtx {
     long_shader: [Option<ObjectHandle>; ShaderStage::COUNT],
 
     blend: Option<BlendState>,
-    /// `hw_blend_state.rt[i].colormask`: blend state reaches GL only at draw, so this is what a
-    /// clear restores.
-    hw_colormask: [u8; MAX_COLOR_BUFS],
-    hw_independent_blend: bool,
+    /// Blend state reaches GL only at draw; this is what it last told GL, and what a clear
+    /// restores.
+    hw_blend: HwBlend,
+    blend_dirty: bool,
     dsa: Option<(ObjectHandle, DepthStencilAlpha)>,
     rs: Option<RasterizerState>,
     hw_rs: HwRs,
@@ -468,15 +474,35 @@ pub struct SubCtx {
     blend_color: [f32; 4],
     ve: Option<ObjectHandle>,
     vbos: Vec<VertexBuffer>,
+    /// How many vertex buffers the last draw bound, so a shorter set unbinds the rest.
+    old_num_vbos: usize,
+    vbo_dirty: bool,
     ib: Option<IndexBuffer>,
     consts: [Vec<u32>; ShaderStage::COUNT],
+    const_dirty: [bool; ShaderStage::COUNT],
     ubos: [BTreeMap<u32, Ubo>; ShaderStage::COUNT],
+    ubos_dirty: [u32; ShaderStage::COUNT],
     views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
+    /// The view slots re-bound at the next draw, one bit each.
+    views_dirty: [u32; ShaderStage::COUNT],
+    /// The level count of each view the last draw bound, in sampler order, for the GLES
+    /// `textureQueryLevels` emulation.
+    texture_levels: [Vec<GLint>; ShaderStage::COUNT],
     samplers: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
     shaders: [Option<Bound>; ShaderStage::COUNT],
+    /// A stage was bound or its key's inputs changed: the draw re-selects the variants.
+    shader_dirty: bool,
     /// The last draw's primitive mode, which the fragment shader's key reads; the C's is zero
     /// until a draw, and zero is points.
     prim_mode: PrimType,
+    /// Every program linked for this sub-context, and the one the draws run.
+    programs: Vec<LinkedProgram>,
+    prog: Option<u64>,
+    next_program_serial: u64,
+    /// The `VirglBlock` contents, and a cookie that moves with every change so a program
+    /// uploads it once per change.
+    sysval: Sysval,
+    sysval_cookie: u32,
     ssbos: [BTreeMap<u32, Ssbo>; ShaderStage::COUNT],
     images: [BTreeMap<u32, ImageView>; ShaderStage::COUNT],
     abos: BTreeMap<u32, Ssbo>,
@@ -503,8 +529,8 @@ impl SubCtx {
             objects: BTreeMap::new(),
             long_shader: [None; ShaderStage::COUNT],
             blend: None,
-            hw_colormask: [0xf; MAX_COLOR_BUFS],
-            hw_independent_blend: false,
+            hw_blend: HwBlend::default(),
+            blend_dirty: false,
             dsa: None,
             rs: None,
             hw_rs: HwRs::default(),
@@ -527,13 +553,25 @@ impl SubCtx {
             blend_color: [0.0; 4],
             ve: None,
             vbos: Vec::new(),
+            old_num_vbos: 0,
+            vbo_dirty: false,
             ib: None,
             consts: Default::default(),
+            const_dirty: [false; ShaderStage::COUNT],
             ubos: Default::default(),
+            ubos_dirty: [0; ShaderStage::COUNT],
             views: Default::default(),
+            views_dirty: [0; ShaderStage::COUNT],
+            texture_levels: Default::default(),
             samplers: Default::default(),
             shaders: Default::default(),
+            shader_dirty: false,
             prim_mode: PrimType::Points,
+            programs: Vec::new(),
+            prog: None,
+            next_program_serial: 0,
+            sysval: Sysval::default(),
+            sysval_cookie: 0,
             ssbos: Default::default(),
             images: Default::default(),
             abos: BTreeMap::new(),
@@ -561,9 +599,20 @@ impl SubCtx {
         for so in self.streamouts.drain(..) {
             gl.delete_transform_feedback(so.id);
         }
+        for p in self.programs.drain(..) {
+            if let Some(b) = p.sysval_buffer {
+                gl.delete_buffer(b);
+            }
+            gl.delete_program(p.id);
+        }
         let objects = std::mem::take(&mut self.objects);
         for (_, obj) in objects {
             release(gl, obj);
+        }
+        for b in std::mem::take(&mut self.shaders) {
+            if let Some(Bound::Owned(s)) = b {
+                release(gl, Object::Shader(s));
+            }
         }
         self.gl_ctx
     }
@@ -618,6 +667,7 @@ fn release(gl: &Gl, obj: Object) {
         }
         Object::Query(q) => gl.delete_query(q.id),
         Object::Shader(s) => {
+            // The programs linking its variants went with the sub-context (`draw::release_shader`).
             if let ShaderText::Whole(p) = s.text {
                 for v in p.variants {
                     if let Some(id) = v.id {
@@ -645,6 +695,17 @@ const ZERO_DSA: DepthStencilAlpha = DepthStencilAlpha {
     depth: DepthState { enabled: false, writemask: false, func: CompareFunc::Never },
     alpha: AlphaState { enabled: false, func: CompareFunc::Never, ref_value: 0.0 },
     stencil: [ZERO_FACE; 2],
+};
+
+/// The C's zeroed `pipe_blend_state`.
+const ZERO_BLEND: BlendState = BlendState {
+    independent_blend_enable: false,
+    logicop_enable: false,
+    dither: false,
+    alpha_to_coverage: false,
+    alpha_to_one: false,
+    logicop_func: LogicOp::Clear,
+    rt: [RtBlend { equation: None, colormask: 0 }; 8],
 };
 
 /// The C's zeroed `pipe_rasterizer_state`.
@@ -809,11 +870,7 @@ impl Context {
                 self.clear(host, buffers, color, depth, stencil);
                 Ok(())
             }
-            Command::DrawVbo(draw) => {
-                self.sub_mut().prim_mode = draw.mode;
-                host.todo.note("DRAW_VBO");
-                Err(Fault::Unimplemented { cmd: kind, what: "draws" })
-            }
+            Command::DrawVbo(draw) => self.draw_vbo(host, draw),
             Command::ResourceInlineWrite { transfer, data } => {
                 self.inline_write(host, transfer, data)
             }
@@ -822,7 +879,9 @@ impl Context {
             }
             Command::SetIndexBuffer(ib) => self.set_index_buffer(host, ib),
             Command::SetConstantBuffer { stage, data, .. } => {
-                self.sub_mut().consts[stage.index()] = data.to_vec();
+                let sub = self.sub_mut();
+                sub.consts[stage.index()] = data.to_vec();
+                sub.const_dirty[stage.index()] = true;
                 Ok(())
             }
             Command::SetStencilRef { front, back } => {
@@ -874,11 +933,17 @@ impl Context {
             Command::EndQuery(h) => self.end_query(host, h),
             Command::GetQueryResult { query, wait } => self.get_query_result(host, query, wait),
             Command::SetPolygonStipple(rows) => {
-                self.sub_mut().polygon_stipple = rows;
+                let sub = self.sub_mut();
+                sub.polygon_stipple = rows;
+                sub.sysval.stipple = rows;
+                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
                 Ok(())
             }
             Command::SetClipState(planes) => {
-                self.sub_mut().clip_state = planes;
+                let sub = self.sub_mut();
+                sub.clip_state = planes;
+                sub.sysval.clip_planes = planes;
+                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
                 Ok(())
             }
             Command::SetSampleMask(mask) => {
@@ -1143,6 +1208,10 @@ impl Context {
                         {
                             sub.current_so = Some(c - 1);
                         }
+                        if so.xfb == Xfb::Paused {
+                            gl.bind_transform_feedback(Some(so.id));
+                            gl.end_transform_feedback();
+                        }
                         gl.delete_transform_feedback(so.id);
                     } else {
                         i += 1;
@@ -1167,6 +1236,9 @@ impl Context {
                     *slot = Some(Bound::Owned(shader));
                     return;
                 }
+                let Object::Shader(shader) = old else { unreachable!() };
+                draw::release_shader(sub, gl, shader);
+                return;
             }
             _ => {}
         }
@@ -1190,7 +1262,11 @@ impl Context {
                 let Object::Blend(s) = self.sub().object(cmd, h, ObjectType::Blend)? else {
                     unreachable!()
                 };
-                self.sub_mut().blend = Some(*s);
+                let s = *s;
+                let sub = self.sub_mut();
+                sub.blend = Some(s);
+                sub.shader_dirty = true;
+                sub.blend_dirty = true;
                 Ok(())
             }
             ObjectType::Dsa => {
@@ -1233,9 +1309,14 @@ impl Context {
         }
         if sub.dsa.map(|(h, _)| h) != state.map(|(h, _)| h) {
             sub.stencil_dirty = true;
+            sub.shader_dirty = true;
         }
         sub.dsa = state;
         let s = sub.dsa_state();
+        if state.is_some() && sub.sysval.alpha_ref_val != s.alpha.ref_value {
+            sub.sysval.alpha_ref_val = s.alpha.ref_value;
+            sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
+        }
         if s.depth.enabled {
             if !sub.depth_test_enabled {
                 gl.enable(GL_DEPTH_TEST);
@@ -1288,7 +1369,11 @@ impl Context {
         // The C toggles GL_CLIP_PLANE0+i here even on GLES, where the enum does not exist and
         // the call is an error that poisons the context. Clip planes are the shader's on GLES;
         // the toggle is dropped, and the C's error with it.
-        sub.hw_rs.clip_plane_enable = s.clip_plane_enable;
+        if s.clip_plane_enable != sub.hw_rs.clip_plane_enable {
+            sub.hw_rs.clip_plane_enable = s.clip_plane_enable;
+            sub.sysval.clip_plane_enabled = if s.clip_plane_enable != 0 { 1.0 } else { 0.0 };
+            sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
+        }
         if features.has(Feature::multisample) {
             if features.has(Feature::sample_mask) {
                 gl.set_enabled(GL_SAMPLE_MASK, s.multisample);
@@ -1318,6 +1403,9 @@ impl Context {
         let Some(Object::VertexElements(v)) = sub.objects.get_mut(&h) else {
             return Err(Fault::IllegalHandle { cmd, handle: h });
         };
+        if sub.ve != Some(h) {
+            sub.vbo_dirty = true;
+        }
         sub.ve = Some(h);
         if v.elements.len() as u32 > max_attribs {
             return Err(Fault::OutOfRange { cmd, what: "vertex attribute count" });
@@ -1363,8 +1451,16 @@ impl Context {
                 _ => return,
             },
         };
+        let same = match (&bound, &sub.shaders[stage.index()]) {
+            (None, None) => true,
+            (Some(Bound::Object(a)), Some(b)) => b.is(*a),
+            _ => false,
+        };
+        if !same {
+            sub.shader_dirty = true;
+        }
         if let Some(Bound::Owned(s)) = std::mem::replace(&mut sub.shaders[stage.index()], bound) {
-            release(host.gl, Object::Shader(s));
+            draw::release_shader(sub, host.gl, s);
         }
     }
 
@@ -1582,6 +1678,9 @@ impl Context {
             // No format can be a rectangle target on GLES (`vrend_formats.c` probes only
             // desktop GL for it), so every rectangle view is served by a 2D texture.
             emulated_rect: !is_buffer && v.target == TextureTarget::Rect,
+            skip_srgb_decode: v.format != res.args.format
+                && res.args.format.describe().is_some_and(|d| d.is_srgb())
+                && !desc.is_some_and(|d| d.is_srgb()),
             view,
             first_layer,
             last_layer,
@@ -1864,8 +1963,10 @@ impl Context {
                 far,
             };
             sub.viewport_dirty |= 1 << idx;
-            if idx == 0 {
+            if idx == 0 && sub.viewport_is_negative != negative {
                 sub.viewport_is_negative = negative;
+                sub.sysval.winsys_adjust_y = if negative { -1.0 } else { 1.0 };
+                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
             }
         }
     }
@@ -2078,6 +2179,8 @@ impl Context {
                 eprintln!("[virglrs] vrend: framebuffer incomplete: {status:#x}");
             }
         }
+        sub.shader_dirty = true;
+        sub.blend_dirty = true;
         Ok(())
     }
 
@@ -2142,7 +2245,12 @@ impl Context {
                 host.resource(cmd, r)?;
             }
         }
-        self.sub_mut().vbos = vbos;
+        let sub = self.sub_mut();
+        if sub.vbos != vbos {
+            sub.vbo_dirty = true;
+        }
+        sub.old_num_vbos = sub.vbos.len();
+        sub.vbos = vbos;
         Ok(())
     }
 
@@ -2172,7 +2280,8 @@ impl Context {
         resource: Option<ResourceHandle>,
     ) -> Result<(), Fault> {
         let cmd = Cmd::SetUniformBuffer;
-        let ubos = &mut self.sub_mut().ubos[stage.index()];
+        let sub = self.sub_mut();
+        let ubos = &mut sub.ubos[stage.index()];
         match resource {
             None => {
                 ubos.remove(&index);
@@ -2184,6 +2293,9 @@ impl Context {
                 }
                 ubos.insert(index, Ubo { resource: r, offset, length });
             }
+        }
+        if index < 32 {
+            sub.ubos_dirty[stage.index()] |= 1 << index;
         }
         Ok(())
     }
@@ -2211,8 +2323,12 @@ impl Context {
             if sub.views[stage.index()].get(&slot) == Some(h) {
                 continue;
             }
+            if slot < 32 {
+                sub.views_dirty[stage.index()] |= 1 << slot;
+            }
             let (gl, features, formats, limits) =
                 (host.gl, host.features, host.formats, host.limits);
+            let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
             match &mut res.storage {
                 Storage::Texture { name, target, .. } if view.view.is_none() => {
@@ -2239,6 +2355,7 @@ impl Context {
                 Storage::Buffer { name, tbo, .. } => {
                     let tbo_tex = *tbo.get_or_insert_with(|| gl.gen_texture());
                     gl.bind_texture(GL_TEXTURE_BUFFER, Some(tbo_tex));
+                    buffer_view = true;
                     let entry = formats.get(view.format);
                     let mut ifmt = entry.map_or(GL_NONE, |e| e.gl.internalformat);
                     if ifmt == GL_NONE || ifmt == GL_ALPHA8_EXT {
@@ -2265,7 +2382,11 @@ impl Context {
                     return Err(Fault::IllegalResource { cmd, handle: view.resource });
                 }
             }
-            self.sub_mut().views[stage.index()].insert(slot, *h);
+            let sub = self.sub_mut();
+            sub.views[stage.index()].insert(slot, *h);
+            if buffer_view {
+                sub.shader_dirty = true;
+            }
         }
         let end = start_slot + views.len() as u32;
         self.sub_mut().views[stage.index()].retain(|slot, _| *slot < end);
@@ -2451,7 +2572,7 @@ impl Context {
             }
         }
         let sub = self.sub_mut();
-        sub.streamouts.push(Streamout { id, targets: targets.to_vec() });
+        sub.streamouts.push(Streamout { id, targets: targets.to_vec(), xfb: Xfb::NeedBegin });
         sub.current_so = Some(sub.streamouts.len() - 1);
         Ok(())
     }
@@ -2586,7 +2707,7 @@ impl Context {
         let sub = self.sub_mut();
         if buffers & PIPE_CLEAR_COLOR != 0 {
             gl.clear_color(color);
-            if sub.hw_independent_blend && indep {
+            if sub.hw_blend.independent && indep {
                 for i in 0..MAX_COLOR_BUFS {
                     gl.color_mask_i(i as GLuint, [true; 4]);
                 }
@@ -2626,12 +2747,12 @@ impl Context {
         }
         if buffers & PIPE_CLEAR_COLOR != 0 {
             let mask = |m: u8| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0];
-            if sub.hw_independent_blend && indep {
-                for (i, m) in sub.hw_colormask.iter().enumerate() {
+            if sub.hw_blend.independent && indep {
+                for (i, m) in sub.hw_blend.colormask.iter().enumerate() {
                     gl.color_mask_i(i as GLuint, mask(*m));
                 }
             } else {
-                gl.color_mask(mask(sub.hw_colormask[0]));
+                gl.color_mask(mask(sub.hw_blend.colormask[0]));
             }
         }
         gl.set_enabled(GL_SCISSOR_TEST, sub.hw_rs.scissor);
