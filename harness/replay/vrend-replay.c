@@ -27,6 +27,9 @@
 //                 empty diff means the oracle is measuring nothing.
 //   --readback R  score only this resource (default: every colour offscreen, at its unref)
 //   --sweep       score every colour offscreen at its unref -- the default
+//   --no-zero-new leave a new resource's contents undefined instead of zeroing them, which is
+//                 how to see what an unwritten resource was reading. Goldens are recorded with
+//                 the zeroing ON, so a score line is the renderer's answer and not its allocator's.
 //   --sweep-w W   restrict --sweep to targets of this width
 //   --score F     write the score to F
 //   --expect F    compare the score against F and exit non-zero on any difference
@@ -202,6 +205,7 @@ static void iosurf_remember(uint32_t handle, uint32_t w, uint32_t h)
 }
 static int want_ctx = -1;
 static const char *score_path, *expect_path, *caps_path;
+static bool zero_new = true;
 
 /* The score, accumulated in stream order. Two implementations that render the same pixels in a
  * different order are not the same implementation, so the ORDER is part of what is pinned.
@@ -350,6 +354,41 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
       score_addf("iosurface res=%u %ux%u sync=%d read-failed=%d\n", handle, w, h, sr, ir);
    }
    free(sp);
+}
+
+/* Define what the score will read, before anything else can leave undefined bytes there.
+ *
+ * A texture's contents are undefined until something writes them -- glTexStorage2D and
+ * glTexImage2D with NULL both say so -- and this driver does not zero them, so an unwritten
+ * resource reads back whatever the last tenant of that GPU memory left. Hashing that grades the
+ * allocator, not the renderer: two implementations that agree on every pixel they actually draw
+ * still differ on every resource neither of them ever wrote, and one that agrees today agrees by
+ * luck. This is the tool that tells the two apart. A score line that moves under --zero-new was
+ * never the renderer's answer.
+ *
+ * It zeroes through exactly the call shape score_resource() reads with: same box, same
+ * 4-bytes-per-pixel stride, same level, so precisely the region the score observes is defined,
+ * and anything the renderer genuinely writes overwrites it.
+ *
+ * Measured before it became the default: on vrend, blit, sampled and surface it moves not one
+ * line, so it disturbs nothing any renderer actually draws. On the VP9 corpus it moves 224
+ * resources -- decode target planes the guest allocates and never decodes into -- and with it on
+ * the two renderers agree on every one of them, where before they disagreed on 22. --no-zero-new
+ * turns it off, which is how you look at what was there instead.
+ *
+ * A format that refuses the transfer -- depth/stencil, compressed -- is left alone: a refusal
+ * here is not a failure of the run.
+ */
+static void zero_resource(uint32_t handle, uint32_t width, uint32_t height, int ctx)
+{
+   uint32_t w = width ? width : 1, h = height ? height : 1;
+   size_t need = (size_t)w * h * 4;
+   uint8_t *zeros = calloc(1, need);
+   if (!zeros) return;
+   struct iovec ziov = { .iov_base = zeros, .iov_len = need };
+   struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
+   (void)virgl_renderer_transfer_write_iov(handle, (uint32_t)ctx, 0, w * 4, 0, &box, 0, &ziov, 1);
+   free(zeros);
 }
 
 static void score_resource(const struct res_ev *ev)
@@ -513,6 +552,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
       else if (!strcmp(argv[i], "--caps") && i + 1 < argc) caps_path = argv[++i];
@@ -775,6 +815,9 @@ int main(int argc, char **argv)
              * "Illegal resource" as a handle the context has never heard of. */
             virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
             virgl_renderer_ctx_attach_resource(want_ctx, (int)r->handle);
+            /* After the attach, which is what gives vrend the resource a transfer can reach. */
+            if (zero_new && r->kind != RES_BLOB)
+               zero_resource(r->handle, r->width, r->height, want_ctx);
          }
 
          p += h.total_len;

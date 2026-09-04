@@ -222,23 +222,24 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   planes chained behind it, one two-plane IOSurface), and that is a second contract needing its
   own corpus, not a newer version of this one.
 
-  Twenty-two of its lines are expected to differ, and none of them is a decoded picture. They are
-  the plane resources of one decode target the guest creates nine times without ever destroying
-  it and never decodes into; the eight targets that do receive frames match the C on all 963.
-  Nothing in either renderer writes those planes, so what the sweep reads back is whatever the
-  driver last left in that texture memory -- undefined, stable per renderer, and different
-  between them. The signature is plain in the fixture: the generation the buffer actually holds
-  matches, and of one later generation two planes match while the third does not, which no
-  decoded frame would do. The real fix belongs in the scorer, which should not hash a resource
-  the renderer never wrote; until it does, a diff confined to those resources is the expected
-  state and a line outside them is a regression.
-
   The corpus is `vrend-vp9stock.bin`, captured with `capture.sh vrend` while decoding
   `spikes/vt-vp9-decode/vp90-2-09-aq2.webm` from the limina tree -- a real conformance clip, not
   `videotestsrc`, which has no hidden frames and no reference management to get wrong. The decode
   is checked against `avdec_vp9` before anything is pinned: VP9 is normatively exact, so the two
   must agree byte for byte, and eight consecutive runs must agree with each other. A golden taken
   from one run of an intermittently faulting leg grades the port against a bad frame.
+
+  **A resource is zeroed when it is created, so a score line is the renderer's answer and not
+  its allocator's.** A texture's contents are undefined until something writes them, and this
+  driver does not zero them, so an unwritten resource reads back whatever the last tenant of that
+  GPU memory left -- deterministic per renderer and different between them, which grades the
+  allocation history rather than the port. This corpus is where it surfaced: the guest allocates
+  224 decode-target planes it never decodes into, and the two renderers disagreed on 22 of them
+  while agreeing on all 963 decoded pictures. The replayer now writes zeros over each new
+  resource through exactly the call shape the score reads it with, so the untouched case is
+  defined and identical. Measured before adopting it: not one line moves on `vrend`, `blit`,
+  `sampled` or `surface`, so it disturbs nothing any renderer actually draws. `--no-zero-new`
+  turns it off, which is how to look at what was there instead -- never record a golden that way.
 
   `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 33
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
