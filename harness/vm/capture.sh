@@ -9,6 +9,10 @@
 #   capture.sh venus  [options]   enhanced GNOME guest, venus recorder. Its shell renders through
 #                                 classic virgl, so venus traffic here comes from Vulkan clients
 #   capture.sh vrend  [options]   stock guest, classic command tracer (vrend_trace)
+#   capture.sh video  [options]   enhanced guest, classic command tracer. The video codecs the
+#                                 stock guest cannot reach: its mesa is built
+#                                 -Dvideo-codecs=all_free and the VA frontend enforces that
+#                                 driver-independently, so a decode corpus has to come from here
 #
 #   --mb N        recorder capacity, MB (default 512). The venus recorder STOPS at the cap and
 #                 says so — a truncated corpus is a valid prefix, so a small cap costs coverage,
@@ -69,15 +73,17 @@ case "$MODE" in
     export LIMINA_VKR_RECORD_OUT="$RIG/captures/$NAME.vkrc"
     export LIMINA_VKR_RECORD_FIFO="$RIG/captures/$NAME.fifo"
     OUT="$LIMINA_VKR_RECORD_OUT" ;;
-  vrend)
-    DISK="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
+  vrend|video)
+    [ "$MODE" = video ] \
+      && DISK="$RIG/disks/Fedora-Workstation-44.enhanced.test.raw" \
+      || DISK="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
     # A classic corpus is named vrend*, which is how dump.sh knows to write a .bin.
     case "$NAME" in vrend*) ;; *) NAME="vrend-$NAME" ;; esac
     export LIMINA_VREND_TRACE="$MB"
     export LIMINA_VREND_TRACE_OUT="$RIG/captures/$NAME.bin"
     export LIMINA_VREND_TRACE_FIFO="$RIG/captures/$NAME.fifo"
     OUT="$LIMINA_VREND_TRACE_OUT" ;;
-  *) echo "usage: capture.sh {synoik|venus|vrend} [--mb N] [--out NAME] [--window] [--seconds N]" >&2
+  *) echo "usage: capture.sh {synoik|venus|vrend|video} [--mb N] [--out NAME] [--window] [--seconds N]" >&2
      exit 2 ;;
 esac
 
