@@ -135,6 +135,13 @@ impl LinkedProgram {
     }
 }
 
+/// The vertex buffer slots a bind must clear: the ones the hardware still holds past the set
+/// the guest has now. `hw` is what the last bind left bound -- not what the last state-set
+/// replaced, which is a different number the moment the guest sets twice before drawing.
+fn stale_vbo_slots(bound: usize, hw: usize) -> std::ops::Range<usize> {
+    bound..hw.max(bound)
+}
+
 fn stage_prefix(stage: ShaderStage) -> &'static str {
     match stage {
         ShaderStage::Vertex => "vs",
@@ -1262,9 +1269,10 @@ impl Context {
                 None => gl.bind_vertex_buffer(i as GLuint, None, 0, 0),
             }
         }
-        for i in sub.vbos.len()..sub.old_num_vbos {
+        for i in stale_vbo_slots(sub.vbos.len(), sub.hw_num_vbos) {
             gl.bind_vertex_buffer(i as GLuint, None, 0, 0);
         }
+        sub.hw_num_vbos = sub.vbos.len();
         sub.vbo_dirty = false;
     }
 
@@ -1562,5 +1570,20 @@ impl Context {
             sub.streamouts[i].xfb = Xfb::Paused;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_that_never_reached_a_draw_still_leaves_its_buffers_unbound() {
+        // Four bound, then the guest sets two and one before drawing again: the slots to clear
+        // are those the hardware holds, not the ones the last set replaced.
+        assert_eq!(stale_vbo_slots(4, 0), 4..4);
+        assert_eq!(stale_vbo_slots(1, 4), 1..4);
+        assert_eq!(stale_vbo_slots(4, 4), 4..4);
+        assert_eq!(stale_vbo_slots(6, 4), 6..6);
     }
 }
