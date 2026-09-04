@@ -25,6 +25,7 @@ use super::gl::{
     BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, ProgramName,
     QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, VertexArrayName,
 };
+use super::pipe::slots::{MAX_COLOR_BUFS, MAX_VIEWPORTS};
 use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage};
@@ -49,8 +50,6 @@ const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
 const PIPE_CLEAR_COLOR0: u32 = 1 << 2;
 const PIPE_CLEAR_COLOR: u32 = 0xff << 2;
-const MAX_COLOR_BUFS: usize = 8;
-const MAX_VIEWPORTS: usize = 16;
 
 /// What the guest side of the renderer answers about a resource's pages.
 pub trait Guest {

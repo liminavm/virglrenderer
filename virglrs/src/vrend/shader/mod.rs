@@ -26,31 +26,16 @@ pub mod glsl;
 use super::features::{Feature, Features};
 use super::gl::Gl;
 use super::gl::gles::{GL_MAX_TESS_PATCH_COMPONENTS, GL_SHADING_LANGUAGE_VERSION};
+pub use super::pipe::slots::{
+    MAX_COLOR_BUFS, MAX_COMBINED_SSBO_BINDING_POINTS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
+    MAX_SHADER_SAMPLER_VIEWS, MAX_SO_OUTPUTS, NUM_CLIP_PLANES, POLYGON_STIPPLE_SIZE,
+};
 use super::pipe::{CompareFunc, LogicOp, PrimType};
 use super::proto::StreamOutput;
 use super::resource::Limits;
 use super::tgsi::{self, Interpolate, Location, Semantic};
 
 pub use glsl::{Failure, Strings, convert, create_passthrough_tcs};
-
-/// `VIRGL_NUM_CLIP_PLANES`.
-pub const NUM_CLIP_PLANES: usize = 8;
-/// `VREND_POLYGON_STIPPLE_SIZE`.
-pub const POLYGON_STIPPLE_SIZE: usize = 32;
-/// `VREND_MAX_COMBINED_SSBO_BINDING_POINTS`.
-pub const MAX_COMBINED_SSBO_BINDING_POINTS: u32 = 32;
-/// `PIPE_MAX_COLOR_BUFS`.
-pub const MAX_COLOR_BUFS: usize = 8;
-/// `PIPE_MAX_SHADER_SAMPLER_VIEWS`.
-pub const MAX_SHADER_SAMPLER_VIEWS: usize = 128;
-/// `PIPE_MAX_SHADER_INPUTS`.
-pub const MAX_SHADER_INPUTS: usize = 80;
-/// `PIPE_MAX_SHADER_BUFFERS`.
-pub const MAX_SHADER_BUFFERS: usize = 32;
-/// `PIPE_MAX_SHADER_IMAGES`.
-pub const MAX_SHADER_IMAGES: usize = 32;
-/// `PIPE_MAX_SO_OUTPUTS`.
-pub const MAX_SO_OUTPUTS: usize = 64;
 
 /// `gl_advanced_blend_mode`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
