@@ -16,6 +16,7 @@ use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName}
 use super::pipe::TextureTarget;
 use super::proto::Format;
 use crate::metal::{PixelFormat, Surface};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -247,9 +248,32 @@ pub enum Storage {
 
 /// A resource the host holds. Its GL object is deleted by [`Resource::destroy`], never by drop:
 /// deleting needs the driver and a current context, which a drop does not have.
+/// What a render target's texture view is a function of: the format it reinterprets the resource
+/// in, and the layer range it restricts to. The level range is not part of it -- a surface's view
+/// always spans the resource's whole mip chain -- and neither is anything the guest sets on the
+/// view object afterwards, because nothing does. That makes two surfaces with the same key the
+/// same view, which is why the resource can own it.
+///
+/// A *sampler* view has no such key: its swizzle, depth/stencil read mode and sRGB decode live on
+/// the view object itself and are not derivable from the resource, so those stay where they are.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ViewKey {
+    pub format: Format,
+    pub first_layer: u32,
+    pub layers: u32,
+}
+
 pub struct Resource {
     pub args: Args,
     pub storage: Storage,
+    /// The render-target views taken of this resource, one per distinct [`ViewKey`].
+    ///
+    /// They live here rather than on the surface objects that ask for them because a view outlives
+    /// the surface: the guest may destroy a surface the framebuffer is still drawing through, and
+    /// a texture deleted underneath a live attachment is a lifetime bug that no amount of purging
+    /// at destroy sites can close. Held by the one thing a view cannot outlive, it needs no purge
+    /// at all -- the views go when the storage does.
+    views: BTreeMap<ViewKey, TextureName>,
 }
 
 impl Resource {
@@ -345,11 +369,42 @@ impl Resource {
         } else {
             alloc_texture(gl, winsys, features, formats, &args)?
         };
-        Ok(Resource { args, storage })
+        Ok(Resource { args, storage, views: BTreeMap::new() })
+    }
+
+    /// The render-target view for `key`, minted the first time it is asked for.
+    ///
+    /// `internalformat` is the format table's answer for `key.format`; the caller has the table
+    /// and this does not.
+    pub fn view(&mut self, gl: &Gl, key: ViewKey, internalformat: GLenum) -> Option<TextureName> {
+        let Storage::Texture { name, target, .. } = self.storage else { return None };
+        Some(*self.views.entry(key).or_insert_with(|| {
+            let v = gl.gen_texture();
+            gl.texture_view(
+                v,
+                target,
+                name,
+                internalformat,
+                0,
+                self.args.last_level + 1,
+                key.first_layer,
+                key.layers,
+            );
+            v
+        }))
+    }
+
+    /// The render-target view for `key`, if it has already been minted. Every surface mints its
+    /// view at creation, so an attach only ever reads one back.
+    pub fn view_texture(&self, key: ViewKey) -> Option<TextureName> {
+        self.views.get(&key).copied()
     }
 
     /// Delete the GL object, on a current context that shares with the one that made it.
     pub fn destroy(self, gl: &Gl) {
+        for v in self.views.into_values() {
+            gl.delete_texture(v);
+        }
         match self.storage {
             Storage::Guest | Storage::Host(_) => {}
             Storage::Buffer { name, tbo, .. } => {
