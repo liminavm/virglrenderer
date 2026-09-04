@@ -171,10 +171,11 @@ invariants a port owes, none of which the C encodes as a type:
    the venus harness drives, so they are P2 infrastructure, not P5 work.
 6. **The VideoToolbox backend + AV1/H.264 bitstream synthesis (4.1k).** Ours
    already, well understood, and it maps cleanly onto `objc2` +
-   `objc2-video-toolbox` + `objc2-io-surface`. `dav1d` → `rav1d` (the Rust port).
+   `objc2-video-toolbox` + `objc2-io-surface`. The C's dav1d fallback is not ported:
+   see P4.
 
 Crates that carry weight: `objc2` family (IOSurface, Metal, VideoToolbox, Mach
-ports), `rav1d`. `u_format`'s table is already generated from Mesa's XML — port that
+ports). `u_format`'s table is already generated from Mesa's XML — port that
 generator to emit Rust alongside the venus one.
 
 **Vulkan is reached through a generated proc table, not `ash`.** The decoder fills our
@@ -680,12 +681,16 @@ buildable throughout as the A-side reference.
   pixels, a distinct hash per frame, three replays byte-identical. It cost one flag. The replay
   harness never passed `USE_VIDEO`, and that flag is what registers VP9 and AV1 as supplemental
   VideoToolbox decoders, without which every session create fails and the targets score empty
-  while everything else looks clean. What can break that equivalence is not the decoder: it is **choosing a different
-  decoder**. dav1d is not a peer backend -- it is a mid-stream fallback inside the AV1 codec,
-  entered only for frames the hardware returns wrongly (super-resolution). If the Rust leg
-  switches at a different unit than the C, the hashes diverge for a reason that is not a bug,
-  so the switch rule is ported exactly and the switch point is logged and compared. rav1d
-  standing in for dav1d bit-for-bit is a claim to verify while implementing, not to assume.
+  while everything else looks clean.
+
+  **There is one decoder, and it is VideoToolbox.** The C carries a dav1d fallback entered
+  mid-stream for AV1 frames the hardware returns wrongly (super-resolution) and for a host with
+  no AV1 silicon at all. Neither is ported. A superres frame is refused, because a refused frame
+  is a lost frame while a delivered one is a wrong picture nothing reports; and a host without
+  the silicon advertises no AV1, which leaves the stream on the guest's own dav1d -- better
+  tested than ours, and the same place the C's stock tier leaves it. That also removes the one
+  thing that could break the two legs' equivalence for a reason that is not a bug: a switch to
+  a different decoder at a different unit.
 
   **VP9 is the only codec a stock guest can drive, and so it goes first.** Stock Fedora's
   mesa is built `-Dvideo-codecs=all_free` and its VA frontend enforces that
