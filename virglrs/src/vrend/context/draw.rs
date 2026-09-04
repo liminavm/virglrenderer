@@ -706,8 +706,8 @@ impl Context {
         if changed {
             // Every constant buffer and view is re-bound for a new program.
             for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
-                sub.ubos_dirty[stage.index()] = !0;
-                sub.views_dirty[stage.index()] = !0;
+                sub.ubos_dirty[stage.index()] = Dirty::all();
+                sub.views_dirty[stage.index()] = Dirty::all();
             }
         }
         sub.shader_dirty = false;
@@ -861,16 +861,20 @@ impl Context {
             return next_ubo_id;
         };
         let mut mask = prog.ubo_used_mask[s];
-        let used: u32 = sub.ubos[s].keys().filter(|k| **k < 32).map(|k| 1u32 << k).sum();
+        // The decoder refuses an index past the mask, so every key is a slot it holds.
+        let mut used = Dirty::none();
+        for slot in sub.ubos[s].keys() {
+            used.mark(*slot);
+        }
         let mut dirty = sub.ubos_dirty[s];
-        let update = dirty & used;
-        if update == 0 {
+        let update = dirty.intersect(used);
+        if update.is_empty() {
             return next_ubo_id + mask.count_ones();
         }
         while mask != 0 {
             let i = mask.trailing_zeros();
             mask &= mask - 1;
-            if update & (1 << i) != 0
+            if update.contains(i)
                 && let Some(cb) = sub.ubos[s].get(&i)
                 && let Some(res) = host.resources.get(&cb.resource)
                 && let Storage::Buffer { name, .. } = res.storage
@@ -882,7 +886,7 @@ impl Context {
                     cb.offset as usize,
                     cb.length as usize,
                 );
-                dirty &= !(1 << i);
+                dirty.unmark(i);
             }
             next_ubo_id += 1;
         }
@@ -942,7 +946,7 @@ impl Context {
                 Some(Object::SamplerView(v)) => Some(v),
                 _ => None,
             });
-            if dirty & (1 << i) != 0
+            if dirty.contains(i)
                 && let Some(view) = view
             {
                 gl.active_texture(next_sampler_id);
@@ -1025,7 +1029,7 @@ impl Context {
                 tl[i] = l;
             }
         }
-        sub.views_dirty[s] = 0;
+        sub.views_dirty[s].clear();
         // A later glBindTexture for another reason must not disturb the units just bound.
         gl.active_texture(max_units.saturating_sub(1));
         next_sampler_id

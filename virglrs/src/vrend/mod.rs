@@ -19,6 +19,7 @@ pub mod caps;
 pub mod context;
 pub mod debug;
 pub mod decode;
+pub mod dirty;
 pub mod egl;
 pub mod encode;
 pub mod features;
