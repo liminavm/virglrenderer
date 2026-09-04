@@ -1,0 +1,11 @@
+loop 0 created 10 failed 0 unrefs 9 submits 1 cmds 10 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 1
+res=10 64x64 hash=75b37bbbd875cb83 ink=4096/4096
+res=11 64x64 hash=50eeb25b191fba03 ink=4096/4096
+res=12 64x64 hash=3e1139b88fb88083 ink=4096/4096
+res=13 64x64 hash=2c050286b5cb8483 ink=4096/4096
+res=14 64x64 hash=61d81224b05fa083 ink=4096/4096
+res=15 64x64 hash=d4b09fdef0408003 ink=4096/4096
+res=16 64x64 hash=5fb32844912bc683 ink=4096/4096
+res=17 32x32 hash=d0e45a55c6476703 ink=1024/1024
+res=20 64x64 hash=c49756b10d751483 ink=4096/4096
+iosurface res=21 32x32 sync=0 hash=21f92de8a77e5403 ink=1024/1024

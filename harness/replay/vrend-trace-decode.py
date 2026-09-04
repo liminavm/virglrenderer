@@ -364,9 +364,14 @@ def main():
                 ref(dw[1], r[0], "SET_INDEX_BUFFER")
             elif name == "RESOURCE_INLINE_WRITE" and len(dw) > 1:
                 ref(dw[1], r[0], "RESOURCE_INLINE_WRITE")
-            elif name in ("BLIT", "RESOURCE_COPY_REGION") and len(dw) > 2:
+            elif name == "RESOURCE_COPY_REGION" and len(dw) > 6:
                 ref(dw[1], r[0], name + " dst")
-                ref(dw[2], r[0], name + " src")
+                ref(dw[6], r[0], name + " src")
+            elif name == "BLIT" and len(dw) > 13:
+                # BLIT does not share COPY_REGION's layout: its destination block carries a
+                # format and a full box, so the source handle sits at dword 13, not 2.
+                ref(dw[4], r[0], name + " dst")
+                ref(dw[13], r[0], name + " src")
             elif name == "CREATE_OBJECT" and len(dw) > 2:
                 kind = (dw[0] >> 8) & 0xFF
                 # VIRGL_OBJECT_SAMPLER_VIEW is 6 and VIRGL_OBJECT_SURFACE 8 -- both name a
