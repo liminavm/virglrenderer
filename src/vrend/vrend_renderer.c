@@ -9583,8 +9583,15 @@ int vrend_renderer_resource_sync_iosurface(struct vrend_resource *res)
       return -1;
 
    /* EGLImage mode: the texture's storage IS the IOSurface — nothing to
-    * copy, only completion to guarantee before the present reads the bytes. */
+    * copy, only completion to guarantee before the present reads the bytes.
+    *
+    * The renders live on the queue of the sub-context that drew them, and glFinish waits for
+    * the current context's queue only. Finishing ctx0, which never draws, let the present read
+    * the frame before last off a scanout -- the replay harness caught it, reading a scanout's
+    * surface a frame behind its texture. Finish the context that was current, which is the one
+    * that last rendered, before switching. */
    if (!res->iosurf_pbo) {
+      glFinish();
       vrend_hw_switch_context(vrend_state.ctx0, true);
       glFinish();
       return 0;
