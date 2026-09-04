@@ -121,8 +121,8 @@ pub struct LinkedProgram {
     /// The `VirglBlock` binding and the buffer behind it, once a stage declared the block.
     pub virgl_block_bind: Option<GLuint>,
     pub sysval_buffer: Option<BufferName>,
-    /// The sub-context's `sysval_cookie` the buffer last held.
-    pub sysval_cookie: Option<u32>,
+    /// The block the buffer holds, so a draw uploads only a block that changed.
+    pub sysval_uploaded: Option<Sysval>,
     pub reads_drawid: bool,
     pub fs_blend_equation_advanced: u32,
 }
@@ -492,7 +492,7 @@ fn add_shader_program(
         tex_levels_uniform_id: [-1; ShaderStage::COUNT],
         virgl_block_bind: None,
         sysval_buffer: None,
-        sysval_cookie: None,
+        sysval_uploaded: None,
         reads_drawid: false,
         fs_blend_equation_advanced: fs.info.fs_blend_equation_advanced,
     };
@@ -1159,20 +1159,19 @@ impl Context {
     fn fill_sysval_uniform_block(&mut self, host: &mut Host<'_>) {
         let gl = host.gl;
         let sub = self.sub_mut();
-        let cookie = sub.sysval_cookie;
-        let bytes = sub.sysval.bytes();
+        let sysval = sub.sysval;
         let Some(prog) = sub.program_mut() else {
             return;
         };
         if prog.virgl_block_bind.is_none() {
             return;
         }
-        if prog.sysval_cookie != Some(cookie) {
+        if prog.sysval_uploaded != Some(sysval) {
             let buf = prog.sysval_buffer.expect("a bound block has its buffer");
             gl.bind_buffer(GL_UNIFORM_BUFFER, Some(buf));
-            gl.buffer_sub_data(GL_UNIFORM_BUFFER, 0, &bytes);
+            gl.buffer_sub_data(GL_UNIFORM_BUFFER, 0, &sysval.bytes());
             gl.bind_buffer(GL_UNIFORM_BUFFER, None);
-            prog.sysval_cookie = Some(cookie);
+            prog.sysval_uploaded = Some(sysval);
         }
     }
 
@@ -1334,11 +1333,7 @@ impl Context {
 
         if features.has(Feature::draw_parameters) && reads_drawid {
             let drawid = draw.tess.map_or(0, |t| t.drawid) as i32;
-            let sub = self.sub_mut();
-            if sub.sysval.drawid_base != drawid {
-                sub.sysval.drawid_base = drawid;
-                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
-            }
+            self.sub_mut().sysval.drawid_base = drawid;
         }
 
         self.draw_bind_objects(host, new_program);
