@@ -668,23 +668,40 @@ buildable throughout as the A-side reference.
   **What scores it.** Both legs call the same VideoToolbox on the same host, so a golden is
   exact -- not because these codecs are normatively bit-exact, though they are, but because
   even a quirky VT produces the same bytes twice. The decoded planes land in guest resources
-  and leave by the ordinary readback path, so a replay corpus scores video with no harness
-  surgery. What can break that equivalence is not the decoder: it is **choosing a different
+  and leave by the ordinary readback path, so a replay corpus should score video with no
+  harness surgery -- confirmed while pinning the first corpus, not assumed, since it rests
+  on the decoded planes passing the sweep predicate. What can break that equivalence is not the decoder: it is **choosing a different
   decoder**. dav1d is not a peer backend -- it is a mid-stream fallback inside the AV1 codec,
   entered only for frames the hardware returns wrongly (super-resolution). If the Rust leg
   switches at a different unit than the C, the hashes diverge for a reason that is not a bug,
   so the switch rule is ported exactly and the switch point is logged and compared. rav1d
   standing in for dav1d bit-for-bit is a claim to verify while implementing, not to assume.
 
-  **Order, and why.** *The corpus first*: only the C leg can record it, the end gate needs it
-  regardless, and it carries real `virgl_picture_desc` inputs -- synthetic descriptors
-  exercise paths no player takes. *Then the builders*: `virgl_h264_build_parameter_sets`,
-  `annexb_to_avcc`, `virgl_av1_build_temporal_unit` and their HEVC counterparts are pure
-  bytes-in/bytes-out, roughly 2,600 lines with an exact oracle that needs no GL, no VT and no
-  VM, so they are ordinary `cargo test` work against fixtures dumped from the C by a small
-  generator linking the builder objects. *Then* the command path and buffer lifetime, *then*
-  VT decode and delivery, *then* AV1, which is the only codec needing synthesis of a header
-  the guest's parser already destroyed.
+  **VP9 is the only codec a stock guest can drive, and so it goes first.** Stock Fedora's
+  mesa is built `-Dvideo-codecs=all_free` and its VA frontend enforces that
+  driver-independently, so H.264 and HEVC cannot be reached from an unmodified guest at all.
+  VP9 is also the codec that needs the least of us: the guest's slice buffers already hold a
+  complete frame, so the backend concatenates, wraps and delivers, with no parameter sets to
+  synthesize. That makes it the one slice that exercises the command path, the buffer
+  lifetime and the delivery path without any bitstream work underneath -- which is exactly
+  what should be proven first. H.264 and HEVC corpora need a guest mesa rebuilt with the
+  codecs on; AV1 is free but wants M3-or-later silicon to decode in hardware.
+
+  **Order, and why.** *A VP9 corpus first*: only the C leg can record it, the end gate needs
+  it regardless, and it carries real `virgl_picture_desc` inputs -- synthetic descriptors
+  exercise paths no player takes. *Then the whole VP9 leg*: caps, codec and buffer lifetime,
+  command path, VT session, delivery. That is a scoring, end-to-end video renderer, and every
+  later codec is bitstream work behind an interface it has already proven. *Then the
+  builders*: `virgl_h264_build_parameter_sets`, `annexb_to_avcc`,
+  `virgl_av1_build_temporal_unit` and their HEVC counterparts are pure bytes-in/bytes-out,
+  roughly 2,600 lines with an exact oracle that needs no GL, no VT and no VM -- ordinary
+  `cargo test` work against fixtures dumped from the C by a small generator linking the
+  builder objects. *Then* H.264, HEVC, and AV1 last, being the only codec that must
+  synthesize a header the guest's parser already destroyed.
+
+  The `LIMINA_AV1_CAPTURE` dumps are not those fixtures: the C calls them an ABI-shaped dump
+  for a spike built from the same tree, never a persisted format. Descriptors come from the
+  wire corpus, which is one.
 
   **`create_buffer` resolves its planes once.** It takes up to three guest resource handles,
   one per plane. They become shares at create, not handles re-looked-up at delivery, because
