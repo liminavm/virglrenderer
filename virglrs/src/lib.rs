@@ -20,5 +20,6 @@ pub mod ids;
 pub mod metal;
 pub mod renderer;
 pub mod venus;
+pub mod videotoolbox;
 pub mod vrend;
 pub mod vulkan;

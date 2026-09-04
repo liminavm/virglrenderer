@@ -5,9 +5,9 @@
 
 /// What the caller asked this renderer to be.
 ///
-/// The C ABI says this in a bitmask of eleven `virgl_renderer_init` flags, of which exactly three
+/// The C ABI says this in a bitmask of eleven `virgl_renderer_init` flags, of which exactly four
 /// mean anything here; the rest select a winsys this build does not use. So the Rust API asks for
-/// the three, by name, and the shim does the decoding -- a caller should not have to know which
+/// the four, by name, and the shim does the decoding -- a caller should not have to know which
 /// bit is which, nor that one of them is spelled inside out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Config {
@@ -18,6 +18,10 @@ pub struct Config {
     /// The VMM cannot inject memory pages, so a blob must come from the guest's own heap. The
     /// guest reads this back out of the venus capset and allocates accordingly.
     pub guest_vram: bool,
+    /// Serve hardware video decode. Off by default, and the host advertises no codec until it is
+    /// asked for: bringing VideoToolbox up registers supplemental decoders process-wide, which is
+    /// not a thing to do to a caller who never asked for video.
+    pub video: bool,
 }
 
 /// The renderer a context bound when it was created.

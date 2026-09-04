@@ -24,9 +24,11 @@ use super::gl::gles::GL_VERSION;
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::transfer::{self, Info};
+use crate::config::Config;
 use crate::guest_mem::Iov;
 use crate::ids::{ContextId, ResourceHandle};
 use crate::metal;
+use crate::videotoolbox;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -64,6 +66,11 @@ pub struct Vrend {
     shader_cfg: shader::Config,
     /// What the guest's driver is told of the host, probed once from the same answers.
     caps: caps::CapsV2,
+    /// What VideoToolbox decodes here, or `None` when the caller did not ask for video.
+    ///
+    /// Probing is what registers the supplemental decoders, so this is also the record that
+    /// registration happened: nothing can ask this host about a codec without holding one.
+    video: Option<videotoolbox::Support>,
     ctx0: egl::Context,
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
@@ -91,7 +98,7 @@ const VERSIONS: [Version; 3] = [
 
 impl Vrend {
     /// Open the winsys, bring ctx0 up on this thread and probe the driver.
-    pub fn new() -> Result<Vrend, InitError> {
+    pub fn new(config: Config) -> Result<Vrend, InitError> {
         let winsys = Winsys::open(Flavour::Gles)?;
         let mut ctx0 = None;
         for v in VERSIONS {
@@ -125,6 +132,22 @@ impl Vrend {
                 "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
             },
         );
+        let video = config.video.then(videotoolbox::Support::probe);
+        if let Some(support) = video {
+            let names: Vec<&str> = videotoolbox::Codec::ALL
+                .iter()
+                .filter(|c| support.decodes(**c))
+                .map(|c| c.name())
+                .collect();
+            eprintln!(
+                "[virglrs] vrend: hardware video decode {}",
+                if names.is_empty() {
+                    "UNAVAILABLE -- this host has silicon for none of the codecs we serve".into()
+                } else {
+                    names.join(" ")
+                },
+            );
+        }
         Ok(Vrend {
             winsys,
             gl,
@@ -133,6 +156,7 @@ impl Vrend {
             limits,
             shader_cfg,
             caps,
+            video,
             ctx0,
             version,
             current: Current::Ctx0,
@@ -147,6 +171,14 @@ impl Vrend {
     /// The classic capsets, as probed at init.
     pub fn caps(&self) -> &caps::CapsV2 {
         &self.caps
+    }
+
+    /// What this host decodes in hardware, or `None` when the caller did not ask for video.
+    ///
+    /// `None` and a support that decodes nothing are different answers and stay different: the
+    /// first is a configuration, the second is this machine's silicon.
+    pub fn video(&self) -> Option<&videotoolbox::Support> {
+        self.video.as_ref()
     }
 
     pub fn gl(&self) -> &Gl {
@@ -176,6 +208,7 @@ impl Vrend {
             limits,
             shader_cfg,
             caps: _,
+            video: _,
             ctx0,
             version,
             current,
@@ -451,7 +484,7 @@ mod tests {
     #[test]
     #[ignore = "needs the zink-on-KosmicKrisp environment"]
     fn the_host_table_for_the_corpus_formats() {
-        let v = Vrend::new().expect("vrend comes up");
+        let v = Vrend::new(Config::default()).expect("vrend comes up");
         let present: Vec<&str> = v.features.present().map(|f| f.name()).collect();
         eprintln!("features: {}", present.join(" "));
         for raw in [1, 2, 20, 48, 49, 64, 65, 67, 131, 134, 177, 227] {
