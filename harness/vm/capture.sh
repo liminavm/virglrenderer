@@ -10,9 +10,11 @@
 #                                 classic virgl, so venus traffic here comes from Vulkan clients
 #   capture.sh vrend  [options]   stock guest, classic command tracer (vrend_trace)
 #
-#   --mb N        recorder capacity, MB (default 256). The venus recorder STOPS at the cap and
+#   --mb N        recorder capacity, MB (default 512). The venus recorder STOPS at the cap and
 #                 says so — a truncated corpus is a valid prefix, so a small cap costs coverage,
-#                 never validity.
+#                 never validity. The default holds a desktop's 64 MiB wallpaper upload, which a
+#                 smaller one drops: the corpus still replays, as a flat-colour desktop that
+#                 measures none of it.
 #   --out NAME    write captures/NAME.vkrc instead of captures/<mode>.vkrc, and dump it with
 #                 `dump.sh NAME`. A corpus is pinned by the score recorded from it, so a second
 #                 capture under the same name silently replaces what a fixture was measured
@@ -34,7 +36,7 @@ cd "$(dirname "$0")"
 RIG="$(pwd)"
 
 MODE="${1:-}"; shift || true
-MB=256; WINDOW=0; SECONDS_TO_DUMP=""; NAME=""; RENDERER=c
+MB=512; WINDOW=0; SECONDS_TO_DUMP=""; NAME=""; RENDERER=c
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in

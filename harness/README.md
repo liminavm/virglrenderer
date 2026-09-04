@@ -158,18 +158,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   is, and `VkHostAddressRangeEXT` reached the driver with its address and size swapped.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens and
   5 IOSurfaces from the classic corpus: the stock guest's GNOME session with its wallpaper, which
-  is one 64 MiB transfer, so the capture takes a 512 MB tracer
-  (`capture.sh vrend --mb 512`). The corpus that carries the wallpaper also carries the mip chain
-  the guest builds from it with eleven blits and the overview composited over it; the tracer once
-  dropped any transfer past 1 MiB, and a corpus recorded that way replayed to a flat-colour
-  desktop that measured none of this. `vrend-nodraw.score` is the same run with every `DRAW_VBO`
-  dropped, and the diff between the two is the positive control: 19 offscreens lose their ink, and
-  all three 1280x800 scanout IOSurfaces go from fully inked to one shared all-zero hash. An empty
-  diff would mean the oracle measures nothing.
-  `synoik.score` is the venus content fixture:
-  its capture was taken mid-workload, so 22 device allocations are still live and half of them
-  carry GPU-written bytes. `venus.score` and `synoik-lifecycle.score` are the lifecycle fixtures:
-  vkmark runs to completion and the synoik session is stopped before its dump, so every context
+  arrives as one 64 MiB transfer and is why the recorder's default capacity is 512 MB. That one
+  transfer is most of what the corpus measures — the mip chain the guest builds from it with
+  eleven blits, and the overview composited over it — so a recorder that drops it replays to a
+  flat-colour desktop that measures none of this. `vrend-nodraw.score` is the same run with every
+  `DRAW_VBO` dropped, and the diff between the two is the positive control: 19 offscreens lose
+  their ink, and all three 1280x800 scanout IOSurfaces go from fully inked to one shared all-zero
+  hash. An empty diff would mean the oracle measures nothing. `synoik.score` is the venus content
+  fixture: its capture was taken mid-workload, so 22 device allocations are still live and half
+  of them carry GPU-written bytes. `venus.score` and `synoik-lifecycle.score` are the lifecycle
+  fixtures: vkmark runs to completion and the synoik session is stopped before its dump, so every context
   censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there. The two synoik
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
