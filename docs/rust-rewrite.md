@@ -591,16 +591,32 @@ buildable throughout as the A-side reference.
 
   *A resource exists before anything knows what it is.* `PipeResourceSetType` retro-types a
   handle that was already created and attached, so there is a window in which a handle names an
-  untyped thing. Modelling that window as a storage state is the best local answer and still a
-  state that should not be representable. The question to reopen is whether the Rust API should
-  carry an imported buffer as shared storage from the start, with the wire's create-then-type
-  two-step translated in `ffi.rs` -- which is the "would this still make sense if `ffi.rs` were
-  deleted?" test, and it currently would not.
+  untyped thing. The window is protocol-inherent -- `SET_TYPE` arrives in the command stream and
+  attach precedes it by ordering, which no amount of deleting `ffi.rs` changes -- so what is owed
+  is a better representation of it, not its removal. See *existence precedes purpose* below.
 
   *A placeholder reports success for work it did not do.* When the adopt refuses, the fallback
   is a texture whose contents are wrong, and the guest is told the command succeeded. The C's
   own comment says as much. Zeroing keeps it from leaking another context's memory; it does not
   make the answer true.
+
+  **Existence precedes purpose, and it does so in both protocols.** Neither wire says what a
+  buffer is *for* at the moment it is created, and the two renderers are forced to opposite
+  answers. venus must commit early: the guest is handed a host pointer at `vkAllocateMemory`, so
+  where the bytes live is fixed then and can never move, and a scanout is recognised by shape --
+  export plus dedicated image -- because nothing declares one. vrend must defer: a blob is
+  attached by the VMM before any command stream can type it. `mint_surface` is the contrast that
+  proves the point, committing at create because `BIND_SCANOUT` and `BIND_SHARED` are
+  declarations rather than inferences. The linear-vs-optimal tiling rule belongs to the same
+  family, committing to a CPU-addressable layout before knowing whether the image is ever
+  presented.
+
+  The mechanisms cannot be unified -- one protocol forces early, the other forces late. The
+  representation can be, and the tree already converges on it: `Pages.why` latches a resolved
+  negative with its reason and says it once. The rule that generalises, and the one a redesign
+  should aim at: **when purpose arrives after existence, "not yet known" is a typed state with
+  one owner, carrying what is known and why it is unresolved -- never a side table, never a
+  silent guess, never success reported for wrong contents.**
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
