@@ -369,7 +369,7 @@ pub fn is_bgra(format: Format) -> bool {
     matches!(format.name(), "B8G8R8A8_UNORM" | "B8G8R8X8_UNORM" | "B8G8R8A8_SRGB" | "B8G8R8X8_SRGB")
 }
 
-fn is_srgb(format: Format) -> bool {
+pub fn is_srgb(format: Format) -> bool {
     format.describe().is_some_and(|d| d.is_srgb())
 }
 

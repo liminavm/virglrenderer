@@ -16,6 +16,7 @@
 //! one refused. Nothing a guest sends reaches an `assert`: a handle that is not in the table, a
 //! resource the context does not have, a shape the host cannot serve -- each is a [`Fault`].
 
+use super::blitter::Blitter;
 use super::decode::Batch;
 use super::dirty::Dirty;
 use super::egl::{self, EglError, Version, Winsys};
@@ -70,6 +71,11 @@ pub trait Guest {
 pub enum Current {
     Ctx0,
     Sub(CtxId, SubCtxId),
+    /// The blitter's own GL context, for the length of one blit. It is a state of this enum and
+    /// not a flag beside it because it is the same fact: a switch back that consulted a stale
+    /// `Sub` would decide it had nothing to do, and every GL call after the blit -- the rest of
+    /// the batch, which does not ask -- would land in the blitter's context.
+    Blitter,
 }
 
 /// Commands this build could not serve, counted by shape. Printed once each as they are first
@@ -110,6 +116,8 @@ pub struct Host<'a> {
     pub ctx: CtxId,
     pub current: &'a mut Current,
     pub todo: &'a mut Todo,
+    /// The shader blitter, built on the first blit that needs it.
+    pub blitter: &'a mut Option<Blitter>,
 }
 
 impl Host<'_> {

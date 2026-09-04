@@ -541,10 +541,12 @@ buildable throughout as the A-side reference.
   debugging aids with no reader here. Not served yet, each counted and named in the log
   when a stream asks: tessellation without a control shader (the C's injected TCS),
   advanced blend equations, a layered image bound as a subset of its levels or layers,
-  the C's bridge of UBO 0 into the constant array, the shader blitter (a blit whose
-  formats swizzle differently, or that swaps red and blue for an IOSurface-backed end),
+  the C's bridge of UBO 0 into the constant array, the shader blitter's depth path,
   implicit-multisample surfaces, the resource-copy fallback through guest memory, blob
-  resources, video. The first pixel gate has passed: the stock guest's GNOME session,
+  resources, video. The shader blitter's colour path is in: a blit whose ends disagree
+  about their swizzle, that swaps red and blue for an IOSurface-backed end, or that has
+  to convert a colourspace by hand, runs as a textured quad in the blitter's own shared
+  GL context, and `blit.score` pins five such blits against the C. The first pixel gate has passed: the stock guest's GNOME session,
   booted headless on virglrs and on the C and read from the presented frame, is
   bit-identical between the two but for the clock's digits. (kmscube was the planned
   workload; the stock guest autologs into GNOME, which holds DRM master, so the desktop
@@ -582,6 +584,26 @@ to have it, each because reproducing the C would mean reproducing a defect.
 - **The fourteen `ASTC_*_SRGB` formats are registered.** The C's `ASTC_FORMAT` macro never adds
   the sRGB rows, so its capset advertises fewer formats than its host has
   (`virglrs/vrend-gen/gl_formats.py`, and `harness/README.md` on `vrend.caps`).
+- **The blitter reads the two sRGB features under their own names.** The C fills
+  `has_srgb_write_control` from `feat_texture_srgb_decode` and `has_texture_srgb_decode` from
+  `feat_srgb_write_control` — a transposition, and the first of the pair gates whether the blit
+  enables `GL_FRAMEBUFFER_SRGB`. Unobservable on this host, where the pinned `blit.score` matches
+  the C on an sRGB blit either way, and a host with one extension and not the other would diverge.
+
+## Known gaps, with the shape of their fix
+
+Not deviations: places the port is faithful to the C and the C is wrong, kept only because no
+fixture can yet tell a fix from a regression.
+
+- **A blit mutates sampler state behind the view cache.** `vrend_set_tex_param` sets the base and
+  max level, the filters, the wrap modes and the format swizzle on the *source texture object*,
+  which contexts share. The sampler-view bind skips its work when the same view handle is set into
+  the same slot again, so a redundant re-bind after a blit leaves the blitter's parameters in
+  place. The C has the same hole and a wider one — it caches `cur_base`, `cur_max` and
+  `cur_swizzle` on the texture itself, so no later bind of any view repairs it. The fix is not
+  another purge at the blit: it is for the blit to sample through a texture it owns, or for the
+  cache to key on something the blit necessarily changes. It needs a corpus that blits a texture
+  that is also a bound sampler view, re-binds the identical view, and then draws.
 
 ## Consequences to accept
 
