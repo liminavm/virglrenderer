@@ -105,7 +105,7 @@ pub enum Equivalent {
 
 /// `util_format_description`, the parts the renderer reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Desc {
+pub struct Description {
     pub name: &'static str,
     pub layout: Layout,
     pub block: Block,
@@ -124,7 +124,7 @@ pub struct Desc {
     pub equivalent: Option<Equivalent>,
 }
 
-impl Desc {
+impl Description {
     /// `util_format_get_blocksize`: bytes per block, never zero.
     pub fn block_bytes(&self) -> u32 {
         (self.block.bits / 8).max(1)
@@ -236,7 +236,7 @@ impl Desc {
 
 impl Format {
     /// The format's description, if the wire number names a format gallium knows.
-    pub fn describe(self) -> Option<&'static Desc> {
+    pub fn describe(self) -> Option<&'static Description> {
         DESCRIPTIONS[self.wire() as usize].as_ref()
     }
 
@@ -571,7 +571,7 @@ fn multisample_works(gl: &Gl, internalformat: GLenum) -> bool {
 mod tests {
     use super::*;
 
-    fn by_name(name: &str) -> (Format, &'static Desc) {
+    fn by_name(name: &str) -> (Format, &'static Description) {
         let n = DESCRIPTIONS
             .iter()
             .position(|d| d.is_some_and(|d| d.name == name))

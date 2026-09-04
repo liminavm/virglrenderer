@@ -53,12 +53,12 @@ fn uprcase(c: u8) -> u8 {
 /// A cursor over the text. The text is what the guest sent up to its first NUL, and reading past
 /// the end answers NUL, as the C's terminated buffer does.
 #[derive(Clone, Copy)]
-struct Cur<'a> {
+struct Cursor<'a> {
     text: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Cur<'a> {
+impl<'a> Cursor<'a> {
     fn at(&self, off: usize) -> u8 {
         self.text.get(self.pos + off).copied().unwrap_or(0)
     }
@@ -412,8 +412,8 @@ impl Default for Bracket {
 }
 
 impl Bracket {
-    fn ind_reg(&self) -> IndReg {
-        IndReg {
+    fn ind_reg(&self) -> IndirectRegister {
+        IndirectRegister {
             file: self.ind_file,
             index: self.ind_index as i16,
             swizzle: self.ind_comp,
@@ -432,7 +432,7 @@ struct DclRegister {
 
 struct Parser<'a> {
     text: &'a [u8],
-    cur: Cur<'a>,
+    cur: Cursor<'a>,
     processor: Processor,
     /// Six bits in the C.
     implied_array_size: u32,
@@ -511,7 +511,7 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn parse_file(cur: &mut Cur<'a>) -> Option<File> {
+    fn parse_file(cur: &mut Cursor<'a>) -> Option<File> {
         cur.match_name(File::ALL, File::name)
     }
 
@@ -804,9 +804,9 @@ impl<'a> Parser<'a> {
         Ok(src)
     }
 
-    fn parse_texoffset_operand(&mut self) -> R<TexOffset> {
+    fn parse_texoffset_operand(&mut self) -> R<TextureOffset> {
         let (file, b) = self.parse_register()?;
-        let mut off = TexOffset { file, index: b.index as i16, swizzle: [0; 3] };
+        let mut off = TextureOffset { file, index: b.index as i16, swizzle: [0; 3] };
         if let Some(sw) = self.parse_optional_swizzle(3)? {
             off.swizzle = [sw[0], sw[1], sw[2]];
         }
@@ -814,7 +814,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `match_inst`: the mnemonic, with its optional `_SAT` and `_PRECISE` suffixes.
-    fn match_inst(cur: &mut Cur<'a>, info: &Info) -> Option<(bool, bool)> {
+    fn match_inst(cur: &mut Cursor<'a>, info: &Info) -> Option<(bool, bool)> {
         let mut c = *cur;
         if c.match_whole(info.mnemonic) {
             *cur = c;
@@ -872,7 +872,7 @@ impl<'a> Parser<'a> {
             memory: None,
             dst: [Dst::default(); MAX_DST],
             src: [Src::default(); MAX_SRC],
-            tex_offsets: [TexOffset::default(); MAX_TEX_OFFSETS],
+            tex_offsets: [TextureOffset::default(); MAX_TEX_OFFSETS],
         };
         // The SAMPLE family takes no target argument but carries the texture word, for its
         // offsets.
@@ -1408,7 +1408,7 @@ impl<'a> Parser<'a> {
 }
 
 /// `str_match_format`: a `PIPE_FORMAT_*` name, by the wire number it stands for.
-fn match_format(cur: &mut Cur<'_>) -> Option<u16> {
+fn match_format(cur: &mut Cursor<'_>) -> Option<u16> {
     for n in 0..FORMAT_MAX {
         let Some(desc) = Format::from_wire(n).and_then(Format::describe) else {
             continue;
@@ -1430,7 +1430,7 @@ pub fn parse(text: &[u8], max_tokens: u32) -> Result<Shader, Error> {
     let text = &text[..end];
     let mut p = Parser {
         text,
-        cur: Cur { text, pos: 0 },
+        cur: Cursor { text, pos: 0 },
         processor: Processor::Fragment,
         implied_array_size: 0,
         num_immediates: 0,

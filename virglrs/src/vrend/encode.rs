@@ -13,7 +13,7 @@ use crate::ids::ResourceHandle;
 
 /// Appends one command, header included, to `out`.
 pub fn encode(cmd: &Command<'_>, out: &mut Vec<u32>) {
-    let mut e = Enc { out, start: 0 };
+    let mut e = Encoder { out, start: 0 };
     e.start = e.out.len();
     e.out.push(0);
     let obj = match cmd {
@@ -27,7 +27,7 @@ pub fn encode(cmd: &Command<'_>, out: &mut Vec<u32>) {
     e.out[e.start] = cmd.kind().wire() | (obj << 8) | (u32::from(len) << 16);
 }
 
-struct Enc<'o> {
+struct Encoder<'o> {
     out: &'o mut Vec<u32>,
     start: usize,
 }
@@ -40,7 +40,7 @@ fn obj(o: Option<ObjectHandle>) -> u32 {
     o.map_or(0, ObjectHandle::get)
 }
 
-impl Enc<'_> {
+impl Encoder<'_> {
     fn u(&mut self, v: u32) {
         self.out.push(v);
     }

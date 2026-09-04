@@ -12,7 +12,7 @@ use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
 use crate::guest_mem::{GuestMap, Iov};
 use crate::ids::{
-    BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
+    BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
 };
 use crate::venus;
 use crate::venus::context::Submitted;
@@ -138,7 +138,7 @@ pub enum BlobSource {
     /// The guest asks the host for memory it does not yet have.
     HostMinted,
     /// A venus context publishes device memory it already holds.
-    Exported { ctx: CtxId, mem: BlobId },
+    Exported { ctx: ContextId, mem: BlobId },
 }
 
 /// Host memory the guest maps, or a handle a context exported.
@@ -249,7 +249,7 @@ pub enum BlobStorage {
     /// kept -- what the C keeps too. Good only in the context that mapped it, and only while
     /// that allocation stands: `key` is what says whether it still does, and it says so about
     /// the *object*, not the id, which the guest may have given to something else since.
-    Borrowed { ctx: CtxId, mem: BlobId, key: ObjectKey, mapping: HostMapping },
+    Borrowed { ctx: ContextId, mem: BlobId, key: ObjectKey, mapping: HostMapping },
 }
 
 /// How a guest may cache memory the host published to it.
@@ -303,7 +303,7 @@ pub struct Resource {
     pub priv_: VmmPtr,
     /// Contexts this resource is attached to. A resource outlives the contexts that used it, so
     /// this is what says whether an unref may actually free it.
-    pub attached: Vec<CtxId>,
+    pub attached: Vec<ContextId>,
 }
 
 // The resource table is shared with every ring thread, so it must be safe to read from more than
@@ -325,7 +325,7 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
         self.get(&handle)?.shm().map(Arc::clone)
     }
 
-    fn bytes(&self, ctx: CtxId, handle: ResourceHandle) -> Option<ResourceBytes> {
+    fn bytes(&self, ctx: ContextId, handle: ResourceHandle) -> Option<ResourceBytes> {
         let Some(res) = self.get(&handle) else {
             eprintln!("[virglrs] ctx {}: resource {handle:?} is not in the table", ctx.get());
             return None;
@@ -396,11 +396,11 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
 /// a resource, and the pages behind it. Attachment is the gate here for the reason it is in
 /// `ShmResources`: it is the decision virtio-gpu already made.
 impl Guest for BTreeMap<ResourceHandle, Resource> {
-    fn attached(&self, ctx: CtxId, handle: ResourceHandle) -> bool {
+    fn attached(&self, ctx: ContextId, handle: ResourceHandle) -> bool {
         self.get(&handle).is_some_and(|r| r.attached.contains(&ctx))
     }
 
-    fn pages(&self, ctx: CtxId, handle: ResourceHandle) -> Option<Iov<'_>> {
+    fn pages(&self, ctx: ContextId, handle: ResourceHandle) -> Option<Iov<'_>> {
         let r = self.get(&handle)?;
         if !r.attached.contains(&ctx) || r.iov.is_empty() {
             return None;
@@ -425,7 +425,7 @@ impl Resource {
 }
 
 pub struct Context {
-    pub id: CtxId,
+    pub id: ContextId,
     /// The renderer this context bound. It is the only thing that says which one a submission
     /// belongs to, and it cannot change once the context exists.
     pub capset: CapsetId,
@@ -474,7 +474,7 @@ pub struct Renderer {
     /// that is the actual access pattern: many readers looking up a handle, one writer when the
     /// VMM creates or unrefs. See the lock order in `venus::vkr`.
     resources: Arc<RwLock<BTreeMap<ResourceHandle, Resource>>>,
-    contexts: BTreeMap<CtxId, Context>,
+    contexts: BTreeMap<ContextId, Context>,
     fences: Retirement,
     /// The venus renderer, present only when this build was initialized to serve it.
     venus: Option<venus::vkr::Vkr>,
@@ -761,7 +761,7 @@ impl Renderer {
     pub fn transfer(
         &mut self,
         handle: ResourceHandle,
-        ctx: Option<CtxId>,
+        ctx: Option<ContextId>,
         to_host: bool,
         info: &transfer::Info,
         iov: Vec<GuestIov>,
@@ -788,12 +788,12 @@ impl Renderer {
 
     pub fn context_create(
         &mut self,
-        id: CtxId,
+        id: ContextId,
         capset: CapsetId,
         name: String,
     ) -> Result<(), Error> {
         // A guest reusing a live id is the guest's error, not ours: rejected rather than
-        // replacing an entry it still holds. Zero needs no check -- `CtxId` cannot be zero.
+        // replacing an entry it still holds. Zero needs no check -- `ContextId` cannot be zero.
         if self.contexts.contains_key(&id) {
             return Err(Error::ContextExists);
         }
@@ -822,7 +822,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn context_destroy(&mut self, id: CtxId) {
+    pub fn context_destroy(&mut self, id: ContextId) {
         if self.contexts.remove(&id).is_none() {
             return;
         }
@@ -857,11 +857,11 @@ impl Renderer {
         self.resources.write().expect("the resource lock is never poisoned").clear();
     }
 
-    pub fn context(&self, id: CtxId) -> Option<&Context> {
+    pub fn context(&self, id: ContextId) -> Option<&Context> {
         self.contexts.get(&id)
     }
 
-    pub fn ctx_attach_resource(&mut self, ctx: CtxId, handle: ResourceHandle) {
+    pub fn ctx_attach_resource(&mut self, ctx: ContextId, handle: ResourceHandle) {
         if !self.contexts.contains_key(&ctx) {
             return;
         }
@@ -872,7 +872,7 @@ impl Renderer {
         });
     }
 
-    pub fn ctx_detach_resource(&mut self, ctx: CtxId, handle: ResourceHandle) {
+    pub fn ctx_detach_resource(&mut self, ctx: ContextId, handle: ResourceHandle) {
         self.with_resource_mut(handle, |r| r.attached.retain(|c| *c != ctx));
     }
 
@@ -880,7 +880,7 @@ impl Renderer {
 
     pub fn context_create_fence(
         &mut self,
-        ctx: CtxId,
+        ctx: ContextId,
         ring: RingIdx,
         fence: FenceId,
     ) -> Result<(), Error> {
@@ -907,7 +907,7 @@ impl Renderer {
     /// and the answer says how much ran. The caller waits -- holding none of this renderer, which
     /// is the whole reason the wait is not taken here -- and comes back with the remainder. See
     /// [`Submitted`] and [`Renderer::ring_waiter`].
-    pub fn submit_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<Submitted, Error> {
+    pub fn submit_cmd(&mut self, ctx: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
         let Some(c) = self.contexts.get(&ctx) else {
             return Err(Error::NoContext);
         };
@@ -936,7 +936,7 @@ impl Renderer {
     /// held. See [`Submitted::Waiting`].
     pub fn ring_waiter(
         &self,
-        ctx: CtxId,
+        ctx: ContextId,
         ring: RingId,
         seqno: u32,
     ) -> Result<venus::ring_thread::RingWaiter, Error> {
@@ -957,7 +957,7 @@ impl Renderer {
     }
 
     /// Feed one replay journal entry to a context's default stream.
-    pub fn venus_replay_cmd(&mut self, ctx: CtxId, buf: &[u8]) -> Result<(), Error> {
+    pub fn venus_replay_cmd(&mut self, ctx: ContextId, buf: &[u8]) -> Result<(), Error> {
         // A journal entry never suspends: `Context::submit_ring` and the replay path refuse a
         // wait outright, because there is no thread on the other side of one during a replay.
         match self.venus_mut()?.submit(ctx, buf).map_err(venus_error)? {
@@ -970,18 +970,18 @@ impl Renderer {
     /// Feed one replay journal entry to a named ring's stream.
     pub fn venus_replay_ring_cmd(
         &mut self,
-        ctx: CtxId,
+        ctx: ContextId,
         ring: RingId,
         buf: &[u8],
     ) -> Result<(), Error> {
         self.venus_mut()?.submit_ring(ctx, ring, buf).map_err(venus_error)
     }
 
-    pub fn venus_replay_begin(&mut self, ctx: CtxId) -> Result<(), Error> {
+    pub fn venus_replay_begin(&mut self, ctx: ContextId) -> Result<(), Error> {
         self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_begin(ctx).map_err(venus_error)
     }
 
-    pub fn venus_replay_end(&mut self, ctx: CtxId) -> Result<(), Error> {
+    pub fn venus_replay_end(&mut self, ctx: ContextId) -> Result<(), Error> {
         self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
     }
 
@@ -1008,7 +1008,7 @@ impl Renderer {
     ///
     /// An empty census and a census that could not be taken are different answers, and the VMM
     /// decides whether to snapshot on the difference -- so the failure says which it was.
-    pub fn venus_memory_census(&self, ctx_id: CtxId) -> Result<Vec<Allocation>, Error> {
+    pub fn venus_memory_census(&self, ctx_id: ContextId) -> Result<Vec<Allocation>, Error> {
         self.venus_context(ctx_id, |ctx| ctx.driver().memory_census())
     }
 
@@ -1020,7 +1020,7 @@ impl Renderer {
     /// that is gone then has no address to give, instead of having a stale one.
     pub fn venus_memory_export(
         &mut self,
-        ctx_id: CtxId,
+        ctx_id: ContextId,
         mem: BlobId,
         blob_size: u64,
     ) -> Result<(Exported, Option<Storage>, ObjectKey), Error> {
@@ -1165,7 +1165,7 @@ impl Renderer {
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
     pub fn venus_memory_read(
         &self,
-        ctx_id: CtxId,
+        ctx_id: ContextId,
         mem_id: u64,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
@@ -1181,7 +1181,7 @@ impl Renderer {
     /// context" -- which a caller asking for a snapshot needs to tell apart.
     fn venus_context<R>(
         &self,
-        ctx_id: CtxId,
+        ctx_id: ContextId,
         f: impl FnOnce(&venus::context::Context) -> R,
     ) -> Result<R, Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
@@ -1213,7 +1213,7 @@ mod tests {
     /// A sink that goes nowhere. Nothing here retires a fence; the renderer needs one to exist.
     struct NoSink;
     impl FenceSink for NoSink {
-        fn context_fence(&mut self, _ctx: CtxId, _ring: RingIdx, _fence: FenceId) {}
+        fn context_fence(&mut self, _ctx: ContextId, _ring: RingIdx, _fence: FenceId) {}
         fn global_fence(&mut self, _fence: ClientFenceId) {}
     }
 
@@ -1255,7 +1255,7 @@ mod tests {
         // this build, so the export itself is refused -- what is being asked here is that the
         // refusal came from the export path and not from minting something first.
         let exported = BlobDesc {
-            source: BlobSource::Exported { ctx: CtxId::new(1).unwrap(), mem: BlobId(9) },
+            source: BlobSource::Exported { ctx: ContextId::new(1).unwrap(), mem: BlobId(9) },
             ..minted
         };
         assert_eq!(
@@ -1290,8 +1290,8 @@ mod tests {
     fn a_context_reaches_the_resources_the_guest_attached_to_it() {
         use crate::venus::ring::ShmResources;
 
-        let one = CtxId::new(1).unwrap();
-        let two = CtxId::new(2).unwrap();
+        let one = ContextId::new(1).unwrap();
+        let two = ContextId::new(2).unwrap();
         let blob = ResourceHandle::new(1).unwrap();
 
         // The exporting allocation, as its context's object table holds it: what a borrowed
@@ -1306,7 +1306,7 @@ mod tests {
             )
             .unwrap();
         let key = objects.key_of(ObjectId(66)).unwrap();
-        let borrowed = |attached: Vec<CtxId>| Resource {
+        let borrowed = |attached: Vec<ContextId>| Resource {
             handle: blob,
             backing: Backing::Blob {
                 desc: BlobDesc {
@@ -1431,9 +1431,9 @@ mod tests {
         use crate::venus::driver::Storage;
         use crate::venus::ring::ShmResources;
 
-        let one = CtxId::new(1).unwrap();
-        let two = CtxId::new(2).unwrap();
-        let three = CtxId::new(3).unwrap();
+        let one = ContextId::new(1).unwrap();
+        let two = ContextId::new(2).unwrap();
+        let three = ContextId::new(3).unwrap();
         let blob = ResourceHandle::new(1).unwrap();
 
         let surface = crate::metal::Surface::scanout(64, 8, crate::metal::PixelFormat::Bgra, 256)
@@ -1641,7 +1641,7 @@ mod tests {
 
         const MEM: ObjectId = ObjectId(66);
         let mut r = renderer(Config { venus: true, ..Config::default() });
-        let one = CtxId::new(1).unwrap();
+        let one = ContextId::new(1).unwrap();
         r.context_create(one, CapsetId::Venus, "exporter".into()).expect("a fresh id");
 
         // The allocation the blob borrows, as the context's table holds it.
@@ -1703,7 +1703,7 @@ mod tests {
         use crate::venus::driver::NoSurface;
 
         let mut r = renderer(Config { venus: true, ..Config::default() });
-        let one = CtxId::new(1).unwrap();
+        let one = ContextId::new(1).unwrap();
         let account = Account::for_test(None);
         let pages = Storage::pages_for_test(4096, &account);
         assert_eq!(pages.surface().err(), Some(NoSurface::NotDedicated), "the pages know why");
@@ -1775,7 +1775,7 @@ mod tests {
         let fd = a_descriptor();
         let raw = fd.as_raw_fd();
         let mut r = renderer(Config::default());
-        let ctx = CtxId::new(1).unwrap();
+        let ctx = ContextId::new(1).unwrap();
         let res = ResourceHandle::new(1).unwrap();
 
         r.context_create(ctx, CapsetId::Virgl, "before".into()).expect("a fresh id");

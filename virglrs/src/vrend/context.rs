@@ -21,7 +21,7 @@ use super::decode::Batch;
 use super::dirty::Dirty;
 use super::egl::{self, EglError, Version, Winsys};
 use super::features::{Feature, Features};
-use super::formats::{Desc, Table};
+use super::formats::{Description, Table};
 use super::gl::gles::*;
 use super::gl::{
     BindingPoint, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl,
@@ -38,7 +38,7 @@ use super::resource::{self, Limits, Resource, Storage, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi};
 use crate::guest_mem::{HostSpan, Iov};
-use crate::ids::{CtxId, ResourceHandle};
+use crate::ids::{ContextId, ResourceHandle};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -62,16 +62,16 @@ const PIPE_CLEAR_COLOR: u32 = 0xff << 2;
 /// What the guest side of the renderer answers about a resource's pages.
 pub trait Guest {
     /// Whether the context may reach the resource: the C's per-context `res_hash`.
-    fn attached(&self, ctx: CtxId, handle: ResourceHandle) -> bool;
+    fn attached(&self, ctx: ContextId, handle: ResourceHandle) -> bool;
     /// The resource's attached pages, when the context may reach it and it has any.
-    fn pages(&self, ctx: CtxId, handle: ResourceHandle) -> Option<Iov<'_>>;
+    fn pages(&self, ctx: ContextId, handle: ResourceHandle) -> Option<Iov<'_>>;
 }
 
 /// Which GL context the thread has current, by name, so a switch is one compare.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Current {
     Ctx0,
-    Sub(CtxId, SubCtxId),
+    Sub(ContextId, SubContextId),
     /// The blitter's own GL context, for the length of one blit. It is a state of this enum and
     /// not a flag beside it because it is the same fact: a switch back that consulted a stale
     /// `Sub` would decide it had nothing to do, and every GL call after the blit -- the rest of
@@ -111,10 +111,10 @@ pub struct Host<'a> {
     pub features: &'a Features,
     pub formats: &'a Table,
     pub limits: &'a Limits,
-    pub shader_cfg: &'a shader::Cfg,
+    pub shader_cfg: &'a shader::Config,
     pub resources: &'a mut BTreeMap<ResourceHandle, Resource>,
     pub guest: &'a dyn Guest,
-    pub ctx: CtxId,
+    pub ctx: ContextId,
     pub current: &'a mut Current,
     pub todo: &'a mut Todo,
     /// The shader blitter, built on the first blit that needs it.
@@ -122,7 +122,7 @@ pub struct Host<'a> {
 }
 
 impl Host<'_> {
-    fn make_current(&mut self, sub: SubCtxId, gl_ctx: &egl::Context) {
+    fn make_current(&mut self, sub: SubContextId, gl_ctx: &egl::Context) {
         let want = Current::Sub(self.ctx, sub);
         if *self.current != want {
             self.winsys
@@ -322,7 +322,7 @@ pub struct Sampler {
     pub ids: Option<[SamplerName; 2]>,
 }
 
-pub struct Surf {
+pub struct Surface {
     pub resource: ResourceHandle,
     pub format: Format,
     pub level: u32,
@@ -335,7 +335,7 @@ pub struct Surf {
     pub view: Option<ViewKey>,
 }
 
-impl Surf {
+impl Surface {
     /// The layer the surface attaches, or `None` for every layer (the C's -1).
     fn layer(&self) -> Option<GLint> {
         (self.first_layer == self.last_layer).then_some(self.first_layer as GLint)
@@ -365,7 +365,7 @@ pub enum Object {
     VertexElements(VertexElements),
     SamplerView(View),
     SamplerState(Sampler),
-    Surface(Surf),
+    Surface(Surface),
     Query(Query),
     StreamoutTarget(StreamoutTarget),
 }
@@ -496,7 +496,7 @@ pub struct ImageView {
     pub level_size: u32,
 }
 
-pub struct SubCtx {
+pub struct SubContext {
     gl_ctx: egl::Context,
     fb: FramebufferName,
     blit_fbs: [FramebufferName; 2],
@@ -581,15 +581,15 @@ pub struct SubCtx {
     render_condition: Option<(ObjectHandle, bool, RenderCondMode)>,
 }
 
-impl SubCtx {
+impl SubContext {
     /// `vrend_renderer_create_sub_ctx`'s GL side, on a context just made current.
-    fn new(gl: &Gl, gl_ctx: egl::Context) -> SubCtx {
+    fn new(gl: &Gl, gl_ctx: egl::Context) -> SubContext {
         let vao = gl.gen_vertex_array();
         let fb = gl.gen_framebuffer();
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
         let blit_fbs = [gl.gen_framebuffer(), gl.gen_framebuffer()];
         let vp = ViewportHw { x: 0, y: 0, width: 0, height: 0, near: 0.0, far: 1.0 };
-        SubCtx {
+        SubContext {
             gl_ctx,
             fb,
             blit_fbs,
@@ -701,7 +701,7 @@ impl SubCtx {
         }
     }
 
-    fn surface(&self, cmd: Cmd, handle: ObjectHandle) -> Result<&Surf, Fault> {
+    fn surface(&self, cmd: Cmd, handle: ObjectHandle) -> Result<&Surface, Fault> {
         match self.object(cmd, handle, ObjectType::Surface)? {
             Object::Surface(s) => Ok(s),
             _ => unreachable!("looked up as a surface"),
@@ -832,16 +832,16 @@ const ZERO_RS: RasterizerState = RasterizerState {
 // ---- the context ----
 
 pub struct Context {
-    subs: BTreeMap<SubCtxId, SubCtx>,
-    current: SubCtxId,
+    subs: BTreeMap<SubContextId, SubContext>,
+    current: SubContextId,
     fault: Option<Fault>,
 }
 
 impl Context {
     /// `vrend_create_context`: a context with sub-context 0, current on this thread.
     pub fn new(host: &mut Host<'_>) -> Result<Context, EglError> {
-        let mut ctx = Context { subs: BTreeMap::new(), current: SubCtxId(0), fault: None };
-        ctx.create_sub(host, SubCtxId(0))?;
+        let mut ctx = Context { subs: BTreeMap::new(), current: SubContextId(0), fault: None };
+        ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
     }
 
@@ -850,15 +850,15 @@ impl Context {
     }
 
     /// Whether this context's GL contexts are `Current::Sub(self, ...)`.
-    pub fn current_sub(&self) -> SubCtxId {
+    pub fn current_sub(&self) -> SubContextId {
         self.current
     }
 
-    fn sub(&self) -> &SubCtx {
+    fn sub(&self) -> &SubContext {
         self.subs.get(&self.current).expect("the current sub-context exists")
     }
 
-    fn sub_mut(&mut self) -> &mut SubCtx {
+    fn sub_mut(&mut self) -> &mut SubContext {
         self.subs.get_mut(&self.current).expect("the current sub-context exists")
     }
 
@@ -869,13 +869,13 @@ impl Context {
 
     /// Every sub-context's GL context, for the renderer to wait on. Each has its own command
     /// queue, so work one of them rendered is not covered by a finish on any other.
-    pub fn gl_contexts(&self) -> impl Iterator<Item = (SubCtxId, &egl::Context)> {
+    pub fn gl_contexts(&self) -> impl Iterator<Item = (SubContextId, &egl::Context)> {
         self.subs.iter().map(|(id, sub)| (*id, &sub.gl_ctx))
     }
 
     /// `vrend_destroy_context`: unbind what the C unbinds, then every sub-context.
     pub fn destroy(mut self, host: &mut Host<'_>) {
-        let ids: Vec<SubCtxId> = self.subs.keys().rev().copied().collect();
+        let ids: Vec<SubContextId> = self.subs.keys().rev().copied().collect();
         for id in ids {
             let sub = self.subs.remove(&id).expect("listed");
             host.make_current(id, &sub.gl_ctx);
@@ -885,13 +885,13 @@ impl Context {
         *host.current = Current::Ctx0;
     }
 
-    fn create_sub(&mut self, host: &mut Host<'_>, id: SubCtxId) -> Result<(), EglError> {
+    fn create_sub(&mut self, host: &mut Host<'_>, id: SubContextId) -> Result<(), EglError> {
         if self.subs.contains_key(&id) {
             return Ok(());
         }
         let gl_ctx = host.winsys.create_context(host.version, Some(host.share))?;
         host.make_current(id, &gl_ctx);
-        let sub = SubCtx::new(host.gl, gl_ctx);
+        let sub = SubContext::new(host.gl, gl_ctx);
         self.subs.insert(id, sub);
         Ok(())
     }
@@ -1161,7 +1161,7 @@ impl Context {
 
 impl Context {
     /// `vrend_renderer_set_sub_ctx`: an unknown id is ignored.
-    fn set_sub_ctx(&mut self, host: &mut Host<'_>, id: SubCtxId) {
+    fn set_sub_ctx(&mut self, host: &mut Host<'_>, id: SubContextId) {
         if id == self.current {
             return;
         }
@@ -1172,7 +1172,7 @@ impl Context {
     }
 
     /// `vrend_renderer_destroy_sub_ctx`: sub-context 0 is never destroyed.
-    fn destroy_sub_ctx(&mut self, host: &mut Host<'_>, id: SubCtxId) {
+    fn destroy_sub_ctx(&mut self, host: &mut Host<'_>, id: SubContextId) {
         if id.0 == 0 {
             return;
         }
@@ -1182,7 +1182,7 @@ impl Context {
         host.make_current(id, &sub.gl_ctx);
         drop(sub.destroy(host.gl));
         if self.current == id {
-            self.current = SubCtxId(0);
+            self.current = SubContextId(0);
         }
         self.make_current(host);
     }
@@ -1783,7 +1783,7 @@ impl Context {
     }
 
     /// `vrend_create_surface`, and the texture view it makes when the host has them.
-    fn create_surface(&mut self, host: &mut Host<'_>, s: Surface) -> Result<Surf, Fault> {
+    fn create_surface(&mut self, host: &mut Host<'_>, s: proto::Surface) -> Result<Surface, Fault> {
         let cmd = Cmd::CreateObject;
         let gl = host.gl;
         let res = host.resource(cmd, s.resource)?;
@@ -1831,7 +1831,7 @@ impl Context {
                 view = Some(key);
             }
         }
-        Ok(Surf {
+        Ok(Surface {
             resource: s.resource,
             format: s.format,
             level,

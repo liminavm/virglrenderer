@@ -41,7 +41,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::ids::CtxId;
+use crate::ids::ContextId;
 
 /// How the cap is configured, and what it is called.
 const CAP_ENV: &str = "LIMINA_GPU_MEM_BUDGET_MIB";
@@ -74,9 +74,9 @@ pub struct Budget {
 /// resident either way, and the cap is enforced against what is resident.
 #[derive(Default)]
 struct Ledger {
-    ctxs: BTreeMap<CtxId, Slot>,
+    ctxs: BTreeMap<ContextId, Slot>,
     /// What outlived the context it was charged to.
-    shared: PerCtx,
+    shared: PerContext,
     /// The next slot's epoch. See [`Slot::epoch`].
     epochs: u64,
 }
@@ -88,7 +88,7 @@ impl Ledger {
     }
 
     /// The slot a charge was made against, if it is still that slot.
-    fn slot_of(&mut self, ctx: CtxId, epoch: u64) -> Option<&mut PerCtx> {
+    fn slot_of(&mut self, ctx: ContextId, epoch: u64) -> Option<&mut PerContext> {
         self.ctxs.get_mut(&ctx).filter(|s| s.epoch == epoch).map(|s| &mut s.live)
     }
 }
@@ -102,7 +102,7 @@ struct Slot {
     /// was made against, not merely the id, and a slot that is gone is credited to the shared
     /// bucket the retire moved it into.
     epoch: u64,
-    live: PerCtx,
+    live: PerContext,
 }
 
 /// One context's live allocations, by what they are and how big.
@@ -112,17 +112,17 @@ struct Slot {
 /// derived from this every time they are asked for. There are a handful of contexts and a handful
 /// of distinct sizes; the cost is not worth a number that can drift.
 #[derive(Default)]
-struct PerCtx {
+struct PerContext {
     live: BTreeMap<(&'static str, u64), u32>,
 }
 
-impl PerCtx {
+impl PerContext {
     fn bytes(&self) -> u64 {
         self.live.iter().map(|((_, size), n)| size * u64::from(*n)).sum()
     }
 
     /// Move everything here into `other`. What a retire does with a slot's residue.
-    fn drain_into(&mut self, other: &mut PerCtx) {
+    fn drain_into(&mut self, other: &mut PerContext) {
         for ((what, size), n) in std::mem::take(&mut self.live) {
             *other.live.entry((what, size)).or_insert(0) += n;
         }
@@ -160,7 +160,7 @@ impl PerCtx {
 /// gone is the ledger's decision, not the charge's.
 pub struct Charge {
     budget: Arc<Budget>,
-    ctx: CtxId,
+    ctx: ContextId,
     epoch: u64,
     what: &'static str,
     size: u64,
@@ -201,18 +201,18 @@ impl Drop for Charge {
 /// remember to say so.
 pub struct Account {
     budget: Arc<Budget>,
-    ctx: CtxId,
+    ctx: ContextId,
     epoch: u64,
 }
 
 impl Account {
     /// Open `ctx`'s slot. One at a time per id: a second opening while the first stands is not a
     /// guest's doing -- the VMM names contexts -- but this renderer holding two accounts for one.
-    pub fn open(budget: &Arc<Budget>, ctx: CtxId) -> Account {
+    pub fn open(budget: &Arc<Budget>, ctx: ContextId) -> Account {
         let mut ledger = budget.ledger.lock().expect("the budget ledger");
         let epoch = ledger.epochs;
         ledger.epochs += 1;
-        let prev = ledger.ctxs.insert(ctx, Slot { epoch, live: PerCtx::default() });
+        let prev = ledger.ctxs.insert(ctx, Slot { epoch, live: PerContext::default() });
         assert!(prev.is_none(), "ctx {} opened a second budget account", ctx.get());
         Account { budget: Arc::clone(budget), ctx, epoch }
     }
@@ -273,7 +273,7 @@ impl Account {
     /// test that set `LIMINA_GPU_MEM_BUDGET_MIB` would be setting it for every other test at once.
     #[cfg(test)]
     pub fn for_test(cap: Option<u64>) -> Account {
-        Account::open(&Budget::with_cap(cap, false), CtxId::new(1).expect("1 is not zero"))
+        Account::open(&Budget::with_cap(cap, false), ContextId::new(1).expect("1 is not zero"))
     }
 }
 
@@ -342,7 +342,7 @@ impl Budget {
     }
 
     /// What one context holds.
-    pub fn live_for(&self, ctx: CtxId) -> u64 {
+    pub fn live_for(&self, ctx: ContextId) -> u64 {
         self.ledger.lock().expect("the budget ledger").ctxs.get(&ctx).map_or(0, |s| s.live.bytes())
     }
 
@@ -355,7 +355,7 @@ impl Budget {
     /// is a leak -- and the two cannot be told apart here. Both move to the shared bucket, where
     /// the cap goes on seeing them and the report names them, and each is credited from there
     /// when its holder lets go.
-    fn retire(&self, ctx: CtxId, epoch: u64) {
+    fn retire(&self, ctx: ContextId, epoch: u64) {
         let mut ledger = self.ledger.lock().expect("the budget ledger");
         // Only this account's slot: `open` refuses a second account for a live id, so a slot
         // under another epoch here is one a later account owns, and stays.
@@ -412,8 +412,8 @@ fn mib(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    fn ctx(n: u32) -> CtxId {
-        CtxId::new(n).expect("not zero")
+    fn ctx(n: u32) -> ContextId {
+        ContextId::new(n).expect("not zero")
     }
 
     /// A charge outlives the context that made it, and the ledger goes on counting it for as

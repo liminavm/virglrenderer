@@ -565,13 +565,13 @@ impl Protocol for AllOfIt {
 /// reason to guess it in advance -- so it grows, and the only bound that matters is applied later,
 /// against the window the guest actually offered. Nothing is written toward a guest here either
 /// way: this is host memory, and [`ReplyStream::write`] is the one place it crosses over.
-enum Buf<'a> {
+enum Buffer<'a> {
     Fixed(&'a mut [u8]),
     Grow(&'a mut Vec<u8>),
 }
 
 pub struct Encoder<'a> {
-    buf: Buf<'a>,
+    buf: Buffer<'a>,
     pos: usize,
     fatal: bool,
     protocol: &'a dyn Protocol,
@@ -588,7 +588,7 @@ pub struct Encoder<'a> {
 impl<'a> Encoder<'a> {
     /// An encoder that must fit what it is given. Overflowing is `fatal`.
     pub fn new(buf: &'a mut [u8], protocol: &'a dyn Protocol) -> Self {
-        Encoder { buf: Buf::Fixed(buf), pos: 0, fatal: false, protocol, padding: None }
+        Encoder { buf: Buffer::Fixed(buf), pos: 0, fatal: false, protocol, padding: None }
     }
 
     /// An encoder that takes as much room as it needs from `buf`, which it empties first.
@@ -599,7 +599,7 @@ impl<'a> Encoder<'a> {
     /// the previous reply into this one, silently and only sometimes.
     pub fn growing(buf: &'a mut Vec<u8>, protocol: &'a dyn Protocol) -> Self {
         buf.clear();
-        Encoder { buf: Buf::Grow(buf), pos: 0, fatal: false, protocol, padding: None }
+        Encoder { buf: Buffer::Grow(buf), pos: 0, fatal: false, protocol, padding: None }
     }
 
     /// The next `advance` bytes to write into, growing the buffer if it is allowed to.
@@ -608,8 +608,8 @@ impl<'a> Encoder<'a> {
     fn room(&mut self, advance: usize) -> Option<&mut [u8]> {
         let end = self.pos.checked_add(advance)?;
         match &mut self.buf {
-            Buf::Fixed(b) => b.get_mut(self.pos..end),
-            Buf::Grow(v) => {
+            Buffer::Fixed(b) => b.get_mut(self.pos..end),
+            Buffer::Grow(v) => {
                 if v.len() < end {
                     v.resize(end, 0);
                 }
@@ -650,8 +650,8 @@ impl<'a> Encoder<'a> {
     /// The bytes written so far.
     pub fn written(&self) -> &[u8] {
         match &self.buf {
-            Buf::Fixed(b) => &b[..self.pos],
-            Buf::Grow(v) => &v[..self.pos],
+            Buffer::Fixed(b) => &b[..self.pos],
+            Buffer::Grow(v) => &v[..self.pos],
         }
     }
 

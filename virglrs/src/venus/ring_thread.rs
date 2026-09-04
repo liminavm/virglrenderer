@@ -36,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ids::{CtxId, RingId};
+use crate::ids::{ContextId, RingId};
 
 use super::proto::types::VkRingStatusFlagBitsMESA;
 use super::ring::{ReplyStream, Ring, RingControl};
@@ -148,7 +148,7 @@ pub fn seqno_ge(a: u32, b: u32) -> bool {
 /// nothing at all.
 #[must_use = "a waiter that is never waited on is a submission that never finished"]
 pub struct RingWaiter {
-    ctx: CtxId,
+    ctx: ContextId,
     id: RingId,
     seqno: u32,
     control: Arc<RingControl>,
@@ -312,7 +312,7 @@ impl RingThread {
     /// A wait on this ring's head, in a form that holds nothing of the renderer.
     pub fn waiter(
         &self,
-        ctx: CtxId,
+        ctx: ContextId,
         seqno: u32,
         wait_ring: Arc<WaitRing>,
         fatal: Arc<AtomicBool>,

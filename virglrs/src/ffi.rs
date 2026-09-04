@@ -29,7 +29,7 @@ use crate::abi::{
 };
 use crate::config::{CapsetId, Config};
 use crate::fence;
-use crate::ids::{BlobId, ClientFenceId, CtxId, FenceId, ResourceHandle, RingId, RingIdx};
+use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 use crate::venus::context::{Submitted, Wait};
 use crate::vrend::pipe::TextureTarget;
@@ -79,7 +79,7 @@ struct VmmFences {
 }
 
 impl fence::FenceSink for VmmFences {
-    fn context_fence(&mut self, ctx: CtxId, ring: RingIdx, fence: FenceId) {
+    fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
         if let Some(f) = self.write_context_fence {
             f(self.cookie.0, ctx.get(), ring.0, fence.0);
         }
@@ -383,7 +383,7 @@ fn export_query(q: &mut abi::ExportQuery) -> c_int {
 /// Zero is not a small context id: it is that ABI's implicit global, the `force_ctx_0` world this
 /// tree exists to remove. The two are different kinds of thing, so an entry point below has to say
 /// which one it is answering -- and nothing inside the renderer has to know the global was ever a
-/// possibility, because no [`CtxId`] can carry it.
+/// possibility, because no [`ContextId`] can carry it.
 ///
 /// This is deliberately private and deliberately only on the upstream entry points. limina's own
 /// `virgl_renderer_limina_*` calls have no global: we designed them, and there a zero is simply an
@@ -392,13 +392,13 @@ enum AbiCtx {
     /// The implicit global. Nothing here implements it; vrend is where it will mean something.
     Global,
     /// A context the guest created.
-    Ctx(CtxId),
+    Context(ContextId),
 }
 
 impl AbiCtx {
     fn new(raw: u32) -> AbiCtx {
-        match CtxId::new(raw) {
-            Some(id) => AbiCtx::Ctx(id),
+        match ContextId::new(raw) {
+            Some(id) => AbiCtx::Context(id),
             None => AbiCtx::Global,
         }
     }
@@ -422,7 +422,7 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
     name: *const c_char,
 ) -> c_int {
     // The global is not a context the guest may create; it is the one that always existed.
-    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id) else {
+    let AbiCtx::Context(id) = AbiCtx::new(ctx_id) else {
         return EINVAL;
     };
     let name = read_name(name, nlen);
@@ -435,7 +435,7 @@ pub extern "C" fn virgl_renderer_context_create_with_flags(
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_context_destroy(handle: u32) {
     // The global is never destroyed, so this is a no-op for it, as it has always been.
-    if let AbiCtx::Ctx(id) = AbiCtx::new(handle) {
+    if let AbiCtx::Context(id) = AbiCtx::new(handle) {
         with((), |r| r.context_destroy(id));
     }
 }
@@ -443,7 +443,7 @@ pub extern "C" fn virgl_renderer_context_destroy(handle: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_attach_resource(ctx_id: c_int, res_handle: c_int) {
     // Nothing is attached to the global: it holds no resource table of its own.
-    let (AbiCtx::Ctx(id), Some(handle)) =
+    let (AbiCtx::Context(id), Some(handle)) =
         (AbiCtx::new(ctx_id as u32), ResourceHandle::new(res_handle as u32))
     else {
         return;
@@ -453,7 +453,7 @@ pub extern "C" fn virgl_renderer_ctx_attach_resource(ctx_id: c_int, res_handle: 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_ctx_detach_resource(ctx_id: c_int, res_handle: c_int) {
-    let (AbiCtx::Ctx(id), Some(handle)) =
+    let (AbiCtx::Context(id), Some(handle)) =
         (AbiCtx::new(ctx_id as u32), ResourceHandle::new(res_handle as u32))
     else {
         return;
@@ -497,7 +497,7 @@ fn classic_desc(a: &ResourceCreateArgs) -> Option<(ResourceHandle, ClassicArgs)>
 /// The blob the ABI's create args describe.
 ///
 /// `ctx_id` is dropped: nothing reads it today, and when host3d blobs land its Rust shape is
-/// `Option<CtxId>` rather than a `u32`, because a guest-memory blob legitimately has no context
+/// `Option<ContextId>` rather than a `u32`, because a guest-memory blob legitimately has no context
 /// and zero is how the ABI spells that.
 /// The C's flat argument struct as the two operations it actually encodes.
 ///
@@ -511,7 +511,7 @@ fn blob_desc(a: &CreateBlobArgs) -> Option<renderer::BlobDesc> {
         // names no memory either. `None` here is the refusal -- the alternative, treating it as a
         // mint, would answer with fresh zeroed pages for a guest that asked for its own bytes.
         (crate::abi::BLOB_MEM_HOST3D, id) if id != 0 => {
-            renderer::BlobSource::Exported { ctx: CtxId::new(a.ctx_id)?, mem: BlobId(id) }
+            renderer::BlobSource::Exported { ctx: ContextId::new(a.ctx_id)?, mem: BlobId(id) }
         }
         _ => renderer::BlobSource::HostMinted,
     };
@@ -1052,7 +1052,7 @@ fn transfer_iov(
     let info = transfer::Info { level, stride, layer_stride, offset, region, synchronized: false };
     let ctx = match AbiCtx::new(ctx_id) {
         AbiCtx::Global => None,
-        AbiCtx::Ctx(id) => Some(id),
+        AbiCtx::Context(id) => Some(id),
     };
     let iov = read_iov(iov, iovec_cnt);
     with(EINVAL, |r| match r.transfer(handle, ctx, to_host, &info, iov) {
@@ -1071,7 +1071,7 @@ pub extern "C" fn virgl_renderer_submit_cmd(
     ndw: c_int,
 ) -> c_int {
     // vrend's global context arrives in P3; until then this ABI has no global to submit to.
-    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id as u32) else {
+    let AbiCtx::Context(id) = AbiCtx::new(ctx_id as u32) else {
         return EINVAL;
     };
     with_cmd_bytes(buffer, ndw, |buf| submit_all(id, buf)).unwrap_or(EINVAL)
@@ -1088,7 +1088,7 @@ pub extern "C" fn virgl_renderer_submit_cmd(
 ///
 /// The C has no equivalent because it has no such lock -- its ring threads dispatch against the
 /// context with nothing held at all, which is the design this rewrite exists to replace.
-fn submit_all(id: CtxId, buf: &[u8]) -> c_int {
+fn submit_all(id: ContextId, buf: &[u8]) -> c_int {
     let mut at = 0usize;
     loop {
         let out = with(Err(renderer::Error::NoContext), |r| r.submit_cmd(id, &buf[at..]));
@@ -1232,7 +1232,7 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     fence_id: u64,
 ) -> c_int {
     // The global has no per-context ring to fence; `virgl_renderer_create_fence` is its path.
-    let AbiCtx::Ctx(id) = AbiCtx::new(ctx_id) else {
+    let AbiCtx::Context(id) = AbiCtx::new(ctx_id) else {
         return EINVAL;
     };
     with(EINVAL, |r| match r.context_create_fence(id, RingIdx(ring_idx), FenceId(fence_id)) {
@@ -1318,7 +1318,7 @@ pub extern "C" fn virgl_renderer_limina_journal_unpin(_ctx_id: u32, _key: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
-    let Some(ctx) = CtxId::new(ctx_id) else {
+    let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
     with(EINVAL, |r| match Some(r.venus_replay_begin(ctx)) {
@@ -1333,7 +1333,7 @@ pub extern "C" fn virgl_renderer_limina_replay_submit(
     cmd: *mut c_void,
     size: u32,
 ) -> c_int {
-    let Some(ctx) = CtxId::new(ctx_id) else {
+    let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
     with_bytes(cmd, size as usize, |buf| {
@@ -1356,7 +1356,7 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
     // which is a fence timeline index and a different concept -- two rings whose ids differed
     // only above bit 32 became the same ring, silently.
     let ring = RingId(ring_id);
-    let Some(ctx) = CtxId::new(ctx_id) else {
+    let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
     with_bytes(cmd, size as usize, |buf| {
@@ -1370,7 +1370,7 @@ pub extern "C" fn virgl_renderer_limina_replay_ring_cmd(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
-    let Some(ctx) = CtxId::new(ctx_id) else {
+    let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
     with(EINVAL, |r| match Some(r.venus_replay_end(ctx)) {
@@ -1427,7 +1427,7 @@ pub extern "C" fn virgl_renderer_limina_memory_census(
         return EINVAL;
     }
     with(EINVAL, |r| {
-        let Some(ctx) = CtxId::new(ctx_id) else {
+        let Some(ctx) = ContextId::new(ctx_id) else {
             return EINVAL;
         };
         let census = match r.venus_memory_census(ctx) {
@@ -1477,7 +1477,7 @@ pub extern "C" fn virgl_renderer_limina_memory_read(
     with(EINVAL, |r| {
         // SAFETY: the VMM's contract is `size` writable bytes at `buf` for the length of the call.
         let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize) };
-        let Some(ctx) = CtxId::new(ctx_id) else {
+        let Some(ctx) = ContextId::new(ctx_id) else {
             return EINVAL;
         };
         // The ABI answers success or a code, never a count -- a caller that wants fewer bytes
@@ -1870,7 +1870,7 @@ mod tests {
                 blob_mem: host3d,
                 blob_flags: 4,
                 source: renderer::BlobSource::Exported {
-                    ctx: CtxId::new(2).unwrap(),
+                    ctx: ContextId::new(2).unwrap(),
                     mem: BlobId(5),
                 },
                 size: 6,

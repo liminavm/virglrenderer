@@ -77,7 +77,7 @@ const SRGB_ENCODE: &str = "cvec4 srgb_encode(cvec4 col) {\n\
 /// takes a `u64` key. Nothing here needs that, and the packing is where a widened enum would
 /// silently start aliasing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ProgKey {
+pub struct ProgramKey {
     /// Whether this blit writes a colour. A depth-writing blit is a different program with a
     /// different output -- `gl_FragDepth` rather than a draw buffer -- so it is the first thing
     /// the key distinguishes, and none of the colour fields below say anything when it is false.
@@ -101,7 +101,7 @@ pub struct Blitter {
     vbo: BufferName,
     fbo: FramebufferName,
     vs: ShaderName,
-    programs: HashMap<ProgKey, ProgramName>,
+    programs: HashMap<ProgramKey, ProgramName>,
 }
 
 /// One end of the quad in the destination's pixels, or the source's texels.
@@ -283,7 +283,7 @@ impl Blitter {
     /// The caller has made this blitter's context current and resolved every end of the blit into
     /// [`Job`]; this touches nothing the caller owns but the two textures the job names.
     pub fn run(&mut self, gl: &Gl, features: &Features, job: &Job) -> Result<(), Unserved> {
-        let key = ProgKey {
+        let key = ProgramKey {
             color: job.color,
             manual_srgb_decode: job.manual_srgb_decode,
             manual_srgb_encode: job.manual_srgb_encode,
@@ -387,7 +387,7 @@ impl Blitter {
 
     /// The program for this key, built and cached on first use. `None` when the shader would not
     /// compile or the program would not link, which is reported once by the caller.
-    fn program(&mut self, gl: &Gl, key: ProgKey) -> Option<ProgramName> {
+    fn program(&mut self, gl: &Gl, key: ProgramKey) -> Option<ProgramName> {
         if let Some(p) = self.programs.get(&key) {
             return Some(*p);
         }
@@ -546,7 +546,7 @@ fn depth_fragment_source(tex: tgsi::Texture, msaa: bool) -> String {
     format!("{header}uniform mediump sampler{sampler} samp;\nin vec4 tc;\n{body}")
 }
 
-pub fn fragment_source(key: ProgKey) -> String {
+pub fn fragment_source(key: ProgramKey) -> String {
     let tex = tgsi_texture(key.target, key.num_samples);
     let msaa = key.num_samples > 1;
     if !key.color {

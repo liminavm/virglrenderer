@@ -436,15 +436,15 @@ pub fn decode<'a>(cmd: Cmd, obj: u32, words: &'a [u32]) -> Result<Command<'a>, R
         }
         Cmd::SetSubCtx => {
             w.exact(1)?;
-            Command::SetSubCtx(SubCtxId(w.u(1)))
+            Command::SetSubCtx(SubContextId(w.u(1)))
         }
         Cmd::CreateSubCtx => {
             w.exact(1)?;
-            Command::CreateSubCtx(SubCtxId(w.u(1)))
+            Command::CreateSubCtx(SubContextId(w.u(1)))
         }
         Cmd::DestroySubCtx => {
             w.exact(1)?;
-            Command::DestroySubCtx(SubCtxId(w.u(1)))
+            Command::DestroySubCtx(SubContextId(w.u(1)))
         }
         Cmd::BindShader => {
             w.exact(2)?;
@@ -1521,9 +1521,9 @@ mod tests {
                 length: 512,
                 resource: Some(r(7)),
             },
-            Command::SetSubCtx(SubCtxId(2)),
-            Command::CreateSubCtx(SubCtxId(3)),
-            Command::DestroySubCtx(SubCtxId(3)),
+            Command::SetSubCtx(SubContextId(2)),
+            Command::CreateSubCtx(SubContextId(3)),
+            Command::DestroySubCtx(SubContextId(3)),
             Command::BindShader { handle: Some(o(4)), stage: ShaderStage::Fragment },
             Command::SetTessState([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             Command::SetMinSamples(2),

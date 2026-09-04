@@ -25,7 +25,7 @@ use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::transfer::{self, Info};
 use crate::guest_mem::Iov;
-use crate::ids::{CtxId, ResourceHandle};
+use crate::ids::{ContextId, ResourceHandle};
 use crate::metal;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -61,7 +61,7 @@ pub struct Vrend {
     pub formats: Table,
     pub limits: Limits,
     /// What the translator may assume of the host, read once alongside the limits.
-    shader_cfg: shader::Cfg,
+    shader_cfg: shader::Config,
     /// What the guest's driver is told of the host, probed once from the same answers.
     caps: caps::CapsV2,
     ctx0: egl::Context,
@@ -69,7 +69,7 @@ pub struct Vrend {
     version: Version,
     current: Current,
     resources: BTreeMap<ResourceHandle, Resource>,
-    contexts: BTreeMap<CtxId, Context>,
+    contexts: BTreeMap<ContextId, Context>,
     pub todo: Todo,
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
@@ -111,7 +111,7 @@ impl Vrend {
         }
         features.reconcile(&gl);
         let limits = Limits::query(&gl, &features);
-        let shader_cfg = shader::Cfg::probe(&gl, &features, &limits);
+        let shader_cfg = shader::Config::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
         let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats);
         eprintln!(
@@ -159,9 +159,9 @@ impl Vrend {
     /// borrows of this renderer, so a context can run against the rest of it.
     fn split<'a>(
         &'a mut self,
-        ctx: CtxId,
+        ctx: ContextId,
         guest: &'a dyn Guest,
-    ) -> (Host<'a>, &'a mut BTreeMap<CtxId, Context>) {
+    ) -> (Host<'a>, &'a mut BTreeMap<ContextId, Context>) {
         let Vrend {
             winsys,
             gl,
@@ -200,14 +200,14 @@ impl Vrend {
 
     // ---- contexts ----
 
-    pub fn context_create(&mut self, id: CtxId, guest: &dyn Guest) -> Result<(), EglError> {
+    pub fn context_create(&mut self, id: ContextId, guest: &dyn Guest) -> Result<(), EglError> {
         let (mut host, contexts) = self.split(id, guest);
         let c = Context::new(&mut host)?;
         contexts.insert(id, c);
         Ok(())
     }
 
-    pub fn context_destroy(&mut self, id: CtxId, guest: &dyn Guest) {
+    pub fn context_destroy(&mut self, id: ContextId, guest: &dyn Guest) {
         let (mut host, contexts) = self.split(id, guest);
         if let Some(c) = contexts.remove(&id) {
             c.destroy(&mut host);
@@ -218,14 +218,14 @@ impl Vrend {
         self.sweep_doomed();
     }
 
-    pub fn has_context(&self, id: CtxId) -> bool {
+    pub fn has_context(&self, id: ContextId) -> bool {
         self.contexts.contains_key(&id)
     }
 
     /// Run a batch on a context. `None` for a context this renderer does not have.
     pub fn submit(
         &mut self,
-        id: CtxId,
+        id: ContextId,
         words: &[u32],
         guest: &dyn Guest,
     ) -> Option<Result<(), Fault>> {
@@ -350,7 +350,7 @@ impl Vrend {
     /// ones when the caller gave none.
     pub fn transfer(
         &mut self,
-        ctx: Option<CtxId>,
+        ctx: Option<ContextId>,
         handle: ResourceHandle,
         to_host: bool,
         own: Option<&Iov<'_>>,
@@ -384,11 +384,11 @@ impl Vrend {
 struct NoGuest;
 
 impl Guest for NoGuest {
-    fn attached(&self, _: CtxId, _: ResourceHandle) -> bool {
+    fn attached(&self, _: ContextId, _: ResourceHandle) -> bool {
         false
     }
 
-    fn pages(&self, _: CtxId, _: ResourceHandle) -> Option<Iov<'_>> {
+    fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
         None
     }
 }

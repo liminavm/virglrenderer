@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::config::Config;
-use crate::ids::{CtxId, RingId};
+use crate::ids::{ContextId, RingId};
 
 use super::budget::Budget;
 use super::context::{Context, Submitted, Unimplemented, Wait};
@@ -58,7 +58,7 @@ pub struct Vkr {
     /// One lock per context, not one over the table: a context is exactly the unit a ring thread
     /// needs exclusively, so two guests' rings dispatch at the same time. The `Arc` is what lets a
     /// ring thread hold a claim on its own context without holding the renderer.
-    contexts: BTreeMap<CtxId, Arc<Mutex<Context>>>,
+    contexts: BTreeMap<ContextId, Arc<Mutex<Context>>>,
     /// The commands this build does not serve yet, counted across every context. Kept on the root
     /// because it answers a question about the build, not about a guest.
     pub todo: Arc<Mutex<Unimplemented>>,
@@ -147,7 +147,7 @@ impl Vkr {
     /// id it already holds, so a repeat reaching here means the two maps have drifted apart.
     /// Replacing the entry would drop a live context -- its rings and every host handle in it --
     /// and return as though a context had been created.
-    pub fn context_create(&mut self, id: CtxId) {
+    pub fn context_create(&mut self, id: ContextId) {
         // Checked before the new context is built: building it opens the id's budget account,
         // which is one per live id too.
         assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
@@ -156,7 +156,7 @@ impl Vkr {
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
     /// not a guest that gets to keep host memory after it is gone.
-    pub fn context_destroy(&mut self, id: CtxId) {
+    pub fn context_destroy(&mut self, id: ContextId) {
         // Stop the rings before letting go of the context, and do it in that order deliberately.
         // A ring thread upgrades a weak claim on this context for the length of one dispatch, so
         // a thread still running when the last strong reference goes could be holding the last
@@ -179,13 +179,17 @@ impl Vkr {
     ///
     /// Scoped rather than returning a `&Context`, because the reference is only sound while the
     /// lock is held and a signature that hands one out cannot say that.
-    pub fn with_context<R>(&self, id: CtxId, f: impl FnOnce(&Context) -> R) -> Option<R> {
+    pub fn with_context<R>(&self, id: ContextId, f: impl FnOnce(&Context) -> R) -> Option<R> {
         let ctx = self.contexts.get(&id)?;
         Some(f(&ctx.lock().expect("a context lock is never poisoned")))
     }
 
     /// The same, for the paths that change a context rather than read one.
-    pub fn with_context_mut<R>(&self, id: CtxId, f: impl FnOnce(&mut Context) -> R) -> Option<R> {
+    pub fn with_context_mut<R>(
+        &self,
+        id: ContextId,
+        f: impl FnOnce(&mut Context) -> R,
+    ) -> Option<R> {
         let ctx = self.contexts.get(&id)?;
         Some(f(&mut ctx.lock().expect("a context lock is never poisoned")))
     }
@@ -197,7 +201,7 @@ impl Vkr {
     /// here rather than in the create handler is what keeps a handler free of the renderer's
     /// locks -- and it is why a ring cannot start reading in the middle of the batch that made it,
     /// which would let it race the rest of its own creation.
-    fn promote(&mut self, id: CtxId) {
+    fn promote(&mut self, id: ContextId) {
         let Some(arc) = self.contexts.get(&id) else {
             return;
         };
@@ -243,7 +247,7 @@ impl Vkr {
     ///
     /// Rings are promoted whether the batch finished or suspended. A `vkCreateRingMESA` before the
     /// wait has to start reading, or the wait is on a ring that will never run.
-    pub fn submit(&mut self, id: CtxId, buf: &[u8]) -> Result<Submitted, Error> {
+    pub fn submit(&mut self, id: ContextId, buf: &[u8]) -> Result<Submitted, Error> {
         let out = self.on_context(id, |ctx, todo, global, resources| {
             ctx.submit(buf, todo, global, resources)
         })?;
@@ -257,14 +261,19 @@ impl Vkr {
     /// Every piece is an `Arc` to something a ring thread also holds, so the wait needs nothing
     /// from this renderer once it has been handed over -- which is the whole point: the thread it
     /// is waiting for needs the locks the waiter would otherwise still be holding.
-    pub fn ring_waiter(&self, id: CtxId, ring: RingId, seqno: u32) -> Result<RingWaiter, Error> {
+    pub fn ring_waiter(
+        &self,
+        id: ContextId,
+        ring: RingId,
+        seqno: u32,
+    ) -> Result<RingWaiter, Error> {
         let arc = self.contexts.get(&id).ok_or(Error::NoContext)?;
         let ctx = arc.lock().expect("a context lock is never poisoned");
         ctx.ring_waiter(ring, seqno).ok_or(Error::NoRing)
     }
 
     /// Feed one journal entry to a ring's stream. Replay only, so nothing is promoted here.
-    pub fn submit_ring(&mut self, id: CtxId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
+    pub fn submit_ring(&mut self, id: ContextId, ring: RingId, buf: &[u8]) -> Result<(), Error> {
         self.on_context_ok(id, |ctx, todo, global, resources| {
             ctx.submit_ring(ring, buf, todo, global, resources)
         })
@@ -277,7 +286,7 @@ impl Vkr {
     /// fails once the context has been found.
     fn on_context<T>(
         &mut self,
-        id: CtxId,
+        id: ContextId,
         f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> T,
     ) -> Result<T, Error> {
         let ctx = self.contexts.get(&id).ok_or(Error::NoContext)?;
@@ -290,13 +299,13 @@ impl Vkr {
     /// The same, for the callers whose only two answers are "it ran" and "it poisoned".
     fn on_context_ok(
         &mut self,
-        id: CtxId,
+        id: ContextId,
         f: impl FnOnce(&mut Context, &mut Unimplemented, &Global, &dyn ShmResources) -> bool,
     ) -> Result<(), Error> {
         if self.on_context(id, f)? { Ok(()) } else { Err(Error::Poisoned) }
     }
 
-    pub fn replay_begin(&mut self, id: CtxId) -> Result<(), Error> {
+    pub fn replay_begin(&mut self, id: ContextId) -> Result<(), Error> {
         self.with_context_mut(id, Context::replay_begin).ok_or(Error::NoContext)?;
         Ok(())
     }
@@ -305,7 +314,7 @@ impl Vkr {
     ///
     /// The order matters and matches the C: the rings start first, then `replaying` clears. A ring
     /// promoted here resumes at the head its snapshot restored, not at the start of its buffer.
-    pub fn replay_end(&mut self, id: CtxId) -> Result<(), Error> {
+    pub fn replay_end(&mut self, id: ContextId) -> Result<(), Error> {
         self.with_context_mut(id, Context::replay_end).ok_or(Error::NoContext)?;
         // After the flag clears, not before: promotion refuses to start a ring while the context
         // is still replaying, which is the single check both paths go through.
@@ -326,8 +335,8 @@ mod tests {
     const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const BUF_AT: usize = 0xc0;
     const BUF_SIZE: usize = 0x20000;
-    fn ctx_id() -> CtxId {
-        CtxId::new(1).expect("1 is not zero")
+    fn ctx_id() -> ContextId {
+        ContextId::new(1).expect("1 is not zero")
     }
 
     /// A resource table with exactly one mapped shm resource, which is all a ring needs.

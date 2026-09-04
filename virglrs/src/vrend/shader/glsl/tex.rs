@@ -6,7 +6,7 @@
 
 use super::inst::{DestInfo, SourceInfo};
 use super::{
-    Ctx, MAX_IMMEDIATE, MAX_SAMPLERS, Qual, bit32, emit, proc_prefix, samplertype_is_shadow,
+    Context, MAX_IMMEDIATE, MAX_SAMPLERS, Qual, bit32, emit, proc_prefix, samplertype_is_shadow,
     samplertype_to_req_bits, swiz_char, swizzle_string, wm_string,
 };
 use crate::vrend::proto::Format;
@@ -82,7 +82,7 @@ fn is_r32_format(virgl_format: u16) -> bool {
 }
 
 /// `set_texture_reqs`.
-pub(super) fn set_texture_reqs(ctx: &mut Ctx<'_>, inst: &Instruction, sreg_index: i32) -> bool {
+pub(super) fn set_texture_reqs(ctx: &mut Context<'_>, inst: &Instruction, sreg_index: i32) -> bool {
     if sreg_index < 0 || sreg_index as usize >= MAX_SAMPLERS {
         eprintln!("[virglrs] Sampler view exceeded, max is {MAX_SAMPLERS}");
         return false;
@@ -100,7 +100,7 @@ pub(super) fn set_texture_reqs(ctx: &mut Ctx<'_>, inst: &Instruction, sreg_index
 
 /// `emit_txq`.
 pub(super) fn emit_txq(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sreg_index: i32,
     srcs: &[String],
@@ -204,7 +204,7 @@ pub(super) fn emit_txq(
 
 /// `emit_txqs`: sample queries.
 pub(super) fn emit_txqs(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sreg_index: i32,
     srcs: &[String],
@@ -269,7 +269,7 @@ fn tex_inst_ext(inst: &Instruction) -> &'static str {
 }
 
 /// `get_temp`: the GLSL for a temporary register.
-pub(super) fn get_temp(ctx: &mut Ctx<'_>, indirect_dim: bool, dim: i32, reg: i32) -> String {
+pub(super) fn get_temp(ctx: &mut Context<'_>, indirect_dim: bool, dim: i32, reg: i32) -> String {
     match ctx.find_temp_range(reg) {
         Some(i) => {
             let range = ctx.temp_ranges[i];
@@ -289,7 +289,7 @@ pub(super) fn get_temp(ctx: &mut Ctx<'_>, indirect_dim: bool, dim: i32, reg: i32
 }
 
 /// `fill_offset_buffer`: the offset argument of a texture instruction.
-fn fill_offset_buffer(ctx: &mut Ctx<'_>, inst: &Instruction, offset_buf: &mut String) -> bool {
+fn fill_offset_buffer(ctx: &mut Context<'_>, inst: &Instruction, offset_buf: &mut String) -> bool {
     let off = inst.tex_offsets[0];
     let texture = inst.tex().texture;
     let sw = |i: usize| swiz_char(off.swizzle[i]);
@@ -412,7 +412,7 @@ fn fill_immediate_offset(
 
 /// `emit_lodq`.
 pub(super) fn emit_lodq(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &SourceInfo,
     dinfo: &DestInfo,
@@ -454,7 +454,7 @@ pub(super) fn emit_lodq(
 
 /// `translate_tex`.
 pub(super) fn translate_tex(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &SourceInfo,
     dinfo: &DestInfo,
@@ -986,7 +986,7 @@ fn coord_prefix(resource: Texture) -> (Qual, bool) {
 }
 
 /// `is_integer_memory`.
-fn is_integer_memory(ctx: &Ctx<'_>, file: File, index: u32) -> bool {
+fn is_integer_memory(ctx: &Context<'_>, file: File, index: u32) -> bool {
     match file {
         File::Buffer => ctx.ssbo_integer_mask & bit32(index) != 0,
         File::Memory => ctx.integer_memory,
@@ -1003,7 +1003,7 @@ fn is_coherent(inst: &Instruction) -> bool {
 
 /// `set_image_qualifier`.
 fn set_image_qualifier(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     reg_index: i32,
     indirect: bool,
@@ -1027,7 +1027,7 @@ fn set_image_qualifier(
 
 /// `set_memory_qualifier`.
 fn set_memory_qualifier(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     reg_index: i32,
     indirect: bool,
@@ -1061,7 +1061,13 @@ fn bit_scan_consecutive_range(mask: u32) -> (i32, i32) {
 }
 
 /// `emit_store_mem`.
-fn emit_store_mem(ctx: &mut Ctx<'_>, dst: &str, writemask: u8, srcs: &[String], conversion: &str) {
+fn emit_store_mem(
+    ctx: &mut Context<'_>,
+    dst: &str,
+    writemask: u8,
+    srcs: &[String],
+    conversion: &str,
+) {
     for (i, swizzle) in ['x', 'y', 'z', 'w'].into_iter().enumerate() {
         if writemask & (1 << i) != 0 {
             emit!(
@@ -1080,7 +1086,7 @@ fn emit_store_mem(ctx: &mut Ctx<'_>, dst: &str, writemask: u8, srcs: &[String], 
 
 /// `make_ssbo_varstring`, GLES leg: an indirect index never reaches the name here, the
 /// callers switch over the array instead.
-pub(super) fn make_ssbo_varstring(ctx: &Ctx<'_>, register_index: u32) -> String {
+pub(super) fn make_ssbo_varstring(ctx: &Context<'_>, register_index: u32) -> String {
     let cname = proc_prefix(ctx.prog_type);
     let atomic_ssbo = ctx.ssbo_atomic_mask & bit32(register_index) != 0;
     let atomic_str = if atomic_ssbo { "atomic" } else { "" };
@@ -1097,7 +1103,7 @@ pub(super) fn make_ssbo_varstring(ctx: &Ctx<'_>, register_index: u32) -> String 
 
 /// `translate_store`.
 pub(super) fn translate_store(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &SourceInfo,
     srcs: &[String],
@@ -1218,7 +1224,7 @@ pub(super) fn translate_store(
 
 /// `emit_load_mem`.
 fn emit_load_mem(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     dst: &str,
     writemask: u8,
     conversion: &str,
@@ -1245,7 +1251,7 @@ fn emit_load_mem(
 
 /// `translate_load`.
 pub(super) fn translate_load(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &SourceInfo,
     dinfo: &DestInfo,
@@ -1414,7 +1420,7 @@ fn atomic_opname(opcode: Opcode) -> Option<(&'static str, bool)> {
 
 /// `translate_resq`.
 pub(super) fn translate_resq(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     srcs: &[String],
     dst: &str,
@@ -1454,7 +1460,7 @@ pub(super) fn translate_resq(
 
 /// `translate_atomic`.
 pub(super) fn translate_atomic(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &SourceInfo,
     srcs: &[String],
