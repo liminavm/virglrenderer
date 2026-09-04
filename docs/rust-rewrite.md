@@ -563,6 +563,26 @@ buildable throughout as the A-side reference.
   archived. Then the follow-up: delete rutabaga's FFI shim and depend on the crate
   directly.
 
+## Where virglrs deliberately differs from the C
+
+Parity with the C is the default and the harness measures it. These are the places we chose not
+to have it, each because reproducing the C would mean reproducing a defect.
+
+- **A surface destroyed while attached is detached there and then.** The C's framebuffer holds a
+  reference, so the surface keeps taking pixels until the next `SET_FRAMEBUFFER_STATE`. Here the
+  surface's view texture dies with it, and GL detaches a deleted texture only from the bound
+  framebuffer — so the C's behaviour would be reproduced by luck, and the slot's value copy would
+  compare equal to an identical later bind and skip re-attaching what GL had quietly dropped. The
+  attachment and the slot are emptied together. A guest that destroys a bound surface and then
+  draws gets a blank attachment where the C gives it pixels.
+- **The count of bound vertex buffers belongs to the bind, not to the state-set.** The C keeps
+  `num_vbos` beside `old_num_vbos`, written at `SET_VERTEX_BUFFERS`; two sets between draws leave
+  the slots the first set bound still attached. `hw_num_vbos` is written by the bind that bound
+  them.
+- **The fourteen `ASTC_*_SRGB` formats are registered.** The C's `ASTC_FORMAT` macro never adds
+  the sRGB rows, so its capset advertises fewer formats than its host has
+  (`virglrs/vrend-gen/gl_formats.py`, and `harness/README.md` on `vrend.caps`).
+
 ## Consequences to accept
 
 - **Upstream gets the fixes made up to the switch, and nothing after.** The delta

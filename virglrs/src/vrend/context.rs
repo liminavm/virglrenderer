@@ -669,6 +669,27 @@ fn evict_view(
     held
 }
 
+/// Empty every framebuffer slot naming `handle`: whether the depth slot held it, and the colour
+/// slots that did. The attachments they name are the ones to detach.
+fn evict_surface(
+    zsurf: &mut Option<BoundSurface>,
+    cbufs: &mut [Option<BoundSurface>],
+    handle: ObjectHandle,
+) -> (bool, Vec<usize>) {
+    let held_z = zsurf.is_some_and(|s| s.handle == handle);
+    if held_z {
+        *zsurf = None;
+    }
+    let mut colours = Vec::new();
+    for (i, slot) in cbufs.iter_mut().enumerate() {
+        if slot.is_some_and(|s| s.handle == handle) {
+            *slot = None;
+            colours.push(i);
+        }
+    }
+    (held_z, colours)
+}
+
 /// Release an object's GL side. The sub-context that made it is current.
 fn release(gl: &Gl, obj: Object) {
     match obj {
@@ -1219,6 +1240,45 @@ impl Context {
                         }
                     }
                     *stage = rebuilt;
+                }
+            }
+            Object::Surface(_) => {
+                // A DEVIATION FROM THE C, which holds a reference from the framebuffer, so a
+                // surface destroyed while attached keeps taking pixels until the next
+                // SET_FRAMEBUFFER_STATE. Here the surface's view texture is deleted with it,
+                // and an attachment naming a deleted texture is detached by GL only if that
+                // framebuffer happens to be the bound one -- so the C's behaviour would be
+                // reproduced by luck, and the slot's value copy would compare equal to an
+                // identical later bind and skip re-attaching what GL had quietly dropped.
+                // The attachment and the slot are emptied together instead, which costs one
+                // detach for a guest that destroys a bound surface before rebinding.
+                let fb = self.sub().fb;
+                let sub = self.sub_mut();
+                let (held_z, colours) = evict_surface(&mut sub.zsurf, &mut sub.cbufs, handle);
+                for i in &colours {
+                    sub.swizzle_output_rgb_to_bgr &= !(1 << i);
+                    sub.needs_manual_srgb_encode &= !(1 << i);
+                }
+                if held_z || !colours.is_empty() {
+                    gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+                    if held_z {
+                        gl.framebuffer_texture_2d(
+                            GL_DEPTH_STENCIL_ATTACHMENT,
+                            GL_TEXTURE_2D,
+                            None,
+                            0,
+                        );
+                    }
+                    for i in colours {
+                        gl.framebuffer_texture_2d(
+                            GL_COLOR_ATTACHMENT0 + i as GLenum,
+                            GL_TEXTURE_2D,
+                            None,
+                            0,
+                        );
+                    }
+                    sub.shader_dirty = true;
+                    sub.blend_dirty = true;
                 }
             }
             Object::StreamoutTarget(_) => {
@@ -3171,6 +3231,33 @@ mod tests {
         // A handle the guest reuses for a new view then binds afresh, instead of reading as
         // already bound.
         assert!(!evict_view(&mut views, &mut dirty, h(9)));
+    }
+
+    fn bound(handle: u32) -> BoundSurface {
+        BoundSurface {
+            handle: ObjectHandle::new(handle).unwrap(),
+            resource: ResourceHandle::new(1).unwrap(),
+            format: format("B8G8R8A8_UNORM"),
+            level: 0,
+            nr_samples: 0,
+            tex_height: 16,
+            y_0_top: false,
+        }
+    }
+
+    #[test]
+    fn a_destroyed_surface_leaves_every_attachment_it_held() {
+        let h = ObjectHandle::new(9).unwrap();
+        let mut zsurf = Some(bound(9));
+        let mut cbufs = vec![Some(bound(4)), None, Some(bound(9)), Some(bound(9))];
+        let (held_z, colours) = evict_surface(&mut zsurf, &mut cbufs, h);
+        assert!(held_z && zsurf.is_none());
+        assert_eq!(colours, vec![2, 3]);
+        assert_eq!(cbufs, vec![Some(bound(4)), None, None, None]);
+        // The handle the guest frees is reused by its next create, so a slot left holding it
+        // would answer "already bound" to a different surface.
+        let (held_z, colours) = evict_surface(&mut zsurf, &mut cbufs, h);
+        assert!(!held_z && colours.is_empty());
     }
 
     #[test]
