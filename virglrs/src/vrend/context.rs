@@ -1788,7 +1788,9 @@ impl Context {
                 let key = ViewKey { format: s.format, first_layer: fl, layers: layers as u32 };
                 // Minted now rather than at the first attach, so a driver that refuses the view
                 // is a fault on the command that asked for it.
-                host.resource_mut(cmd, s.resource)?.view(gl, key, internalformat);
+                host.resource_mut(cmd, s.resource)?
+                    .view(gl, key, internalformat)
+                    .expect("the storage was matched as a texture above");
                 view = Some(key);
             }
         }
