@@ -703,21 +703,43 @@ buildable throughout as the A-side reference.
   for a spike built from the same tree, never a persisted format. Descriptors come from the
   wire corpus, which is one.
 
+  **A decoded frame is delivered twice, and that is a negotiation.** VideoToolbox hands back a
+  CVPixelBuffer, never a dmabuf, so there is nothing for the guest to import. The C therefore
+  writes each plane into the *guest's pages* as well as into its own texture, and says so with
+  `VIRGL_CAP_V2_VIDEO_GUEST_PLANES`; without that bit the guest has to keep allocating
+  one-page stub BOs whose fd cannot honestly be exported. A second bit,
+  `VIRGL_CAP_V2_VIDEO_PLANAR_TARGET`, says the host will take a decode target as **one**
+  resource in a planar format with its planes chained behind it, rather than one resource per
+  plane -- backed by a planar IOSurface where it can be, and an RGBA conversion everywhere
+  else. The two are separate because the writeback shipped first and a host can do it without
+  accepting the composite shape.
+
+  Both bits are protocol, so virglrs advertises them only when it serves them, and the
+  samplable-format set has to agree with them exactly. Advertising a planar format the host
+  cannot actually back is not a negotiation the guest can recover from: the kernel hands out
+  the handle before we are asked, so a refused create is followed by an attach and sampler
+  views on a resource that does not exist, and the context is poisoned for the rest of its
+  life without the guest ever learning why. Only NV12 and NV21 can back a composite target, so
+  only those two are advertised -- virglrs currently advertises IYUV and YV12 as well, which is
+  a live deviation recorded in `harness/README.md` and closed by this phase.
+
   **`create_buffer` resolves its planes once.** It takes up to three guest resource handles,
-  one per plane. They become shares at create, not handles re-looked-up at delivery, because
-  the guest can free a plane mid-decode and a delivery path consulting a table the guest can
-  empty is the lifetime bug this tree keeps refusing to write. Same shape as the resource
-  work already landed.
+  one per plane -- or one handle for the whole composite target, which is why the plane index
+  has to travel with the delivery rather than being inferred from "one plane, one resource".
+  The handles become shares at create, not handles re-looked-up at delivery, because the guest
+  can free a plane mid-decode and a delivery path consulting a table the guest can empty is the
+  lifetime bug this tree keeps refusing to write. Same shape as the resource work already
+  landed.
 
   **One new unsafe module.** VideoToolbox, CoreMedia and CoreVideo are C APIs, so no `objc2`
   and no second Objective-C file -- `metal.rs` stays the only one. The new module goes on
   `CLAUDE.md`'s unsafe list, which is exhaustive on purpose.
 
   **Three gates, all of them already built.** The caps deviation the replay gate prints every
-  run (`num_video_caps`, `video_caps`) closes when video caps are served, and is a free
-  regression line from the first commit. The corpus score is exact. The end gate is a video
-  playing in the guest, read under the liveness discipline -- a playing video is its own
-  moving element.
+  run -- `num_video_caps`, `video_caps`, `capability_bits_v2`, and the planar half of
+  `sampler` -- closes as video lands, and is a free regression line from the first commit. The
+  corpus score is exact. The end gate is a video playing in the guest, read under the liveness
+  discipline: a playing video is its own moving element.
 - **P5 — snapshot.** Journal export, `memory_write`, sync export/restore, classic
   content export/restore. Ends at suspend/resume parity.
 - **P6 — cutover.** Rust becomes the default prefix; limina's manifest and
