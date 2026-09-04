@@ -284,6 +284,19 @@ impl Untyped {
     /// and the guest would composite the one nobody draws into.
     /// A refusal hands the storage back, so a rejected upgrade leaves the handle exactly as it
     /// was rather than deleting it: there is no path that loses a resource by failing to type it.
+    ///
+    /// Two kinds of refusal meet here and only one of them is a fault. [`check`] asks the
+    /// guest's half -- whether these arguments describe an image at all -- and a guest that
+    /// describes none has erred, so that is the fault. Everything after it asks the *host's*
+    /// half: whether this driver can alias these particular bytes. It is entitled to say no,
+    /// about a resource that is perfectly well described, and a compositor that asked to import
+    /// something this host cannot adopt must keep running. So every answer there degrades to a
+    /// blank texture instead, at either place adoption can fail -- making the image, and binding
+    /// it. The C's comment on this path records what the alternative cost: a context poisoned
+    /// permanently, every later submit failing, reproduced against a real desktop.
+    ///
+    /// The one refusal past `check` that is still a fault is a texture that cannot be allocated
+    /// even with no image to bind, because then there is nothing left to degrade to.
     pub fn upgrade(
         self,
         gl: &Gl,
@@ -312,11 +325,28 @@ impl Untyped {
         let adopted = image.is_some();
         // The share is gone into the image, or was never there; a refusal past this point has
         // nothing left to hand back but an empty slot, which is what the handle already was.
-        let storage = match alloc_texture(gl, features, formats, &args, image) {
+        let mut storage = alloc_texture(gl, features, formats, &args, image);
+        if let (Err(why), true) = (&storage, adopted) {
+            // The image was made and would not bind. Nothing about the resource is wrong, only
+            // the adoption, so it falls back to the blank texture a resource with no surface
+            // gets rather than taking the context down with it.
+            eprintln!(
+                "[virglrs] vrend: an exported {}x{} {} surface imported but would not bind \
+                 ({why:?}); it gets a blank texture and its contents will be wrong",
+                args.width,
+                args.height,
+                args.format.name()
+            );
+            storage = alloc_texture(gl, features, formats, &args, None);
+        }
+        let storage = match storage {
             Ok(s) => s,
             Err(e) => return Err((Untyped { surface: None }, e)),
         };
-        if !adopted {
+        // Whether an image backs the storage is read off the storage, not carried alongside it:
+        // the adopt can fail at either step, and a second boolean tracking it would be a copy of
+        // this fact that the retry above is exactly the thing to make disagree.
+        if !matches!(&storage, Storage::Texture(t) if t.image.is_some()) {
             // `glTexStorage` leaves contents undefined, which is another context's memory read
             // as pixels -- wrong, and a leak. Blank is still wrong; it is not also a leak.
             zero_texture(gl, formats, &args, &storage);
