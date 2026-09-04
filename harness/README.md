@@ -44,8 +44,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `REPLAY_DUMP_DIR` (narrowed by `REPLAY_DUMP_W`) writes every scored readback and surface as raw
   BGRA, for `rgba2png.py` and a pixel diff.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
+- `corpus.py` — the synthetic-corpus writer: the trace container and the virgl commands, shared
+  by the `make-*-corpus.py` scripts.
 - `make-blit-corpus.py` — writes a synthetic classic corpus that forces the shader blitter, for
   the gate no recorded session provides (see `fixtures/blit.score` below).
+- `make-sampled-corpus.py` — the same, for the blits whose destination the sweep cannot read
+  back; it scores them through a draw (see `fixtures/sampled.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -207,6 +211,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   swap an IOSurface-backed BGRA scanout forces. Its own comments carry which variants exist and
   why the depth-writing ones do not. The corpus is generated rather than recorded, so it is
   reproducible from the script and the score is pinned from the C the same way as the rest.
+  `sampled.score` covers what `blit.score` cannot. The sweep reads back only a plain 2D colour
+  offscreen, so a blit into a layer of an array — or out of one slice of a 3D texture — has no
+  line in any score and would replay green having measured nothing. `make-sampled-corpus.py`
+  writes `vm/captures/sampled.bin`, which SAMPLES each such destination in a draw whose own
+  destination the sweep does read. The oracle is deliberately a different mechanism from the one
+  under test: a blit that writes the wrong layer, read back by a copy that reads the wrong layer,
+  hashes exactly like a correct pair, whereas a draw naming its layer in a texture coordinate
+  shares nothing with the blitter's attachment path. Every layer the corpus does not blit into
+  carries its own fill, so a stray blit is visible from the untouched end too.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
