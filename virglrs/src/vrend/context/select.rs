@@ -97,7 +97,7 @@ pub(super) fn can_emulate_logicop(features: &Features, op: LogicOp) -> bool {
 /// `util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, component)`: the width
 /// of the channel the component reads, in the RGB colour space alone -- an sRGB or depth format
 /// answers zero, as gallium's does.
-fn component_bits(desc: &Desc, component: usize) -> u8 {
+fn component_bits(desc: &Description, component: usize) -> u8 {
     if desc.colorspace != super::super::formats::Colorspace::Rgb {
         return 0;
     }
@@ -166,7 +166,7 @@ fn compile(gl: &Gl, stage: ShaderStage, variant: &mut Variant) -> bool {
     }
 }
 
-impl SubCtx {
+impl SubContext {
     fn mint_variant_id(&mut self) -> VariantId {
         let id = VariantId(self.next_variant_id);
         self.next_variant_id += 1;
@@ -328,7 +328,7 @@ impl SubCtx {
             let mut add_alpha_test = true;
             let logicop = self.blend.is_some_and(|b| b.logicop_enable);
             for (i, surf) in self.cbufs.iter().enumerate() {
-                let Some(desc) = surf.and_then(|s| s.format.describe()) else {
+                let Some(desc) = surf.as_ref().and_then(|s| s.format.describe()) else {
                     continue;
                 };
                 if desc.is_pure_integer() {

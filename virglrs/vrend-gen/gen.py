@@ -124,7 +124,7 @@ def desc(f, index):
         equiv = 'Some(Equivalent::Srgb(%d))' % index[f.srgb_equivalent.name]
     elif f.linear_equivalent and f.linear_equivalent.name in index:
         equiv = 'Some(Equivalent::Linear(%d))' % index[f.linear_equivalent.name]
-    return ('Desc { name: "%s", layout: Layout::%s, block: Block { width: %d, height: %d, '
+    return ('Description { name: "%s", layout: Layout::%s, block: Block { width: %d, height: %d, '
             'depth: %d, bits: %d }, nr_channels: %d, channels: [%s], swizzle: [%s], '
             'colorspace: Colorspace::%s, is_array: %s, is_bitmask: %s, is_mixed: %s, '
             'is_unorm: %s, is_snorm: %s, equivalent: %s }' % (
@@ -170,7 +170,7 @@ def main():
              'pub const FORMAT_COUNT: usize = %d;' % count, '',
              '/// Every `virgl_formats` value, described. A number the wire assigns no name to is',
              '/// `None`.',
-             'pub static DESCRIPTIONS: [Option<Desc>; FORMAT_COUNT] = [']
+             'pub static DESCRIPTIONS: [Option<Description>; FORMAT_COUNT] = [']
     described = 0
     for v in range(count):
         name = next((n for n, val in numbering.items() if val == v and n != 'MAX'), None)

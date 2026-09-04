@@ -5,7 +5,7 @@
 //! context, and the first pass that runs ahead of it.
 
 use super::{
-    Ctx, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS, MAX_SYSTEM_VALUES, TempRange,
+    Context, Failure, Immed, Io, MAX_IMMEDIATE, MAX_IO, MAX_SAMPLERS, MAX_SYSTEM_VALUES, TempRange,
     VecType, bit32, fail, req, samplertype_is_shadow, samplertype_to_req_bits,
     stage_output_name_prefix, sysval,
 };
@@ -18,7 +18,7 @@ use crate::vrend::tgsi::{
 };
 
 /// `iter_decls`: the first pass over the declarations.
-pub(super) fn iter_decls(ctx: &mut Ctx<'_>, decl: &Declaration) -> Result<(), Failure> {
+pub(super) fn iter_decls(ctx: &mut Context<'_>, decl: &Declaration) -> Result<(), Failure> {
     match decl.file {
         File::Input => {
             if decl.semantic.name == Semantic::Fog {
@@ -52,7 +52,7 @@ pub(super) fn iter_decls(ctx: &mut Ctx<'_>, decl: &Declaration) -> Result<(), Fa
 }
 
 /// `analyze_instruction`: the first pass over the instructions.
-pub(super) fn analyze_instruction(ctx: &mut Ctx<'_>, inst: &Instruction) {
+pub(super) fn analyze_instruction(ctx: &mut Context<'_>, inst: &Instruction) {
     if inst.opcode == Opcode::Atomimin || inst.opcode == Opcode::Atomimax {
         let src = &inst.src[0];
         if src.file == File::Buffer {
@@ -159,7 +159,7 @@ fn sysvalue_map(name: Semantic) -> Option<(&'static str, u64, bool)> {
 }
 
 /// `allocate_temp_range`.
-fn allocate_temp_range(ctx: &mut Ctx<'_>, first: i32, last: i32, array_id: i32) {
+fn allocate_temp_range(ctx: &mut Context<'_>, first: i32, last: i32, array_id: i32) {
     if array_id > 0 {
         ctx.temp_ranges.push(TempRange { first, last, array_id, precise_result: false });
     } else {
@@ -175,7 +175,7 @@ fn allocate_temp_range(ctx: &mut Ctx<'_>, first: i32, last: i32, array_id: i32) 
 }
 
 /// `add_images`.
-fn add_images(ctx: &mut Ctx<'_>, first: usize, last: usize, img_decl: &ImageInfo) {
+fn add_images(ctx: &mut Context<'_>, first: usize, last: usize, img_decl: &ImageInfo) {
     let descr = Format::from_wire(u32::from(img_decl.format)).and_then(Format::describe);
     if let Some(d) = descr {
         let sw = |i: usize| d.swizzle[i];
@@ -237,7 +237,7 @@ fn add_images(ctx: &mut Ctx<'_>, first: usize, last: usize, img_decl: &ImageInfo
 }
 
 /// `add_samplers`.
-fn add_samplers(ctx: &mut Ctx<'_>, first: usize, last: usize, ty: Texture, ret: ReturnType) {
+fn add_samplers(ctx: &mut Context<'_>, first: usize, last: usize, ty: Texture, ret: ReturnType) {
     if ret == ReturnType::Sint || ret == ReturnType::Uint {
         ctx.shader_req_bits |= req::INTS;
     }
@@ -260,7 +260,7 @@ fn add_samplers(ctx: &mut Ctx<'_>, first: usize, last: usize, ty: Texture, ret: 
 }
 
 /// `iter_declaration`: the second pass over a declaration.
-pub(super) fn iter_declaration(ctx: &mut Ctx<'_>, decl: &Declaration) -> Result<(), Failure> {
+pub(super) fn iter_declaration(ctx: &mut Context<'_>, decl: &Declaration) -> Result<(), Failure> {
     let processor = ctx.prog_type;
     let first = u32::from(decl.first);
     let last = u32::from(decl.last);
@@ -963,7 +963,7 @@ pub(super) fn iter_declaration(ctx: &mut Ctx<'_>, decl: &Declaration) -> Result<
 }
 
 /// `iter_property`.
-pub(super) fn iter_property(ctx: &mut Ctx<'_>, prop: &PropertyToken) -> Result<(), Failure> {
+pub(super) fn iter_property(ctx: &mut Context<'_>, prop: &PropertyToken) -> Result<(), Failure> {
     let data = prop.data;
     match prop.name {
         Property::FsColor0WritesAllCbufs => {
@@ -1026,7 +1026,7 @@ pub(super) fn iter_property(ctx: &mut Ctx<'_>, prop: &PropertyToken) -> Result<(
 }
 
 /// `iter_immediate`.
-pub(super) fn iter_immediate(ctx: &mut Ctx<'_>, imm: &Immediate) -> Result<(), Failure> {
+pub(super) fn iter_immediate(ctx: &mut Context<'_>, imm: &Immediate) -> Result<(), Failure> {
     if ctx.imm.len() >= MAX_IMMEDIATE {
         return fail(format!("Number of immediates exceeded, max is: {MAX_IMMEDIATE}"));
     }

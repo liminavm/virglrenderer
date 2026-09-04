@@ -40,7 +40,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ids::CtxId;
+use crate::ids::ContextId;
 
 use super::proto::types::VkRingStatusFlagBitsMESA;
 use super::ring::RingControl;
@@ -89,7 +89,7 @@ impl Monitor {
     ///
     /// `period_us` is the guest's number and is never zero -- a zero period is a guest error, and
     /// is refused by the handler before it gets here.
-    pub fn start(ctx: CtxId, period_us: u32) -> Monitor {
+    pub fn start(ctx: ContextId, period_us: u32) -> Monitor {
         assert!(period_us > 0, "a zero reporting period is refused at the boundary, not here");
         let shared = Arc::new(Shared {
             rings: Mutex::new(Vec::new()),
@@ -162,7 +162,7 @@ impl Drop for Monitor {
 }
 
 /// The loop: stamp every live ring, drop the dead ones, sleep until the next cadence.
-fn run(ctx: CtxId, shared: &Shared) {
+fn run(ctx: ContextId, shared: &Shared) {
     let mut last: Option<Instant> = None;
     while shared.running.load(Ordering::Acquire) {
         let period = *shared.period.lock().expect("the monitor period is a leaf lock");
@@ -235,8 +235,8 @@ mod tests {
     use crate::venus::proto::types::VkRingCreateInfoMESA;
     use crate::venus::ring::{Ring, ShmResources};
 
-    fn ctx() -> CtxId {
-        CtxId::new(3).expect("3 is a context id")
+    fn ctx() -> ContextId {
+        ContextId::new(3).expect("3 is a context id")
     }
     const RES: ResourceHandle = ResourceHandle::new(449).unwrap();
     const AT: usize = 8;

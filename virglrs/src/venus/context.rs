@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ids::{CtxId, ResourceHandle, RingId};
+use crate::ids::{ContextId, ResourceHandle, RingId};
 
 use super::budget::{Account, Budget};
 use super::cs::Handle;
@@ -113,7 +113,7 @@ use crate::vulkan::Global;
 const GENERATE_REPLY: u32 = 0x1;
 
 pub struct Context {
-    pub id: CtxId,
+    pub id: ContextId,
     /// The hard poison. It outlives any one command and any one submission: once the stream cannot
     /// be trusted, nothing later in it can be either.
     /// Shared rather than owned: a ring's thread poisons the context it belongs to when its
@@ -253,7 +253,7 @@ impl RingSlot {
 }
 
 impl Context {
-    pub fn new(id: CtxId, budget: &Arc<Budget>) -> Context {
+    pub fn new(id: ContextId, budget: &Arc<Budget>) -> Context {
         Context {
             id,
             fatal: Arc::new(AtomicBool::new(false)),
@@ -910,7 +910,7 @@ fn run_streams(
 /// Poison the context, saying which command and why. Every caller leaves the loop right after,
 /// so this prints unconditionally: the flag may already be set -- the decoder sets the same one
 /// when a command does not decode -- and that is the case whose reason is most worth reading.
-fn poison(id: CtxId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
+fn poison(id: ContextId, dec: &Decoder<'_>, cmd: VkCommandTypeEXT, why: &str) {
     let name = vn_command_name(cmd)
         .map(str::to_string)
         .unwrap_or_else(|| format!("command type {}", cmd.0));
@@ -952,7 +952,7 @@ pub struct Handlers<'a> {
     resources: &'a dyn ShmResources,
     /// Which context this is, for the resource questions whose answer is only meaningful within
     /// one -- a guest id names an allocation, and every context numbers its own.
-    ctx: CtxId,
+    ctx: ContextId,
     /// The ring this batch arrived on, or `None` for the context's own stream. Several commands
     /// are legal on exactly one of the two, and a reply belongs to whichever it was.
     current_ring: Option<RingId>,
@@ -3763,7 +3763,7 @@ mod tests {
         assert_eq!(vn_command_name(cmd), Some("vkGetPipelineCacheData"));
 
         let g = crate::vulkan::global();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
         let mut todo = Unimplemented::default();
         assert!(
@@ -3784,7 +3784,7 @@ mod tests {
         let mut todo = Unimplemented::default();
         let g = crate::vulkan::global();
 
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         let w = header(cmd, GENERATE_REPLY);
         let mut full = w.clone();
         full.extend_from_slice(&1u64.to_le_bytes()); // instance id
@@ -3795,7 +3795,7 @@ mod tests {
         // In replay the flag is stripped, so the command reaches the dispatcher instead of the
         // poison. It still names an instance nothing created, which poisons for its own reason --
         // what separates the two paths is whether the command was dispatched at all.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
         assert!(!ctx.submit(&full, &mut todo, &g, &NO_RESOURCES).ran());
         assert_eq!(ctx.dispatched, 1);
@@ -3899,7 +3899,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let inner = wire_seek(0x10, GENERATE_REPLY);
         assert!(t.1.copy_in(STREAM, &inner));
@@ -3949,7 +3949,7 @@ mod tests {
         let mut todo = Unimplemented::default();
 
         // Not waiting: the command is lost, the context lives.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_cache_data(GHOST, 0));
@@ -3957,7 +3957,7 @@ mod tests {
         assert!(!ctx.fatal());
 
         // Waiting: nothing the host could write is an honest answer, so it writes none and stops.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.objects.borrow_mut().add_ghost(ObjectId(GHOST));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_cache_data(GHOST, GENERATE_REPLY));
@@ -4002,7 +4002,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let inner = wire_instance_version();
         assert!(t.1.copy_in(A, &inner));
@@ -4049,7 +4049,7 @@ mod tests {
 
         // Nothing to run, in a resource that is not even mapped: the skip is what keeps this from
         // being an error at all.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         let nowhere = super::super::proto::types::VkCommandStreamDescriptionMESA {
             resourceId: RING_RES.get() + 1,
@@ -4060,7 +4060,7 @@ mod tests {
         assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "an empty stream is not an error");
 
         // The same empty stream, asked to answer past the end of the window.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
         batch.extend_from_slice(&wire_execute(&[nowhere], Some(&[0x101])));
         assert!(
@@ -4087,7 +4087,7 @@ mod tests {
                 size: 4,
             },
         ] {
-            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+            let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
             assert!(
                 !ctx.submit(&wire_execute(&[s], None), &mut todo, &g, &t).ran(),
                 "{} bytes at {} of resource {} is not a stream this resource holds",
@@ -4114,7 +4114,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let innermost = wire_instance_version();
         assert!(t.1.copy_in(C, &innermost));
@@ -4139,13 +4139,13 @@ mod tests {
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
 
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         assert!(!ctx.submit(&wire_execute(&[], None), &mut todo, &g, &t).ran(), "no streams");
         assert!(ctx.fatal());
 
         // Positions, and no reply stream was ever set: the guest has said where every answer
         // belongs and there is nowhere any of them could belong.
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         let w = wire_execute(&[stream_at(0x22000, 4)], Some(&[0]));
         assert!(!ctx.submit(&w, &mut todo, &g, &t).ran(), "positions with no window");
         assert!(ctx.fatal());
@@ -4170,7 +4170,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Set the window, then seek inside it and ask for a reply. The seek is what moves the
         // answer off the top of the window, so finding it at `AT` proves the position was honoured
@@ -4201,7 +4201,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Two bytes of room for a four-byte answer.
         let mut batch = wire_set_reply(&reply_at(WINDOW, 2));
@@ -4229,7 +4229,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+            let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
             batch.extend_from_slice(&wire_seek(position, 0));
@@ -4254,7 +4254,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         // Out of range, and asking for a reply: the seek fails and the answer must not land.
         let mut batch = wire_set_reply(&reply_at(WINDOW, SIZE));
@@ -4272,7 +4272,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         assert!(!ctx.submit(&wire_seek(0, 0), &mut todo, &g, &t).ran(), "there is nothing to seek");
         assert!(ctx.fatal());
@@ -4457,7 +4457,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+            let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&cmd);
@@ -4568,7 +4568,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -4665,7 +4665,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(wait_idle);
@@ -4835,7 +4835,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
@@ -4976,7 +4976,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         {
             let mut table = ctx.objects.borrow_mut();
             for (id, host, ty) in [
@@ -5112,7 +5112,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkGetImageSubresourceLayout2(layout);
@@ -5229,7 +5229,7 @@ mod tests {
         let mapped = t.1.len() as u64;
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkDeviceWaitIdle(idle);
@@ -5358,7 +5358,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
-                    ctx: CtxId::new(1).expect("1 is not zero"),
+                    ctx: ContextId::new(1).expect("1 is not zero"),
                     reject: None,
                     resources: &t,
                     rings: &mut rings,
@@ -5416,7 +5416,7 @@ mod tests {
             ) -> Option<std::sync::Arc<crate::guest_mem::GuestMap>> {
                 None
             }
-            fn bytes(&self, _: CtxId, _: crate::ids::ResourceHandle) -> Option<ResourceBytes> {
+            fn bytes(&self, _: ContextId, _: crate::ids::ResourceHandle) -> Option<ResourceBytes> {
                 Some(ResourceBytes::Allocation(Published { memory: ObjectId(0x9999), size: 4096 }))
             }
         }
@@ -5441,7 +5441,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -5498,7 +5498,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
-                    ctx: CtxId::new(1).expect("1 is not zero"),
+                    ctx: ContextId::new(1).expect("1 is not zero"),
                     reject: None,
                     resources: &t,
                     rings: &mut rings,
@@ -5602,7 +5602,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
-                    ctx: CtxId::new(1).expect("1 is not zero"),
+                    ctx: ContextId::new(1).expect("1 is not zero"),
                     reject: None,
                     resources: &t,
                     rings: &mut rings,
@@ -5699,7 +5699,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
-                    ctx: CtxId::new(1).expect("1 is not zero"),
+                    ctx: ContextId::new(1).expect("1 is not zero"),
                     reject: None,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
@@ -5818,7 +5818,7 @@ mod tests {
                     todo: &mut todo,
                     driver: &mut driver,
                     global: &global,
-                    ctx: CtxId::new(1).expect("1 is not zero"),
+                    ctx: ContextId::new(1).expect("1 is not zero"),
                     reject: None,
                     resources: &NO_RESOURCES,
                     rings: &mut rings,
@@ -5882,7 +5882,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let speaks = crate::venus::driver::renderer_extensions();
         assert_eq!(speaks.len(), 2, "the two protocol extensions this build serializes");
@@ -5988,7 +5988,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let mut fns = crate::vulkan::Instance::default();
         fns.plant_vkGetPhysicalDeviceImageFormatProperties(probe);
@@ -6124,7 +6124,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -6240,7 +6240,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -6276,7 +6276,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         let cmd = wire!(
             ser::vn_sizeof_vkQueueWaitIdle_args,
@@ -6332,7 +6332,7 @@ mod tests {
             let t = ring_table();
             let g = crate::vulkan::global();
             let mut todo = Unimplemented::default();
-            let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+            let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
             let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
             batch.extend_from_slice(&wire_unserved(if reply_wanted { GENERATE_REPLY } else { 0 }));
@@ -6372,7 +6372,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
 
         assert!(
             ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran(),
@@ -6456,7 +6456,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(
@@ -6487,7 +6487,7 @@ mod tests {
         let t = ring_table();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(!ctx.submit(&wire_monitored_ring(7, 0), &mut todo, &g, &t).ran(), "refused");
@@ -6562,7 +6562,7 @@ mod tests {
     fn ctx_with_ring(t: &OneShm) -> Context {
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
         assert!(
             ctx.submit(&wire_create_ring(7, &ring_info()), &mut todo, &g, t).ran(),
@@ -6666,7 +6666,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         for ring in [7u64, 9] {
@@ -6709,7 +6709,7 @@ mod tests {
         let info = ring_info();
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(ctx.submit(&wire_create_ring(7, &info), &mut todo, &g, &t).ran());
@@ -6748,7 +6748,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -6802,7 +6802,7 @@ mod tests {
                 todo: &mut todo,
                 driver: &mut driver,
                 global: &global,
-                ctx: CtxId::new(1).expect("1 is not zero"),
+                ctx: ContextId::new(1).expect("1 is not zero"),
                 reject: None,
                 resources: &t,
                 rings: &mut rings,
@@ -6845,7 +6845,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -6884,7 +6884,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -6915,7 +6915,7 @@ mod tests {
     fn a_submission_for_a_ring_that_is_not_here_fails_without_poisoning() {
         let g = crate::vulkan::global();
         let mut todo = Unimplemented::default();
-        let mut ctx = Context::new(CtxId::new(1).unwrap(), &Budget::with_cap(None, false));
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
         ctx.replay_begin();
 
         assert!(
@@ -6955,7 +6955,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -6998,7 +6998,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -7091,7 +7091,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7161,7 +7161,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7197,7 +7197,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &t,
             rings: &mut rings,
@@ -7319,7 +7319,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7415,7 +7415,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7464,7 +7464,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7520,7 +7520,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7551,7 +7551,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7638,7 +7638,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7676,7 +7676,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7818,7 +7818,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7892,7 +7892,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7924,7 +7924,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -7980,7 +7980,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8026,7 +8026,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8056,7 +8056,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8229,7 +8229,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8310,7 +8310,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8447,7 +8447,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8621,7 +8621,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8780,7 +8780,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -8927,7 +8927,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9128,7 +9128,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9270,7 +9270,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9355,7 +9355,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9418,7 +9418,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9609,7 +9609,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9778,7 +9778,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -9999,7 +9999,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10195,7 +10195,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10331,7 +10331,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10405,7 +10405,7 @@ mod tests {
         fns.plant_vkDestroyDevice(device);
 
         let mut ctx =
-            Context::new(CtxId::new(7).expect("7 is not zero"), &Budget::with_cap(None, false));
+            Context::new(ContextId::new(7).expect("7 is not zero"), &Budget::with_cap(None, false));
         ctx.driver_mut().plant_device(VkDevice(DEVICE), fns);
         {
             let mut t = ctx.objects().borrow_mut();
@@ -10485,7 +10485,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10570,7 +10570,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10728,7 +10728,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -10881,7 +10881,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -11020,7 +11020,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -11179,7 +11179,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,
@@ -11412,7 +11412,7 @@ mod tests {
             todo: &mut todo,
             driver: &mut driver,
             global: &global,
-            ctx: CtxId::new(1).expect("1 is not zero"),
+            ctx: ContextId::new(1).expect("1 is not zero"),
             reject: None,
             resources: &NO_RESOURCES,
             rings: &mut rings,

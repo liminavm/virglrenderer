@@ -169,7 +169,7 @@ impl std::fmt::Display for ObjectHandle {
 /// between them, and every object table and every piece of bound state is per sub-context.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
-pub struct SubCtxId(pub u32);
+pub struct SubContextId(pub u32);
 
 /// A video codec's handle, in the video context's own namespace.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -733,9 +733,9 @@ pub enum Command<'a> {
         length: u32,
         resource: Option<ResourceHandle>,
     },
-    SetSubCtx(SubCtxId),
-    CreateSubCtx(SubCtxId),
-    DestroySubCtx(SubCtxId),
+    SetSubCtx(SubContextId),
+    CreateSubCtx(SubContextId),
+    DestroySubCtx(SubContextId),
     BindShader {
         handle: Option<ObjectHandle>,
         stage: ShaderStage,

@@ -22,8 +22,8 @@ mod tex;
 use std::fmt;
 
 use super::{
-    Array, Cfg, Info, InterpInfo, IoArray, IoArrayInfo, Key, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
-    MAX_SO_OUTPUTS, POLYGON_STIPPLE_SIZE, VarInfo,
+    Array, Config, Info, InterpInfo, IoArray, IoArrayInfo, Key, MAX_SHADER_BUFFERS,
+    MAX_SHADER_IMAGES, MAX_SO_OUTPUTS, POLYGON_STIPPLE_SIZE, VarInfo,
 };
 use crate::vrend::pipe::{LogicOp, PrimType};
 use crate::vrend::proto::StreamOutput;
@@ -227,7 +227,7 @@ pub(super) enum IoDir {
 
 /// `io_decl_type`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum IoDecl {
+pub(super) enum IoDeclaration {
     Plain,
     Block,
 }
@@ -329,7 +329,7 @@ pub(super) struct Immed {
 /// buffers carry an error flag that a failed emit sets and the driver checks at the end; the
 /// flags are here for the same purpose.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub(super) struct Bufs {
+pub(super) struct Buffers {
     pub indent_level: i32,
     pub required_sysval_uniform_decls: u8,
     pub main: String,
@@ -339,7 +339,7 @@ pub(super) struct Bufs {
     pub hdr_error: bool,
 }
 
-impl Bufs {
+impl Buffers {
     /// `emit_indent`: a tab per level, at most fifteen.
     fn emit_indent(&mut self) {
         if self.indent_level > 0 {
@@ -400,12 +400,12 @@ macro_rules! hdr {
 pub(super) use {emit, hdr};
 
 /// `dump_ctx`: the state of one translation.
-pub(super) struct Ctx<'a> {
-    pub cfg: &'a Cfg,
+pub(super) struct Context<'a> {
+    pub cfg: &'a Config,
     pub key: &'a Key,
     pub info: &'a scan::Info,
     pub prog_type: Processor,
-    pub bufs: Bufs,
+    pub bufs: Buffers,
     pub instno: u32,
 
     /// The C's `src_bufs` and `dst_bufs`: one per operand slot, kept across instructions,
@@ -523,19 +523,19 @@ pub(super) struct Ctx<'a> {
     pub local_cs_block_size: [u16; 3],
 }
 
-impl<'a> Ctx<'a> {
+impl<'a> Context<'a> {
     pub(super) fn new(
-        cfg: &'a Cfg,
+        cfg: &'a Config,
         key: &'a Key,
         info: &'a scan::Info,
         processor: Processor,
-    ) -> Ctx<'a> {
-        Ctx {
+    ) -> Context<'a> {
+        Context {
             cfg,
             key,
             info,
             prog_type: processor,
-            bufs: Bufs::default(),
+            bufs: Buffers::default(),
             instno: 0,
             src_bufs: Default::default(),
             dst_bufs: Default::default(),
@@ -950,7 +950,7 @@ pub(super) fn swiz_char(swiz: u8) -> char {
 /// renderer needs to know about it. `so_info` is the stream-output layout the guest sent with
 /// the shader; it comes back in the info, with the GLSL name of each output beside it.
 pub fn convert(
-    cfg: &Cfg,
+    cfg: &Config,
     program: &tgsi::Program,
     req_local_mem: u32,
     key: &Key,
@@ -964,7 +964,7 @@ pub fn convert(
     // treatment here -- its inputs are collected and its clip-distance reads noted -- and
     // only the second pass knows the stage. Both readers are harmless for a non-fragment
     // program, and the walk is reproduced as it is.
-    let mut ctx = Ctx::new(cfg, key, &program.info, Processor::Fragment);
+    let mut ctx = Context::new(cfg, key, &program.info, Processor::Fragment);
     for token in &shader.tokens {
         match token {
             Token::Declaration(d) => decl::iter_decls(&mut ctx, d)?,
@@ -1075,7 +1075,7 @@ pub fn convert(
 }
 
 /// `fill_interpolants` / `fill_fragment_interpolants`.
-fn fill_interpolants(ctx: &Ctx<'_>, sinfo: &mut VarInfo) {
+fn fill_interpolants(ctx: &Context<'_>, sinfo: &mut VarInfo) {
     if ctx.interp_input_mask == 0 || ctx.prog_type != Processor::Fragment {
         return;
     }
@@ -1093,7 +1093,7 @@ fn fill_interpolants(ctx: &Ctx<'_>, sinfo: &mut VarInfo) {
 }
 
 /// `fill_var_sinfo`.
-fn fill_var_sinfo(ctx: &Ctx<'_>, sinfo: &mut VarInfo) {
+fn fill_var_sinfo(ctx: &Context<'_>, sinfo: &mut VarInfo) {
     sinfo.num_ucp = if ctx.is_last_vertex_stage { super::NUM_CLIP_PLANES as i32 } else { 0 };
     sinfo.fs_info.has_sample_input = ctx.has_sample_input;
     sinfo.fs_info.has_noperspective = ctx.has_noperspective;
@@ -1107,7 +1107,7 @@ fn fill_var_sinfo(ctx: &Ctx<'_>, sinfo: &mut VarInfo) {
 }
 
 /// `fill_sinfo`.
-pub(super) fn fill_sinfo(ctx: &mut Ctx<'_>, sinfo: &mut Info) {
+pub(super) fn fill_sinfo(ctx: &mut Context<'_>, sinfo: &mut Info) {
     sinfo.use_pervertex_in = ctx.has_pervertex;
     sinfo.samplers_used_mask = ctx.samplers_used;
     sinfo.images_used_mask = ctx.images_used_mask;
@@ -1186,7 +1186,7 @@ pub(super) fn fill_sinfo(ctx: &mut Ctx<'_>, sinfo: &mut Info) {
 
 /// `emit_required_sysval_uniforms`: the `VirglBlock` uniform block, whole, when any member is
 /// read.
-pub(super) fn emit_required_sysval_uniforms(bufs: &mut Bufs) {
+pub(super) fn emit_required_sysval_uniforms(bufs: &mut Buffers) {
     if bufs.required_sysval_uniform_decls == 0 {
         return;
     }
@@ -1204,7 +1204,7 @@ pub(super) fn emit_required_sysval_uniforms(bufs: &mut Bufs) {
 /// vertex shader's outputs through, for a pipeline that has an evaluation shader but no
 /// control shader of its own.
 pub fn create_passthrough_tcs(
-    cfg: &Cfg,
+    cfg: &Config,
     vs: &Shader,
     key: &Key,
     tess_factors: &[f32; 6],
@@ -1220,8 +1220,8 @@ mod tests {
 
     /// The host's configuration when the corpus was recorded: GLES 3.1 on zink over
     /// KosmicKrisp, as `vrend_renderer.c` fills `shader_cfg`.
-    pub(crate) fn corpus_cfg() -> Cfg {
-        Cfg {
+    pub(crate) fn corpus_cfg() -> Config {
+        Config {
             glsl_version: 310,
             max_draw_buffers: 8,
             max_shader_patch_varyings: 30,

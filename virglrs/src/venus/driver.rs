@@ -4158,7 +4158,7 @@ mod tests {
     fn a_shared_surface_stays_charged_after_its_allocation_is_gone() {
         use super::super::budget::Budget;
         let budget = Budget::with_cap(None, false);
-        let one = crate::ids::CtxId::new(1).expect("not zero");
+        let one = crate::ids::ContextId::new(1).expect("not zero");
         let mut d = Driver::new(Account::open(&budget, one));
 
         let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
@@ -4588,7 +4588,7 @@ mod tests {
         }
 
         let budget = Budget::with_cap(None, false);
-        let one = crate::ids::CtxId::new(1).expect("not zero");
+        let one = crate::ids::ContextId::new(1).expect("not zero");
         let mut d = Driver::new(Account::open(&budget, one));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);

@@ -12,8 +12,8 @@ use super::tex::{
     translate_load, translate_resq, translate_store, translate_tex,
 };
 use super::{
-    Ctx, Failure, Io, IoDecl, IoDir, MAX_IMMEDIATE, MAX_IO, Qual, VecType, bit32, bit64, emit,
-    fail, proc_prefix, req, stage_output_name_prefix, swiz_char,
+    Context, Failure, Io, IoDeclaration, IoDir, MAX_IMMEDIATE, MAX_IO, Qual, VecType, bit32, bit64,
+    emit, fail, proc_prefix, req, stage_output_name_prefix, swiz_char,
 };
 use crate::vrend::shader::Key;
 use crate::vrend::tgsi::info::OpType;
@@ -96,7 +96,7 @@ pub(super) fn write_io_as_src(
     io: &Io,
     list: &[Io],
     src: &Src,
-    decl_type: IoDecl,
+    decl_type: IoDeclaration,
 ) {
     if io.first == io.last && io.overlapping_array.is_none() {
         result.push_str(&format!("{}{}", io.glsl_name, array_or_varname));
@@ -105,14 +105,18 @@ pub(super) fn write_io_as_src(
     let base = io.overlapping_array.map_or(io, |i| &list[i]);
     let offset = i32::from(src.index) - io.first as i32 + io.array_offset as i32;
     let s = match (decl_type, src.indirect) {
-        (IoDecl::Block, true) => {
+        (IoDeclaration::Block, true) => {
             format!("{}.{}[addr{} + {}]", array_or_varname, base.glsl_name, src.ind.index, offset)
         }
-        (IoDecl::Block, false) => format!("{}.{}[{}]", array_or_varname, base.glsl_name, offset),
-        (IoDecl::Plain, true) => {
+        (IoDeclaration::Block, false) => {
+            format!("{}.{}[{}]", array_or_varname, base.glsl_name, offset)
+        }
+        (IoDeclaration::Plain, true) => {
             format!("{}{}[addr{} + {}]", base.glsl_name, array_or_varname, src.ind.index, offset)
         }
-        (IoDecl::Plain, false) => format!("{}{}[{}]", base.glsl_name, array_or_varname, offset),
+        (IoDeclaration::Plain, false) => {
+            format!("{}{}[{}]", base.glsl_name, array_or_varname, offset)
+        }
     };
     result.push_str(&s);
 }
@@ -124,7 +128,7 @@ pub(super) fn write_io_as_dst(
     io: &Io,
     list: &[Io],
     dst: &Dst,
-    decl_type: IoDecl,
+    decl_type: IoDeclaration,
 ) {
     if io.first == io.last {
         let s = match io.overlapping_array {
@@ -137,20 +141,24 @@ pub(super) fn write_io_as_dst(
     let base = io.overlapping_array.map_or(io, |i| &list[i]);
     let offset = i32::from(dst.index) - io.first as i32 + io.array_offset as i32;
     let s = match (decl_type, dst.indirect) {
-        (IoDecl::Block, true) => {
+        (IoDeclaration::Block, true) => {
             format!("{}.{}[addr{} + {}]", array_or_varname, base.glsl_name, dst.ind.index, offset)
         }
-        (IoDecl::Block, false) => format!("{}.{}[{}]", array_or_varname, base.glsl_name, offset),
-        (IoDecl::Plain, true) => {
+        (IoDeclaration::Block, false) => {
+            format!("{}.{}[{}]", array_or_varname, base.glsl_name, offset)
+        }
+        (IoDeclaration::Plain, true) => {
             format!("{}{}[addr{} + {}]", base.glsl_name, array_or_varname, dst.ind.index, offset)
         }
-        (IoDecl::Plain, false) => format!("{}{}[{}]", base.glsl_name, array_or_varname, offset),
+        (IoDeclaration::Plain, false) => {
+            format!("{}{}[{}]", base.glsl_name, array_or_varname, offset)
+        }
     };
     result.push_str(&s);
 }
 
 /// `get_destination_info_generic`.
-fn destination_info_generic(ctx: &Ctx<'_>, dst_reg: &Dst, io: &Io, writemask: &str) -> String {
+fn destination_info_generic(ctx: &Context<'_>, dst_reg: &Dst, io: &Io, writemask: &str) -> String {
     let stage_prefix = stage_output_name_prefix(ctx.prog_type);
     let mut reswizzled = String::new();
     let wm = reswizzle_dest(io, dst_reg, &mut reswizzled, writemask);
@@ -161,10 +169,10 @@ fn destination_info_generic(ctx: &Ctx<'_>, dst_reg: &Dst, io: &Io, writemask: &s
     } else {
         String::new()
     };
-    let mut decl_type = IoDecl::Plain;
+    let mut decl_type = IoDeclaration::Plain;
     if io.first != io.last && ctx.prefer_generic_io_block(IoDir::Out) {
         blkarray = blockvarname(stage_prefix, io, &blkarray);
-        decl_type = IoDecl::Block;
+        decl_type = IoDeclaration::Block;
     }
     write_io_as_dst(&mut result, &blkarray, io, &ctx.outputs, dst_reg, decl_type);
     result.push_str(wm);
@@ -178,7 +186,7 @@ fn find_io_index(io: &[Io], index: i32) -> Option<usize> {
 
 /// `get_destination_info`. Fills `ctx.dst_bufs`, the fp64 originals, and the writemask.
 fn get_destination_info(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     dinfo: &mut DestInfo,
     fp64_dsts: &mut [String; 2],
@@ -309,7 +317,14 @@ fn get_destination_info(
                         let wm = reswizzle_dest(&output, &dst_reg, &mut reswizzled, writemask)
                             .to_string();
                         let mut s = String::new();
-                        write_io_as_dst(&mut s, "", &output, &ctx.outputs, &dst_reg, IoDecl::Plain);
+                        write_io_as_dst(
+                            &mut s,
+                            "",
+                            &output,
+                            &ctx.outputs,
+                            &dst_reg,
+                            IoDeclaration::Plain,
+                        );
                         if !output.override_no_wm {
                             s.push_str(&wm);
                         }
@@ -428,7 +443,7 @@ fn shift_swizzles(io: &Io, src: &Src, shifted: &mut String, swizzle: &str) -> bo
 /// `get_source_info_generic`.
 #[allow(clippy::too_many_arguments)]
 fn source_info_generic(
-    ctx: &Ctx<'_>,
+    ctx: &Context<'_>,
     iot: IoDir,
     srcstypeprefix: Qual,
     prefix: &str,
@@ -446,7 +461,7 @@ fn source_info_generic(
         if shift_swizzles(io, src, &mut shifted, swizzle) { shifted.as_str() } else { swizzle };
 
     let mut result = format!("{}({}", srcstypeprefix.s(), prefix);
-    let mut decl_type = IoDecl::Plain;
+    let mut decl_type = IoDeclaration::Plain;
     let mut arrayname = arrayname.to_string();
     if (io.first != io.last || io.overlapping_array.is_some()) && ctx.prefer_generic_io_block(iot) {
         let array = io.overlapping_array.map_or(io, |i| &list[i]);
@@ -456,7 +471,7 @@ fn source_info_generic(
             stage_output_name_prefix(ctx.prog_type)
         };
         arrayname = blockvarname(stage_prefix, array, &arrayname);
-        decl_type = IoDecl::Block;
+        decl_type = IoDeclaration::Block;
     }
     write_io_as_src(&mut result, &arrayname, io, list, src, decl_type);
     result.push_str(&format!("{})", if io.is_int { "" } else { swizzle }));
@@ -486,7 +501,7 @@ fn source_info_patch(
         io,
         list,
         src,
-        IoDecl::Plain,
+        IoDeclaration::Plain,
     );
     result.push_str(&format!("{})", if io.is_int { "" } else { swizzle }));
     result
@@ -524,7 +539,7 @@ fn source_swizzle(src: &Src) -> String {
 /// `create_swizzled_clipdist`.
 #[allow(clippy::too_many_arguments)]
 fn swizzled_clipdist(
-    ctx: &Ctx<'_>,
+    ctx: &Context<'_>,
     src: &Src,
     input_idx: usize,
     gl_in: bool,
@@ -574,7 +589,7 @@ fn swizzled_clipdist(
 
 /// `load_clipdist_fs`.
 fn load_clipdist_fs(
-    ctx: &Ctx<'_>,
+    ctx: &Context<'_>,
     src: &Src,
     input_idx: usize,
     stypeprefix: &str,
@@ -593,7 +608,7 @@ fn load_clipdist_fs(
 /// `get_source_info`. Fills `ctx.src_bufs` and, for the interpolation opcodes, the swizzle of
 /// the first operand that the caller applies to the result instead.
 fn get_source_info(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     inst: &Instruction,
     sinfo: &mut SourceInfo,
     src_swizzle0: &mut String,
@@ -1309,7 +1324,7 @@ fn get_source_info(
 }
 
 /// `rewrite_1d_image_coordinate`, GLES leg: a 1D image is a 2D one with a zero row.
-fn rewrite_1d_image_coordinate(ctx: &mut Ctx<'_>, inst: &Instruction) {
+fn rewrite_1d_image_coordinate(ctx: &mut Context<'_>, inst: &Instruction) {
     let texture = inst.memory.map_or(Texture::Buffer, |m| m.texture);
     if inst.src[0].file == File::Image && (texture == Texture::D1 || texture == Texture::Array1d) {
         let buf = ctx.src_bufs[1].clone();
@@ -1361,7 +1376,7 @@ fn collapse_vars_to_arrays(io: &mut [Io], semantic: Semantic) -> bool {
 
 /// `rewrite_io_ranged`: with indirect IO access but separately sent values, arrays are
 /// emulated by putting values into arrays by semantic.
-fn rewrite_io_ranged(ctx: &mut Ctx<'_>) {
+fn rewrite_io_ranged(ctx: &mut Context<'_>) {
     if ctx.info.is_indirect(File::Input) || ctx.key.require_input_arrays {
         let generic_array = collapse_vars_to_arrays(&mut ctx.inputs, Semantic::Generic);
         let patch_array = collapse_vars_to_arrays(&mut ctx.inputs, Semantic::Patch);
@@ -1381,7 +1396,7 @@ fn rewrite_io_ranged(ctx: &mut Ctx<'_>) {
 }
 
 /// `rewrite_vs_pos_array`.
-fn rewrite_vs_pos_array(ctx: &mut Ctx<'_>) {
+fn rewrite_vs_pos_array(ctx: &mut Context<'_>) {
     let mut range_start = 0xffff;
     let mut range_end = 0;
     let mut io_idx = 0;
@@ -1421,7 +1436,7 @@ fn renumber_io_arrays(io: &mut [Io]) {
 }
 
 /// `handle_io_arrays`.
-pub(super) fn handle_io_arrays(ctx: &mut Ctx<'_>) {
+pub(super) fn handle_io_arrays(ctx: &mut Context<'_>) {
     if ctx.guest_sent_io_arrays {
         renumber_io_arrays(&mut ctx.inputs);
         renumber_io_arrays(&mut ctx.outputs);
@@ -1470,7 +1485,7 @@ fn add_missing_semantic_inputs(
 }
 
 /// `add_missing_inputs`: inputs the stage before emits but this one did not declare.
-fn add_missing_inputs(ctx: &mut Ctx<'_>) {
+fn add_missing_inputs(ctx: &mut Context<'_>) {
     let mut generics_declared = 0u64;
     let mut patches_declared = 0u64;
     let mut texcoord_declared = 0u64;
@@ -1535,7 +1550,7 @@ fn add_missing_inputs(ctx: &mut Ctx<'_>) {
 }
 
 /// `iter_instruction`.
-pub(super) fn iter_instruction(ctx: &mut Ctx<'_>, inst: &Instruction) -> Result<(), Failure> {
+pub(super) fn iter_instruction(ctx: &mut Context<'_>, inst: &Instruction) -> Result<(), Failure> {
     let mut dinfo = DestInfo::default();
     let mut sinfo = SourceInfo { svec4: Qual::Vec4, ..SourceInfo::default() };
     let mut fp64_dsts: [String; 2] = [String::new(), String::new()];
@@ -2218,7 +2233,7 @@ pub(super) fn iter_instruction(ctx: &mut Ctx<'_>, inst: &Instruction) -> Result<
 }
 
 /// The first source's immediate, at its X swizzle: what `EMIT`, `ENDPRIM` and `MEMBAR` carry.
-fn immediate_word(ctx: &Ctx<'_>, inst: &Instruction) -> Result<u32, Failure> {
+fn immediate_word(ctx: &Context<'_>, inst: &Instruction) -> Result<u32, Failure> {
     let src = &inst.src[0];
     if src.index < 0 || src.index as usize >= MAX_IMMEDIATE {
         return fail(format!("Immediate range exceeded, max is {MAX_IMMEDIATE}"));

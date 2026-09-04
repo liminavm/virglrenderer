@@ -394,7 +394,7 @@ pub const MAX_TEX_OFFSETS: usize = 4;
 
 /// `tgsi_ind_register`: the register an indirect index is read from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct IndReg {
+pub struct IndirectRegister {
     pub file: File,
     pub index: i16,
     pub swizzle: u8,
@@ -402,9 +402,9 @@ pub struct IndReg {
     pub array_id: u16,
 }
 
-impl Default for IndReg {
-    fn default() -> IndReg {
-        IndReg { file: File::Null, index: 0, swizzle: SWIZZLE_X, array_id: 0 }
+impl Default for IndirectRegister {
+    fn default() -> IndirectRegister {
+        IndirectRegister { file: File::Null, index: 0, swizzle: SWIZZLE_X, array_id: 0 }
     }
 }
 
@@ -425,9 +425,9 @@ pub struct Src {
     pub swizzle: [u8; 4],
     pub absolute: bool,
     pub negate: bool,
-    pub ind: IndReg,
+    pub ind: IndirectRegister,
     pub dim: Dimension,
-    pub dim_ind: IndReg,
+    pub dim_ind: IndirectRegister,
 }
 
 impl Default for Src {
@@ -440,9 +440,9 @@ impl Default for Src {
             swizzle: [SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W],
             absolute: false,
             negate: false,
-            ind: IndReg::default(),
+            ind: IndirectRegister::default(),
             dim: Dimension::default(),
-            dim_ind: IndReg::default(),
+            dim_ind: IndirectRegister::default(),
         }
     }
 }
@@ -455,9 +455,9 @@ pub struct Dst {
     pub indirect: bool,
     pub dimension: bool,
     pub index: i16,
-    pub ind: IndReg,
+    pub ind: IndirectRegister,
     pub dim: Dimension,
-    pub dim_ind: IndReg,
+    pub dim_ind: IndirectRegister,
 }
 
 impl Default for Dst {
@@ -468,24 +468,24 @@ impl Default for Dst {
             indirect: false,
             dimension: false,
             index: 0,
-            ind: IndReg::default(),
+            ind: IndirectRegister::default(),
             dim: Dimension::default(),
-            dim_ind: IndReg::default(),
+            dim_ind: IndirectRegister::default(),
         }
     }
 }
 
 /// `tgsi_texture_offset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TexOffset {
+pub struct TextureOffset {
     pub file: File,
     pub index: i16,
     pub swizzle: [u8; 3],
 }
 
-impl Default for TexOffset {
-    fn default() -> TexOffset {
-        TexOffset { file: File::Null, index: 0, swizzle: [0; 3] }
+impl Default for TextureOffset {
+    fn default() -> TextureOffset {
+        TextureOffset { file: File::Null, index: 0, swizzle: [0; 3] }
     }
 }
 
@@ -536,7 +536,7 @@ pub struct Instruction {
     pub memory: Option<MemoryInfo>,
     pub dst: [Dst; MAX_DST],
     pub src: [Src; MAX_SRC],
-    pub tex_offsets: [TexOffset; MAX_TEX_OFFSETS],
+    pub tex_offsets: [TextureOffset; MAX_TEX_OFFSETS],
 }
 
 impl Instruction {

@@ -349,7 +349,7 @@ struct Linked<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProgramSerial(u64);
 
-impl SubCtx {
+impl SubContext {
     /// The next name, taken through a `Cell` so minting one does not need the whole
     /// sub-context: the program being named is built from a borrow of it.
     fn mint_program_serial(&self) -> ProgramSerial {
@@ -413,7 +413,7 @@ impl SubCtx {
 
 /// The C's `vrend_shader_destroy`, and the one place a shader leaves a sub-context: the
 /// programs linking each variant, then the variant's GL shader.
-pub(super) fn release_shader(sub: &mut SubCtx, gl: &Gl, shader: Shader) {
+pub(super) fn release_shader(sub: &mut SubContext, gl: &Gl, shader: Shader) {
     if let ShaderText::Whole(p) = shader.text {
         for v in p.variants {
             sub.forget_programs_of(gl, v.id);

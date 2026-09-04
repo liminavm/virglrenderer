@@ -64,7 +64,7 @@ fn copy_compatible(formats: &Table, src: Format, dst: Format, allow_compressed: 
 }
 
 /// gallium's `util_is_format_compatible`.
-fn plain_compatible(s: &Desc, d: &Desc) -> bool {
+fn plain_compatible(s: &Description, d: &Description) -> bool {
     if s.block.bits != d.block.bits
         || s.nr_channels != d.nr_channels
         || s.colorspace != d.colorspace

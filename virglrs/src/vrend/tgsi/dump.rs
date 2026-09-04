@@ -39,10 +39,10 @@ struct Register {
     file: File,
     dimension: bool,
     dim: Dimension,
-    dim_ind: IndReg,
+    dim_ind: IndirectRegister,
     indirect: bool,
     index: i16,
-    ind: IndReg,
+    ind: IndirectRegister,
 }
 
 impl From<&Src> for Register {

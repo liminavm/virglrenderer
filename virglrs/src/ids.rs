@@ -71,19 +71,19 @@ id!(
 ///
 /// Guest-chosen and reused: an id freed by one destroy names something else after the next
 /// create. Never zero -- `NonZeroU32` rather than a checked constructor over a `u32`, so that the
-/// invariant is a property the compiler knows and `Option<CtxId>` costs no more than a `u32`.
+/// invariant is a property the compiler knows and `Option<ContextId>` costs no more than a `u32`.
 ///
 /// The value originates in the guest: its kernel picks a context id when a process opens the DRM
 /// node and sends it in the virtio-gpu header. So it arrives as an untrusted integer, and
-/// [`CtxId::new`] is where that integer is parsed -- the same place the caller already handles a
+/// [`ContextId::new`] is where that integer is parsed -- the same place the caller already handles a
 /// header it could not make sense of.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
-pub struct CtxId(NonZeroU32);
+pub struct ContextId(NonZeroU32);
 
-impl CtxId {
-    pub fn new(raw: u32) -> Option<CtxId> {
-        NonZeroU32::new(raw).map(CtxId)
+impl ContextId {
+    pub fn new(raw: u32) -> Option<ContextId> {
+        NonZeroU32::new(raw).map(ContextId)
     }
 
     pub fn get(self) -> u32 {
@@ -91,7 +91,7 @@ impl CtxId {
     }
 }
 
-impl std::fmt::Display for CtxId {
+impl std::fmt::Display for ContextId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -101,7 +101,7 @@ impl std::fmt::Display for CtxId {
 ///
 /// Guest-chosen and REUSED: a handle freed by one unref names something else after the next
 /// create. Never zero -- `NonZeroU32` rather than a checked constructor over a `u32`, for the
-/// reason [`CtxId`] gives, and because the alternative was a zero check at one call site with
+/// reason [`ContextId`] gives, and because the alternative was a zero check at one call site with
 /// every other lookup left to miss quietly.
 ///
 /// Like a context id it arrives as an untrusted integer, from the VMM at the C ABI or from a

@@ -8,24 +8,24 @@
 use super::exit::{blockname, blockvarname, emit_fog_fixup_hdr};
 use super::tex::internalformat_string;
 use super::{
-    Ctx, Failure, Image, Io, IoDir, MAX_SO_OUTPUTS, Qual, Sampler, Strings, bit32, bit64, emit,
+    Context, Failure, Image, Io, IoDir, MAX_SO_OUTPUTS, Qual, Sampler, Strings, bit32, bit64, emit,
     gs_input_prim_to_size, hdr, prim_to_name, prim_to_tes_name, proc_prefix, req,
     samplertype_is_shadow, spacing_string, stage_output_name_prefix,
 };
 use crate::vrend::shader::{
-    AdvancedBlend, Cfg, FsInfo, Info, Key, sampler_return_conv, sampler_type_conv,
+    AdvancedBlend, Config, FragmentInfo, Info, Key, sampler_return_conv, sampler_type_conv,
 };
 use crate::vrend::tgsi::{
     Declaration, File, Interpolate, Location, Processor, Semantic, Shader, Token, scan,
 };
 
 /// `emit_ext`.
-fn emit_ext(ctx: &mut Ctx<'_>, name: &str, verb: &str) {
+fn emit_ext(ctx: &mut Context<'_>, name: &str, verb: &str) {
     ctx.bufs.ver_ext(&format!("#extension GL_{name} : {verb}\n"));
 }
 
 /// `emit_header`, GLES leg.
-pub(super) fn emit_header(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_header(ctx: &mut Context<'_>) {
     let bits = ctx.shader_req_bits;
     ctx.bufs.ver_ext(&format!("#version {} es\n", ctx.cfg.glsl_version));
 
@@ -118,7 +118,7 @@ pub(super) fn emit_header(ctx: &mut Ctx<'_>) {
 }
 
 /// `get_interp_string`.
-fn interp_string(cfg: &Cfg, interpolate: Interpolate, flatshade: bool) -> &'static str {
+fn interp_string(cfg: &Config, interpolate: Interpolate, flatshade: bool) -> &'static str {
     match interpolate {
         Interpolate::Linear => {
             if cfg.has_nopersective {
@@ -149,7 +149,7 @@ fn aux_string(location: Location) -> &'static str {
 }
 
 /// `emit_sampler_decl`.
-fn emit_sampler_decl(ctx: &mut Ctx<'_>, i: u32, range: i32, sampler: Sampler) {
+fn emit_sampler_decl(ctx: &mut Context<'_>, i: u32, range: i32, sampler: Sampler) {
     let sname = proc_prefix(ctx.prog_type);
     let precision = "highp";
     let ptc = sampler_return_conv(sampler.ret);
@@ -177,7 +177,7 @@ fn emit_sampler_decl(ctx: &mut Ctx<'_>, i: u32, range: i32, sampler: Sampler) {
 }
 
 /// `emit_image_decl`.
-fn emit_image_decl(ctx: &mut Ctx<'_>, i: u32, range: i32, image: Image) {
+fn emit_image_decl(ctx: &mut Context<'_>, i: u32, range: i32, image: Image) {
     let volatile_str = if image.vflag { "volatile " } else { "" };
     let coherent_str = if image.coherent { "coherent " } else { "" };
     let precision = "highp ";
@@ -247,7 +247,7 @@ fn emit_image_decl(ctx: &mut Ctx<'_>, i: u32, range: i32, image: Image) {
 }
 
 /// `emit_ios_common`.
-fn emit_ios_common(ctx: &mut Ctx<'_>) -> u32 {
+fn emit_ios_common(ctx: &mut Context<'_>) -> u32 {
     let sname = proc_prefix(ctx.prog_type);
     let mut glsl_ver_required = ctx.glsl_ver_required;
 
@@ -424,7 +424,7 @@ fn emit_ios_common(ctx: &mut Ctx<'_>) -> u32 {
 }
 
 /// `emit_ios_streamout`.
-fn emit_ios_streamout(ctx: &mut Ctx<'_>) {
+fn emit_ios_streamout(ctx: &mut Context<'_>) {
     let Some(so) = ctx.so else {
         return;
     };
@@ -463,7 +463,7 @@ fn emit_ios_streamout(ctx: &mut Ctx<'_>) {
 
 /// `emit_ios_generic`.
 fn emit_ios_generic(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     iot: IoDir,
     prefix: &str,
     io: &Io,
@@ -586,7 +586,7 @@ fn semantic_to_compare(name: Semantic) -> Semantic {
 }
 
 /// `get_interpolator_prefix`.
-fn interpolator_prefix(cfg: &Cfg, io: &Io, fs_info: &FsInfo, flatshade: bool) -> String {
+fn interpolator_prefix(cfg: &Config, io: &Io, fs_info: &FragmentInfo, flatshade: bool) -> String {
     if matches!(
         io.name,
         Semantic::Generic | Semantic::TexCoord | Semantic::Color | Semantic::BColor
@@ -611,7 +611,7 @@ const FRONT_COLOR_EMITTED: u8 = 1 << 0;
 const BACK_COLOR_EMITTED: u8 = 1 << 1;
 
 /// `emit_ios_generic_outputs`.
-fn emit_ios_generic_outputs(ctx: &mut Ctx<'_>, can_emit_generic: fn(&Io) -> bool) {
+fn emit_ios_generic_outputs(ctx: &mut Context<'_>, can_emit_generic: fn(&Io) -> bool) {
     let mut fc_emitted = 0u64;
     let mut bc_emitted = 0u64;
     for i in 0..ctx.outputs.len() {
@@ -671,7 +671,7 @@ fn emit_ios_generic_outputs(ctx: &mut Ctx<'_>, can_emit_generic: fn(&Io) -> bool
 }
 
 /// `emit_ios_patch`.
-fn emit_ios_patch(ctx: &mut Ctx<'_>, prefix: &str, io: &Io, inout: &str, size: i32) -> u64 {
+fn emit_ios_patch(ctx: &mut Context<'_>, prefix: &str, io: &Io, inout: &str, size: i32) -> u64 {
     let mut emitted_patches = 0u64;
     if io.last == io.first {
         hdr!(ctx.bufs, "{} {} vec4 {};\n", prefix, inout, io.glsl_name);
@@ -693,7 +693,7 @@ fn can_emit_generic_geom(io: &Io) -> bool {
 }
 
 /// `emit_ios_vs`.
-fn emit_ios_vs(ctx: &mut Ctx<'_>) {
+fn emit_ios_vs(ctx: &mut Context<'_>) {
     for i in 0..ctx.inputs.len() {
         let input = ctx.inputs[i].clone();
         if !input.glsl_predefined_no_emit {
@@ -812,7 +812,7 @@ fn depth_layout(layout: u32) -> Option<&'static str> {
 }
 
 /// `emit_ios_fs`.
-fn emit_ios_fs(ctx: &mut Ctx<'_>) {
+fn emit_ios_fs(ctx: &mut Context<'_>) {
     // `fs_emit_layout` only chooses a `gl_FragCoord` layout on desktop GL.
     if ctx.early_depth_stencil {
         ctx.bufs.hdr("layout(early_fragment_tests) in;\n");
@@ -948,7 +948,7 @@ fn emit_ios_fs(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_ios_per_vertex_in`.
-fn emit_ios_per_vertex_in(ctx: &mut Ctx<'_>) {
+fn emit_ios_per_vertex_in(ctx: &mut Context<'_>) {
     if ctx.num_in_clip_dist == 0 {
         return;
     }
@@ -978,7 +978,7 @@ fn emit_ios_per_vertex_in(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_ios_per_vertex_out`.
-fn emit_ios_per_vertex_out(ctx: &mut Ctx<'_>, instance_var: &str) {
+fn emit_ios_per_vertex_out(ctx: &mut Context<'_>, instance_var: &str) {
     let mut clip_dist = if ctx.num_clip_dist_prop != 0 {
         i32::from(ctx.num_clip_dist_prop)
     } else {
@@ -1018,7 +1018,7 @@ fn emit_ios_per_vertex_out(ctx: &mut Ctx<'_>, instance_var: &str) {
 }
 
 /// `emit_ios_geom`.
-fn emit_ios_geom(ctx: &mut Ctx<'_>) {
+fn emit_ios_geom(ctx: &mut Context<'_>) {
     let invocbuf = if ctx.gs_num_invocations > 1 {
         format!(", invocations = {}", ctx.gs_num_invocations)
     } else {
@@ -1098,7 +1098,7 @@ fn emit_ios_geom(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_ios_tcs`.
-fn emit_ios_tcs(ctx: &mut Ctx<'_>) {
+fn emit_ios_tcs(ctx: &mut Context<'_>) {
     for i in 0..ctx.inputs.len() {
         let input = ctx.inputs[i].clone();
         if !input.glsl_predefined_no_emit {
@@ -1149,7 +1149,7 @@ fn emit_ios_tcs(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_ios_tes`.
-fn emit_ios_tes(ctx: &mut Ctx<'_>) {
+fn emit_ios_tes(ctx: &mut Context<'_>) {
     for i in 0..ctx.inputs.len() {
         let input = ctx.inputs[i].clone();
         if !input.glsl_predefined_no_emit {
@@ -1190,7 +1190,7 @@ fn emit_ios_tes(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_ios_cs`.
-fn emit_ios_cs(ctx: &mut Ctx<'_>) {
+fn emit_ios_cs(ctx: &mut Context<'_>) {
     let [x, y, z] = ctx.local_cs_block_size;
     hdr!(
         ctx.bufs,
@@ -1206,7 +1206,7 @@ fn emit_ios_cs(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_interp_info`.
-fn emit_interp_info(ctx: &mut Ctx<'_>, semantic: Semantic, sid: u32) {
+fn emit_interp_info(ctx: &mut Context<'_>, semantic: Semantic, sid: u32) {
     for interp in &ctx.key.fs_info.interps {
         if interp.semantic_name == semantic && u32::from(interp.semantic_index) == sid {
             let s = format!(
@@ -1222,7 +1222,7 @@ fn emit_interp_info(ctx: &mut Ctx<'_>, semantic: Semantic, sid: u32) {
 
 /// `emit_match_interfaces`: the outputs the next stage expects and this one did not emit.
 fn emit_match_interfaces(
-    ctx: &mut Ctx<'_>,
+    ctx: &mut Context<'_>,
     expected: u64,
     emitted: u64,
     semantic: Semantic,
@@ -1245,7 +1245,7 @@ fn emit_match_interfaces(
 }
 
 /// `emit_ios`.
-pub(super) fn emit_ios(ctx: &mut Ctx<'_>) -> u32 {
+pub(super) fn emit_ios(ctx: &mut Context<'_>) -> u32 {
     ctx.interp_input_mask = 0;
     let mut glsl_ver_required = ctx.glsl_ver_required;
 
@@ -1296,7 +1296,7 @@ pub(super) fn emit_ios(ctx: &mut Ctx<'_>) -> u32 {
 
 /// `iter_vs_declaration`: a vertex shader's outputs become the passthrough TCS's inputs and
 /// outputs both.
-fn iter_vs_declaration(ctx: &mut Ctx<'_>, decl: &Declaration) {
+fn iter_vs_declaration(ctx: &mut Context<'_>, decl: &Declaration) {
     let shader_in_prefix = "vso";
     let shader_out_prefix = "tco";
     if decl.file != File::Output {
@@ -1395,7 +1395,7 @@ fn iter_vs_declaration(ctx: &mut Ctx<'_>, decl: &Declaration) {
 
 /// `vrend_shader_create_passthrough_tcs`.
 pub(super) fn passthrough_tcs(
-    cfg: &Cfg,
+    cfg: &Config,
     vs: &Shader,
     key: &Key,
     tess_factors: &[f32; 6],
@@ -1407,7 +1407,7 @@ pub(super) fn passthrough_tcs(
         indirect_files: 0,
         dimension_indirect_files: 0,
     };
-    let mut ctx = Ctx::new(cfg, key, &info, Processor::TessCtrl);
+    let mut ctx = Context::new(cfg, key, &info, Processor::TessCtrl);
 
     for token in &vs.tokens {
         if let Token::Declaration(d) = token {

@@ -5,26 +5,26 @@
 //! moves, the prescale, and the fragment stage's tests and fixups.
 
 use super::{
-    Ctx, Io, IoDir, MAX_SO_OUTPUTS, MAX_VARYING, Processor, bit32, emit, stage_output_name_prefix,
-    sysval,
+    Context, Io, IoDir, MAX_SO_OUTPUTS, MAX_VARYING, Processor, bit32, emit,
+    stage_output_name_prefix, sysval,
 };
 use crate::vrend::pipe::{CompareFunc, LogicOp};
 use crate::vrend::tgsi::Semantic;
 
 /// `emit_cbuf_writes`.
-fn emit_cbuf_writes(ctx: &mut Ctx<'_>) {
+fn emit_cbuf_writes(ctx: &mut Context<'_>) {
     for i in ctx.outputs.len() as u32..ctx.cfg.max_draw_buffers {
         emit!(ctx.bufs, "fsout_c{} = fsout_c0;\n", i);
     }
 }
 
 /// `emit_a8_swizzle`.
-fn emit_a8_swizzle(ctx: &mut Ctx<'_>) {
+fn emit_a8_swizzle(ctx: &mut Context<'_>) {
     ctx.bufs.emit("fsout_c0.x = fsout_c0.w;\n");
 }
 
 /// `emit_alpha_test`.
-fn emit_alpha_test(ctx: &mut Ctx<'_>) {
+fn emit_alpha_test(ctx: &mut Context<'_>) {
     if ctx.outputs.is_empty() {
         return;
     }
@@ -52,7 +52,7 @@ fn emit_alpha_test(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_pstipple_pass`.
-fn emit_pstipple_pass(ctx: &mut Ctx<'_>) {
+fn emit_pstipple_pass(ctx: &mut Context<'_>) {
     let mask = super::super::POLYGON_STIPPLE_SIZE - 1;
     ctx.bufs.emit("{\n");
     emit!(ctx.bufs, "   int spx = int(gl_FragCoord.x) & {};\n", mask);
@@ -64,7 +64,7 @@ fn emit_pstipple_pass(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_color_select`.
-pub(super) fn emit_color_select(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_color_select(ctx: &mut Context<'_>) {
     if !ctx.key.color_two_side || ctx.color_in_mask & 0x3 == 0 {
         return;
     }
@@ -88,13 +88,13 @@ pub(super) fn emit_color_select(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_prescale`.
-pub(super) fn emit_prescale(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_prescale(ctx: &mut Context<'_>) {
     ctx.bufs.emit("gl_Position.y = gl_Position.y * winsys_adjust_y;\n");
     ctx.bufs.required_sysval_uniform_decls |= sysval::WINSYS_ADJUST_Y;
 }
 
 /// `prepare_so_movs`.
-pub(super) fn prepare_so_movs(ctx: &mut Ctx<'_>) {
+pub(super) fn prepare_so_movs(ctx: &mut Context<'_>) {
     let so = ctx.so.expect("stream output present");
     for (i, o) in so.outputs.iter().enumerate().take(MAX_SO_OUTPUTS) {
         ctx.write_so_outputs[i] = true;
@@ -131,7 +131,7 @@ pub(super) fn blockvarname(stage_prefix: &str, io: &Io, postfix: &str) -> String
 }
 
 /// `get_so_name`.
-fn so_name(ctx: &Ctx<'_>, from_block: bool, output: &Io, index: u32, wm: &str) -> String {
+fn so_name(ctx: &Context<'_>, from_block: bool, output: &Io, index: u32, wm: &str) -> String {
     if output.first == output.last
         || (output.name != Semantic::Generic && output.name != Semantic::TexCoord)
     {
@@ -150,7 +150,7 @@ fn so_name(ctx: &Ctx<'_>, from_block: bool, output: &Io, index: u32, wm: &str) -
 }
 
 /// `emit_so_movs`.
-pub(super) fn emit_so_movs(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_so_movs(ctx: &mut Context<'_>) {
     let so = ctx.so.expect("stream output present");
     if so.outputs.len() >= MAX_SO_OUTPUTS {
         eprintln!("[virglrs] Num outputs exceeded, max is {MAX_SO_OUTPUTS}");
@@ -235,7 +235,7 @@ pub(super) fn emit_so_movs(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_clip_dist_movs`.
-pub(super) fn emit_clip_dist_movs(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_clip_dist_movs(ctx: &mut Context<'_>) {
     let has_prop = (ctx.num_clip_dist_prop + ctx.num_cull_dist_prop) > 0;
     let mut num_clip =
         i32::from(if has_prop { ctx.num_clip_dist_prop } else { ctx.key.num_out_clip });
@@ -287,7 +287,7 @@ pub(super) fn emit_clip_dist_movs(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_fog_fixup_hdr`.
-pub(super) fn emit_fog_fixup_hdr(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_fog_fixup_hdr(ctx: &mut Context<'_>) {
     let mut fixup_mask = ctx.key.vs.fog_fixup_mask;
     let prefix = stage_output_name_prefix(Processor::Vertex);
     while fixup_mask != 0 {
@@ -298,7 +298,7 @@ pub(super) fn emit_fog_fixup_hdr(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_fog_fixup_write`: unwritten fog outputs are forced to (0, 0, 0, 1).
-fn emit_fog_fixup_write(ctx: &mut Ctx<'_>) {
+fn emit_fog_fixup_write(ctx: &mut Context<'_>) {
     let mut fixup_mask = ctx.key.vs.fog_fixup_mask;
     let prefix = stage_output_name_prefix(Processor::Vertex);
     while fixup_mask != 0 {
@@ -309,7 +309,7 @@ fn emit_fog_fixup_write(ctx: &mut Ctx<'_>) {
 }
 
 /// `handle_vertex_proc_exit`.
-pub(super) fn handle_vertex_proc_exit(ctx: &mut Ctx<'_>) {
+pub(super) fn handle_vertex_proc_exit(ctx: &mut Context<'_>) {
     if ctx.so.is_some() && !ctx.key.gs_present && !ctx.key.tes_present {
         emit_so_movs(ctx);
     }
@@ -325,7 +325,7 @@ pub(super) fn handle_vertex_proc_exit(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_fragment_logicop`.
-fn emit_fragment_logicop(ctx: &mut Ctx<'_>) {
+fn emit_fragment_logicop(ctx: &mut Context<'_>) {
     let Some(func) = ctx.key.fs.logicop_func else {
         return;
     };
@@ -406,7 +406,7 @@ fn emit_fragment_logicop(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_cbuf_swizzle`.
-fn emit_cbuf_swizzle(ctx: &mut Ctx<'_>) {
+fn emit_cbuf_swizzle(ctx: &mut Context<'_>) {
     let mut cbuf_id = 0u32;
     for i in 0..ctx.outputs.len() {
         if ctx.outputs[i].name == Semantic::Color {
@@ -419,7 +419,7 @@ fn emit_cbuf_swizzle(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_cbuf_colorspace_convert`.
-fn emit_cbuf_colorspace_convert(ctx: &mut Ctx<'_>) {
+fn emit_cbuf_colorspace_convert(ctx: &mut Context<'_>) {
     for i in 0..ctx.outputs.len() as u32 {
         if u32::from(ctx.key.fs.needs_manual_srgb_encode_bitmask) & bit32(i) != 0 {
             emit!(
@@ -433,7 +433,7 @@ fn emit_cbuf_colorspace_convert(ctx: &mut Ctx<'_>) {
 }
 
 /// `handle_fragment_proc_exit`.
-pub(super) fn handle_fragment_proc_exit(ctx: &mut Ctx<'_>) {
+pub(super) fn handle_fragment_proc_exit(ctx: &mut Context<'_>) {
     if ctx.key.pstipple_enabled {
         emit_pstipple_pass(ctx);
     }
@@ -458,7 +458,7 @@ pub(super) fn handle_fragment_proc_exit(ctx: &mut Ctx<'_>) {
 }
 
 /// `emit_fs_clipdistance_load`.
-pub(super) fn emit_fs_clipdistance_load(ctx: &mut Ctx<'_>) {
+pub(super) fn emit_fs_clipdistance_load(ctx: &mut Context<'_>) {
     if !ctx.fs_uses_clipdist_input {
         return;
     }

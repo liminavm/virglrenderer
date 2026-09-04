@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::ids::{ClientFenceId, CtxId, FenceId, RingIdx};
+use crate::ids::{ClientFenceId, ContextId, FenceId, RingIdx};
 
 /// Where a retired fence goes.
 ///
@@ -33,7 +33,7 @@ use crate::ids::{ClientFenceId, CtxId, FenceId, RingIdx};
 pub trait FenceSink: Send {
     /// A fence on one context's ring has retired. Delivered in creation order within a ring; no
     /// order is imposed across rings, because the guest can observe none.
-    fn context_fence(&mut self, ctx: CtxId, ring: RingIdx, fence: FenceId);
+    fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId);
 
     /// A fence on the legacy global path has retired.
     fn global_fence(&mut self, fence: ClientFenceId);
@@ -41,7 +41,7 @@ pub trait FenceSink: Send {
 
 enum Job {
     /// A context fence: retires through `write_context_fence` with its ring and id.
-    Context(CtxId, RingIdx, FenceId),
+    Context(ContextId, RingIdx, FenceId),
     /// A legacy global fence: retires through `global_fence` with the client's own id.
     Global(ClientFenceId),
     Stop,
@@ -69,7 +69,7 @@ impl Retirement {
         Retirement { q, thread: Some(thread) }
     }
 
-    pub fn retire_context(&self, ctx: CtxId, ring: RingIdx, fence: FenceId) {
+    pub fn retire_context(&self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
         self.push(Job::Context(ctx, ring, fence));
     }
 
@@ -133,7 +133,7 @@ mod tests {
     struct Recorder(Sender<(u32, u32, u64)>);
 
     impl FenceSink for Recorder {
-        fn context_fence(&mut self, ctx: CtxId, ring: RingIdx, fence: FenceId) {
+        fn context_fence(&mut self, ctx: ContextId, ring: RingIdx, fence: FenceId) {
             let _ = self.0.send((ctx.get(), ring.0, fence.0));
         }
 
@@ -157,7 +157,7 @@ mod tests {
         let (tx, rx) = channel();
         let r = Retirement::start(Box::new(Recorder(tx)));
 
-        let ctx = CtxId::new(7).unwrap();
+        let ctx = ContextId::new(7).unwrap();
         for i in 1..=N {
             r.retire_context(ctx, RingIdx(1), FenceId(i));
         }

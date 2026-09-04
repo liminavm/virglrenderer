@@ -21,7 +21,7 @@ use super::cs::ObjectId;
 use super::driver::Storage;
 use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
-use crate::ids::{CtxId, ResourceHandle};
+use crate::ids::{ContextId, ResourceHandle};
 
 /// The largest ring buffer we will accept, from the C's `VKR_RING_BUFFER_MAX_SIZE`.
 ///
@@ -250,7 +250,7 @@ pub trait ShmResources {
     ///
     /// The default answers only the mapping arm: a table with no exports in it has nothing to say
     /// about allocations, and every test stub is one of those.
-    fn bytes(&self, _ctx: CtxId, handle: ResourceHandle) -> Option<ResourceBytes> {
+    fn bytes(&self, _ctx: ContextId, handle: ResourceHandle) -> Option<ResourceBytes> {
         self.shm(handle).map(ResourceBytes::Host)
     }
 }

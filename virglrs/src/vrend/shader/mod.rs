@@ -12,7 +12,7 @@
 //! Only the C's GLES leg is ported. This renderer drives a GLES 3.1 context and nothing else
 //! (`docs/rust-rewrite.md`), so the C's `use_gles`, `use_core_profile` and
 //! `use_explicit_locations` switches are fixed at true, true and false and do not appear in
-//! [`Cfg`]; the desktop branches they guarded are not here. A desktop context is its own gated
+//! [`Config`]; the desktop branches they guarded are not here. A desktop context is its own gated
 //! change, and it brings its branches with it.
 //!
 //! [`Key`] is what the renderer's state contributes to a translation -- the C's
@@ -115,7 +115,7 @@ impl AdvancedBlend {
 /// `vrend_shader_cfg`: what the host's GL can do, as the translator needs to know it. Read once
 /// from the probed features when the renderer comes up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Cfg {
+pub struct Config {
     pub glsl_version: u32,
     /// At most eight (`PIPE_MAX_COLOR_BUFS`).
     pub max_draw_buffers: u32,
@@ -133,12 +133,12 @@ pub struct Cfg {
     pub has_vs_viewport_index: bool,
 }
 
-impl Cfg {
+impl Config {
     /// The C's `shader_cfg` fill at context creation, from the probed features and limits and
     /// the driver's `GL_SHADING_LANGUAGE_VERSION`.
-    pub fn probe(gl: &Gl, features: &Features, limits: &Limits) -> Cfg {
+    pub fn probe(gl: &Gl, features: &Features, limits: &Limits) -> Config {
         let has = |f| features.has(f);
-        Cfg {
+        Config {
             glsl_version: glsl_es_version(&gl.get_string(GL_SHADING_LANGUAGE_VERSION)),
             max_draw_buffers: limits.max_draw_buffers,
             max_shader_patch_varyings: if has(Feature::tessellation) {
@@ -187,7 +187,7 @@ pub struct InterpInfo {
 
 /// `vrend_fs_shader_info`: the fragment shader's demands on the stage feeding it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct FsInfo {
+pub struct FragmentInfo {
     pub glsl_ver: u32,
     pub has_sample_input: bool,
     pub has_noperspective: bool,
@@ -257,7 +257,7 @@ pub struct Key {
     pub in_texcoord_expected_mask: u64,
     pub in_patch_expected_mask: u64,
     pub force_invariant_inputs: [u32; 4],
-    pub fs_info: FsInfo,
+    pub fs_info: FragmentInfo,
     pub in_arrays: IoArrayInfo,
     pub fs: FsKey,
     pub vs: VsKey,
@@ -295,7 +295,7 @@ impl Default for Key {
             in_texcoord_expected_mask: 0,
             in_patch_expected_mask: 0,
             force_invariant_inputs: [0; 4],
-            fs_info: FsInfo::default(),
+            fs_info: FragmentInfo::default(),
             in_arrays: IoArrayInfo::default(),
             fs: FsKey::default(),
             vs: VsKey::default(),
@@ -404,7 +404,7 @@ impl Info {
 /// key, so belongs to the variant.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct VarInfo {
-    pub fs_info: FsInfo,
+    pub fs_info: FragmentInfo,
     pub num_in_clip: u8,
     pub num_in_cull: u8,
     pub num_out_clip: u8,
