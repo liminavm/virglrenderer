@@ -6,10 +6,12 @@
 //! Each follows the C's choice of GL path -- `glCopyImageSubData` when the two images are
 //! copy-compatible and nothing but pixels move, `glBlitFramebuffer` when a framebuffer can hold
 //! both ends, the shader blitter otherwise -- because the path decides the pixels: a
-//! framebuffer blit converts and filters where a copy does neither. The shader blitter is not
-//! here yet; a blit that needs it is counted and skipped, not faked through another path.
+//! framebuffer blit converts and filters where a copy does neither. The blitter's colour path is
+//! in [`super::super::blitter`]; a blit that would have to write depth through it is counted and
+//! skipped, not faked through another path.
 
 use super::*;
+use crate::vrend::blitter;
 
 const PIPE_MASK_RGBA: u8 = 0xf;
 const PIPE_MASK_Z: u8 = 0x10;
@@ -352,24 +354,139 @@ impl Context {
             can_fbo = false;
         }
         if !can_fbo {
+            let r = self.blit_shader(host, b, &src_end, &dst_end, redblue);
             cleanup(host);
-            host.todo.note("the shader blitter");
-            eprintln!(
-                "[virglrs] vrend: blit needs the shader blitter: {} -> {} mask {:#x} {}x{} -> {}x{}",
-                b.src.format.name(),
-                b.dst.format.name(),
-                b.mask,
-                b.src.region.width,
-                b.src.region.height,
-                b.dst.region.width,
-                b.dst.region.height,
-            );
-            return Ok(());
+            return r;
         }
         let r =
             self.blit_fbo(host, b, &src_end, &dst_end, gl_filter, [src_y1, src_y2, dst_y1, dst_y2]);
         cleanup(host);
         r
+    }
+
+    /// `vrend_renderer_blit_gl`'s caller half: resolve both ends into a [`blitter::Job`], run it
+    /// in the blitter's own GL context, and put the caller's context back.
+    fn blit_shader(
+        &mut self,
+        host: &mut Host<'_>,
+        b: &Blit,
+        src_end: &End,
+        dst_end: &End,
+        redblue: bool,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::Blit;
+        // Depth-writing blits need the blitter's other shader, which is not here. They are the
+        // one shape of blit the harness cannot score -- the score reads colour offscreens -- so
+        // porting them would ship code no fixture measures.
+        let src_desc = b.src.format.describe();
+        let dst_desc = b.dst.format.describe();
+        if src_desc.is_some_and(|d| d.has_depth())
+            && dst_desc.is_some_and(|d| d.has_depth())
+            && b.mask & PIPE_MASK_Z != 0
+        {
+            host.todo.note("the shader blitter's depth path");
+            return Ok(());
+        }
+        let formats = host.formats;
+        let src_res = host.resource(cmd, b.src.resource)?;
+        let dst_res = host.resource(cmd, b.dst.resource)?;
+        // `vrend_renderer_prepare_blit_extra_info`'s swizzle: the destination's own stored order,
+        // then red and blue traded if exactly one end is an IOSurface-backed BGRA texture.
+        let mut swizzle = [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W];
+        if needs_swizzle(formats, b.dst.format, b.src.format)
+            && let Some(s) = formats.get(dst_res.args.format).and_then(|e| e.gl.swizzle)
+        {
+            swizzle = s;
+        }
+        if redblue {
+            swizzle.swap(0, 2);
+        }
+        let identity = swizzle == [Swizzle::X, Swizzle::Y, Swizzle::Z, Swizzle::W];
+        let manual_srgb_decode = src_res.needs_srgb_decode(b.src.format);
+        let manual_srgb_encode = dst_res.needs_srgb_encode(b.dst.format);
+        // The C reads these two the wrong way round -- it fills `has_srgb_write_control` from
+        // `feat_texture_srgb_decode` and `has_texture_srgb_decode` from `feat_srgb_write_control`.
+        // Written straight here; the pinned score says whether the transposition is observable.
+        let has_srgb_write_control = host.has(Feature::srgb_write_control);
+        let has_texture_srgb_decode = host.has(Feature::texture_srgb_decode);
+        let job = blitter::Job {
+            src: src_end.name,
+            src_gl_target: src_end.target,
+            src_target: src_res.args.target,
+            src_w: src_res.width_at(b.src.level),
+            src_h: src_res.height_at(b.src.level),
+            src_level: b.src.level,
+            src_samples: src_res.args.nr_samples,
+            src_format: b.src.format,
+            src_table_swizzle: formats.get(b.src.format).and_then(|e| e.gl.swizzle),
+            set_srgb_decode: has_texture_srgb_decode
+                && !manual_srgb_decode
+                && resource::is_srgb(b.src.format),
+            filter: b.filter,
+            src_box: (
+                blitter::Point { x: b.src.region.x, y: b.src.region.y },
+                b.src.region.width,
+                b.src.region.height,
+            ),
+            src_z: b.src.region.z,
+            src_depth: b.src.region.depth,
+            dst: dst_end.name,
+            dst_gl_target: dst_end.target,
+            dst_w: dst_res.width_at(b.dst.level),
+            dst_h: dst_res.height_at(b.dst.level),
+            dst_level: b.dst.level,
+            dst_layer: b.dst.region.z,
+            dst_box: (
+                blitter::Point { x: b.dst.region.x, y: b.dst.region.y },
+                b.dst.region.width,
+                b.dst.region.height,
+            ),
+            dst_depth: b.dst.region.depth,
+            swizzle: (!identity).then_some(swizzle),
+            manual_srgb_decode,
+            manual_srgb_encode,
+            framebuffer_srgb: has_srgb_write_control.then(|| {
+                !manual_srgb_encode
+                    && (resource::is_srgb(b.dst.format) || resource::is_srgb(b.src.format))
+            }),
+            scissor: b.scissor_enable.then(|| {
+                let s = b.scissor;
+                [
+                    s.minx as GLint,
+                    s.miny as GLint,
+                    s.maxx as GLint - s.minx as GLint,
+                    s.maxy as GLint - s.miny as GLint,
+                ]
+            }),
+        };
+        let (gl, winsys, features) = (host.gl, host.winsys, host.features);
+        if host.blitter.is_none() {
+            match blitter::Blitter::open(winsys, gl, host.version, host.share) {
+                Ok(b) => *host.blitter = Some(b),
+                Err(e) => {
+                    eprintln!("[virglrs] vrend: no GL context for the blitter ({e}); no blit");
+                    host.todo.note("the shader blitter");
+                    return Ok(());
+                }
+            }
+            // `Blitter::open` left its own context current.
+            *host.current = Current::Blitter;
+        }
+        let blitter = host.blitter.as_mut().expect("just built");
+        winsys.make_current(blitter.context()).expect("the blitter's context can be made current");
+        *host.current = Current::Blitter;
+        let outcome = blitter.run(gl, features, &job);
+        // Unconditionally, and before anything else can run: the commands after this one in the
+        // batch do not switch contexts, they assume the sub-context's is current.
+        self.make_current(host);
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(blitter::Unserved::NoFeature(feature)) => Err(Fault::NoFeature { cmd, feature }),
+            Err(blitter::Unserved::NoProgram) => {
+                host.todo.note("the shader blitter");
+                Ok(())
+            }
+        }
     }
 
     /// `vrend_renderer_blit_fbo`.

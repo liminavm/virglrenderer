@@ -15,6 +15,7 @@
 //! `egl` and `gl` are the host side: the winsys and the driver's entry points, the two named
 //! unsafe modules of this renderer (CLAUDE.md). Everything above them is safe Rust.
 
+pub mod blitter;
 pub mod caps;
 pub mod context;
 pub mod debug;

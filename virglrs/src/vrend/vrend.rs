@@ -13,6 +13,7 @@
 //! `vrend_hw_switch_context` does: every entry point names the context it needs, and the switch
 //! is one place rather than a habit.
 
+use super::blitter;
 use super::caps;
 use super::context::{Context, Current, Fault, Guest, Host, Todo};
 use super::egl::{self, EglError, Flavour, Version, Winsys};
@@ -69,6 +70,9 @@ pub struct Vrend {
     resources: BTreeMap<ResourceHandle, Resource>,
     contexts: BTreeMap<CtxId, Context>,
     pub todo: Todo,
+    /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
+    /// that never takes the blitter's path never pays for it.
+    blitter: Option<blitter::Blitter>,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -122,6 +126,7 @@ impl Vrend {
             resources: BTreeMap::new(),
             contexts: BTreeMap::new(),
             todo: Todo::default(),
+            blitter: None,
         })
     }
 
@@ -163,6 +168,7 @@ impl Vrend {
             resources,
             contexts,
             todo,
+            blitter,
         } = self;
         let host = Host {
             gl,
@@ -178,6 +184,7 @@ impl Vrend {
             ctx,
             current,
             todo,
+            blitter,
         };
         (host, contexts)
     }

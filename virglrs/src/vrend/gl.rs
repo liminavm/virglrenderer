@@ -138,6 +138,12 @@ impl ImageUnit {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct UniformLocation(GLint);
 
+/// Where a vertex attribute lives in a linked program. GL spells "the program has no such
+/// attribute" as -1, and every call taking one then reinterprets it as a huge index; here it is
+/// `None` from [`Gl::get_attrib_location`] onwards.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AttribLocation(GLuint);
+
 impl ShaderName {
     pub fn raw(self) -> GLuint {
         self.0
@@ -856,6 +862,16 @@ impl Gl {
         true
     }
 
+    /// `glBufferData` with contents: allocate the store and fill it in one call.
+    pub fn buffer_data(&self, target: GLenum, data: &[u8], usage: GLenum) -> bool {
+        let Ok(size) = GLsizeiptr::try_from(data.len()) else {
+            return false;
+        };
+        // SAFETY: the driver reads `size` bytes from `data`, and `size` is `data`'s length.
+        unsafe { self.t.glBufferData()(target, size, data.as_ptr().cast(), usage) };
+        true
+    }
+
     pub fn buffer_sub_data(&self, target: GLenum, offset: usize, data: &[u8]) -> bool {
         let (Ok(offset), Ok(size)) = (GLintptr::try_from(offset), GLsizeiptr::try_from(data.len()))
         else {
@@ -1432,6 +1448,35 @@ impl Gl {
         unsafe { self.t.glVertexBindingDivisor()(binding, divisor) };
     }
 
+    /// `glVertexAttribPointer`: the pre-separate-attribute-format binding, where the format and
+    /// the buffer are named in one call. `offset` is a byte offset into the bound `GL_ARRAY_BUFFER`.
+    pub fn vertex_attrib_pointer(
+        &self,
+        index: AttribLocation,
+        size: GLint,
+        ty: GLenum,
+        normalized: bool,
+        stride: GLsizei,
+        offset: u32,
+    ) {
+        // SAFETY: the pointer is an offset into the bound buffer, which the driver bounds.
+        unsafe {
+            self.t.glVertexAttribPointer()(
+                index.0,
+                size,
+                ty,
+                normalized as GLboolean,
+                stride,
+                offset_ptr(offset),
+            )
+        };
+    }
+
+    pub fn enable_vertex_attrib_array_at(&self, index: AttribLocation) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glEnableVertexAttribArray()(index.0) };
+    }
+
     pub fn enable_vertex_attrib_array(&self, index: GLuint) {
         // SAFETY: plain scalar.
         unsafe { self.t.glEnableVertexAttribArray()(index) };
@@ -1653,6 +1698,15 @@ impl Gl {
         let loc =
             unsafe { self.t.glGetUniformLocation()(program.0, name.as_ptr().cast::<GLchar>()) };
         (loc >= 0).then_some(UniformLocation(loc))
+    }
+
+    /// `glGetAttribLocation`; `None` when the program has no such attribute.
+    pub fn get_attrib_location(&self, program: ProgramName, name: &str) -> Option<AttribLocation> {
+        let name = std::ffi::CString::new(name).expect("an attribute name has no NUL");
+        // SAFETY: a NUL-terminated string, live for the call.
+        let loc =
+            unsafe { self.t.glGetAttribLocation()(program.0, name.as_ptr().cast::<GLchar>()) };
+        u32::try_from(loc).ok().map(AttribLocation)
     }
 
     /// `glGetUniformBlockIndex`; `None` when the program has no such block.
