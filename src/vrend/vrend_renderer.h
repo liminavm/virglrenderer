@@ -98,6 +98,12 @@ struct vrend_resource {
     * VREND_RESOURCE_STORAGE_GUEST_ELSE_SYSTEM buffer storage.
     */
    char *ptr;
+   /* True once ->ptr holds content the guest backing does not: a detach copied the
+    * backing into it, or a transfer wrote it while no backing was attached. Only then
+    * does an attach copy ->ptr back out. A fresh resource's zero-filled ->ptr must never
+    * be written over a backing the guest may already have filled: the guest does not
+    * wait for ATTACH_BACKING to be processed before writing its mapping. */
+   bool ptr_valid;
    /* IOV pointing to shared guest memory storage for this resource. */
    const struct iovec *iov;
    uint32_t num_iovs;
@@ -114,6 +120,23 @@ struct vrend_resource {
    void *iosurface;      /* struct vkr_mtl_iosurface *, owned */
    GLuint iosurf_pbo;    /* pinned-memory PBO aliasing the IOSurface bytes */
    GLenum iosurf_read_format; /* glReadPixels format producing display byte order */
+   /* limina: a planar video surface's planes, each with its own EGLImage in
+    * ->aux_plane_egl_image. Nonzero ->iosurf_planes is what marks ->iosurface as
+    * planar; the strides are the surface's own, which the plane writes address by. */
+   uint32_t iosurf_planes;
+   uint32_t iosurf_plane_stride[VIRGL_GBM_MAX_PLANES];
+   /* limina: a planar target has two kinds of consumer. A plane view samples the
+    * IOSurface plane directly; a composite view (the guest sampling the planar format
+    * itself, which dri2 takes whenever the driver reports the format samplable) reads
+    * ->gl_id, the RGBA texture, which nothing on the decode path fills. So the planes
+    * are converted into ->gl_id on the GPU (vrend_renderer_convert_planes_gl), but only
+    * once a composite view exists: ->composite_sampled is set by the first such view,
+    * ->planes_dirty by every decode delivery, and the pass runs at whichever of the two
+    * comes second. ->plane_tex are the pass's own textures over the plane images, so
+    * the IOSurface is imported once per plane and not once per frame. */
+   bool composite_sampled;
+   bool planes_dirty;
+   GLuint plane_tex[2];
 #endif
 
    uint64_t size;
@@ -557,6 +580,17 @@ struct vrend_resource *vrend_renderer_ctx_res_lookup(struct vrend_context *ctx,
 
 void vrend_renderer_resource_destroy(struct vrend_resource *res);
 
+/* limina: how the guest laid out one plane of a planar format. Chroma planes are
+ * subsampled, so a plane's own width/height are not the resource's. Shared with
+ * vrend_video, which has to answer the same question per decoded plane. */
+struct guest_plane {
+   uint32_t width, height, bpp;
+};
+
+void vrend_guest_plane_layout(enum virgl_formats format, uint32_t width, uint32_t height,
+                              struct guest_plane planes[VIRGL_GBM_MAX_PLANES],
+                              uint32_t *plane_count);
+
 static inline void
 vrend_resource_reference(struct vrend_resource **ptr, struct vrend_resource *tex)
 {
@@ -670,6 +704,10 @@ int vrend_renderer_export_query(struct pipe_resource *pres,
                                 struct virgl_renderer_export_query *export_query);
 
 void vrend_sync_make_current(virgl_gl_context);
+
+/* limina: the decode path delivered a new frame into a planar target's IOSurface planes.
+ * Marks its RGBA base texture stale and refills it when a composite view exists. */
+void vrend_resource_planes_written(struct vrend_context *ctx, struct vrend_resource *res);
 
 int
 vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,

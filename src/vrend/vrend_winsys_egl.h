@@ -85,8 +85,11 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
 #endif
 
 #ifdef __APPLE__
-/* limina: EGLImage whose storage is an IOSurface (venus->vrend buffer import). */
-void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface);
+/* limina: EGLImage whose storage is an IOSurface (venus->vrend buffer import).
+ * fourcc 0 imports the whole, self-describing surface; a DRM fourcc imports
+ * plane `plane` of a planar one as that format. */
+void *virgl_egl_image_from_iosurface(struct virgl_egl *egl, void *iosurface,
+                                     uint32_t plane, uint32_t fourcc);
 #endif
 /* Guard-free EGL; used by the GBM paths and the IOSurface import alike. */
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);

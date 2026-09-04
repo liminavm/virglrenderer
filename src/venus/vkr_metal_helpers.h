@@ -105,6 +105,41 @@ vkr_mtl_iosurface_alloc_plain(uint32_t width,
                               uint32_t iosurface_pixel_format,
                               uint32_t bytes_per_element);
 
+#define VKR_MTL_MAX_PLANES 3
+
+/* Write `rows` rows of `row_bytes` from `src` (of stride `src_stride`) into one plane of a
+ * planar IOSurface. Returns 0 if the plane does not exist or the row does not fit. */
+int
+vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf,
+                              uint32_t plane,
+                              const void *src,
+                              uint32_t src_stride,
+                              uint32_t rows,
+                              uint32_t row_bytes);
+
+/* Copy one plane of a planar IOSurface into the same plane of another, as many rows and
+ * bytes per row as both have. Returns 0 if either surface lacks the plane. */
+int
+vkr_mtl_iosurface_plane_copy(struct vkr_mtl_iosurface *dst,
+                             struct vkr_mtl_iosurface *src,
+                             uint32_t plane);
+
+/* Allocate a multi-planar IOSurface (no Metal texture), dictating each plane's pitch and
+ * offset rather than letting IOSurface choose: the guest is handed this layout and
+ * addresses the planes by it. Writes the accepted per-plane stride and offset into
+ * out_stride/out_offset (both at least VKR_MTL_MAX_PLANES long) and returns NULL if
+ * IOSurface would not honour the layout. Free with vkr_mtl_iosurface_free. */
+struct vkr_mtl_iosurface *
+vkr_mtl_iosurface_alloc_planar(uint32_t width,
+                               uint32_t height,
+                               uint32_t iosurface_pixel_format,
+                               uint32_t plane_count,
+                               const uint32_t *plane_width,
+                               const uint32_t *plane_height,
+                               const uint32_t *plane_bpe,
+                               uint32_t *out_stride,
+                               uint32_t *out_offset);
+
 /* Field accessors for TUs that must not include this (Vulkan-typed) header — vrend
  * forward-declares these instead. */
 uint32_t
@@ -140,6 +175,12 @@ vkr_mtl_texture_from_iosurface(void *mtl_device, void *io_surface, uint32_t mtl_
  * place that takes a retain, so a growing difference names the holder directly. */
 void
 vkr_mtl_refcount_census(char *buf, unsigned long len);
+
+/* The IOSurface ledger's two halves: allocations through these helpers, and frees. */
+long vkr_mtl_iosurface_alloc_count(void);
+long vkr_mtl_iosurface_free_count(void);
+/* CF retain count of the surface behind a handle (a LEAD, not a verdict), -1 if none. */
+long vkr_mtl_iosurface_retain_count(const struct vkr_mtl_iosurface *surf);
 
 void
 vkr_mtl_texture_release(void *mtl_texture);

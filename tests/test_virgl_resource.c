@@ -30,6 +30,9 @@
 */
 #include <check.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <sys/uio.h>
 #include <errno.h>
 #include <virglrenderer.h>
 #include "virgl_hw.h"
@@ -304,6 +307,81 @@ START_TEST(private_ptr)
 }
 END_TEST
 
+/* A resource kept in host system memory (VIRGL_BIND_CUSTOM) gets a zeroed host shadow at
+ * create. Attaching guest backing must not push that shadow into the guest's pages: the
+ * guest may already have written them, and it never waited for the attach. */
+START_TEST(attach_keeps_guest_backing)
+{
+  int ret;
+  ret = testvirgl_init_single_ctx(context_flags);
+  ck_assert_int_eq(ret, 0);
+  struct virgl_renderer_resource_create_args args = { 1, PIPE_BUFFER, PIPE_FORMAT_R8_UNORM, VIRGL_BIND_CUSTOM, 4096, 1, 1, 1, 0, 0, 0 };
+  ret = virgl_renderer_resource_create(&args, NULL, 0);
+  ck_assert_int_eq(ret, 0);
+
+  struct iovec iov;
+  iov.iov_len = 4096;
+  iov.iov_base = malloc(iov.iov_len);
+  memset(iov.iov_base, 0xa5, iov.iov_len);
+  ret = virgl_renderer_resource_attach_iov(1, &iov, 1);
+  ck_assert_int_eq(ret, 0);
+  for (size_t i = 0; i < iov.iov_len; i++)
+    ck_assert_uint_eq(((uint8_t *)iov.iov_base)[i], 0xa5);
+
+  virgl_renderer_resource_detach_iov(1, NULL, NULL);
+  virgl_renderer_resource_unref(1);
+  free(iov.iov_base);
+  testvirgl_fini_single_ctx();
+}
+END_TEST
+
+/* The one legitimate write-back at attach: content the guest cannot have, because it
+ * reached the host while no backing was attached (a transfer into the shadow, or a
+ * detach that captured the previous backing). */
+START_TEST(attach_restores_host_only_content)
+{
+  int ret;
+  ret = testvirgl_init_single_ctx(context_flags);
+  ck_assert_int_eq(ret, 0);
+  struct virgl_renderer_resource_create_args args = { 1, PIPE_BUFFER, PIPE_FORMAT_R8_UNORM, VIRGL_BIND_CUSTOM, 4096, 1, 1, 1, 0, 0, 0 };
+  ret = virgl_renderer_resource_create(&args, NULL, 0);
+  ck_assert_int_eq(ret, 0);
+  virgl_renderer_ctx_attach_resource(1, 1);
+
+  struct iovec src;
+  src.iov_len = 4096;
+  src.iov_base = malloc(src.iov_len);
+  memset(src.iov_base, 0x5a, src.iov_len);
+  struct virgl_box box = { 0, 0, 0, 4096, 1, 1 };
+  ret = virgl_renderer_transfer_write_iov(1, 1, 0, 0, 0, &box, 0, &src, 1);
+  ck_assert_int_eq(ret, 0);
+
+  struct iovec iov;
+  iov.iov_len = 4096;
+  iov.iov_base = calloc(1, iov.iov_len);
+  ret = virgl_renderer_resource_attach_iov(1, &iov, 1);
+  ck_assert_int_eq(ret, 0);
+  for (size_t i = 0; i < iov.iov_len; i++)
+    ck_assert_uint_eq(((uint8_t *)iov.iov_base)[i], 0x5a);
+
+  /* detach captures the guest's bytes; a fresh backing gets them back */
+  memset(iov.iov_base, 0x3c, iov.iov_len);
+  virgl_renderer_resource_detach_iov(1, NULL, NULL);
+  memset(iov.iov_base, 0, iov.iov_len);
+  ret = virgl_renderer_resource_attach_iov(1, &iov, 1);
+  ck_assert_int_eq(ret, 0);
+  for (size_t i = 0; i < iov.iov_len; i++)
+    ck_assert_uint_eq(((uint8_t *)iov.iov_base)[i], 0x3c);
+
+  virgl_renderer_resource_detach_iov(1, NULL, NULL);
+  virgl_renderer_ctx_detach_resource(1, 1);
+  virgl_renderer_resource_unref(1);
+  free(iov.iov_base);
+  free(src.iov_base);
+  testvirgl_fini_single_ctx();
+}
+END_TEST
+
 static Suite *virgl_init_suite(void)
 {
   Suite *s;
@@ -315,6 +393,8 @@ static Suite *virgl_init_suite(void)
   tcase_add_loop_test(tc_core, virgl_res_tests, 0, ARRAY_SIZE(testlist));
   tcase_add_loop_test(tc_core, cubemaparray_res_tests, 0, ARRAY_SIZE(cubemaparray_testlist));
   tcase_add_test(tc_core, private_ptr);
+  tcase_add_test(tc_core, attach_keeps_guest_backing);
+  tcase_add_test(tc_core, attach_restores_host_only_content);
   suite_add_tcase(s, tc_core);
   return s;
 

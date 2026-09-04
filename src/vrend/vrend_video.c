@@ -66,6 +66,9 @@
  */
 
 
+#include <inttypes.h>
+#include <time.h>
+
 #include "util/u_format.h"
 
 #include "virgl_video.h"
@@ -74,7 +77,20 @@
 #include "vrend_debug.h"
 #include "vrend_winsys.h"
 #include "vrend_renderer.h"
+#include "vrend_iov.h"
 #include "vrend_video.h"
+
+#ifdef __APPLE__
+/* From vkr_metal_helpers (same library), forward-declared rather than included: the
+ * header needs Vulkan types, which vrend deliberately keeps out. Same reason and same
+ * shape as the declarations in vrend_renderer.c. */
+struct vkr_mtl_iosurface;
+int vkr_mtl_iosurface_plane_write(struct vkr_mtl_iosurface *surf, uint32_t plane,
+                                  const void *src, uint32_t src_stride, uint32_t rows,
+                                  uint32_t row_bytes);
+int vkr_mtl_iosurface_plane_copy(struct vkr_mtl_iosurface *dst, struct vkr_mtl_iosurface *src,
+                                 uint32_t plane);
+#endif
 
 struct vrend_context;
 
@@ -82,7 +98,23 @@ struct vrend_video_context {
     struct vrend_context *ctx;
     struct list_head codecs;
     struct list_head buffers;
+    /* Per-frame commands naming a codec or buffer this context does not have. */
+    uint64_t lookup_misses;
 };
+
+/* The per-frame commands report success to the guest whatever the lookup finds (the
+ * protocol has no way to say "your codec is gone"), so the only witness of a guest
+ * decoding into nothing is this log. Rate-limited: once, then every power of ten. */
+static void lookup_miss(struct vrend_video_context *ctx, const char *what,
+                        uint32_t cdc_handle, bool cdc, uint32_t tgt_handle, bool tgt)
+{
+    uint64_t n = ++ctx->lookup_misses;
+    if (n == 1 || n == 10 || n == 100 || n == 1000 || n % 10000 == 0)
+        virgl_error("video: %s names codec %u (%s) and buffer %u (%s) -- %" PRIu64
+                    " such command%s on this context so far, decoding into nothing\n",
+                    what, cdc_handle, cdc ? "found" : "MISSING", tgt_handle,
+                    tgt ? "found" : "MISSING", n, n == 1 ? "" : "s");
+}
 
 struct vrend_video_codec {
     struct virgl_video_codec *codec;
@@ -148,14 +180,103 @@ static struct vrend_video_buffer *get_video_buffer(
 }
 
 
+/* Clamp a plane copy to what the SOURCE actually holds.
+ *
+ * Every reader below sizes its copy from the resource, and the resource is the aligned
+ * allocation while the source is CoreVideo's actual plane -- which holds exactly the
+ * rows the picture has. Copying the resource's height out of it reads off the end of the
+ * mapping, at any resolution where the two differ. It faults only once the pool's slack
+ * runs out before the next page, which is what makes it intermittent.
+ *
+ * The 2026-09-01 dogfood SIGSEGV is that read: a byte read, translation fault
+ * (esr 0x92000007), at a page-aligned address that was the memmove source, copying a
+ * 480-byte row. The picture's dimensions are not recoverable from the report -- the
+ * video traces were not armed -- so the row length is what is measured and the height
+ * is not. The clamp does not depend on knowing them.
+ *
+ * The backend already knows the answer and no reader asked: plane->size is the mapped
+ * extent. Derive the copy from it. A backend that leaves size zero -- the dmabuf path,
+ * which never maps -- keeps the caller's dimensions, since there is nothing to clamp to.
+ *
+ * The defect predates the composite decode target (it arrived with the mapped-plane
+ * delivery itself) and outlived the build that crashed, so it is not something the
+ * planar work introduced or fixed. */
+static bool clamp_plane_to_source(const struct virgl_video_dma_buf_plane *plane,
+                                  unsigned blocksize, const char *what,
+                                  unsigned *width, unsigned *height)
+{
+    /* Falling short is the steady state for 1080p and would log every frame. */
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("LIMINA_VIDEO_CLAMP_TRACE") ? 1 : 0;
+
+    if (!plane->size || !plane->pitch)
+        return *width && *height;
+
+    const unsigned rows = plane->size / plane->pitch;
+    const unsigned cols = blocksize ? plane->pitch / blocksize : *width;
+    const unsigned want_h = *height, want_w = *width;
+
+    if (rows < *height)
+        *height = rows;
+    if (cols < *width)
+        *width = cols;
+
+    if (trace && (want_h != *height || want_w != *width))
+        virgl_warn("%s: clamped %ux%u to %ux%u — the source holds %u rows of %u bytes "
+                   "(size %u, pitch %u)\n", what, want_w, want_h, *width, *height,
+                   rows, plane->pitch, plane->size, plane->pitch);
+
+    return *width && *height;
+}
+
 /* Upload one CPU-mapped plane of a decoded picture into the guest-visible resource.
  *
  * The dmabuf path below hands the picture over as an EGLImage and blits; a backend
  * with no dmabuf to export — VideoToolbox, whose output is a CVPixelBuffer — maps
  * the plane instead and we copy. */
-static void upload_mapped_plane(struct vrend_resource *res,
+static void upload_mapped_plane(struct vrend_resource *res, unsigned plane_idx,
                                 const struct virgl_video_dma_buf_plane *plane)
 {
+#ifdef __APPLE__
+    /* limina: a composite target has one resource for the whole picture, so there is no
+     * per-plane GL texture to upload into -- res->base.format is the planar format and
+     * res->gl_id is the RGBA texture composite consumers sample. The plane's pixels
+     * belong in the IOSurface plane the guest's own plane view is bound to, which is
+     * where a plane sampler reads them and needs no upload at all. */
+    if (plane_idx < res->iosurf_planes) {
+        struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+        uint32_t plane_count = 0;
+
+        vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
+                                 geom, &plane_count);
+        if (plane_idx < plane_count) {
+            unsigned w = geom[plane_idx].width, h = geom[plane_idx].height;
+
+            if (clamp_plane_to_source(plane, geom[plane_idx].bpp, "iosurface plane", &w, &h)) {
+                static int wtrace = -1;
+                if (wtrace < 0)
+                    wtrace = getenv("LIMINA_VIDEO_WRITEBACK_TRACE") ? 1 : 0;
+                if (wtrace) {
+                    /* Whether the SOURCE carries a picture is a separate question from
+                     * whether the write lands, and only one of them is visible later. */
+                    const unsigned char *b = plane->map;
+                    size_t probe = plane->pitch < 4096 ? plane->pitch : 4096, nz = 0;
+                    for (size_t i = 0; b && i < probe; i++)
+                        nz += b[i] != 0;
+                    virgl_warn("iosurface write: ios=%u plane %u %ux%u pitch %u "
+                               "src nonzero %zu/%zu\n",
+                               vrend_renderer_resource_get_iosurface_id(res), plane_idx, w, h,
+                               plane->pitch, nz, probe);
+                }
+                vkr_mtl_iosurface_plane_write(res->iosurface, plane_idx, plane->map,
+                                              plane->pitch, h, w * geom[plane_idx].bpp);
+            }
+            return;
+        }
+    }
+#endif
+
     /* Ask vrend how this resource was actually created rather than deriving a GL
      * format from the plane's size: an R8 luma plane and an RG8 chroma plane both
      * arrive here, and a mismatched format silently uploads the wrong bytes. */
@@ -167,16 +288,131 @@ static void upload_mapped_plane(struct vrend_resource *res,
         return;
     }
 
+    unsigned up_w = res->base.width0, up_h = res->base.height0;
+
+    if (!clamp_plane_to_source(plane, blocksize, "plane upload", &up_w, &up_h))
+        return;
+
     /* VideoToolbox pads plane rows, so the source stride is not the width. */
     glBindTexture(GL_TEXTURE_2D, res->gl_id);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, plane->pitch / blocksize);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                    res->base.width0, res->base.height0,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, up_w, up_h,
                     entry->glformat, entry->gltype, plane->map);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+/* limina: also land the decoded plane in the guest's own memory.
+ *
+ * upload_mapped_plane() above puts the pixels in a host GL texture, which is all a
+ * guest that samples the target needs. A guest that *exports* it needs more: the fd
+ * has to name storage that actually holds the frame. Guest mesa refuses an export
+ * whose laid-out size exceeds the storage behind it -- correctly, since the classic
+ * per-plane resource has a one-page stub BO however large the picture -- and the
+ * refusal costs Firefox its hardware decoder.
+ *
+ * So when the guest allocated the plane in guest memory (VIRGL_CAP_V2_VIDEO_GUEST_PLANES,
+ * which is what tells it that doing so is worthwhile), write the frame there too. The
+ * texture upload stays: sampling must not start depending on the guest's copy being
+ * read back, and the readback only happens once per batch.
+ *
+ * Layout is the guest's, in vrend_resource::guest_pixels_*. Which entry applies depends
+ * on the shape the guest asked for: with one resource per plane every target is plane 0
+ * of its own resource, while a composite target is one resource holding all the planes,
+ * so the index has to come from the caller either way.
+ */
+static void writeback_plane_to_guest(struct vrend_resource *res, unsigned plane_idx,
+                                     const struct virgl_video_dma_buf_plane *plane)
+{
+    struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+    uint32_t plane_count = 0;
+    unsigned blocksize, width, height_in;
+
+    vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
+                             geom, &plane_count);
+    /* A per-plane resource describes one plane and nothing else, so its own plane 0 is
+     * the answer however many planes the video buffer has. */
+    if (plane_count < 2)
+        plane_idx = 0;
+    else if (plane_idx >= plane_count)
+        return;
+
+    blocksize = geom[plane_idx].bpp;
+    width = geom[plane_idx].width;
+    height_in = geom[plane_idx].height;
+
+    /* The extent check below bounds the DESTINATION. The source walk further down reads
+     * plane->map + y * plane->pitch and needs its own bound, for the same reason the
+     * uploads do. */
+    if (!clamp_plane_to_source(plane, blocksize, "writeback", &width, &height_in))
+        return;
+    size_t row, stride, offset, height, extent, storage;
+    /* Every reason to skip is a legitimate steady state, so none of them can log per
+     * frame. But when the guest ends up reading an unwritten target the skip IS the
+     * fault, and silence is exactly the wrong answer -- hence one env-gated trace
+     * naming the numbers that decided it. */
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("LIMINA_VIDEO_WRITEBACK_TRACE") ? 1 : 0;
+
+    if (!blocksize) {
+        if (trace)
+            virgl_warn("writeback: res fmt %d plane %u has no blocksize\n",
+                       res->base.format, plane_idx);
+        return;
+    }
+
+    /* Nothing to write into: a host-only resource, which is the pre-existing case. */
+    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs)) {
+        if (trace)
+            virgl_warn("writeback: no guest storage (map %p, iov %p, num_iovs %d)\n",
+                       res->guest_pixels_map, (void *)res->iov, res->num_iovs);
+        return;
+    }
+
+    row = (size_t)width * blocksize;
+    height = height_in;
+    stride = res->guest_pixels_stride[plane_idx] ? res->guest_pixels_stride[plane_idx] : row;
+    offset = res->guest_pixels_offset[plane_idx];
+
+    if (stride < row) {
+        virgl_error("%s: guest stride %zu < row %zu for plane %u of %ux%u %s\n", __func__,
+                    stride, row, plane_idx, res->base.width0, res->base.height0,
+                    util_format_name(res->base.format));
+        return;
+    }
+
+    /* Measure the whole extent before copying any of it. A half-written frame is worse
+     * than an unwritten one: it plays, and only a checksum would ever catch it.
+     *
+     * Falling short is the normal case, not an error, and must stay silent. A classic
+     * per-plane resource has guest iovecs too -- the one-page shadow -- so every decoded
+     * frame reaches here with storage far too small until guest mesa starts allocating
+     * these in guest memory. Whether the storage is big enough IS the test for "the
+     * guest wants the frame here"; there is nothing else to ask. */
+    extent = offset + (height ? (height - 1) * stride + row : 0);
+    storage = res->guest_pixels_map ? res->guest_pixels_map_size
+                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+    if (trace)
+        virgl_warn("writeback: plane %u %ux%u of %ux%u %s row %zu stride %zu off %zu "
+                   "extent %zu storage %zu src pitch %u -> %s\n",
+                   plane_idx, width, height_in, res->base.width0, res->base.height0,
+                   util_format_name(res->base.format), row, stride, offset, extent,
+                   storage, plane->pitch, extent > storage ? "SKIP" : "write");
+    if (extent > storage)
+        return;
+
+    for (size_t y = 0; y < height; y++) {
+        const char *src = (const char *)plane->map + y * plane->pitch;
+        size_t dst = offset + y * stride;
+
+        if (res->guest_pixels_map)
+            memcpy((char *)res->guest_pixels_map + dst, src, row);
+        else
+            vrend_write_to_iovec(res->iov, res->num_iovs, dst, src, row);
+    }
 }
 
 static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
@@ -186,6 +422,8 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         virgl_error("%s: dmabuf is not readable\n", __func__);
         return -1;
     }
+
+    struct vrend_resource *composite = NULL;
 
     for (unsigned i = 0; i < dmabuf->num_planes && i < buf->num_planes; i++) {
         struct vrend_video_plane *plane = &buf->planes[i];
@@ -198,7 +436,14 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
         }
 
         if (dmabuf->planes[i].fd < 0 && dmabuf->planes[i].map) {
-            upload_mapped_plane(res, &dmabuf->planes[i]);
+            upload_mapped_plane(res, i, &dmabuf->planes[i]);
+            writeback_plane_to_guest(res, i, &dmabuf->planes[i]);
+#ifdef __APPLE__
+            /* A composite target is one resource for every plane; tell it once, after
+             * all of its planes are in place, not per plane. */
+            if (res->iosurf_planes)
+                composite = res;
+#endif
             continue;
         }
 
@@ -241,6 +486,9 @@ static int sync_dmabuf_to_video_buffer(struct vrend_video_buffer *buf,
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (composite)
+        vrend_resource_planes_written(buf->ctx->ctx, composite);
 
     return 0;
 }
@@ -384,10 +632,144 @@ static void vrend_video_encode_completed(
     cdc->feed_res = NULL;
 }
 
+/* limina: where a plane of a target lives in guest memory, if it lives there at all. The
+ * same test writeback_plane_to_guest() applies: storage too small for the plane means the
+ * guest never asked for the frame there (the classic one-page shadow), and is silent. */
+static bool guest_plane_span(struct vrend_resource *res, unsigned plane_idx, size_t row,
+                             size_t height, size_t *offset, size_t *stride)
+{
+    size_t extent, storage;
+
+    if (!res->guest_pixels_map && (!res->iov || !res->num_iovs))
+        return false;
+
+    *stride = res->guest_pixels_stride[plane_idx] ? res->guest_pixels_stride[plane_idx] : row;
+    *offset = res->guest_pixels_offset[plane_idx];
+    if (*stride < row)
+        return false;
+
+    extent = *offset + (height ? (height - 1) * *stride + row : 0);
+    storage = res->guest_pixels_map ? res->guest_pixels_map_size
+                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+    return extent <= storage;
+}
+
+/* limina: the guest-memory half of copying a picture: a guest that reads or exports the
+ * target's own storage (VIRGL_CAP_V2_VIDEO_GUEST_PLANES) must find the copy there too. */
+static void copy_guest_plane(struct vrend_resource *src, struct vrend_resource *dst,
+                             unsigned plane_idx)
+{
+    struct guest_plane geom[VIRGL_GBM_MAX_PLANES];
+    uint32_t plane_count = 0;
+    size_t row, height, soff, sstride, doff, dstride;
+    char *tmp;
+
+    vrend_guest_plane_layout(dst->base.format, dst->base.width0, dst->base.height0,
+                             geom, &plane_count);
+    if (plane_count < 2)
+        plane_idx = 0;
+    else if (plane_idx >= plane_count)
+        return;
+
+    row = (size_t)geom[plane_idx].width * geom[plane_idx].bpp;
+    height = geom[plane_idx].height;
+    if (!row || !height ||
+        !guest_plane_span(src, plane_idx, row, height, &soff, &sstride) ||
+        !guest_plane_span(dst, plane_idx, row, height, &doff, &dstride))
+        return;
+
+    tmp = malloc(row);
+    if (!tmp)
+        return;
+    for (size_t y = 0; y < height; y++) {
+        if (src->guest_pixels_map)
+            memcpy(tmp, (const char *)src->guest_pixels_map + soff + y * sstride, row);
+        else
+            vrend_read_from_iovec(src->iov, src->num_iovs, soff + y * sstride, tmp, row);
+        if (dst->guest_pixels_map)
+            memcpy((char *)dst->guest_pixels_map + doff + y * dstride, tmp, row);
+        else
+            vrend_write_to_iovec(dst->iov, dst->num_iovs, doff + y * dstride, tmp, row);
+    }
+    free(tmp);
+}
+
+/* limina: replicate the picture one target holds into another, everywhere a decoded
+ * picture would land -- the host texture or IOSurface plane a sampler reads, and the
+ * guest's own storage. Called by the backend for a frame it cannot decode (a codec with
+ * no reference pictures yet, after a snapshot restore), so the target the guest is about
+ * to present shows the same picture as the last one it presented. */
+static void vrend_video_copy_picture(struct virgl_video_codec *codec,
+                                     struct virgl_video_buffer *from,
+                                     struct virgl_video_buffer *to)
+{
+    struct vrend_video_buffer *src = vrend_video_buffer(from);
+    struct vrend_video_buffer *dst = vrend_video_buffer(to);
+    struct vrend_resource *composite = NULL;
+
+    (void)codec;
+
+    if (!src || !dst || src == dst || src->ctx != dst->ctx)
+        return;
+
+    for (unsigned i = 0; i < src->num_planes && i < dst->num_planes; i++) {
+        struct vrend_resource *sres, *dres;
+
+        sres = vrend_renderer_ctx_res_lookup(src->ctx->ctx, src->planes[i].res_handle);
+        dres = vrend_renderer_ctx_res_lookup(dst->ctx->ctx, dst->planes[i].res_handle);
+        if (!sres || !dres || sres == dres)
+            continue;
+        if (sres->base.format != dres->base.format ||
+            sres->base.width0 != dres->base.width0 ||
+            sres->base.height0 != dres->base.height0) {
+            /* Once: a pool of mixed shapes would otherwise say so at frame rate. */
+            static bool warned;
+            if (!warned)
+                virgl_error("%s: targets %u and %u differ in shape; not copying\n",
+                            __func__, src->handle, dst->handle);
+            warned = true;
+            return;
+        }
+
+#ifdef __APPLE__
+        /* A composite target is one resource for every plane; its pixels live in the
+         * IOSurface planes, and the composite is told once, after all of them. */
+        if (i < dres->iosurf_planes) {
+            if (i < sres->iosurf_planes)
+                vkr_mtl_iosurface_plane_copy(dres->iosurface, sres->iosurface, i);
+            composite = dres;
+            copy_guest_plane(sres, dres, i);
+            continue;
+        }
+#endif
+
+        /* src texture -> framebuffer -> dst texture, the way a decoded plane lands. */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, dst->planes[i].framebuffer);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, sres->gl_id, 0);
+        if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            virgl_error("%s: plane %u of target %u is not readable as a framebuffer\n",
+                        __func__, i, src->handle);
+            continue;
+        }
+        glBindTexture(GL_TEXTURE_2D, dres->gl_id);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                            dres->base.width0, dres->base.height0);
+        copy_guest_plane(sres, dres, i);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (composite)
+        vrend_resource_planes_written(dst->ctx->ctx, composite);
+}
+
 static struct virgl_video_callbacks video_callbacks = {
     .decode_completed           = vrend_video_decode_completed,
     .encode_upload_picture      = vrend_video_enocde_upload_picture,
     .encode_completed           = vrend_video_encode_completed,
+    .copy_picture               = vrend_video_copy_picture,
 };
 
 int vrend_video_init(int drm_fd)
@@ -617,8 +999,10 @@ int vrend_video_begin_frame(struct vrend_video_context *ctx,
     struct vrend_video_codec *cdc = get_video_codec(ctx, cdc_handle);
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
 
-    if (!cdc || !tgt)
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "begin_frame", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
+    }
 
     return virgl_video_begin_frame(cdc->codec, tgt->buffer);
 }
@@ -788,8 +1172,8 @@ int vrend_video_decode_bitstream(struct vrend_video_context *ctx,
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
     union virgl_picture_desc desc;
 
-    if (!cdc || !tgt){
-        virgl_error("video codec: %p, video buffer: %p, invalid.\n", (void *)cdc, (void *)tgt);
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "decode_bitstream", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
     }
 
@@ -813,8 +1197,42 @@ int vrend_video_decode_bitstream(struct vrend_video_context *ctx,
             continue;
         }
 
-        vrend_read_from_iovec(res->iov, res->num_iovs, 0,
-                              res->ptr, buffer_sizes[i]);
+        {
+            /* The read is silent about how much it got, and a resource whose backing has
+             * not been attached yet has no iovecs at all -- so a bitstream that never
+             * arrived is indistinguishable here from one full of zeros, and only
+             * VideoToolbox complains, much later and about the wrong thing. */
+            size_t got = vrend_read_from_iovec(res->iov, res->num_iovs, 0,
+                                               res->ptr, buffer_sizes[i]);
+            if (!res->iov || !res->num_iovs || got < buffer_sizes[i])
+                virgl_warn("%s: bs res %d gave %zu of %u bytes (iov %p, num_iovs %d)\n",
+                           __func__, buffer_handles[i], got, buffer_sizes[i],
+                           (void *)res->iov, res->num_iovs);
+
+            /* An all-zero bitstream is either memory the guest never wrote, or memory whose
+             * write has not reached us yet. Re-reading the SAME iovecs a moment later tells
+             * the two apart, and only one of them is a coherency problem. */
+            if (getenv("LIMINA_BS_REREAD") && buffer_sizes[i] >= 8) {
+                /* Whether the whole buffer is wrong or only part of it separates a bad
+                 * scatter-gather translation from a buffer that was never written. */
+                const uint8_t *all = (const uint8_t *)res->ptr;
+                size_t nz = 0, first_nz = buffer_sizes[i];
+                for (size_t k = 0; k < buffer_sizes[i]; k++)
+                    if (all[k]) { nz++; if (first_nz == buffer_sizes[i]) first_nz = k; }
+                virgl_warn("BSSTAT handle=%u res=%p iov=%p n=%d size=%u nonzero=%zu "
+                           "first_nz=%zu\n", buffer_handles[i], (void *)res,
+                           (void *)res->iov, res->num_iovs, buffer_sizes[i], nz, first_nz);
+                const uint8_t *p8 = (const uint8_t *)res->ptr;
+                if (!p8[0] && !p8[1] && !p8[2] && !p8[3]) {
+                    struct timespec ts = { 0, 2 * 1000 * 1000 };
+                    nanosleep(&ts, NULL);
+                    vrend_read_from_iovec(res->iov, res->num_iovs, 0,
+                                          res->ptr, buffer_sizes[i]);
+                    virgl_warn("%s: bs res %d was zero; after 2ms re-read: %02x %02x %02x %02x\n",
+                               __func__, buffer_handles[i], p8[0], p8[1], p8[2], p8[3]);
+                }
+            }
+        }
         bs_buffers[num_bs] = res->ptr;
         bs_sizes[num_bs] = buffer_sizes[i];
         num_bs++;
@@ -892,8 +1310,10 @@ int vrend_video_end_frame(struct vrend_video_context *ctx,
     struct vrend_video_codec *cdc = get_video_codec(ctx, cdc_handle);
     struct vrend_video_buffer *tgt = get_video_buffer(ctx, tgt_handle);
 
-    if (!cdc || !tgt)
+    if (!cdc || !tgt) {
+        lookup_miss(ctx, "end_frame", cdc_handle, !!cdc, tgt_handle, !!tgt);
         return -1;
+    }
 
     return virgl_video_end_frame(cdc->codec, tgt->buffer);
 }

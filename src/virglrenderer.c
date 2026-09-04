@@ -139,8 +139,17 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
    vrend_args.flags = args->flags;
 
    pipe_res = vrend_renderer_resource_create(&vrend_args, image);
-   if (!pipe_res)
+   if (!pipe_res) {
+      /* A refusal here is invisible to the guest, which goes on to attach backing to the
+       * handle and use it -- so the first thing anyone sees is an "Illegal resource" much
+       * later, naming a handle whose creation nobody logged. */
+      virgl_warn("resource create refused: handle %u target %u format %u bind 0x%x "
+                 "%ux%ux%u array %u samples %u levels %u flags 0x%x\n",
+                 args->handle, args->target, args->format, args->bind, args->width,
+                 args->height, args->depth, args->array_size, args->nr_samples,
+                 args->last_level, args->flags);
       return EINVAL;
+   }
 
    map_info = vrend_renderer_resource_get_map_info(pipe_res);
    res = virgl_resource_create_from_pipe(args->handle, pipe_res, iov, num_iovs);
@@ -2148,14 +2157,18 @@ int virgl_renderer_submit_cmd2(void *buffer,
 {
    TRACE_FUNC();
    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
-   if (!ctx)
+   if (!ctx) {
+      virgl_warn("submit2: ctx %d not found\n", ctx_id);
       return EINVAL;
+   }
 
    if (((uintptr_t)buffer & 3) != 0)
       return EFAULT;
 
-   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t))
+   if (ndw < 0 || (unsigned)ndw > UINT32_MAX / sizeof(uint32_t)) {
+      virgl_warn("submit2: ctx %d bad ndw %d\n", ctx_id, ndw);
       return EINVAL;
+   }
 
    if (num_in_fences) {
       int err = virgl_renderer_context_attach_in_fences(ctx, in_fence_ids, num_in_fences);

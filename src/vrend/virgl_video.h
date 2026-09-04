@@ -129,6 +129,14 @@ struct virgl_video_callbacks {
                              unsigned num_coded_bufs,
                              const void * const *coded_bufs,
                              const unsigned *coded_sizes);
+
+    /* limina: replicate the picture `from` holds into `to`, two targets of the same
+     * context. Optional. A backend calls it for a frame it could not decode -- a codec
+     * with no reference pictures yet -- so that the target the guest is about to present
+     * shows one still picture instead of whatever it held before. */
+    void (*copy_picture)(struct virgl_video_codec *codec,
+                         struct virgl_video_buffer *from,
+                         struct virgl_video_buffer *to);
 };
 
 int virgl_video_init(int drm_fd,

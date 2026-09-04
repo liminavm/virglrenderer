@@ -188,4 +188,10 @@ void vrend_renderer_blit_gl(ASSERTED struct vrend_context *ctx,
                             const struct vrend_blit_info *info);
 void vrend_blitter_fini(void);
 
+/* limina: fill res->gl_id (RGBA) from the two IOSurface planes behind
+ * res->aux_plane_egl_image[0..1] of an NV12/NV21 target. Runs in the blit context;
+ * the caller restores its own with vrend_sync_make_current. Returns false when
+ * nothing was drawn. */
+bool vrend_renderer_convert_planes_gl(struct vrend_resource *res);
+
 #endif

@@ -23,6 +23,9 @@
 
 check_dep = dependency('check')
 
+# check.h pastes ',' onto __VA_ARGS__, a GNU extension clang rejects under -Werror=pedantic.
+test_c_args = cc.get_supported_arguments(['-Wno-gnu-zero-variadic-macro-arguments'])
+
 libvrtest_sources = [
    'testvirgl.c',
    'testvirgl.h',
@@ -43,6 +46,7 @@ endif
 libvrtest = static_library(
    'vrtest',
    libvrtest_sources,
+   c_args : test_c_args,
    dependencies : libvrtest_depends
 )
 
@@ -52,7 +56,8 @@ tests = [
    ['test_virgl_resource', 'test_virgl_resource.c'],
    ['test_virgl_transfer', 'test_virgl_transfer.c'],
    ['test_virgl_cmd', 'test_virgl_cmd.c'],
-   ['test_virgl_strbuf', 'test_virgl_strbuf.c']
+   ['test_virgl_strbuf', 'test_virgl_strbuf.c'],
+   ['test_virgl_journal', 'test_virgl_journal.c']
 ]
 
 fuzzy_tests = [
@@ -70,6 +75,7 @@ endif
 
 foreach t : tests
    test_virgl = executable(t[0], t[1], link_with: libvrtest,
+                           c_args : test_c_args,
                            dependencies : test_depends)
    test(t[0], test_virgl)
 endforeach
@@ -81,6 +87,7 @@ test_virgl_gbm_resources = executable(
    'test_virgl_gbm_resources',
    'test_virgl_gbm_resources.c',
    link_with: libvrtest,
+   c_args : test_c_args,
    dependencies : test_depends)
 
 test('test_virgl_gbm_resources', test_virgl_gbm_resources, is_parallel : false)
@@ -96,6 +103,7 @@ endif
 
 foreach t : fuzzy_tests
    test_virgl_fuzzy = executable(t[0], t[1], link_with: libvrtest,
+                                 c_args : test_c_args,
                                  dependencies : fuzzytest_depends)
    test(t[0], test_virgl)
 endforeach

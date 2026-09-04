@@ -150,6 +150,23 @@ struct vkr_cs_decoder {
    mtx_t resource_mutex;
    const struct vkr_resource *resource;
 
+   /* limina ring-FATAL attribution: which command this decoder is inside, so a
+    * fatal names itself. Maintained by the dispatch tee (vkr_journal_pre/
+    * post_dispatch), which already brackets all four vn_dispatch_command call
+    * sites, keeping the generated venus-protocol headers stock. Every one of the
+    * hundreds of generated set_fatal call sites reports the same shim func/line,
+    * so the COMMAND is what localises a failure, not the call site.
+    *
+    * These are deliberately not cleared when a command ends: at depth 0 they name
+    * the last command that completed, which is what a fatal raised outside any
+    * dispatch (ring header, transport framing) needs to say. dispatch_depth is a
+    * count, not a flag — vkExecuteCommandStreamsMESA nests one level through the
+    * same dispatcher. */
+   uint32_t cur_cmd_type;
+   const uint8_t *cur_cmd_start;
+   uint64_t dispatch_seq;
+   uint32_t dispatch_depth;
+
    const uint8_t *cur;
    const uint8_t *end;
 };
@@ -282,13 +299,22 @@ vkr_cs_decoder_fini(struct vkr_cs_decoder *dec);
 void
 vkr_cs_decoder_reset(struct vkr_cs_decoder *dec);
 
+/* Names a command type for the fatal report; "unknown" for anything the
+ * generated table does not know. */
+const char *
+vkr_cs_command_name(uint32_t cmd_type);
+
+/* Out of line on purpose: this header is included by every generated protocol
+ * TU, and the report is cold — it runs at most once per context, on the way to
+ * a dead ring. */
+void
+vkr_cs_decoder_report_fatal(const struct vkr_cs_decoder *dec, const char *func, int line);
+
 static inline void
 vkr_cs_decoder_set_fatal_at(const struct vkr_cs_decoder *dec, const char *func, int line)
 {
-   if (!*((struct vkr_cs_decoder *)dec)->fatal_error) {
-      vkr_log_error("cs decoder: ring FATAL set at %s:%d (context %u [%s])", func, line,
-                    dec->ctx_id, dec->ctx_name ? dec->ctx_name : "?");
-   }
+   if (!*((struct vkr_cs_decoder *)dec)->fatal_error)
+      vkr_cs_decoder_report_fatal(dec, func, line);
    *((struct vkr_cs_decoder *)dec)->fatal_error = true;
 }
 
