@@ -234,6 +234,42 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   must agree byte for byte, and eight consecutive runs must agree with each other. A golden taken
   from one run of an intermittently faulting leg grades the port against a bad frame.
 
+  `vrend-h264.score` and `vrend-hevc.score` are the parameter-set codecs, 300 pictures each
+  through VideoToolbox, scored the same way -- and, like the VP9 one, from the **stock** guest and
+  its per-plane decode target. What they add over VP9 is the whole synthesis path: the guest sends
+  a parsed picture descriptor and slice NALs, and the SPS/PPS (and VPS) the decoder is configured
+  from are written host-side out of the descriptor. The H.264 corpus also exercises the
+  **session-preserving** path 290 times in 300 frames: `num_ref_idx_lX_active_minus1` reaches us
+  as the effective per-slice count, so the PPS bytes change mid-GOP, and a renderer that rebuilds
+  the session there loses the reference pictures and decodes visibly wrong pixels from that frame
+  on.
+
+  A stock Fedora cannot reach either codec: mesa is built `-Dvideo-codecs=all_free` and the VA
+  frontend refuses both in `vl_codec.c` before the driver is consulted, so no host advertisement
+  gets through. The rig guest therefore carries RPM Fusion's `mesa-va-drivers-freeworld`, which is
+  the route a real Fedora user takes for the same reason and which libva already probes ahead of
+  `/usr/lib64/dri/` -- limina's `scripts/provision/install-freeworld-va.sh` does this to its own
+  images, and the rig clone gets the same two `dnf install` lines by hand. `vainfo` naming a
+  driver under `dri-freeworld/` is the check that it took.
+
+  The clips are 300 frames of real screen content at 1280x720, encoded with four reference frames
+  and a B-pyramid so the decoder has a DPB to get wrong, and the decode is checked against
+  `avdec_h264`/`avdec_h265` in the guest before anything is pinned: both codecs are normatively
+  exact, so hardware and software must agree byte for byte, and eight consecutive C runs must
+  agree with each other.
+
+  ```sh
+  ./capture.sh vrend --out h264 --mb 1024        # then, in the guest:
+  #   gst-launch-1.0 -q filesrc location=rig-h264.mp4 ! qtdemux ! h264parse ! vah264dec   #     ! videoconvert ! video/x-raw,format=I420 ! filesink location=/dev/stdout | md5sum
+  ./dump.sh vrend-h264
+  ```
+
+  **These two are scored with `--ctx 8`, and that is not optional.** They were captured with a
+  whole guest booted, so the decode is one context of four; the replayer with no `--ctx` picks the
+  busiest, which is the console's, and scores 2317 empty resources and not one picture -- a clean
+  exit, a full score file, and no measurement of the thing the corpus exists for. The context to
+  name is the one holding `DECODE_BITSTREAM`.
+
   **A resource is zeroed when it is created, so a score line is the renderer's answer and not
   its allocator's.** A texture's contents are undefined until something writes them, and this
   driver does not zero them, so an unwritten resource reads back whatever the last tenant of that
