@@ -181,8 +181,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the same replay against the Rust prefix with `VIRGLRS_DEBUG=shader`, normalised by the same
   script: the two logs must diff empty, block for block and in order, which holds the key
   construction to the C as well as the translation. Under `--nodraw` that is the 28 blocks of
-  shader creation and `LINK_SHADER`; with draws it is all 34, the six more being the variants selected at draw
-  time.
+  shader creation and `LINK_SHADER`; with draws it is all 34, the six more being the variants
+  selected at draw time.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).

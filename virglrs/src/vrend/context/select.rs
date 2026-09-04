@@ -78,7 +78,7 @@ fn gl_shader_kind(stage: ShaderStage) -> GLenum {
 
 /// `can_emulate_logicop`: whether the fragment shader can do the blend's logic op, which needs
 /// the framebuffer read back unless the op ignores it.
-fn can_emulate_logicop(features: &Features, op: LogicOp) -> bool {
+pub(super) fn can_emulate_logicop(features: &Features, op: LogicOp) -> bool {
     if features.has(Feature::framebuffer_fetch_non_coherent)
         || features.has(Feature::framebuffer_fetch)
     {
@@ -161,7 +161,7 @@ fn compile(gl: &Gl, stage: ShaderStage, variant: &mut Variant) -> bool {
 
 impl SubCtx {
     /// The program bound at `stage`, when a shader is bound there and its text is whole.
-    fn bound_program(&self, stage: ShaderStage) -> Option<&Program> {
+    pub(super) fn bound_program(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
             Bound::Object(h) => match self.objects.get(h) {
                 Some(Object::Shader(s)) => s,
@@ -473,8 +473,8 @@ impl Context {
 
     /// `vrend_select_program`, as far as the variants: every bound stage selected under the
     /// state of the moment, in the C's order -- the fragment stage last, then each again, since
-    /// a stage's key reads its neighbours' newest variants -- and compiled. Linking them into a
-    /// program is not here yet.
+    /// a stage's key reads its neighbours' newest variants -- and compiled. The program that
+    /// links them is `Context::select_linked_program`'s.
     pub(super) fn select_program(&mut self, host: &mut Host<'_>, cmd: Cmd) -> Result<(), Fault> {
         use ShaderStage::*;
         let bound = |s: &Context, stage: ShaderStage| s.sub().shaders[stage.index()].is_some();
@@ -548,8 +548,10 @@ impl Context {
             let stage = ShaderStage::from_wire(i as u32).expect("six stages");
             self.bind_shader(host, *h, stage);
         }
-        let r = self.select_program(host, cmd);
-        self.sub_mut().shaders = prev;
+        let r = self.select_linked_program(host, cmd).map(|_| ());
+        let sub = self.sub_mut();
+        sub.shaders = prev;
+        sub.shader_dirty = true;
         r
     }
 }

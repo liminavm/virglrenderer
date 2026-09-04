@@ -525,16 +525,24 @@ buildable throughout as the A-side reference.
   handed is good exactly as long as the texture), and carries the C's rules for a
   resource that cannot be viewed: no texture view of an IOSurface-backed BGR* texture,
   the red/blue and sRGB conversions moved into the sampler swizzle, the clear colour,
-  and the framebuffer bits the shader key reads. The `vrend-nodraw.score` gate is a
-  zero-line diff against the C. Two of the C's EGL-image rules are deliberately not
+  and the framebuffer bits the shader key reads. Shaders and draws are in: the TGSI
+  parser, the translation to the GLSL the C emits byte for byte, the key each bound
+  state makes and the variant chain it selects, program link with the C's attribute,
+  fragment-data and transform-feedback bindings, `LINK_SHADER`, and `vrend_draw_vbo`
+  with its bind of constants, UBOs, samplers, SSBOs, atomics, images, the sysval block
+  and the vertex bindings. Both `vrend.score` and `vrend-nodraw.score` are a zero-line
+  diff against the C, and the shader log is block-for-block identical to the C's for all
+  34 translations. Two of the C's EGL-image rules are deliberately not
   carried: refusing `glCopyImageSubData` between two `B8G8R8X8` textures when one is an
   EGL image is a Mesa dmabuf quirk (a `GL_RGB8` import) the C's own macOS path says does
   not apply to an IOSurface, and the `LIMINA_VREND_*IOSURFACE*` environment switches are
   debugging aids with no reader here. Not served yet, each counted and named in the log
-  when a stream asks: draws and `LINK_SHADER` (TGSI→GLSL), the shader blitter (a blit
-  whose formats swizzle differently, or that swaps red and blue for an IOSurface-backed
-  end), implicit-multisample surfaces, the resource-copy fallback through guest memory,
-  blob resources, video. Next is the first pixel gate, kmscube against the C's frame.
+  when a stream asks: tessellation without a control shader (the C's injected TCS),
+  advanced blend equations, a layered image bound as a subset of its levels or layers,
+  the C's bridge of UBO 0 into the constant array, the shader blitter (a blit whose
+  formats swizzle differently, or that swaps red and blue for an IOSurface-backed end),
+  implicit-multisample surfaces, the resource-copy fallback through guest memory, blob
+  resources, video. Next is the first pixel gate, kmscube against the C's frame.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
