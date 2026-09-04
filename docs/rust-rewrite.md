@@ -532,7 +532,7 @@ buildable throughout as the A-side reference.
   with its bind of constants, UBOs, samplers, SSBOs, atomics, images, the sysval block
   and the vertex bindings. Both `vrend.score` and `vrend-nodraw.score` are a zero-line
   diff against the C, and the shader log is block-for-block identical to the C's for all
-  34 translations. The classic capsets are served: `virgl_caps_v1` and `v2`, probed once
+  33 translations. The classic capsets are served: `virgl_caps_v1` and `v2`, probed once
   at init from the same features, limits and format table the renderer runs on, and
   pinned against the C's `vrend.caps` field for field. Two of the C's EGL-image rules are deliberately not
   carried: refusing `glCopyImageSubData` between two `B8G8R8X8` textures when one is an
