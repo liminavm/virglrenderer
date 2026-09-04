@@ -589,21 +589,19 @@ to have it, each because reproducing the C would mean reproducing a defect.
   `feat_srgb_write_control` — a transposition, and the first of the pair gates whether the blit
   enables `GL_FRAMEBUFFER_SRGB`. Unobservable on this host, where the pinned `blit.score` matches
   the C on an sRGB blit either way, and a host with one extension and not the other would diverge.
-
-## Known gaps, with the shape of their fix
-
-Not deviations: places the port is faithful to the C and the C is wrong, kept only because no
-fixture can yet tell a fix from a regression.
-
-- **A blit mutates sampler state behind the view cache.** `vrend_set_tex_param` sets the base and
-  max level, the filters, the wrap modes and the format swizzle on the *source texture object*,
-  which contexts share. The sampler-view bind skips its work when the same view handle is set into
-  the same slot again, so a redundant re-bind after a blit leaves the blitter's parameters in
-  place. The C has the same hole and a wider one — it caches `cur_base`, `cur_max` and
-  `cur_swizzle` on the texture itself, so no later bind of any view repairs it. The fix is not
-  another purge at the blit: it is for the blit to sample through a texture it owns, or for the
-  cache to key on something the blit necessarily changes. It needs a corpus that blits a texture
-  that is also a bound sampler view, re-binds the identical view, and then draws.
+- **A blit leaves nothing on its source that a later draw can read.** `vrend_set_tex_param` writes
+  the base and max level, the filters, the wrap modes and the format swizzle onto the *source
+  texture object*, and the sampler-view bind skips its work when the same view handle is set into
+  the same slot again — so on the reading, a draw after a blit samples through the blitter's
+  settings. Measured, it does not: `sampled.score` draws twice through one view with a blit
+  between, and virglrs returns the same pixels both times while the C's second read comes back
+  byte-identical to the blit's destination, carrying the identity swizzle and the forced alpha
+  `vrend_set_tex_param` wrote. Two identical draws with no state change between them have only one
+  correct answer, so the C is wrong here and this is the one fixture in the tree pinned from
+  virglrs rather than from the C — reproducing the bug to keep a golden green is not a trade worth
+  making, and a permanently red line is a gate nobody reads. What shields virglrs is not
+  established; the fixture pins the invariant, so a driver or a cache change that lets the write
+  through moves the score.
 
 ## Consequences to accept
 

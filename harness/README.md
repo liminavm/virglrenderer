@@ -220,6 +220,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   hashes exactly like a correct pair, whereas a draw naming its layer in a texture coordinate
   shares nothing with the blitter's attachment path. Every layer the corpus does not blit into
   carries its own fill, so a stray blit is visible from the untouched end too.
+  **`sampled.score` is the one fixture pinned from virglrs and not from the C.** Its last three
+  lines draw twice through one sampler view with a blit between, and the two implementations
+  disagree: virglrs returns the same pixels both times, the C's second read comes back
+  byte-identical to the blit's destination — the blitter's own texture parameters, reaching a draw
+  that never asked for them. Two identical draws with nothing between them have one correct
+  answer, so the C is the wrong golden here; reproducing its bug to keep a fixture green is not a
+  trade worth making, and a permanently red line is a gate nobody reads. The deviation is in
+  `docs/rust-rewrite.md`; every other line of this fixture, and every other fixture in the tree,
+  is still pinned from the C.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).

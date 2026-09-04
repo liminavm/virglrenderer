@@ -25,6 +25,7 @@ from corpus import (Corpus, cmd0, f32, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW, BI
                     B8G8R8A8_UNORM, B8G8R8X8_UNORM, R32G32B32A32_FLOAT,
                     OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_VERTEX_ELEMENTS,
                     STAGE_VERTEX, STAGE_FRAGMENT,
+                    SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W,
                     TARGET_2D, TARGET_3D, TARGET_2D_ARRAY)
 
 SIDE = 64
@@ -74,7 +75,7 @@ class Rig:
 
     # Handle numbering is by kind so a refused object names itself in a log.
     VS_H = 100
-    FS_ARRAY_H, FS_3D_H = 101, 102
+    FS_ARRAY_H, FS_3D_H, FS_2D_H = 101, 102, 103
     RAST_H, BLEND_H, DSA_H, VE_H, SAMP_H = 110, 111, 112, 113, 114
     NEXT_TRANSIENT = 200   # surfaces, sampler views and vertex buffers, one set per draw
 
@@ -84,6 +85,7 @@ class Rig:
         c.shader(Rig.VS_H, STAGE_VERTEX, VS)
         c.shader(Rig.FS_ARRAY_H, STAGE_FRAGMENT, fs("2D_ARRAY"))
         c.shader(Rig.FS_3D_H, STAGE_FRAGMENT, fs("3D"))
+        c.shader(Rig.FS_2D_H, STAGE_FRAGMENT, fs("2D"))
         c.rasterizer(Rig.RAST_H)
         c.blend(Rig.BLEND_H)
         c.dsa(Rig.DSA_H)
@@ -110,18 +112,23 @@ class Rig:
         self.c.inline_write(h, data, len(data), 1, 0)
         return h
 
-    def sample(self, src, src_fmt, src_target, layer_coord, dst, dst_fmt, side,
-               first_layer=0, last_layer=0):
-        """Draw `src`'s layer into `dst`, which the sweep will read back."""
+    FS_FOR = {TARGET_2D_ARRAY: FS_ARRAY_H, TARGET_3D: FS_3D_H, TARGET_2D: FS_2D_H}
+
+    def view(self, src, src_fmt, src_target, first_layer=0, last_layer=0,
+             first_level=0, last_level=0, swizzle=(0, 1, 2, 3)):
+        h = self.handle()
+        self.c.sampler_view(h, src, src_fmt, src_target, first_layer=first_layer,
+                            last_layer=last_layer, first_level=first_level,
+                            last_level=last_level, swizzle=swizzle)
+        return h
+
+    def sample(self, view, src_target, layer_coord, dst, dst_fmt, side):
+        """Draw what `view` samples into `dst`, which the sweep will read back."""
         c = self.c
-        view = self.handle()
         surf = self.handle()
         vbo = self.vertex_buffer(layer_coord)
-        c.sampler_view(view, src, src_fmt, src_target,
-                       first_layer=first_layer, last_layer=last_layer)
         c.surface(surf, dst, dst_fmt)
-        c.bind_shader(Rig.FS_ARRAY_H if src_target == TARGET_2D_ARRAY else Rig.FS_3D_H,
-                      STAGE_FRAGMENT)
+        c.bind_shader(Rig.FS_FOR[src_target], STAGE_FRAGMENT)
         c.set_framebuffer([surf])
         c.set_viewport(side, side)
         c.set_vertex_buffers([(32, 0, vbo)])
@@ -151,6 +158,39 @@ def build():
     VOL_SRC = 40
     VOL_READ_5, VOL_READ_1 = 41, 42
 
+    # --- what a blit leaves on its source's texture object ---
+    # The blitter samples its source through the source's OWN texture object, and writes that
+    # object's swizzle, base and max level, filters and wrap modes to suit itself. The sampler
+    # view bind is cached on the view handle, so re-binding the identical view after a blit
+    # re-applies none of them. On the reading, the next draw samples through the blitter's
+    # settings. Two draws through one view, identical in every respect, with a blit between:
+    # what the second reads settles it.
+    #
+    # The two implementations disagree, and the C is the one that is wrong. virglrs reads the
+    # same pixels twice, which is the only answer two identical draws with nothing between them
+    # can have. The C's second read comes back byte-identical to the blit's DESTINATION --
+    # identity swizzle, alpha forced to one, exactly what `vrend_set_tex_param` wrote -- so the
+    # blitter's settings reached a draw that never asked for them.
+    #
+    # So this is the one fixture in the tree whose golden is not the C: pinning the C here would
+    # mean reproducing a bug in code already written correctly, and a permanently red line is a
+    # gate nobody reads. The deviation is in `docs/rust-rewrite.md`.
+    #
+    # The observable has to be the SWIZZLE, which is a finding and not a preference. A view that
+    # restricts levels is backed by a GL texture view carrying its own parameters, so the
+    # blitter's writes land on the parent and no draw through that view could see them whatever
+    # happened. Filters and wrap are no better: those come from the bound sampler object, which
+    # overrides the texture's. Only the swizzle is a parameter both ends write on the same
+    # object, and only a full-range view has no view object in between.
+    #
+    # What shields virglrs is not established, and these lines do not depend on it. They pin the
+    # invariant, so if a driver or a change to the view cache ever lets the write through, the
+    # score moves and says so.
+    SAMP_SRC = 50
+    SAMP_BLIT_DST = 51
+    SAMP_READ_BEFORE, SAMP_READ_AFTER = 52, 53
+    SAMP_VIEW_SWIZZLE = (SWIZZLE_Z, SWIZZLE_Y, SWIZZLE_X, SWIZZLE_W)   # red and blue swapped
+
     c.submit()
     c.create(ARR_SRC, B8G8R8X8_UNORM, tex, SIDE)
     c.create(ARR_DST, B8G8R8A8_UNORM, tex, SIDE, array=LAYERS, target=TARGET_2D_ARRAY)
@@ -159,6 +199,10 @@ def build():
     c.create(VOL_SRC, B8G8R8X8_UNORM, tex, SIDE, depth=SLICES, target=TARGET_3D)
     c.create(VOL_READ_5, B8G8R8A8_UNORM, tex, SIDE)
     c.create(VOL_READ_1, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(SAMP_SRC, B8G8R8X8_UNORM, tex, SIDE)
+    c.create(SAMP_BLIT_DST, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(SAMP_READ_BEFORE, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(SAMP_READ_AFTER, B8G8R8A8_UNORM, tex, SIDE)
 
     rig = Rig(c)
 
@@ -169,6 +213,7 @@ def build():
         c.inline_write(ARR_DST, pattern(10 + layer, SIDE, SIDE), SIDE, SIDE, SIDE * 4, z=layer)
     for slice_ in range(SLICES):
         c.inline_write(VOL_SRC, pattern(20 + slice_, SIDE, SIDE), SIDE, SIDE, SIDE * 4, z=slice_)
+    c.inline_write(SAMP_SRC, pattern(30, SIDE, SIDE), SIDE, SIDE, SIDE * 4)
 
     c.blit(ARR_SRC, B8G8R8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
            ARR_DST, B8G8R8A8_UNORM, (0, 0, BLIT_LAYER, SIDE, SIDE, 1))
@@ -180,14 +225,24 @@ def build():
     c.blit(VOL_SRC, B8G8R8X8_UNORM, (0, 0, 1, SIDE, SIDE, 1),
            VOL_READ_1, B8G8R8A8_UNORM, (0, 0, 0, SIDE, SIDE, 1))
 
-    rig.sample(ARR_DST, B8G8R8A8_UNORM, TARGET_2D_ARRAY, BLIT_LAYER,
-               ARR_READ_2, B8G8R8A8_UNORM, SIDE, last_layer=LAYERS - 1)
-    rig.sample(ARR_DST, B8G8R8A8_UNORM, TARGET_2D_ARRAY, 0,
-               ARR_READ_0, B8G8R8A8_UNORM, SIDE, last_layer=LAYERS - 1)
+    arr_view = rig.view(ARR_DST, B8G8R8A8_UNORM, TARGET_2D_ARRAY, last_layer=LAYERS - 1)
+    rig.sample(arr_view, TARGET_2D_ARRAY, BLIT_LAYER, ARR_READ_2, B8G8R8A8_UNORM, SIDE)
+    rig.sample(arr_view, TARGET_2D_ARRAY, 0, ARR_READ_0, B8G8R8A8_UNORM, SIDE)
+
+    # One view, reading the texture with red and blue swapped. Draw through it, blit out of the
+    # same texture -- which writes the format's own swizzle over the view's -- then re-bind the
+    # SAME view and draw again. The two reads agreeing would mean the view's swizzle survived
+    # the blit.
+    samp_view = rig.view(SAMP_SRC, B8G8R8X8_UNORM, TARGET_2D, swizzle=SAMP_VIEW_SWIZZLE)
+    rig.sample(samp_view, TARGET_2D, 0, SAMP_READ_BEFORE, B8G8R8A8_UNORM, SIDE)
+    c.blit(SAMP_SRC, B8G8R8X8_UNORM, (0, 0, 0, SIDE, SIDE, 1),
+           SAMP_BLIT_DST, B8G8R8A8_UNORM, (0, 0, 0, SIDE, SIDE, 1))
+    rig.sample(samp_view, TARGET_2D, 0, SAMP_READ_AFTER, B8G8R8A8_UNORM, SIDE)
     c.submit()
 
     # The sweep reads each scored offscreen AT its unref, so everything it scores is unref'd.
-    for h in (ARR_SRC, ARR_READ_2, ARR_READ_0, VOL_READ_5, VOL_READ_1):
+    for h in (ARR_SRC, ARR_READ_2, ARR_READ_0, VOL_READ_5, VOL_READ_1,
+              SAMP_BLIT_DST, SAMP_READ_BEFORE, SAMP_READ_AFTER):
         c.unref(h)
     c.submit()
     return c
