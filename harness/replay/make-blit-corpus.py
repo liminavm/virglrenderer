@@ -22,10 +22,9 @@
 #   redblue    An IOSurface-backed BGRA resource cannot be viewed, so a blit that names it in the
 #              opposite channel order has to swap red and blue in the shader.
 #
-# What is deliberately NOT here: the depth-writing variants (`blit_build_frag_depth`). The score
-# reads back colour offscreens, so a depth destination would sit in the corpus looking covered
-# while measuring nothing. They need a corpus that samples the blitted depth into a colour
-# target, which needs shaders, which is a different corpus.
+# Every destination here is a plain 2D colour offscreen, which is what the replay sweep reads
+# back. The blits whose destinations it cannot read -- a layer of an array, a depth texture --
+# are in `make-sampled-corpus.py`, which scores them through a draw.
 #
 # Sources are filled by RESOURCE_INLINE_WRITE rather than TRANSFER3D: the bytes travel in the
 # command stream, so the corpus needs no iov and no XFERDATA records to be replayable.
@@ -33,36 +32,14 @@
 # Every destination is exactly the size of the region its blit writes. The score reads a whole
 # resource back, so a destination larger than its blit would carry uninitialised storage into the
 # hash -- which is not a pinnable number: two runs of the C alone disagree on it.
-import struct, sys, zlib
+import sys, zlib
 
-MAGIC = 0x4C4D5654
-HDR = struct.Struct("<IBBHQQII")   # total_len, type, cmd, ctx, seq, mono_ns, payload_len, aux_count
-RES = struct.Struct("<Q12I")       # seq, kind, handle, target, format, bind, w, h, d, array, levels, samples, flags
-
-T_SUBMIT, T_CMD = 1, 2
-RES_CREATE, RES_UNREF = 0, 2
-CCMD_INLINE_WRITE, CCMD_BLIT = 9, 16
-
-CTX = 1
-TARGET_2D = 2
-
-# virgl_hw.h format numbers. The A/X pairs are what force `needs_swizzle`.
-B8G8R8A8_UNORM, B8G8R8X8_UNORM = 1, 2
-R8G8B8A8_UNORM, R8G8B8X8_UNORM = 67, 134
-B8G8R8A8_SRGB, B8G8R8X8_SRGB = 100, 101
-
-BIND_RENDER_TARGET = 1 << 1
-BIND_SAMPLER_VIEW = 1 << 3
-BIND_SCANOUT = 1 << 18
-
-PIPE_MASK_RGBA = 0xF
-FILTER_NEAREST, FILTER_LINEAR = 0, 1
+from corpus import (Corpus, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW, BIND_SCANOUT,
+                    FILTER_NEAREST, FILTER_LINEAR,
+                    B8G8R8A8_UNORM, B8G8R8X8_UNORM, R8G8B8A8_UNORM, R8G8B8X8_UNORM,
+                    B8G8R8A8_SRGB, B8G8R8X8_SRGB)
 
 SIDE = 64   # every resource is SIDE x SIDE; the sweep scores 2D colour targets wider than 8
-
-
-def cmd0(cmd, obj, length):
-    return cmd | (obj << 8) | (length << 16)
 
 
 def source_pixels(handle):
@@ -76,52 +53,13 @@ def source_pixels(handle):
     return bytes(px)
 
 
-class Corpus:
-    def __init__(self):
-        self.res = []
-        self.recs = []
-        self.seq = 1
+def fill(c, handle):
+    c.inline_write(handle, source_pixels(handle), SIDE, SIDE, SIDE * 4)
 
-    def create(self, handle, fmt, bind, side=None):
-        side = SIDE if side is None else side
-        self.res.append(RES.pack(self.seq, RES_CREATE, handle, TARGET_2D, fmt, bind,
-                                 side, side, 1, 1, 0, 0, 0))
 
-    def unref(self, handle):
-        self.res.append(RES.pack(self.seq, RES_UNREF, handle, TARGET_2D, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-
-    def record(self, typ, cmd, aux, payload):
-        total = HDR.size + len(aux) * 4 + len(payload)
-        self.recs.append(HDR.pack(total, typ, cmd, CTX, self.seq, self.seq * 1000,
-                                  len(payload), len(aux))
-                         + struct.pack("<%dI" % len(aux), *aux) + payload)
-        self.seq += 1
-
-    def submit(self):
-        self.record(T_SUBMIT, 0, (0,), b"")
-
-    def command(self, ccmd, dwords):
-        self.record(T_CMD, ccmd, (), struct.pack("<%dI" % len(dwords), *dwords))
-
-    def fill(self, handle):
-        px = source_pixels(handle)
-        dw = list(struct.unpack("<%dI" % (len(px) // 4), px))
-        body = [handle, 0, 0, SIDE * 4, 0, 0, 0, 0, SIDE, SIDE, 1] + dw
-        self.command(CCMD_INLINE_WRITE, [cmd0(CCMD_INLINE_WRITE, 0, len(body))] + body)
-
-    def blit(self, src, src_fmt, dst, dst_fmt, dst_side=SIDE, filt=FILTER_NEAREST):
-        s0 = PIPE_MASK_RGBA | (filt << 8)
-        body = [s0, 0, 0,
-                dst, 0, dst_fmt, 0, 0, 0, dst_side, dst_side, 1,
-                src, 0, src_fmt, 0, 0, 0, SIDE, SIDE, 1]
-        self.command(CCMD_BLIT, [cmd0(CCMD_BLIT, 0, len(body))] + body)
-
-    def dump(self):
-        body = b"".join(self.res) + b"".join(self.recs)
-        # head[13] is `res_full`: the resource ring OVERFLOWED and the log no longer reaches
-        # the start. A synthesised log is complete by construction, so it is 0.
-        head = [MAGIC, 2, 512, len(body), len(self.recs), 0, 0, 0, 0, 0, 0, 0, len(self.res), 0, 0, 0]
-        return struct.pack("<16I", *head) + body
+def blit(c, src, src_fmt, dst, dst_fmt, dst_side=SIDE, filt=FILTER_NEAREST):
+    c.blit(src, src_fmt, (0, 0, 0, SIDE, SIDE, 1),
+           dst, dst_fmt, (0, 0, 0, dst_side, dst_side, 1), filt=filt)
 
 
 def build():
@@ -153,17 +91,17 @@ def build():
 
     c.submit()
     for _, src, src_fmt, dst, dst_fmt, dst_side, _ in variants:
-        c.create(src, src_fmt, tex)
-        c.create(dst, dst_fmt, tex, side=dst_side)
-    c.create(REDBLUE_SRC, R8G8B8A8_UNORM, tex)
-    c.create(REDBLUE_DST, B8G8R8A8_UNORM, tex | BIND_SCANOUT, side=SIDE // 2)
+        c.create(src, src_fmt, tex, SIDE)
+        c.create(dst, dst_fmt, tex, dst_side)
+    c.create(REDBLUE_SRC, R8G8B8A8_UNORM, tex, SIDE)
+    c.create(REDBLUE_DST, B8G8R8A8_UNORM, tex | BIND_SCANOUT, SIDE // 2)
 
     for _, src, src_fmt, dst, dst_fmt, dst_side, filt in variants:
-        c.fill(src)
-        c.blit(src, src_fmt, dst, dst_fmt, dst_side=dst_side, filt=filt)
-    c.fill(REDBLUE_SRC)
-    c.blit(REDBLUE_SRC, R8G8B8A8_UNORM, REDBLUE_DST, R8G8B8A8_UNORM,
-           dst_side=SIDE // 2, filt=FILTER_LINEAR)
+        fill(c, src)
+        blit(c, src, src_fmt, dst, dst_fmt, dst_side=dst_side, filt=filt)
+    fill(c, REDBLUE_SRC)
+    blit(c, REDBLUE_SRC, R8G8B8A8_UNORM, REDBLUE_DST, R8G8B8A8_UNORM,
+         dst_side=SIDE // 2, filt=FILTER_LINEAR)
     c.submit()
 
     # Unref every scored offscreen: the sweep reads each back AT its unref. The scanout is left
