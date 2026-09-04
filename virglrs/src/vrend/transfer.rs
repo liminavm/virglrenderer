@@ -14,6 +14,7 @@
 //! Bounds are checked in `u64` and refused, never truncated: the C computes its sizes in
 //! `GLuint`, and a box past 4 GiB wraps into an accepted transfer.
 
+use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{GLenum, GLint, GLsizei, Gl, TextureName, pixel_bytes};
@@ -463,31 +464,46 @@ pub fn attachment_for(res: &Resource, formats: &Table) -> GLenum {
     }
 }
 
+/// Why a texture could not be attached to a framebuffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unattachable {
+    /// The resource has no texture behind it.
+    NotATexture,
+    /// The shape needs an entry point this host lacks.
+    NoFeature(Feature),
+}
+
 /// Attach `level` of a texture to the bound framebuffer at `attachment`: one `layer` of it, or
-/// every layer when `None` (`vrend_fb_bind_texture_id` with a layer of -1). `false` when the
-/// resource is not a texture or the driver lacks the entry point the shape needs.
+/// every layer when `None` (`vrend_fb_bind_texture_id` with a layer of -1).
 pub fn attach(
     gl: &Gl,
+    features: &Features,
     res: &Resource,
     attachment: GLenum,
     level: GLint,
     layer: Option<GLint>,
-) -> bool {
+) -> Result<(), Unattachable> {
     let Storage::Texture { name, target, .. } = &res.storage else {
-        return false;
+        return Err(Unattachable::NotATexture);
     };
-    attach_texture(gl, *target, *name, attachment, level, layer)
+    attach_texture(gl, features, *target, *name, attachment, level, layer)
+        .map_err(Unattachable::NoFeature)
 }
 
-/// [`attach`] for a texture named directly -- a resource's own, or a view of it.
+/// [`attach`] for a texture named directly -- a resource's own, or a view of it. Every layer
+/// of a layered texture at once needs `glFramebufferTexture`, which GLES has with geometry
+/// shaders; one slice of a 3D texture needs `GL_OES_texture_3D`.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_texture(
     gl: &Gl,
+    features: &Features,
     target: GLenum,
     name: TextureName,
     attachment: GLenum,
     level: GLint,
     layer: Option<GLint>,
-) -> bool {
+) -> Result<(), Feature> {
+    let need = |feature: Feature| if features.has(feature) { Ok(()) } else { Err(feature) };
     let name = &name;
     match (target, layer) {
         (
@@ -498,18 +514,16 @@ pub fn attach_texture(
             | GL_TEXTURE_CUBE_MAP,
             None,
         ) => {
-            if !gl.framebuffer_texture(attachment, Some(*name), level) {
-                return false;
-            }
+            need(Feature::geometry_shader)?;
+            gl.framebuffer_texture(attachment, Some(*name), level);
         }
         (
             GL_TEXTURE_2D_ARRAY | GL_TEXTURE_2D_MULTISAMPLE_ARRAY | GL_TEXTURE_CUBE_MAP_ARRAY,
             Some(layer),
         ) => gl.framebuffer_texture_layer(attachment, Some(*name), level, layer),
         (GL_TEXTURE_3D, Some(layer)) => {
-            if !gl.framebuffer_texture_3d(attachment, Some(*name), level, layer) {
-                return false;
-            }
+            need(Feature::texture_3d_attach)?;
+            gl.framebuffer_texture_3d(attachment, Some(*name), level, layer);
         }
         (GL_TEXTURE_CUBE_MAP, Some(layer)) => gl.framebuffer_texture_2d(
             attachment,
@@ -522,13 +536,14 @@ pub fn attach_texture(
     if attachment == GL_DEPTH_ATTACHMENT {
         gl.framebuffer_texture_2d(GL_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
     }
-    true
+    Ok(())
 }
 
 /// Read one layer of the box out of a texture through a framebuffer: `do_readpixels`.
 #[allow(clippy::too_many_arguments)]
 fn read_layer(
     gl: &Gl,
+    features: &Features,
     formats: &Table,
     res: &Resource,
     level: u32,
@@ -543,7 +558,7 @@ fn read_layer(
     let fb = gl.gen_framebuffer();
     gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
     let attachment = attachment_for(res, formats);
-    let attached = attach(gl, res, attachment, level as GLint, Some(layer));
+    let attached = attach(gl, features, res, attachment, level as GLint, Some(layer)).is_ok();
     gl.drain_errors();
     let read = attached && gl.read_pixels(x, y, w, h, entry.gl.glformat, entry.gl.gltype, dst);
     let err = gl.drain_errors();
@@ -561,6 +576,7 @@ fn read_layer(
 /// Copy the box from the resource into the pages: `vrend_renderer_transfer_send_iov`.
 pub fn read(
     gl: &Gl,
+    features: &Features,
     formats: &Table,
     res: &Resource,
     own: Option<&Iov<'_>>,
@@ -635,6 +651,7 @@ pub fn read(
                 let dst = &mut data[d * layer..(d + 1) * layer];
                 let r = read_layer(
                     gl,
+                    features,
                     formats,
                     res,
                     info.level,

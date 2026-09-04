@@ -34,6 +34,7 @@ pub mod gles {
 use core::ffi::CStr;
 
 use super::egl::Image;
+use super::features::Feature;
 
 pub use gles::Gles;
 use gles::*;
@@ -139,6 +140,142 @@ fn image_bytes(format: GLenum, ty: GLenum, w: GLsizei, h: GLsizei, d: GLsizei) -
     px.checked_mul(dim(w)?)?.checked_mul(dim(h)?)?.checked_mul(dim(d)?)
 }
 
+/// What a wrapper behind a feature does when its proc is absent: `Features::reconcile`
+/// withdrew every feature whose procs are missing at init, so a caller that checked the
+/// feature and still got here found a hole in that table -- a host bug, not a guest one.
+fn promised<T>(proc: Option<T>, feature: Feature, name: &str) -> T {
+    proc.unwrap_or_else(|| {
+        panic!("{name} is behind {}, which reconcile should have withdrawn", feature.name())
+    })
+}
+
+/// The entry points a feature stands for, each resolved to whichever spelling the driver
+/// exports. A resolver is the one place its spellings are listed: the wrapper takes its proc
+/// from it, and [`Gl::missing_procs`] asks the same resolver, so `Features::reconcile`
+/// withdraws a feature before any wrapper could find its proc absent.
+mod procs {
+    use super::gles::*;
+    use super::{
+        Feature, GLbitfield, GLboolean, GLchar, GLeglImageOES, GLenum, GLfloat, GLint, GLintptr,
+        GLsizei, GLsizeiptr, GLuint,
+    };
+    use core::ffi::c_void;
+
+    macro_rules! resolver {
+        ($name:ident: $sig:ty = $first:ident $(, $rest:ident)* $(,)?) => {
+            pub fn $name(t: &Gles) -> Option<$sig> {
+                t.$first() $(.or_else(|| t.$rest()))*
+            }
+        };
+    }
+
+    resolver!(color_mask_i: unsafe extern "C" fn(GLuint, GLboolean, GLboolean, GLboolean, GLboolean)
+        = try_glColorMaski, try_glColorMaskiEXT, try_glColorMaskiOES);
+    resolver!(enable_i: unsafe extern "C" fn(GLenum, GLuint) = try_glEnablei, try_glEnableiEXT, try_glEnableiOES);
+    resolver!(disable_i: unsafe extern "C" fn(GLenum, GLuint) = try_glDisablei, try_glDisableiEXT, try_glDisableiOES);
+    resolver!(blend_func_separate_i: unsafe extern "C" fn(GLuint, GLenum, GLenum, GLenum, GLenum)
+        = try_glBlendFuncSeparatei, try_glBlendFuncSeparateiEXT, try_glBlendFuncSeparateiOES);
+    resolver!(blend_equation_separate_i: unsafe extern "C" fn(GLuint, GLenum, GLenum)
+        = try_glBlendEquationSeparatei, try_glBlendEquationSeparateiEXT, try_glBlendEquationSeparateiOES);
+    resolver!(min_sample_shading: unsafe extern "C" fn(GLfloat) = try_glMinSampleShading, try_glMinSampleShadingOES);
+    resolver!(clip_control: unsafe extern "C" fn(GLenum, GLenum) = try_glClipControlEXT);
+    resolver!(sampler_parameter_iuiv: unsafe extern "C" fn(GLuint, GLenum, *const GLuint)
+        = try_glSamplerParameterIuiv, try_glSamplerParameterIuivEXT, try_glSamplerParameterIuivOES);
+    resolver!(framebuffer_texture: unsafe extern "C" fn(GLenum, GLenum, GLuint, GLint)
+        = try_glFramebufferTexture, try_glFramebufferTextureEXT, try_glFramebufferTextureOES);
+    resolver!(framebuffer_texture_3d: unsafe extern "C" fn(GLenum, GLenum, GLenum, GLuint, GLint, GLint)
+        = try_glFramebufferTexture3DOES);
+    resolver!(texture_view: unsafe extern "C" fn(GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint)
+        = try_glTextureViewOES, try_glTextureViewEXT);
+    resolver!(egl_image_target_tex_storage: unsafe extern "C" fn(GLenum, GLeglImageOES, *const GLint)
+        = try_glEGLImageTargetTexStorageEXT);
+    resolver!(egl_image_target_texture_2d: unsafe extern "C" fn(GLenum, GLeglImageOES)
+        = try_glEGLImageTargetTexture2DOES);
+    resolver!(copy_image_sub_data: unsafe extern "C" fn(GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei)
+        = try_glCopyImageSubData, try_glCopyImageSubDataEXT, try_glCopyImageSubDataOES);
+    resolver!(tex_buffer: unsafe extern "C" fn(GLenum, GLenum, GLuint) = try_glTexBuffer, try_glTexBufferEXT, try_glTexBufferOES);
+    resolver!(tex_buffer_range: unsafe extern "C" fn(GLenum, GLenum, GLuint, GLintptr, GLsizeiptr)
+        = try_glTexBufferRange, try_glTexBufferRangeEXT, try_glTexBufferRangeOES);
+    resolver!(clear_tex_sub_image: unsafe extern "C" fn(GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, *const c_void)
+        = try_glClearTexSubImageEXT);
+    resolver!(bind_frag_data_location_indexed: unsafe extern "C" fn(GLuint, GLuint, GLuint, *const GLchar)
+        = try_glBindFragDataLocationIndexedEXT);
+    resolver!(draw_arrays_instanced_base_instance: unsafe extern "C" fn(GLenum, GLint, GLsizei, GLsizei, GLuint)
+        = try_glDrawArraysInstancedBaseInstanceEXT);
+    resolver!(draw_elements_instanced_base_instance: unsafe extern "C" fn(GLenum, GLsizei, GLenum, *const c_void, GLsizei, GLuint)
+        = try_glDrawElementsInstancedBaseInstanceEXT);
+    resolver!(draw_elements_instanced_base_vertex_base_instance: unsafe extern "C" fn(GLenum, GLsizei, GLenum, *const c_void, GLsizei, GLint, GLuint)
+        = try_glDrawElementsInstancedBaseVertexBaseInstanceEXT);
+    resolver!(multi_draw_arrays_indirect: unsafe extern "C" fn(GLenum, *const c_void, GLsizei, GLsizei)
+        = try_glMultiDrawArraysIndirectEXT);
+    resolver!(multi_draw_elements_indirect: unsafe extern "C" fn(GLenum, GLenum, *const c_void, GLsizei, GLsizei)
+        = try_glMultiDrawElementsIndirectEXT);
+    resolver!(bind_program_pipeline: unsafe extern "C" fn(GLuint) = try_glBindProgramPipeline, try_glBindProgramPipelineEXT);
+    resolver!(tex_storage_3d_multisample: unsafe extern "C" fn(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei, GLboolean)
+        = try_glTexStorage3DMultisample);
+    resolver!(buffer_storage: unsafe extern "C" fn(GLenum, GLsizeiptr, *const c_void, GLbitfield) = try_glBufferStorageEXT);
+
+    /// One proc a feature stands for: the feature, the name a message gives it, and whether the
+    /// driver exported any of its spellings.
+    pub type Behind = (Feature, &'static str, fn(&Gles) -> bool);
+
+    /// Every proc a feature stands for, with the feature and the name a message gives it.
+    pub const BEHIND: &[Behind] = &[
+        (Feature::indep_blend, "glColorMaski", |t| color_mask_i(t).is_some()),
+        (Feature::indep_blend, "glEnablei", |t| enable_i(t).is_some()),
+        (Feature::indep_blend, "glDisablei", |t| disable_i(t).is_some()),
+        (Feature::indep_blend_func, "glBlendFuncSeparatei", |t| blend_func_separate_i(t).is_some()),
+        (Feature::indep_blend_func, "glBlendEquationSeparatei", |t| {
+            blend_equation_separate_i(t).is_some()
+        }),
+        (Feature::sample_shading, "glMinSampleShading", |t| min_sample_shading(t).is_some()),
+        (Feature::clip_control, "glClipControlEXT", |t| clip_control(t).is_some()),
+        (Feature::sampler_border_colors, "glSamplerParameterIuiv", |t| {
+            sampler_parameter_iuiv(t).is_some()
+        }),
+        (Feature::geometry_shader, "glFramebufferTexture", |t| framebuffer_texture(t).is_some()),
+        (Feature::texture_3d_attach, "glFramebufferTexture3DOES", |t| {
+            framebuffer_texture_3d(t).is_some()
+        }),
+        (Feature::texture_view, "glTextureView", |t| texture_view(t).is_some()),
+        (Feature::egl_image_storage, "glEGLImageTargetTexStorageEXT", |t| {
+            egl_image_target_tex_storage(t).is_some()
+        }),
+        (Feature::egl_image, "glEGLImageTargetTexture2DOES", |t| {
+            egl_image_target_texture_2d(t).is_some()
+        }),
+        (Feature::copy_image, "glCopyImageSubData", |t| copy_image_sub_data(t).is_some()),
+        (Feature::arb_or_gles_ext_texture_buffer, "glTexBuffer", |t| tex_buffer(t).is_some()),
+        (Feature::texture_buffer_range, "glTexBufferRange", |t| tex_buffer_range(t).is_some()),
+        (Feature::clear_texture, "glClearTexSubImageEXT", |t| clear_tex_sub_image(t).is_some()),
+        (Feature::dual_src_blend, "glBindFragDataLocationIndexedEXT", |t| {
+            bind_frag_data_location_indexed(t).is_some()
+        }),
+        (Feature::base_instance, "glDrawArraysInstancedBaseInstanceEXT", |t| {
+            draw_arrays_instanced_base_instance(t).is_some()
+        }),
+        (Feature::base_instance, "glDrawElementsInstancedBaseInstanceEXT", |t| {
+            draw_elements_instanced_base_instance(t).is_some()
+        }),
+        (Feature::base_instance, "glDrawElementsInstancedBaseVertexBaseInstanceEXT", |t| {
+            draw_elements_instanced_base_vertex_base_instance(t).is_some()
+        }),
+        (Feature::multi_draw_indirect, "glMultiDrawArraysIndirectEXT", |t| {
+            multi_draw_arrays_indirect(t).is_some()
+        }),
+        (Feature::multi_draw_indirect, "glMultiDrawElementsIndirectEXT", |t| {
+            multi_draw_elements_indirect(t).is_some()
+        }),
+        (Feature::separate_shader_objects, "glBindProgramPipeline", |t| {
+            bind_program_pipeline(t).is_some()
+        }),
+        (Feature::storage_multisample_2d_array, "glTexStorage3DMultisample", |t| {
+            tex_storage_3d_multisample(t).is_some()
+        }),
+        (Feature::arb_buffer_storage, "glBufferStorageEXT", |t| buffer_storage(t).is_some()),
+    ];
+}
+
 /// The driver's entry points behind a safe surface.
 pub struct Gl {
     t: Gles,
@@ -152,6 +289,16 @@ impl Gl {
     /// The raw table, for the census of what the driver exports.
     pub fn table(&self) -> &Gles {
         &self.t
+    }
+
+    /// The features whose entry points the driver did not hand over, each with the proc it
+    /// lacks. `Features::reconcile` withdraws them.
+    pub fn missing_procs(&self) -> Vec<(Feature, &'static str)> {
+        procs::BEHIND
+            .iter()
+            .filter(|(_, _, present)| !present(&self.t))
+            .map(|(f, name, _)| (*f, *name))
+            .collect()
     }
 
     // ---- queries ----
@@ -406,13 +553,14 @@ impl Gl {
         w: GLsizei,
         h: GLsizei,
         d: GLsizei,
-    ) -> bool {
-        let Some(f) = self.t.try_glTexStorage3DMultisample() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::tex_storage_3d_multisample(&self.t),
+            Feature::storage_multisample_2d_array,
+            "glTexStorage3DMultisample",
+        );
         // SAFETY: plain scalars.
         unsafe { f(target, samples, internalformat, w, h, d, GL_TRUE as _) };
-        true
     }
 
     pub fn tex_parameter_i(&self, target: GLenum, name: GLenum, value: GLint) {
@@ -631,8 +779,12 @@ impl Gl {
     }
 
     pub fn buffer_storage_null(&self, target: GLenum, size: usize, flags: GLbitfield) -> bool {
-        let (Some(f), Ok(size)) = (self.t.try_glBufferStorageEXT(), GLsizeiptr::try_from(size))
-        else {
+        let f = promised(
+            procs::buffer_storage(&self.t),
+            Feature::arb_buffer_storage,
+            "glBufferStorageEXT",
+        );
+        let Ok(size) = GLsizeiptr::try_from(size) else {
             return false;
         };
         // SAFETY: a null data pointer allocates without reading.
@@ -738,22 +890,23 @@ impl Gl {
         };
     }
 
-    /// `glFramebufferTexture3DOES`: one slice of a 3D texture. `false` if the driver lacks it.
+    /// `glFramebufferTexture3DOES`: one slice of a 3D texture.
     pub fn framebuffer_texture_3d(
         &self,
         attachment: GLenum,
         tex: Option<TextureName>,
         level: GLint,
         layer: GLint,
-    ) -> bool {
-        let Some(f) = self.t.try_glFramebufferTexture3DOES() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::framebuffer_texture_3d(&self.t),
+            Feature::texture_3d_attach,
+            "glFramebufferTexture3DOES",
+        );
         // SAFETY: plain scalars.
         unsafe {
             f(GL_FRAMEBUFFER, attachment, GL_TEXTURE_3D, tex.map_or(0, |t| t.0), level, layer)
         };
-        true
     }
 
     pub fn check_framebuffer_status(&self) -> GLenum {
@@ -774,30 +927,19 @@ impl Gl {
         unsafe { self.t.glReadBuffer()(src) };
     }
 
-    /// `glFramebufferTexture`: every layer of a layered texture. `false` if the driver has none
-    /// of the three spellings.
-    pub fn framebuffer_texture(
-        &self,
-        attachment: GLenum,
-        tex: Option<TextureName>,
-        level: GLint,
-    ) -> bool {
-        let f = self
-            .t
-            .try_glFramebufferTexture()
-            .or_else(|| self.t.try_glFramebufferTextureEXT())
-            .or_else(|| self.t.try_glFramebufferTextureOES());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glFramebufferTexture`: every layer of a layered texture.
+    pub fn framebuffer_texture(&self, attachment: GLenum, tex: Option<TextureName>, level: GLint) {
+        let f = promised(
+            procs::framebuffer_texture(&self.t),
+            Feature::geometry_shader,
+            "glFramebufferTexture",
+        );
         // SAFETY: plain scalars.
         unsafe { f(GL_FRAMEBUFFER, attachment, tex.map_or(0, |t| t.0), level) };
-        true
     }
 
-    /// `glTextureView` in whichever spelling the driver exports: `view` becomes a view of
-    /// `levels` levels from `first_level` and `layers` layers from `first_layer` of `tex`.
-    /// `false` if the driver has none.
+    /// `glTextureView`: `view` becomes a view of `levels` levels from `first_level` and
+    /// `layers` layers from `first_layer` of `tex`.
     #[allow(clippy::too_many_arguments)]
     pub fn texture_view(
         &self,
@@ -809,39 +951,35 @@ impl Gl {
         levels: GLuint,
         first_layer: GLuint,
         layers: GLuint,
-    ) -> bool {
-        let f = self.t.try_glTextureViewOES().or_else(|| self.t.try_glTextureViewEXT());
-        let Some(f) = f else {
-            return false;
-        };
+    ) {
+        let f = promised(procs::texture_view(&self.t), Feature::texture_view, "glTextureView");
         // SAFETY: plain scalars.
         unsafe {
             f(view.0, target, tex.0, internalformat, first_level, levels, first_layer, layers)
         };
-        true
     }
 
     /// `glEGLImageTargetTexStorageEXT`: the bound texture takes `image` as immutable storage.
-    /// `false` if the driver has none.
-    pub fn egl_image_target_tex_storage(&self, target: GLenum, image: &Image) -> bool {
-        let Some(f) = self.t.try_glEGLImageTargetTexStorageEXT() else {
-            return false;
-        };
+    pub fn egl_image_target_tex_storage(&self, target: GLenum, image: &Image) {
+        let f = promised(
+            procs::egl_image_target_tex_storage(&self.t),
+            Feature::egl_image_storage,
+            "glEGLImageTargetTexStorageEXT",
+        );
         // SAFETY: `image` is a live EGL image on this display, held by the caller across the
         // call; a null attribute list is the documented empty one.
         unsafe { f(target, image.raw(), core::ptr::null()) };
-        true
     }
 
     /// `glEGLImageTargetTexture2DOES`: the bound texture takes `image` as (mutable) storage.
-    /// `false` if the driver has none.
-    pub fn egl_image_target_texture_2d(&self, target: GLenum, image: &Image) -> bool {
-        let Some(f) = self.t.try_glEGLImageTargetTexture2DOES() else {
-            return false;
-        };
+    pub fn egl_image_target_texture_2d(&self, target: GLenum, image: &Image) {
+        let f = promised(
+            procs::egl_image_target_texture_2d(&self.t),
+            Feature::egl_image,
+            "glEGLImageTargetTexture2DOES",
+        );
         // SAFETY: as above.
         unsafe { f(target, image.raw()) };
-        true
     }
 
     pub fn framebuffer_parameter_i(&self, name: GLenum, value: GLint) {
@@ -866,7 +1004,7 @@ impl Gl {
         };
     }
 
-    /// `glCopyImageSubData`, in whichever spelling the driver exports. `false` if none.
+    /// `glCopyImageSubData`.
     #[allow(clippy::too_many_arguments)]
     pub fn copy_image_sub_data(
         &self,
@@ -879,15 +1017,12 @@ impl Gl {
         dst_level: GLint,
         dst_origin: [GLint; 3],
         extent: [GLsizei; 3],
-    ) -> bool {
-        let f = self
-            .t
-            .try_glCopyImageSubData()
-            .or_else(|| self.t.try_glCopyImageSubDataEXT())
-            .or_else(|| self.t.try_glCopyImageSubDataOES());
-        let Some(f) = f else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::copy_image_sub_data(&self.t),
+            Feature::copy_image,
+            "glCopyImageSubData",
+        );
         // SAFETY: plain scalars.
         unsafe {
             f(
@@ -908,7 +1043,6 @@ impl Gl {
                 extent[2],
             )
         };
-        true
     }
 
     pub fn copy_buffer_sub_data(
@@ -930,47 +1064,41 @@ impl Gl {
     }
 
     /// `glTexBufferRange` on the bound `GL_TEXTURE_BUFFER`, or `glTexBuffer` when `range` is
-    /// `None`. `false` if the driver has neither spelling of the one asked for.
+    /// `None`. A range is bounded by the decoder against `max_texture_buffer_size`, a `u32`,
+    /// so it always fits the driver's pointer-sized offset and size.
     pub fn tex_buffer(
         &self,
         internalformat: GLenum,
         buf: BufferName,
         range: Option<(usize, usize)>,
-    ) -> bool {
+    ) {
         match range {
             Some((offset, size)) => {
-                let f = self
-                    .t
-                    .try_glTexBufferRange()
-                    .or_else(|| self.t.try_glTexBufferRangeEXT())
-                    .or_else(|| self.t.try_glTexBufferRangeOES());
-                let (Some(f), Ok(offset), Ok(size)) =
-                    (f, GLintptr::try_from(offset), GLsizeiptr::try_from(size))
-                else {
-                    return false;
-                };
+                let f = promised(
+                    procs::tex_buffer_range(&self.t),
+                    Feature::texture_buffer_range,
+                    "glTexBufferRange",
+                );
+                let offset = GLintptr::try_from(offset).expect("a range the decoder bounded");
+                let size = GLsizeiptr::try_from(size).expect("a range the decoder bounded");
                 // SAFETY: plain scalars.
                 unsafe { f(GL_TEXTURE_BUFFER, internalformat, buf.0, offset, size) };
             }
             None => {
-                let f = self
-                    .t
-                    .try_glTexBuffer()
-                    .or_else(|| self.t.try_glTexBufferEXT())
-                    .or_else(|| self.t.try_glTexBufferOES());
-                let Some(f) = f else {
-                    return false;
-                };
+                let f = promised(
+                    procs::tex_buffer(&self.t),
+                    Feature::arb_or_gles_ext_texture_buffer,
+                    "glTexBuffer",
+                );
                 // SAFETY: plain scalars.
                 unsafe { f(GL_TEXTURE_BUFFER, internalformat, buf.0) };
             }
         }
-        true
     }
 
-    /// `glClearTexSubImageEXT` with one pixel of `format`/`ty` as the value. Refuses a value
-    /// shorter than the pixel or a pair this crate cannot size, and a driver without the
-    /// extension.
+    /// `glClearTexSubImageEXT` with one pixel of `format`/`ty` as the value. The pair comes
+    /// from the format table, which sizes every triple it holds, and the value is the wire's
+    /// four words -- sixteen bytes, the largest pixel there is.
     #[allow(clippy::too_many_arguments)]
     pub fn clear_tex_sub_image(
         &self,
@@ -981,14 +1109,14 @@ impl Gl {
         format: GLenum,
         ty: GLenum,
         value: &[u8],
-    ) -> bool {
-        let (Some(f), Some(need)) = (self.t.try_glClearTexSubImageEXT(), pixel_bytes(format, ty))
-        else {
-            return false;
-        };
-        if value.len() < need {
-            return false;
-        }
+    ) {
+        let f = promised(
+            procs::clear_tex_sub_image(&self.t),
+            Feature::clear_texture,
+            "glClearTexSubImageEXT",
+        );
+        let need = pixel_bytes(format, ty).expect("a triple from the format table has a size");
+        assert!(value.len() >= need, "a clear value shorter than the pixel");
         // SAFETY: the driver reads one pixel -- `need` bytes -- from `value`, which holds them.
         unsafe {
             f(
@@ -1005,7 +1133,6 @@ impl Gl {
                 value.as_ptr().cast(),
             )
         };
-        true
     }
 
     // ---- fixed-function state ----
@@ -1086,16 +1213,9 @@ impl Gl {
         };
     }
 
-    /// `glColorMaski` in whichever spelling the driver exports. `false` if none.
-    pub fn color_mask_i(&self, index: GLuint, rgba: [bool; 4]) -> bool {
-        let f = self
-            .t
-            .try_glColorMaski()
-            .or_else(|| self.t.try_glColorMaskiEXT())
-            .or_else(|| self.t.try_glColorMaskiOES());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glColorMaski`.
+    pub fn color_mask_i(&self, index: GLuint, rgba: [bool; 4]) {
+        let f = promised(procs::color_mask_i(&self.t), Feature::indep_blend, "glColorMaski");
         // SAFETY: plain scalars.
         unsafe {
             f(
@@ -1106,7 +1226,6 @@ impl Gl {
                 rgba[3] as GLboolean,
             )
         };
-        true
     }
 
     pub fn clear_color(&self, rgba: [f32; 4]) {
@@ -1165,15 +1284,15 @@ impl Gl {
         unsafe { self.t.glSampleMaski()(index, mask) };
     }
 
-    /// `glMinSampleShading`. `false` if the driver has neither spelling.
-    pub fn min_sample_shading(&self, value: f32) -> bool {
-        let f = self.t.try_glMinSampleShading().or_else(|| self.t.try_glMinSampleShadingOES());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glMinSampleShading`.
+    pub fn min_sample_shading(&self, value: f32) {
+        let f = promised(
+            procs::min_sample_shading(&self.t),
+            Feature::sample_shading,
+            "glMinSampleShading",
+        );
         // SAFETY: plain scalar.
         unsafe { f(value) };
-        true
     }
 
     pub fn viewport(&self, x: GLint, y: GLint, w: GLsizei, h: GLsizei) {
@@ -1191,14 +1310,11 @@ impl Gl {
         unsafe { self.t.glDepthRangef()(near, far) };
     }
 
-    /// `glClipControlEXT`. `false` if the driver lacks it.
-    pub fn clip_control(&self, origin: GLenum, depth: GLenum) -> bool {
-        let Some(f) = self.t.try_glClipControlEXT() else {
-            return false;
-        };
+    /// `glClipControlEXT`.
+    pub fn clip_control(&self, origin: GLenum, depth: GLenum) {
+        let f = promised(procs::clip_control(&self.t), Feature::clip_control, "glClipControlEXT");
         // SAFETY: plain scalars.
         unsafe { f(origin, depth) };
-        true
     }
 
     pub fn memory_barrier(&self, barriers: GLbitfield) {
@@ -1281,19 +1397,15 @@ impl Gl {
         unsafe { self.t.glSamplerParameterf()(s.0, name, value) };
     }
 
-    /// `glSamplerParameterIuiv` for the border colour. `false` if the driver has no spelling.
-    pub fn sampler_border_color(&self, s: SamplerName, color: &[GLuint; 4]) -> bool {
-        let f = self
-            .t
-            .try_glSamplerParameterIuiv()
-            .or_else(|| self.t.try_glSamplerParameterIuivEXT())
-            .or_else(|| self.t.try_glSamplerParameterIuivOES());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glSamplerParameterIuiv` for the border colour.
+    pub fn sampler_border_color(&self, s: SamplerName, color: &[GLuint; 4]) {
+        let f = promised(
+            procs::sampler_parameter_iuiv(&self.t),
+            Feature::sampler_border_colors,
+            "glSamplerParameterIuiv",
+        );
         // SAFETY: the driver reads four values for `GL_TEXTURE_BORDER_COLOR`; `color` holds four.
         unsafe { f(s.0, GL_TEXTURE_BORDER_COLOR, color.as_ptr()) };
-        true
     }
 
     // ---- transform feedback ----
@@ -1522,21 +1634,22 @@ impl Gl {
         };
     }
 
-    /// `glBindFragDataLocationIndexedEXT`. `false` if the driver has no spelling.
+    /// `glBindFragDataLocationIndexedEXT`.
     pub fn bind_frag_data_location_indexed(
         &self,
         program: ProgramName,
         color: GLuint,
         index: GLuint,
         name: &str,
-    ) -> bool {
-        let Some(f) = self.t.try_glBindFragDataLocationIndexedEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::bind_frag_data_location_indexed(&self.t),
+            Feature::dual_src_blend,
+            "glBindFragDataLocationIndexedEXT",
+        );
         let name = std::ffi::CString::new(name).expect("an output name has no NUL");
         // SAFETY: a NUL-terminated string, live for the call.
         unsafe { f(program.0, color, index, name.as_ptr().cast::<GLchar>()) };
-        true
     }
 
     pub fn uniform_1i(&self, location: GLint, v: GLint) {
@@ -1638,7 +1751,7 @@ impl Gl {
         unsafe { self.t.glBlendEquation()(mode) };
     }
 
-    /// `glBlendFuncSeparatei` in whichever spelling the driver exports. `false` if none.
+    /// `glBlendFuncSeparatei`.
     pub fn blend_func_separate_i(
         &self,
         buf: GLuint,
@@ -1646,61 +1759,36 @@ impl Gl {
         dst_rgb: GLenum,
         src_a: GLenum,
         dst_a: GLenum,
-    ) -> bool {
-        let f = self
-            .t
-            .try_glBlendFuncSeparatei()
-            .or_else(|| self.t.try_glBlendFuncSeparateiEXT())
-            .or_else(|| self.t.try_glBlendFuncSeparateiOES());
-        let Some(f) = f else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::blend_func_separate_i(&self.t),
+            Feature::indep_blend_func,
+            "glBlendFuncSeparatei",
+        );
         // SAFETY: plain scalars.
         unsafe { f(buf, src_rgb, dst_rgb, src_a, dst_a) };
-        true
     }
 
-    /// `glBlendEquationSeparatei` in whichever spelling the driver exports. `false` if none.
-    pub fn blend_equation_separate_i(&self, buf: GLuint, rgb: GLenum, alpha: GLenum) -> bool {
-        let f = self
-            .t
-            .try_glBlendEquationSeparatei()
-            .or_else(|| self.t.try_glBlendEquationSeparateiEXT())
-            .or_else(|| self.t.try_glBlendEquationSeparateiOES());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glBlendEquationSeparatei`.
+    pub fn blend_equation_separate_i(&self, buf: GLuint, rgb: GLenum, alpha: GLenum) {
+        let f = promised(
+            procs::blend_equation_separate_i(&self.t),
+            Feature::indep_blend_func,
+            "glBlendEquationSeparatei",
+        );
         // SAFETY: plain scalars.
         unsafe { f(buf, rgb, alpha) };
-        true
     }
 
-    /// `glEnablei`/`glDisablei` in whichever spelling the driver exports. `false` if none.
-    pub fn set_enabled_i(&self, cap: GLenum, index: GLuint, on: bool) -> bool {
-        if on {
-            let f = self
-                .t
-                .try_glEnablei()
-                .or_else(|| self.t.try_glEnableiEXT())
-                .or_else(|| self.t.try_glEnableiOES());
-            let Some(f) = f else {
-                return false;
-            };
-            // SAFETY: plain scalars.
-            unsafe { f(cap, index) };
+    /// `glEnablei`/`glDisablei`.
+    pub fn set_enabled_i(&self, cap: GLenum, index: GLuint, on: bool) {
+        let f = if on {
+            promised(procs::enable_i(&self.t), Feature::indep_blend, "glEnablei")
         } else {
-            let f = self
-                .t
-                .try_glDisablei()
-                .or_else(|| self.t.try_glDisableiEXT())
-                .or_else(|| self.t.try_glDisableiOES());
-            let Some(f) = f else {
-                return false;
-            };
-            // SAFETY: plain scalars.
-            unsafe { f(cap, index) };
-        }
-        true
+            promised(procs::disable_i(&self.t), Feature::indep_blend, "glDisablei")
+        };
+        // SAFETY: plain scalars.
+        unsafe { f(cap, index) };
     }
 
     // ---- draws ----
@@ -1721,7 +1809,6 @@ impl Gl {
         unsafe { self.t.glDrawArraysInstanced()(mode, first, count, instances) };
     }
 
-    /// `false` if the driver has no spelling.
     pub fn draw_arrays_instanced_base_instance(
         &self,
         mode: GLenum,
@@ -1729,13 +1816,14 @@ impl Gl {
         count: GLsizei,
         instances: GLsizei,
         base_instance: GLuint,
-    ) -> bool {
-        let Some(f) = self.t.try_glDrawArraysInstancedBaseInstanceEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::draw_arrays_instanced_base_instance(&self.t),
+            Feature::base_instance,
+            "glDrawArraysInstancedBaseInstanceEXT",
+        );
         // SAFETY: plain scalars.
         unsafe { f(mode, first, count, instances, base_instance) };
-        true
     }
 
     /// `glDrawElements` with the indices at `offset` into the bound element buffer.
@@ -1830,7 +1918,6 @@ impl Gl {
         };
     }
 
-    /// `false` if the driver has no spelling.
     pub fn draw_elements_instanced_base_instance(
         &self,
         mode: GLenum,
@@ -1839,16 +1926,16 @@ impl Gl {
         offset: u32,
         instances: GLsizei,
         base_instance: GLuint,
-    ) -> bool {
-        let Some(f) = self.t.try_glDrawElementsInstancedBaseInstanceEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::draw_elements_instanced_base_instance(&self.t),
+            Feature::base_instance,
+            "glDrawElementsInstancedBaseInstanceEXT",
+        );
         // SAFETY: as `draw_elements`.
         unsafe { f(mode, count, ty, offset_ptr(offset), instances, base_instance) };
-        true
     }
 
-    /// `false` if the driver has no spelling.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_elements_instanced_base_vertex_base_instance(
         &self,
@@ -1859,13 +1946,14 @@ impl Gl {
         instances: GLsizei,
         base_vertex: GLint,
         base_instance: GLuint,
-    ) -> bool {
-        let Some(f) = self.t.try_glDrawElementsInstancedBaseVertexBaseInstanceEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::draw_elements_instanced_base_vertex_base_instance(&self.t),
+            Feature::base_instance,
+            "glDrawElementsInstancedBaseVertexBaseInstanceEXT",
+        );
         // SAFETY: as `draw_elements`.
         unsafe { f(mode, count, ty, offset_ptr(offset), instances, base_vertex, base_instance) };
-        true
     }
 
     /// `glDrawArraysIndirect` with the command at `offset` into the bound indirect buffer.
@@ -1879,23 +1967,22 @@ impl Gl {
         unsafe { self.t.glDrawElementsIndirect()(mode, ty, offset_ptr(offset)) };
     }
 
-    /// `false` if the driver has no spelling.
     pub fn multi_draw_arrays_indirect(
         &self,
         mode: GLenum,
         offset: u32,
         draw_count: GLsizei,
         stride: GLsizei,
-    ) -> bool {
-        let Some(f) = self.t.try_glMultiDrawArraysIndirectEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::multi_draw_arrays_indirect(&self.t),
+            Feature::multi_draw_indirect,
+            "glMultiDrawArraysIndirectEXT",
+        );
         // SAFETY: as `draw_arrays_indirect`.
         unsafe { f(mode, offset_ptr(offset), draw_count, stride) };
-        true
     }
 
-    /// `false` if the driver has no spelling.
     pub fn multi_draw_elements_indirect(
         &self,
         mode: GLenum,
@@ -1903,13 +1990,14 @@ impl Gl {
         offset: u32,
         draw_count: GLsizei,
         stride: GLsizei,
-    ) -> bool {
-        let Some(f) = self.t.try_glMultiDrawElementsIndirectEXT() else {
-            return false;
-        };
+    ) {
+        let f = promised(
+            procs::multi_draw_elements_indirect(&self.t),
+            Feature::multi_draw_indirect,
+            "glMultiDrawElementsIndirectEXT",
+        );
         // SAFETY: as `draw_arrays_indirect`.
         unsafe { f(mode, ty, offset_ptr(offset), draw_count, stride) };
-        true
     }
 
     pub fn patch_parameter_i(&self, name: GLenum, value: GLint) {
@@ -1939,16 +2027,15 @@ impl Gl {
         unsafe { self.t.glUseProgram()(0) };
     }
 
-    /// `glBindProgramPipeline(0)`. `false` if the driver has no spelling.
-    pub fn bind_program_pipeline_none(&self) -> bool {
-        let f =
-            self.t.try_glBindProgramPipeline().or_else(|| self.t.try_glBindProgramPipelineEXT());
-        let Some(f) = f else {
-            return false;
-        };
+    /// `glBindProgramPipeline(0)`.
+    pub fn bind_program_pipeline_none(&self) {
+        let f = promised(
+            procs::bind_program_pipeline(&self.t),
+            Feature::separate_shader_objects,
+            "glBindProgramPipeline",
+        );
         // SAFETY: zero is "no pipeline".
         unsafe { f(0) };
-        true
     }
 
     pub fn finish(&self) {

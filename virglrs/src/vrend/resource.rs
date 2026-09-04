@@ -676,10 +676,12 @@ fn alloc_texture(
         // The surface becomes the texture's storage: immutable where the driver can make it so,
         // else through the older entry point, which leaves the texture mutable.
         let bound = if immutable && features.has(Feature::egl_image_storage) {
-            gl.egl_image_target_tex_storage(target, &image)
+            gl.egl_image_target_tex_storage(target, &image);
+            true
         } else if features.has(Feature::egl_image) {
             immutable = false;
-            gl.egl_image_target_texture_2d(target, &image)
+            gl.egl_image_target_texture_2d(target, &image);
+            true
         } else {
             false
         };
@@ -699,11 +701,12 @@ fn alloc_texture(
                 gl.tex_storage_2d_multisample(target, samples, ifmt, w, h);
             } else {
                 let d = a.array_size as GLsizei;
-                if !gl.tex_storage_3d_multisample(target, samples, ifmt, w, h, d) {
+                if !features.has(Feature::storage_multisample_2d_array) {
                     gl.bind_texture(target, None);
                     gl.delete_texture(name);
                     return Err(Refusal::UnsupportedMultisampleFormat);
                 }
+                gl.tex_storage_3d_multisample(target, samples, ifmt, w, h, d);
             }
         }
         GL_TEXTURE_CUBE_MAP => {

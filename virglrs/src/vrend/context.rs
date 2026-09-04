@@ -191,10 +191,10 @@ pub enum Fault {
         cmd: Cmd,
         error: GLenum,
     },
-    /// The driver lacks an entry point the command needs.
-    NoEntryPoint {
+    /// The command needs a feature this host lacks, which the capset told the guest.
+    NoFeature {
         cmd: Cmd,
-        name: &'static str,
+        feature: Feature,
     },
     /// A command this build does not serve yet.
     Unimplemented {
@@ -228,8 +228,8 @@ impl fmt::Display for Fault {
             Fault::UnsupportedTexWrap(w) => write!(f, "texture wrap {} is unsupported", w.name()),
             Fault::Transfer { cmd, error } => write!(f, "{}: {error}", cmd.name()),
             Fault::Gl { cmd, error } => write!(f, "{}: GL error {error:#x}", cmd.name()),
-            Fault::NoEntryPoint { cmd, name } => {
-                write!(f, "{}: the driver has no {name}", cmd.name())
+            Fault::NoFeature { cmd, feature } => {
+                write!(f, "{}: the host has no {}", cmd.name(), feature.name())
             }
             Fault::Unimplemented { cmd, what } => {
                 write!(f, "{}: {what} is not served by this build", cmd.name())
@@ -1364,9 +1364,8 @@ impl Context {
         sub.hw_rs.flatshade = s.flatshade;
         if s.clip_halfz != sub.hw_rs.clip_halfz && features.has(Feature::clip_control) {
             let rule = if s.clip_halfz { GL_ZERO_TO_ONE_EXT } else { GL_NEGATIVE_ONE_TO_ONE_EXT };
-            if gl.clip_control(GL_LOWER_LEFT_EXT, rule) {
-                sub.hw_rs.clip_halfz = s.clip_halfz;
-            }
+            gl.clip_control(GL_LOWER_LEFT_EXT, rule);
+            sub.hw_rs.clip_halfz = s.clip_halfz;
         }
         sub.hw_rs.flatshade_first = s.flatshade_first;
         gl.polygon_offset(s.offset_scale, s.offset_units);
@@ -1660,7 +1659,7 @@ impl Context {
                 if !supports_view && resource::is_bgra(v.format) {
                     gl_swizzle.swap(0, 2);
                 }
-                if !gl.texture_view(
+                gl.texture_view(
                     name,
                     target,
                     tex,
@@ -1669,10 +1668,7 @@ impl Context {
                     levels,
                     first_layer,
                     layers as GLuint,
-                ) {
-                    gl.delete_texture(name);
-                    return Err(Fault::NoEntryPoint { cmd, name: "glTextureView" });
-                }
+                );
                 gl.bind_texture(target, Some(name));
                 if desc.is_some_and(|d| d.is_depth_or_stencil())
                     && features.has(Feature::stencil_texturing)
@@ -1755,7 +1751,7 @@ impl Context {
                     return Err(Fault::OutOfRange { cmd, what: "surface layers" });
                 }
                 let v = gl.gen_texture();
-                if !gl.texture_view(
+                gl.texture_view(
                     v,
                     target,
                     name,
@@ -1764,10 +1760,7 @@ impl Context {
                     res.args.last_level + 1,
                     fl,
                     layers as GLuint,
-                ) {
-                    gl.delete_texture(v);
-                    return Err(Fault::NoEntryPoint { cmd, name: "glTextureView" });
-                }
+                );
                 view = Some(v);
             }
         }
@@ -2249,11 +2242,16 @@ impl Context {
         if attachment == GL_COLOR_ATTACHMENT0 {
             attachment += idx;
         }
-        if !transfer::attach_texture(host.gl, target, name, attachment, s.level as GLint, s.layer())
-        {
-            return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-        }
-        Ok(())
+        transfer::attach_texture(
+            host.gl,
+            host.features,
+            target,
+            name,
+            attachment,
+            s.level as GLint,
+            s.layer(),
+        )
+        .map_err(|feature| Fault::NoFeature { cmd, feature })
     }
 
     fn set_vertex_buffers(
@@ -2374,6 +2372,14 @@ impl Context {
                 }
                 Storage::Texture { .. } => {}
                 Storage::Buffer { name, tbo, .. } => {
+                    // `create_sampler_view` refused every range on a host without buffer
+                    // textures, whose limit is zero; this is the same fact, said once more.
+                    if !features.has(Feature::arb_or_gles_ext_texture_buffer) {
+                        return Err(Fault::NoFeature {
+                            cmd,
+                            feature: Feature::arb_or_gles_ext_texture_buffer,
+                        });
+                    }
                     let tbo_tex = *tbo.get_or_insert_with(|| gl.gen_texture());
                     gl.bind_texture(GL_TEXTURE_BUFFER, Some(tbo_tex));
                     buffer_view = true;
@@ -2391,9 +2397,7 @@ impl Context {
                     } else {
                         None
                     };
-                    if !gl.tex_buffer(ifmt, *name, range) {
-                        return Err(Fault::NoEntryPoint { cmd, name: "glTexBuffer" });
-                    }
+                    gl.tex_buffer(ifmt, *name, range);
                 }
                 Storage::Guest | Storage::Host(_) => {
                     return Err(Fault::IllegalResource { cmd, handle: view.resource });
@@ -2870,7 +2874,10 @@ impl Context {
         if res.is_bgra() {
             bytes.swap(0, 2);
         }
-        if !host.gl.clear_tex_sub_image(
+        if !host.has(Feature::clear_texture) {
+            return Err(Fault::NoFeature { cmd, feature: Feature::clear_texture });
+        }
+        host.gl.clear_tex_sub_image(
             name,
             level as GLint,
             [region.x, region.y, region.z],
@@ -2878,9 +2885,7 @@ impl Context {
             entry.gl.glformat,
             entry.gl.gltype,
             &bytes,
-        ) {
-            return Err(Fault::NoEntryPoint { cmd, name: "glClearTexSubImageEXT" });
-        }
+        );
         Ok(())
     }
 }
@@ -2983,6 +2988,7 @@ impl Context {
         let guest = host.guest;
         let ctx = host.ctx;
         let formats = host.formats;
+        let features = host.features;
         let gl = host.gl;
         let Some(pages) = guest.pages(ctx, t.resource) else {
             return Err(Fault::IllegalResource { cmd, handle: t.resource });
@@ -2994,7 +3000,7 @@ impl Context {
                 transfer::write(gl, formats, res, Some(&pages), &pages, &info)
             }
             TransferDirection::FromHost => {
-                transfer::read(gl, formats, res, Some(&pages), &pages, &info)
+                transfer::read(gl, features, formats, res, Some(&pages), &pages, &info)
             }
         };
         r.map_err(|error| Fault::Transfer { cmd, error })
@@ -3014,6 +3020,7 @@ impl Context {
         let guest = host.guest;
         let ctx = host.ctx;
         let formats = host.formats;
+        let features = host.features;
         let gl = host.gl;
         let Some(staging_pages) = guest.pages(ctx, staging) else {
             return Err(Fault::IllegalResource { cmd, handle: staging });
@@ -3026,7 +3033,7 @@ impl Context {
                 transfer::write(gl, formats, res, own.as_ref(), &staging_pages, &info)
             }
             CopyDirection::FromHost => {
-                transfer::read(gl, formats, res, own.as_ref(), &staging_pages, &info)
+                transfer::read(gl, features, formats, res, own.as_ref(), &staging_pages, &info)
             }
         };
         r.map_err(|error| Fault::Transfer { cmd, error })
