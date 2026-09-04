@@ -337,6 +337,8 @@ size_t virgl_oracle_h265_offsets(size_t *out, size_t cap)
       offsetof(struct virgl_h265_picture_desc, pps.lists_modification_present_flag),
       offsetof(struct virgl_h265_picture_desc, pps.log2_parallel_merge_level_minus2),
       offsetof(struct virgl_h265_picture_desc, pps.slice_segment_header_extension_present_flag),
+      offsetof(struct virgl_h265_picture_desc, IDRPicFlag),
+      offsetof(struct virgl_h265_picture_desc, RAPPicFlag),
    };
    const size_t n = sizeof(offsets) / sizeof(offsets[0]);
 

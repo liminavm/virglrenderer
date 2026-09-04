@@ -296,6 +296,15 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         out: *mut CfTypeRef,
     ) -> Status;
+    fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        allocator: CfTypeRef,
+        parameter_set_count: usize,
+        parameter_set_pointers: *const *const u8,
+        parameter_set_sizes: *const usize,
+        nal_unit_header_length: i32,
+        extensions: CfTypeRef,
+        out: *mut CfTypeRef,
+    ) -> Status;
     fn CMBlockBufferCreateWithMemoryBlock(
         structure_allocator: CfTypeRef,
         memory_block: *mut c_void,
@@ -489,6 +498,10 @@ impl Plane<'_> {
 
 // ------------------------------------------------------------------ sessions
 
+/// The length prefix `h264::annexb_to_avcc` writes before each NAL, which is what the format
+/// description has to declare so VideoToolbox reads the same framing back.
+const NAL_LENGTH_SIZE: i32 = 4;
+
 /// The codec configuration record a format description is built around.
 ///
 /// VP9 needs a `vpcC` box; the codecs that follow bring their own shapes, which is why this is an
@@ -504,6 +517,8 @@ pub enum Configuration {
     /// NALs themselves and derives the whole format description -- the dimensions included --
     /// from them.
     H264 { sps: Vec<u8>, pps: Vec<u8> },
+    /// An HEVC VPS, SPS and PPS, as NAL units without framing.
+    Hevc { vps: Vec<u8>, sps: Vec<u8>, pps: Vec<u8> },
 }
 
 impl Configuration {
@@ -532,6 +547,11 @@ impl Configuration {
         Configuration::H264 { sps, pps }
     }
 
+    /// The HEVC record for a stream these parameter sets describe.
+    pub fn hevc(vps: Vec<u8>, sps: Vec<u8>, pps: Vec<u8>) -> Configuration {
+        Configuration::Hevc { vps, sps, pps }
+    }
+
     /// Whether this configuration is carried as parameter set NALs rather than as an atom.
     ///
     /// The two are not interchangeable and only the parameter-set kind can be swapped under a
@@ -539,7 +559,7 @@ impl Configuration {
     pub fn is_parameter_sets(&self) -> bool {
         match self {
             Configuration::Vpcc(_) => false,
-            Configuration::H264 { .. } => true,
+            Configuration::H264 { .. } | Configuration::Hevc { .. } => true,
         }
     }
 
@@ -557,11 +577,13 @@ impl Configuration {
                 height,
             ),
             Configuration::H264 { sps, pps } => {
-                let sets = [sps.as_ptr(), pps.as_ptr()];
+                let sets = [sps.as_slice(), pps.as_slice()];
+                let sets: Vec<*const u8> = sets.iter().map(|set| set.as_ptr()).collect();
                 let sizes = [sps.len(), pps.len()];
                 let mut format = std::ptr::null();
-                // SAFETY: two pointers and two lengths reconciled here, from slices that outlive
-                // the call; the constructor copies what it reads. The result is wrapped at once.
+                // SAFETY: the pointers and the lengths are built from the same slices in the same
+                // order, and those slices outlive the call; the constructor copies what it reads.
+                // The result is wrapped at once.
                 unsafe {
                     CMVideoFormatDescriptionCreateFromH264ParameterSets(
                         std::ptr::null(),
@@ -569,7 +591,28 @@ impl Configuration {
                         sets.as_ptr(),
                         sizes.as_ptr(),
                         // The framing `annexb_to_avcc` produces: a big-endian 32-bit length.
-                        4,
+                        NAL_LENGTH_SIZE,
+                        &mut format,
+                    )
+                    .ok()?;
+                    Owned::from_created(format).ok_or(Status(-1))
+                }
+            }
+            Configuration::Hevc { vps, sps, pps } => {
+                let sets = [vps.as_slice(), sps.as_slice(), pps.as_slice()];
+                let sizes: Vec<usize> = sets.iter().map(|set| set.len()).collect();
+                let sets: Vec<*const u8> = sets.iter().map(|set| set.as_ptr()).collect();
+                let mut format = std::ptr::null();
+                // SAFETY: as above. The extensions dictionary is optional and none is wanted:
+                // everything the description needs is in the parameter sets.
+                unsafe {
+                    CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        std::ptr::null(),
+                        sets.len(),
+                        sets.as_ptr(),
+                        sizes.as_ptr(),
+                        NAL_LENGTH_SIZE,
+                        std::ptr::null(),
                         &mut format,
                     )
                     .ok()?;

@@ -272,7 +272,16 @@ mod at {
     pub const PPS_LISTS_MODIFICATION_PRESENT_FLAG: usize = 1414;
     pub const PPS_LOG2_PARALLEL_MERGE_LEVEL_MINUS2: usize = 1415;
     pub const PPS_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT_FLAG: usize = 1418;
+
+    /// The two flags that say a picture re-seeds the reference pictures. Not part of any
+    /// parameter set: they are the whole of "is this a key frame" for HEVC.
+    pub const IDR_PIC_FLAG: usize = 1584;
+    pub const RAP_PIC_FLAG: usize = 1585;
 }
+
+/// How much of an HEVC picture descriptor is read: through `RAPPicFlag`, the last field this
+/// backend consults, which is one byte.
+pub const DESCRIPTOR_BYTES: usize = at::RAP_PIC_FLAG + 1;
 
 /// The parts of `struct virgl_h265_picture_desc` the three sets are written out of.
 ///
@@ -343,6 +352,12 @@ pub struct PictureDesc {
     pub lists_modification_present: bool,
     pub log2_parallel_merge_level_minus2: u8,
     pub slice_segment_header_extension_present: bool,
+    /// `IDRPicFlag || RAPPicFlag`: this picture re-seeds the reference pictures.
+    ///
+    /// Not part of any parameter set -- it is what the frame gate asks. The two wire flags are
+    /// one answer here rather than two fields, because nothing downstream has a use for telling
+    /// an IDR from another random-access point.
+    pub key: bool,
 }
 
 impl PictureDesc {
@@ -467,6 +482,7 @@ impl PictureDesc {
             slice_segment_header_extension_present: flag(
                 at::PPS_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT_FLAG,
             ),
+            key: flag(at::IDR_PIC_FLAG) || flag(at::RAP_PIC_FLAG),
         }
     }
 
@@ -1014,6 +1030,8 @@ mod oracle {
         at::PPS_LISTS_MODIFICATION_PRESENT_FLAG,
         at::PPS_LOG2_PARALLEL_MERGE_LEVEL_MINUS2,
         at::PPS_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT_FLAG,
+        at::IDR_PIC_FLAG,
+        at::RAP_PIC_FLAG,
     ];
 
     #[test]
