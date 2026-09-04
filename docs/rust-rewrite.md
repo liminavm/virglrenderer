@@ -551,8 +551,8 @@ buildable throughout as the A-side reference.
   itself is the workload.) A caution the gate taught: the Fedora logo the background
   extension draws is present or absent from one boot of the *same* renderer to the next,
   a guest-side race in the extension, so a frame diff has to be read against a second boot
-  of the reference before a difference is charged to the port. `vrend-desktop.score`
-  pins the corpus of that session, wallpaper included.
+  of the reference before a difference is charged to the port. That session, wallpaper
+  included, is now the classic corpus: `vrend.bin` and the `vrend.score` pinned from it.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.

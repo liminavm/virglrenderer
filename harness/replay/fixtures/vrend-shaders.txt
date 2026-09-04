@@ -255,40 +255,6 @@ fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
 }
 
 TGSI received:
-FRAG
-DCL IN[0], GENERIC[0], PERSPECTIVE
-DCL IN[1].xy, GENERIC[1], PERSPECTIVE
-DCL OUT[0], COLOR
-DCL SAMP[0]
-DCL SVIEW[0], 2D, FLOAT
-DCL TEMP[0]
-DCL TEMP[1..4]
-  0: TEX TEMP[0], IN[1].xyyy, SAMP[0], 2D
-  1: MUL OUT[0], IN[0], TEMP[0]
-  2: END
-
-GLSL:
-#version 310 es
-#extension GL_EXT_clip_cull_distance : require
-#extension GL_EXT_blend_func_extended : require
-precision highp float;
-precision highp int;
- smooth    in  vec4 vso_g0;
- smooth    in  vec4 vso_g1;
-   out  vec4 fsout_c0;
- vec4 temp0;
- vec4 temp1;
- vec4 temp2;
- vec4 temp3;
- vec4 temp4;
-uniform highp  sampler2D fssamp0;
-void main(void)
-{
-temp0 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
-fsout_c0 = vec4((((vso_g0) *  vec4(temp0) )));
-}
-
-TGSI received:
 VERT
 DCL IN[0]
 DCL IN[1]
@@ -1231,7 +1197,7 @@ DCL TEMP[37..40]
  10: MOV TEMP[4].y, TEMP[14].xxxx
  11: MOV TEMP[3].x, TEMP[7].xxxx
  12: MOV TEMP[3].y, TEMP[13].xxxx
- 13: MUL TEMP[2].xy, TEMP[3].xyxy, TEMP[4].xyxy
+ 13: MUL TEMP[2].xy, TEMP[3].xyxx, TEMP[4].xyxx
  14: CEIL TEMP[16].x, TEMP[9].yxxx
  15: F2I TEMP[17].x, TEMP[16].xxxx
  16: SHL TEMP[18].x, TEMP[17].xxxx, IMM[1].xxxx
@@ -1243,15 +1209,15 @@ DCL TEMP[37..40]
  22:   UIF TEMP[19].xxxx :24
  23:     BRK
  24:   ENDIF
- 25:   MUL TEMP[20].xy, TEMP[5].xyyy, TEMP[5].yzyy
+ 25:   MUL TEMP[20].xy, TEMP[5].xyxx, TEMP[5].yzxx
  26:   ADD TEMP[21].x, TEMP[5].xxxx, TEMP[20].xxxx
  27:   I2F TEMP[22].x, TEMP[6].xxxx
  28:   DIV TEMP[23].x, TEMP[20].xxxx, TEMP[21].xxxx
  29:   ADD TEMP[24].x, TEMP[22].xxxx, TEMP[23].xxxx
- 30:   MUL TEMP[25].xy, CONST[2].xyyy, TEMP[24].xxxx
- 31:   MUL TEMP[26].xy, TEMP[25].xyyy, CONST[1].xxxx
+ 30:   MUL TEMP[25].xy, CONST[2].xyxx, TEMP[24].xxxx
+ 31:   MUL TEMP[26].xy, TEMP[25].xyxx, CONST[1].xxxx
  32:   MUL TEMP[27].xy, TEMP[26].xyxx, IMM[1].yyyy
- 33:   ADD TEMP[28].xy, IN[1].xyyy, TEMP[26].xyyy
+ 33:   ADD TEMP[28].xy, IN[1].xyxx, TEMP[26].xyxx
  34:   TEX TEMP[29], TEMP[28].xyxx, SAMP[0], 2D
  35:   MUL TEMP[30], TEMP[29], TEMP[21].xxxx
  36:   ADD TEMP[31], TEMP[8], TEMP[30]
@@ -1263,7 +1229,7 @@ DCL TEMP[37..40]
  42:   ADD TEMP[7].x, TEMP[7].xxxx, TEMP[35].xxxx
  43:   MOV TEMP[1].x, TEMP[20].yxxx
  44:   MOV TEMP[1].y, TEMP[5].xzxx
- 45:   MUL TEMP[0].xy, TEMP[20].xyxy, TEMP[1].xyxy
+ 45:   MUL TEMP[0].xy, TEMP[20].xyxx, TEMP[1].xyxx
  46:   UADD TEMP[6].x, TEMP[6].xxxx, IMM[1].wwww
  47:   MOV TEMP[0].z, TEMP[5].xxzx
  48:   MOV TEMP[5].xyz, TEMP[0].xyzz
@@ -1339,7 +1305,7 @@ temp4.x = float(( vec4(temp13).xxxx .x));
 temp4.y = float(( vec4(temp14).xxxx .y));
 temp3.x = float(( vec4(temp7).xxxx .x));
 temp3.y = float(( vec4(temp13).xxxx .y));
-temp2.xy = vec2((( vec4(temp3).xyxy  *  vec4(temp4).xyxy )).xy);
+temp2.xy = vec2((( vec4(temp3).xyxx  *  vec4(temp4).xyxx )).xy);
 temp16.x = float((ceil( vec4(temp9).yxxx )).x);
 temp17.x = float(intBitsToFloat(ivec4( vec4(temp16).xxxx )).x);
 temp18.x = float(uintBitsToFloat((floatBitsToUint(vec4(temp17).xxxx) << (uvec4(1U,1U,1U,1U)))).x);
@@ -1351,15 +1317,15 @@ do {
 	if (bool(floatBitsToUint(vec4(temp19).xxxx).x)) {
 		break;
 		}
-	temp20.xy = vec2((( vec4(temp5).xyyy  *  vec4(temp5).yzyy )).xy);
+	temp20.xy = vec2((( vec4(temp5).xyxx  *  vec4(temp5).yzxx )).xy);
 	temp21.x = float((( vec4(temp5).xxxx  +  vec4(temp20).xxxx )).x);
 	temp22.x = float(ivec4(floatBitsToInt(vec4(temp6).xxxx)).x);
 	temp23.x = float((( vec4(temp20).xxxx  /  vec4(temp21).xxxx )).x);
 	temp24.x = float((( vec4(temp22).xxxx  +  vec4(temp23).xxxx )).x);
-	temp25.xy = vec2(((uintBitsToFloat(fsconst0[2].xyyy) *  vec4(temp24).xxxx )).xy);
-	temp26.xy = vec2((( vec4(temp25).xyyy  * uintBitsToFloat(fsconst0[1].xxxx))).xy);
+	temp25.xy = vec2(((uintBitsToFloat(fsconst0[2].xyxx) *  vec4(temp24).xxxx )).xy);
+	temp26.xy = vec2((( vec4(temp25).xyxx  * uintBitsToFloat(fsconst0[1].xxxx))).xy);
 	temp27.xy = vec2((( vec4(temp26).xyxx  * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).xy);
-	temp28.xy = vec2((((vso_g1.xyyy) +  vec4(temp26).xyyy )).xy);
+	temp28.xy = vec2((((vso_g1.xyxx) +  vec4(temp26).xyxx )).xy);
 	temp29 = vec4((texture(fssamp0,  vec4(temp28).xyxx .xy)));
 	temp30 = vec4((( vec4(temp29)  *  vec4(temp21).xxxx )));
 	temp31 = vec4((( vec4(temp8)  +  vec4(temp30) )));
@@ -1371,7 +1337,7 @@ do {
 	temp7.x = float((( vec4(temp7).xxxx  +  vec4(temp35).xxxx )).x);
 	temp1.x = float(( vec4(temp20).yxxx .x));
 	temp1.y = float(( vec4(temp5).xzxx .y));
-	temp0.xy = vec2((( vec4(temp20).xyxy  *  vec4(temp1).xyxy )).xy);
+	temp0.xy = vec2((( vec4(temp20).xyxx  *  vec4(temp1).xyxx )).xy);
 	temp6.x = float(uintBitsToFloat(uvec4(floatBitsToUint(vec4(temp6).xxxx)) + uvec4((uvec4(2U,2U,2U,2U)))).x);
 	temp0.z = float(( vec4(temp5).xxzx .z));
 	temp5.xyz = vec3(( vec4(temp0).xyzz .xyz));
@@ -1823,7 +1789,7 @@ IMM[1] UINT32 {0, 0, 0, 0}
 DCL TEMP[25..28]
   0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
   1: MUL TEMP[2], IN[0], TEMP[1]
-  2: DIV TEMP[3].xy, IN[1].xyyy, CONST[2].xyyy
+  2: DIV TEMP[3].xy, IN[1].xyxx, CONST[2].xyxx
   3: ADD TEMP[4].xy, CONST[0], CONST[1].xxxx
   4: MUL TEMP[5].x, CONST[1].xxxx, IMM[0].xxxx
   5: ADD TEMP[6].xy, CONST[0].zwzw, TEMP[5].xxxx
@@ -1897,7 +1863,7 @@ void main(void)
 {
 temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
 temp2 = vec4((((vso_g0) *  vec4(temp1) )));
-temp3.xy = vec2((((vso_g1.xyyy) / uintBitsToFloat(fsconst0[2].xyyy))).xy);
+temp3.xy = vec2((((vso_g1.xyxx) / uintBitsToFloat(fsconst0[2].xyxx))).xy);
 temp4.xy = vec2(((uintBitsToFloat(fsconst0[0]) + uintBitsToFloat(fsconst0[1].xxxx))).xy);
 temp5.x = float(((uintBitsToFloat(fsconst0[1].xxxx) * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
 temp6.xy = vec2(((uintBitsToFloat(fsconst0[0].zwzw) +  vec4(temp5).xxxx )).xy);
@@ -2035,7 +2001,7 @@ IMM[1] UINT32 {0, 0, 0, 0}
 DCL TEMP[25..28]
   0: TEX TEMP[1], IN[1].xyyy, SAMP[0], 2D
   1: MUL TEMP[2], IN[0], TEMP[1]
-  2: DIV TEMP[3].xy, IN[1].xyyy, CONST[2].xyyy
+  2: DIV TEMP[3].xy, IN[1].xyxx, CONST[2].xyxx
   3: ADD TEMP[4].xy, CONST[0], CONST[1].xxxx
   4: MUL TEMP[5].x, CONST[1].xxxx, IMM[0].xxxx
   5: ADD TEMP[6].xy, CONST[0].zwzw, TEMP[5].xxxx
@@ -2109,7 +2075,7 @@ void main(void)
 {
 temp1 = vec4((texture(fssamp0, (vso_g1.xyyy).xy)));
 temp2 = vec4((((vso_g0) *  vec4(temp1) )));
-temp3.xy = vec2((((vso_g1.xyyy) / uintBitsToFloat(fsconst0[2].xyyy))).xy);
+temp3.xy = vec2((((vso_g1.xyxx) / uintBitsToFloat(fsconst0[2].xyxx))).xy);
 temp4.xy = vec2(((uintBitsToFloat(fsconst0[0]) + uintBitsToFloat(fsconst0[1].xxxx))).xy);
 temp5.x = float(((uintBitsToFloat(fsconst0[1].xxxx) * uintBitsToFloat(uvec4(3212836864U,3212836864U,3212836864U,3212836864U)))).x);
 temp6.xy = vec2(((uintBitsToFloat(fsconst0[0].zwzw) +  vec4(temp5).xxxx )).xy);
