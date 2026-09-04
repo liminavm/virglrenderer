@@ -1241,13 +1241,28 @@ static void write_tile_group(struct bw *w, const struct virgl_av1_picture_desc *
  * is stored at once, evicting nothing, and only when all eight are live does the guest's
  * choice have to be waited for.
  *
- * Shown frames are held on the same terms as hidden ones. Whether a frame is displayed says
- * nothing about whether the guest stores it: a libaom pyramid GOP stores shown frames and
- * fills eight slots, and emitting one with refresh_frame_flags = 0 because no slot was free
- * loses it -- every later reference resolves to whatever the slot still holds. The cost is
- * that a held shown frame's picture reaches its target a submission late; the backend keeps
- * its target for exactly that reason (held_target), and nothing waits on delivery, so a late
- * picture is a frame of latency rather than a stall.
+ * Whether a frame is displayed says nothing about whether the guest stores it: a libaom
+ * pyramid GOP stores shown frames and fills eight slots, so a shown frame reaches the wall
+ * as readily as a hidden one. But what waiting *costs* differs completely between them, and
+ * that is what decides the shape.
+ *
+ * A shown frame's target is read by the guest as soon as the command-stream fence signals,
+ * and nothing in the protocol makes that wait for delivery. Withholding its picture for a
+ * submission therefore does not buy a frame of latency, it hands the guest whatever the
+ * surface last held: an older picture, or -- on a surface never yet written -- nothing.
+ * Measured on a 1080p24 libaom stream, 325 of 615 frames came back as some earlier frame,
+ * three to seven frames old, alternating with correct ones. A viewer sees the picture lurch
+ * backwards and forwards; a client that queues frames ahead absorbs it and sees nothing.
+ *
+ * The slot, though, is needed only by the *bitstream*, and the picture is needed only by the
+ * guest, so the two are separated. A shown frame at the wall is emitted immediately with
+ * refresh_frame_flags = 0 -- always legal, and settling no eviction -- which delivers the
+ * picture on time and leaves the DPB untouched. It is then re-emitted on the next
+ * submission, hidden and carrying the real refresh, ahead of the frame that might reference
+ * it. The cost is decoding such a frame twice, and only when the guest actually stored it:
+ * the next descriptor says whether it did, and when it did not the copy is simply dropped.
+ *
+ * A hidden frame is still held outright. Nothing reads its target, so it owes nothing early.
  */
 
 /* The picture the frame between two reference maps produced: the surface `now` lists that
@@ -1478,8 +1493,9 @@ static ssize_t emit_frame(struct virgl_av1_obu_state *state,
  * frame it never stored can never be referenced. */
 static ssize_t emit_held(struct virgl_av1_obu_state *state,
                          const uint32_t *before, const uint32_t *live,
-                          uint8_t *out, size_t out_size)
+                          uint8_t *out, size_t out_size, bool *discard)
 {
+   struct virgl_av1_picture_desc desc;
    uint32_t surface;
    uint8_t refresh = 0;
    int slot = -1;
@@ -1497,11 +1513,31 @@ static ssize_t emit_held(struct virgl_av1_obu_state *state,
          fprintf(stderr, "[AV1SLOT] held frame stored by the guest but our slots are all live\n");
    }
 
-   n = emit_frame(state, &state->held_desc, state->held_tiles, state->held_tiles_size,
+   desc = state->held_desc;
+
+   /* A frame whose picture already went out owes only the DPB. If the guest stored nothing
+    * there is nothing left to owe, and re-decoding it would be work no later frame collects.
+    * Otherwise it is re-emitted hidden: the same picture, kept rather than shown. It stays
+    * showable so that a stream displaying it later with show_existing_frame is still legal,
+    * and so the film-grain parameters are written exactly as they were the first time. */
+   if (state->held_reemit) {
+      if (!surface) {
+         state->held = false;
+         state->held_reemit = false;
+         return 0;
+      }
+      desc.picture_parameter.pic_info_fields.show_frame = 0;
+      desc.picture_parameter.pic_info_fields.showable_frame = 1;
+      if (discard)
+         *discard = true;
+   }
+
+   n = emit_frame(state, &desc, state->held_tiles, state->held_tiles_size,
                   refresh, out, out_size);
    if (n < 0)
       return n;   /* keep holding it: a frame dropped here is one no later frame can find */
    state->held = false;
+   state->held_reemit = false;
 
    if (slot >= 0) {
       state->slot_surface[slot] = surface;
@@ -1543,7 +1579,7 @@ static bool hold_frame(struct virgl_av1_obu_state *state,
  */
 static ssize_t advance(struct virgl_av1_obu_state *state,
                        const struct virgl_av1_picture_desc *desc,
-                       uint8_t *out, size_t out_size)
+                       uint8_t *out, size_t out_size, bool *discard)
 {
    ssize_t n;
 
@@ -1552,7 +1588,7 @@ static ssize_t advance(struct virgl_av1_obu_state *state,
 
    /* The held frame goes first: decode order is preserved, and this descriptor's ref[] is
     * what makes its refresh exact. */
-   n = emit_held(state, state->prev_ref, desc->ref, out, out_size);
+   n = emit_held(state, state->prev_ref, desc->ref, out, out_size, discard);
    if (n < 0)
       return n;
 
@@ -1578,11 +1614,13 @@ static ssize_t advance(struct virgl_av1_obu_state *state,
 
 ssize_t virgl_av1_flush_held(struct virgl_av1_obu_state *state,
                              const struct virgl_av1_picture_desc *desc,
-                             uint8_t *out, size_t out_size)
+                             uint8_t *out, size_t out_size, bool *discard)
 {
+   if (discard)
+      *discard = false;
    if (!state || !desc)
       return -1;
-   return advance(state, desc, out, out_size);
+   return advance(state, desc, out, out_size, discard);
 }
 
 size_t virgl_av1_held_bound(const struct virgl_av1_obu_state *state)
@@ -1594,8 +1632,10 @@ size_t virgl_av1_held_bound(const struct virgl_av1_obu_state *state)
 
 void virgl_av1_drop_held(struct virgl_av1_obu_state *state)
 {
-   if (state)
+   if (state) {
       state->held = false;
+      state->held_reemit = false;
+   }
 }
 
 ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
@@ -1619,7 +1659,7 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
    if (state->held)
       return -1;
    if (!state->advanced) {
-      r = advance(state, desc, NULL, 0);
+      r = advance(state, desc, NULL, 0, NULL);
       if (r < 0)
          return r;
    }
@@ -1654,7 +1694,23 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
       if (!hold_frame(state, desc, tiles, tiles_size))
          return -1;
       state->advanced = false;
-      return 0;
+      state->held_reemit = false;
+      if (!p->pic_info_fields.show_frame)
+         return 0;
+
+      /* A shown frame's pixels cannot wait for the slot: the guest reads that target as
+       * soon as the fence signals, and what it finds there otherwise is whatever the
+       * surface last held -- an older picture, or nothing at all. Only the *bitstream*
+       * needs the slot, so the two are separated. The frame goes out now storing nothing,
+       * which is always legal and settles no eviction, and the copy that claims the slot
+       * follows on the next submission, ahead of the frame that might reference it. */
+      r = emit_frame(state, desc, tiles, tiles_size, 0, out, out_size);
+      if (r < 0) {
+         state->held = false;
+         return r;
+      }
+      state->held_reemit = true;
+      return r;
    }
 
    /* A slot is free, so the frame is emitted now into it; which picture landed there is
@@ -1683,7 +1739,7 @@ ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
 {
    if (!state)
       return -1;
-   return emit_held(state, state->prev_ref, NULL, out, out_size);
+   return emit_held(state, state->prev_ref, NULL, out, out_size, NULL);
 }
 
 void virgl_av1_obu_state_fini(struct virgl_av1_obu_state *state)

@@ -88,15 +88,25 @@ struct virgl_av1_obu_state {
     * That is never too late: a frame cannot reference itself. */
    uint32_t slot_surface[VIRGL_AV1_NUM_REF_FRAMES]; /* surface we placed in each of our slots */
 
-   /* A hidden frame held for one submission. Which slot the guest stored a frame in is only
+   /* A frame kept across one submission, because which slot the guest stored it in is only
     * visible in the *next* frame's ref[], and guessing it evicts pictures later frames still
-    * reference. Hidden frames can wait -- nothing needs their pixels until a later
-    * show_existing -- so they are emitted once the answer is in. */
+    * reference.
+    *
+    * What is owed differs by whether the frame is shown. A hidden frame owes both its
+    * picture and its slot, and can wait for both: nothing reads its target, and nothing
+    * needs its pixels until a later show_existing. A shown frame owes its picture *now* --
+    * the guest reads that target as soon as the command-stream fence signals -- so it is
+    * emitted immediately storing nothing, and only its slot is owed. It is then re-emitted
+    * hidden, once the answer is in, purely to put it in the DPB. */
    struct virgl_av1_picture_desc held_desc;
    uint8_t *held_tiles;
    size_t held_tiles_size;
    size_t held_tiles_cap;
    bool held;
+   /* The held frame has already been emitted for its pixels: what remains is the DPB. Its
+    * re-emission decodes to the same picture, which must be *discarded* -- the target was
+    * written when the frame went out, and the guest may have recycled it since. */
+   bool held_reemit;
 
    /* The model has been advanced onto the current descriptor. A frame's tile data may
     * arrive over several decode_bitstream calls, each carrying the same descriptor, so the
@@ -129,10 +139,14 @@ size_t virgl_av1_held_bound(const struct virgl_av1_obu_state *state);
  * Writes at most one temporal unit, which MUST be submitted to the decoder as its own
  * sample and delivered into the *held* frame's target, not this frame's. Idempotent
  * within a frame, so it is safe to call on every decode_bitstream.
+ *
+ * `discard` is set when the unit exists only to place a picture in the DPB, its pixels
+ * having been delivered a submission earlier. Such a unit must still be decoded -- later
+ * frames reference it -- but its picture must not be written anywhere. Ignored when NULL.
  */
 ssize_t virgl_av1_flush_held(struct virgl_av1_obu_state *state,
                              const struct virgl_av1_picture_desc *desc,
-                             uint8_t *out, size_t out_size);
+                             uint8_t *out, size_t out_size, bool *discard);
 
 /* Emit any frame still held. Call once the last frame has been submitted. */
 ssize_t virgl_av1_flush_temporal_unit(struct virgl_av1_obu_state *state,
@@ -155,7 +169,7 @@ void virgl_av1_drop_held(struct virgl_av1_obu_state *state);
  * unit is legal and avoids tracking when a new one is owed.
  *
  * `tiles`/`tiles_size` is the tile payload exactly as the guest sent it. Writes at most one
- * temporal unit -- nothing when the frame is held -- and returns the number of bytes
+ * temporal unit -- nothing when a hidden frame is held -- and returns the number of bytes
  * written, or a negative value on error. Fails rather than emitting a second unit if a held
  * frame has not been flushed first: two units in one buffer reach the decoder as one sample
  * and lose a picture.
