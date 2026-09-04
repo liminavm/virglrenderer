@@ -1695,7 +1695,7 @@ ssize_t virgl_av1_build_temporal_unit(struct virgl_av1_obu_state *state,
          return -1;
       state->advanced = false;
       state->held_reemit = false;
-      if (!p->pic_info_fields.show_frame)
+      if (!p->pic_info_fields.show_frame || getenv("LIMINA_AV1_HOLD_SHOWN"))
          return 0;
 
       /* A shown frame's pixels cannot wait for the slot: the guest reads that target as
