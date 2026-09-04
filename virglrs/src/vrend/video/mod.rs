@@ -446,6 +446,15 @@ enum Shape {
         width: u32,
         height: u32,
     },
+    /// HEVC: the same, with three sets. Key-ness comes from the descriptor here rather than
+    /// from the bitstream -- `IDRPicFlag` and `RAPPicFlag` are on the wire, and H.264 has no
+    /// equivalent.
+    Hevc {
+        sets: h265::ParameterSets,
+        key: bool,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Shape {
@@ -453,7 +462,7 @@ impl Shape {
     fn key(&self) -> bool {
         match self {
             Shape::Vp9(frame) => frame.key,
-            Shape::H264 { key, .. } => *key,
+            Shape::H264 { key, .. } | Shape::Hevc { key, .. } => *key,
         }
     }
 
@@ -461,7 +470,9 @@ impl Shape {
     fn extent(&self) -> (u32, u32) {
         match self {
             Shape::Vp9(frame) => (frame.width, frame.height),
-            Shape::H264 { width, height, .. } => (*width, *height),
+            Shape::H264 { width, height, .. } | Shape::Hevc { width, height, .. } => {
+                (*width, *height)
+            }
         }
     }
 
@@ -470,19 +481,25 @@ impl Shape {
         match self {
             Shape::Vp9(frame) => frame.configuration(),
             Shape::H264 { sets, .. } => Configuration::h264(sets.sps.clone(), sets.pps.clone()),
+            Shape::Hevc { sets, .. } => {
+                Configuration::hevc(sets.vps.clone(), sets.sps.clone(), sets.pps.clone())
+            }
         }
     }
 
     /// Re-frame the accumulated access unit into what VideoToolbox takes.
     ///
-    /// VP9 is handed over as it arrives. H.264 arrives Annex-B -- mesa's frontend prepends a
-    /// start code per slice -- and VideoToolbox accepts only length-prefixed NALs, so the
-    /// framing is rewritten and nothing else: the emulation-prevention bytes inside each NAL
-    /// stay exactly as the encoder wrote them.
+    /// VP9 is handed over as it arrives. H.264 and HEVC arrive Annex-B -- mesa's frontend
+    /// prepends a start code per slice -- and VideoToolbox accepts only length-prefixed NALs,
+    /// so the framing is rewritten and nothing else: the emulation-prevention bytes inside each
+    /// NAL stay exactly as the encoder wrote them.
+    ///
+    /// One rewrite for both, because NAL framing is the one thing the two codecs did not change
+    /// between them -- which is why the C reaches for its H.264 function here too.
     fn access_unit(&self, bitstream: Vec<u8>) -> Option<Vec<u8>> {
         match self {
             Shape::Vp9(_) => Some(bitstream),
-            Shape::H264 { .. } => h264::annexb_to_avcc(&bitstream),
+            Shape::H264 { .. } | Shape::Hevc { .. } => h264::annexb_to_avcc(&bitstream),
         }
     }
 }
@@ -610,6 +627,9 @@ pub const DESCRIPTOR_BYTES: usize = {
     if h264::DESCRIPTOR_BYTES > most {
         most = h264::DESCRIPTOR_BYTES;
     }
+    if h265::DESCRIPTOR_BYTES > most {
+        most = h265::DESCRIPTOR_BYTES;
+    }
     most
 };
 
@@ -618,6 +638,7 @@ pub const DESCRIPTOR_BYTES: usize = {
 const _: () = {
     assert!(DESCRIPTOR_BYTES >= Vp9Frame::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= h264::DESCRIPTOR_BYTES);
+    assert!(DESCRIPTOR_BYTES >= h265::DESCRIPTOR_BYTES);
 };
 
 /// How many planes a guest lays a format out in when it hands the whole picture over as one
@@ -670,6 +691,7 @@ pub fn advertised(support: Option<&videotoolbox::Support>) -> Vec<Profile> {
         Profile::H264Baseline,
         Profile::H264Main,
         Profile::H264High,
+        Profile::HevcMain,
     ]
     .into_iter()
     .filter(|profile| support.decodes(profile.codec()))
@@ -859,9 +881,35 @@ impl Video {
                 let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
                 *shape = Some(Shape::H264 { sets, key, width, height });
             }
+            Profile::HevcMain => {
+                let hevc_profile = h265::HevcProfile::of(profile).expect("an HEVC profile");
+                let desc = h265::PictureDesc::read(descriptor);
+                // The inspection is not only for the id: it establishes that the stream does not
+                // depend on reference picture sets declared in the SPS, which are absent from the
+                // wire and are therefore written empty. A stream that does depend on them is
+                // refused here rather than decoded into quietly wrong pixels.
+                match desc.slice_inspect(accumulated) {
+                    // No slice header yet: this call carried only a fragment.
+                    Ok(None) => return Ok(()),
+                    Ok(Some(_id)) => {}
+                    Err(why) => {
+                        eprintln!("[virglrs] video codec {handle}: HEVC slice refused ({why})");
+                        return Err(Refusal::HostRefusedFrame);
+                    }
+                }
+                let sets = match desc.parameter_sets(width, height, hevc_profile) {
+                    Ok(sets) => sets,
+                    Err(why) => {
+                        eprintln!("[virglrs] video codec {handle}: no HEVC parameter set ({why})");
+                        return Err(Refusal::HostRefusedFrame);
+                    }
+                };
+                let key = shape.as_ref().is_some_and(Shape::key) || desc.key;
+                *shape = Some(Shape::Hevc { sets, key, width, height });
+            }
             // Unreachable: `create_codec` refuses a profile `advertised` does not list, and
             // nothing is listed without a leg here.
-            Profile::HevcMain | Profile::Av1Main => {
+            Profile::Av1Main => {
                 return Err(Refusal::Unsupported("no decode path for that profile"));
             }
         }
@@ -1066,11 +1114,10 @@ mod tests {
         let list = advertised(Some(&support));
 
         assert!(list.iter().all(|profile| support.decodes(profile.codec())));
-        for profile in [Profile::Vp9Profile0, Profile::H264Main] {
+        for profile in [Profile::Vp9Profile0, Profile::H264Main, Profile::HevcMain] {
             assert_eq!(list.contains(&profile), support.decodes(profile.codec()));
         }
         // No leg here yet, whatever the silicon says.
-        assert!(!list.contains(&Profile::HevcMain));
         assert!(!list.contains(&Profile::Av1Main));
     }
 
@@ -1105,5 +1152,19 @@ mod tests {
         );
         // Not Annex-B at all: nothing to guess at, and the caller refuses the frame.
         assert_eq!(h264.access_unit(vec![0x65, 0xaa]), None);
+
+        // HEVC re-frames the same way, and reports key-ness the descriptor gave it.
+        let hevc = Shape::Hevc {
+            sets: h265::ParameterSets { vps: vec![0x40], sps: vec![0x42], pps: vec![0x44] },
+            key: true,
+            width: 1280,
+            height: 720,
+        };
+        assert!(hevc.key());
+        assert_eq!(hevc.extent(), (1280, 720));
+        assert_eq!(
+            hevc.access_unit(vec![0, 0, 1, 0x26, 0x01, 0xaf]),
+            Some(vec![0, 0, 0, 3, 0x26, 0x01, 0xaf])
+        );
     }
 }
