@@ -98,8 +98,8 @@ pub struct LinkedProgram {
     /// Names this program in the sub-context's list; stable while the program lives.
     pub serial: u64,
     pub id: ProgramName,
-    /// The compiled shader of each stage, in stage order, compute excluded.
-    pub stages: [Option<ShaderName>; 5],
+    /// The variant of each stage, in stage order, compute excluded.
+    pub stages: [Option<VariantId>; 5],
     pub dual_src_linked: bool,
     pub last_stage: ShaderStage,
     pub ubo_used_mask: [u32; ShaderStage::COUNT],
@@ -128,9 +128,9 @@ pub struct LinkedProgram {
 }
 
 impl LinkedProgram {
-    /// Whether this program links `shader`.
-    pub fn links(&self, shader: ShaderName) -> bool {
-        self.stages.contains(&Some(shader))
+    /// Whether this program links `variant`.
+    pub fn links(&self, variant: VariantId) -> bool {
+        self.stages.contains(&Some(variant))
     }
 }
 
@@ -333,7 +333,7 @@ struct Linked<'a> {
     stage: ShaderStage,
     info: &'a shader::Info,
     variant: &'a Variant,
-    id: ShaderName,
+    gl: ShaderName,
 }
 
 impl SubCtx {
@@ -361,20 +361,20 @@ impl SubCtx {
             let Some(variant) = program.variants.first() else {
                 return Err(stage);
             };
-            let Some(id) = variant.id else {
+            let Some(gl) = variant.gl else {
                 return Err(stage);
             };
-            out.push(Linked { stage, info: &program.info, variant, id });
+            out.push(Linked { stage, info: &program.info, variant, gl });
         }
         Ok(out)
     }
 
-    /// `vrend_destroy_program` for every program linking `shader`, as the C destroys them with
-    /// the variant.
-    pub(super) fn forget_programs_of(&mut self, gl: &Gl, shader: ShaderName) {
+    /// `vrend_destroy_program` for every program linking `variant`, as the C destroys them
+    /// with the variant.
+    fn forget_programs_of(&mut self, gl: &Gl, variant: VariantId) {
         let mut i = 0;
         while i < self.programs.len() {
-            if self.programs[i].links(shader) {
+            if self.programs[i].links(variant) {
                 let p = self.programs.remove(i);
                 if self.prog == Some(p.serial) {
                     self.prog = None;
@@ -390,14 +390,14 @@ impl SubCtx {
     }
 }
 
-/// The C's `vrend_shader_destroy` for a shader leaving the sub-context: its programs, then its
-/// GL shaders.
+/// The C's `vrend_shader_destroy`, and the one place a shader leaves a sub-context: the
+/// programs linking each variant, then the variant's GL shader.
 pub(super) fn release_shader(sub: &mut SubCtx, gl: &Gl, shader: Shader) {
     if let ShaderText::Whole(p) = shader.text {
         for v in p.variants {
-            if let Some(id) = v.id {
-                sub.forget_programs_of(gl, id);
-                gl.delete_shader(id);
+            sub.forget_programs_of(gl, v.id);
+            if let Some(name) = v.gl {
+                gl.delete_shader(name);
             }
         }
     }
@@ -419,8 +419,8 @@ fn add_shader_program(
     };
     let mut stages = [None; 5];
     for l in linked {
-        gl.attach_shader(id, l.id);
-        stages[l.stage.index()] = Some(l.id);
+        gl.attach_shader(id, l.gl);
+        stages[l.stage.index()] = Some(l.variant.id);
     }
     let by_stage = |s: ShaderStage| linked.iter().find(|l| l.stage == s);
     let vs = by_stage(ShaderStage::Vertex).expect("a program has a vertex stage");
@@ -663,7 +663,7 @@ impl Context {
         let dual_src = dual_src && fs.info.num_outputs > 1;
         let mut ids = [None; 5];
         for l in &linked {
-            ids[l.stage.index()] = Some(l.id);
+            ids[l.stage.index()] = Some(l.variant.id);
         }
         let same = sub.program().is_some_and(|p| p.stages == ids && p.dual_src_linked == dual_src);
         if same {
