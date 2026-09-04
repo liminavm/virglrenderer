@@ -195,8 +195,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   doing: only NV12 and NV21 can back a composite target, and a guest told otherwise creates a
   resource the host then refuses -- after the kernel has already handed it the handle, so the
   guest attaches backing and builds views on a resource that does not exist and has its context
-  poisoned for the rest of its life. Both `sampler` reasons close with video; the ASTC one does
-  not, and stays. A fifth line is a regression.
+  poisoned for the rest of its life. The planar half of `sampler` closes with video; the ASTC
+  half is deliberate and permanent. A fifth line is a regression.
   `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 33
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
