@@ -114,9 +114,10 @@ fn make_view(
     res: &Resource,
     format: Format,
 ) -> Option<End> {
-    let Storage::Texture { name, target, immutable, .. } = res.storage else {
+    let Storage::Texture(t) = &res.storage else {
         return None;
     };
+    let (name, target, immutable) = (t.name, t.target, t.immutable);
     let base = End { name, target, temporary: false };
     if res.args.format == format || !features.has(Feature::texture_view) || !res.supports_view() {
         return Some(base);
@@ -249,20 +250,17 @@ impl Context {
     ) -> Result<(), Fault> {
         let src_res = host.resource(cmd, src)?;
         let dst_res = host.resource(cmd, dst)?;
-        let (
-            Storage::Texture { name: sn, target: st, .. },
-            Storage::Texture { name: dn, target: dt, .. },
-        ) = (&src_res.storage, &dst_res.storage)
+        let (Storage::Texture(s), Storage::Texture(d)) = (&src_res.storage, &dst_res.storage)
         else {
             return Err(Fault::IllegalResource { cmd, handle: dst });
         };
         host.gl.copy_image_sub_data(
-            *sn,
-            *st,
+            s.name,
+            s.target,
             src_level as GLint,
             [src_box.x, src_box.y, src_box.z],
-            *dn,
-            *dt,
+            d.name,
+            d.target,
             dst_level as GLint,
             dst_origin,
             [src_box.width, src_box.height, src_box.depth],
@@ -761,13 +759,14 @@ impl Context {
         let fb0 = self.sub().blit_fbs[0];
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb0));
         let res = host.resource(cmd, resource)?;
-        let Storage::Texture { name, target, .. } = res.storage else {
+        let Storage::Texture(t) = &res.storage else {
             return Err(Fault::IllegalResource { cmd, handle: resource });
         };
+        let (name, target) = (t.name, t.target);
         let name = match view {
             None => name,
             Some(key) => {
-                res.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: resource })?
+                t.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: resource })?
             }
         };
         let end = End { name, target, temporary: false };
@@ -775,7 +774,12 @@ impl Context {
         let colorf = color.map(f32::from_bits);
         let depth = f64::from_bits(color[0] as u64 | (color[1] as u64) << 32);
         let stencil = color[3];
-        self.clear_prepare(host, Some((resource, format)), buffers, colorf, depth, stencil)?;
+        let res = host.resource(cmd, resource)?;
+        let fixup = ColorFixup {
+            srgb_encode: !res.supports_view() && format.describe().is_some_and(|d| d.is_srgb()),
+            swap_red_blue: res.needs_redblue_swizzle(format),
+        };
+        self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let mut bits: GLbitfield = 0;
         if buffers & PIPE_CLEAR_COLOR0 != 0 {
             bits |= GL_COLOR_BUFFER_BIT;

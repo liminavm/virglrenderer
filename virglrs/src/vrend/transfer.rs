@@ -347,8 +347,8 @@ pub fn write(
             }
             Ok(())
         }
-        Storage::Texture { name, target, .. } => {
-            let (name, target) = (*name, *target);
+        Storage::Texture(t) => {
+            let (name, target) = (t.name, t.target);
             if matches!(target, GL_TEXTURE_2D_MULTISAMPLE | GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
                 return Err(Error::Unsupported);
             }
@@ -483,10 +483,10 @@ pub fn attach(
     level: GLint,
     layer: Option<GLint>,
 ) -> Result<(), Unattachable> {
-    let Storage::Texture { name, target, .. } = &res.storage else {
+    let Storage::Texture(t) = &res.storage else {
         return Err(Unattachable::NotATexture);
     };
-    attach_texture(gl, features, *target, *name, attachment, level, layer)
+    attach_texture(gl, features, t.target, t.name, attachment, level, layer)
         .map_err(Unattachable::NoFeature)
 }
 
@@ -555,6 +555,11 @@ fn read_layer(
     dst: &mut [u8],
 ) -> Result<(), Error> {
     let entry = res.entry(formats).ok_or(Error::Unsupported)?;
+    // A readback borrows the framebuffer binding and has to give it back. The guest is entitled
+    // to transfer out of a resource between binding its framebuffer and drawing into it, and a
+    // readback that left the default framebuffer bound would send that draw nowhere -- on a
+    // surfaceless context the default framebuffer is not complete at all.
+    let previous = gl.framebuffer_binding();
     let fb = gl.gen_framebuffer();
     gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
     let attachment = attachment_for(res, formats);
@@ -562,7 +567,7 @@ fn read_layer(
     gl.drain_errors();
     let read = attached && gl.read_pixels(x, y, w, h, entry.gl.glformat, entry.gl.gltype, dst);
     let err = gl.drain_errors();
-    gl.bind_framebuffer(GL_FRAMEBUFFER, None);
+    gl.bind_framebuffer(GL_FRAMEBUFFER, previous);
     gl.delete_framebuffer(fb);
     if !read {
         return Err(Error::Unsupported);

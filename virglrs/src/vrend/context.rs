@@ -42,6 +42,7 @@ use crate::ids::{CtxId, ResourceHandle};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 #[path = "context/blit.rs"]
 mod blit;
@@ -388,18 +389,32 @@ impl Object {
 
 // ---- bound state ----
 
-/// A surface as bound to the framebuffer: the object's fields at the bind, which is what the C
-/// keeps a reference to. Resolved against the resource when bound; the handle is kept so a
-/// later bind of the same object is a no-op.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What a clear has to do to its colour before handing it to GL, because the destination is not
+/// stored the way the guest named it.
+///
+/// The C works this out from the resource each time it clears. Here it is worked out once, by
+/// whoever knows which destination is meant -- the framebuffer at its bind, a `CLEAR_SURFACE` at
+/// its own surface -- because by the time the clear runs the guest may have freed the resource
+/// the answer would have been read from.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ColorFixup {
+    /// The destination cannot be viewed and its surface format is sRGB, so the encode the view
+    /// would have done falls to the writes.
+    pub srgb_encode: bool,
+    /// The destination is stored in the opposite channel order to the format that names it.
+    pub swap_red_blue: bool,
+}
+
 /// A surface as the framebuffer keeps it: everything attaching it needs, and nothing that has to
 /// be looked up again.
+///
 ///
 /// It holds no object handle. The guest may destroy a bound surface, and a slot naming a freed
 /// handle is both a dangling lookup and -- once the handle is reused -- a false "already bound".
 /// A surface is immutable once created, so the description here cannot drift from the object it
 /// was read off, and comparing descriptions is the identity a re-attach actually turns on: two
 /// surfaces that describe the same thing attach the same texture the same way.
+#[derive(Clone, Debug)]
 pub struct BoundSurface {
     pub resource: ResourceHandle,
     pub format: Format,
@@ -410,6 +425,31 @@ pub struct BoundSurface {
     pub nr_samples: u32,
     pub tex_height: u32,
     pub y_0_top: bool,
+    /// Where this hangs on the framebuffer: colour, depth, or both. Read off the resource at the
+    /// bind, which is the last moment the resource is certainly there.
+    pub attachment: GLenum,
+    /// A share of the storage this attaches, which is what makes the description above enough
+    /// to attach from: no lookup in a table the guest can empty between the bind and the attach.
+    pub textures: Arc<resource::Texture>,
+}
+
+impl PartialEq for BoundSurface {
+    /// What the framebuffer attaches, not which object described it. Two surfaces that describe
+    /// the same view of the same storage attach the same texture the same way, so a re-attach
+    /// between them would be a no-op; a surface the guest destroyed and recreated under the same
+    /// handle is the same attachment only if it still describes the same thing.
+    fn eq(&self, other: &Self) -> bool {
+        self.resource == other.resource
+            && self.format == other.format
+            && self.level == other.level
+            && self.layer == other.layer
+            && self.view == other.view
+            && self.nr_samples == other.nr_samples
+            && self.tex_height == other.tex_height
+            && self.y_0_top == other.y_0_top
+            && self.attachment == other.attachment
+            && Arc::ptr_eq(&self.textures, &other.textures)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1612,9 +1652,7 @@ impl Context {
         let entry = formats.get(v.format).ok_or(Fault::IllegalFormat { cmd, format: v.format })?;
         let (is_buffer, tex_name, tex_target, immutable) = match &res.storage {
             Storage::Buffer { .. } => (true, None, GL_TEXTURE_BUFFER, false),
-            Storage::Texture { name, target, immutable, .. } => {
-                (false, Some(*name), *target, *immutable)
-            }
+            Storage::Texture(t) => (false, Some(t.name), t.target, t.immutable),
             Storage::Guest | Storage::Host(_) => {
                 return Err(Fault::IllegalResource { cmd, handle: v.resource });
             }
@@ -1758,7 +1796,8 @@ impl Context {
             ),
         };
         let mut view = None;
-        if let Storage::Texture { target, immutable: true, .. } = res.storage
+        if let Storage::Texture(t) = &res.storage
+            && t.immutable
             && host.features.has(Feature::texture_view)
         {
             let max_layer = res.depth_at(level).saturating_sub(1);
@@ -1777,7 +1816,7 @@ impl Context {
                     .gl
                     .internalformat;
                 let (mut fl, mut ll) = (first_layer, last_layer);
-                if target == GL_TEXTURE_CUBE_MAP && fl == ll {
+                if t.target == GL_TEXTURE_CUBE_MAP && fl == ll {
                     fl = 0;
                     ll = 5;
                 }
@@ -1788,9 +1827,7 @@ impl Context {
                 let key = ViewKey { format: s.format, first_layer: fl, layers: layers as u32 };
                 // Minted now rather than at the first attach, so a driver that refuses the view
                 // is a fault on the command that asked for it.
-                host.resource_mut(cmd, s.resource)?
-                    .view(gl, key, internalformat)
-                    .expect("the storage was matched as a texture above");
+                t.view(gl, key, internalformat, res.args.last_level + 1);
                 view = Some(key);
             }
         }
@@ -2126,11 +2163,11 @@ impl Context {
             Some(h) => Some(self.bound_surface(host, cmd, h)?),
         };
         if self.sub().zsurf != new_z {
-            match new_z {
+            match &new_z {
                 None => {
                     gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0)
                 }
-                Some(z) => self.attach_surface(host, cmd, &z, 0)?,
+                Some(z) => self.attach_surface(host, cmd, z, 0)?,
             }
             self.sub_mut().zsurf = new_z;
         }
@@ -2141,8 +2178,8 @@ impl Context {
                 None => None,
                 Some(h) => Some(self.bound_surface(host, cmd, *h)?),
             };
-            let had = self.sub().cbufs.get(i).copied().flatten();
-            if had != want {
+            let had = self.sub().cbufs.get(i).and_then(Option::as_ref);
+            if had != want.as_ref() {
                 match &want {
                     None => gl.framebuffer_texture_2d(
                         GL_COLOR_ATTACHMENT0 + i as GLenum,
@@ -2185,7 +2222,7 @@ impl Context {
         let (height, upper_left) = if sub.cbufs.is_empty() && sub.zsurf.is_none() {
             (0, false)
         } else if sub.cbufs.is_empty() {
-            let z = sub.zsurf.expect("checked");
+            let z = sub.zsurf.as_ref().expect("checked");
             (resource::minify(z.tex_height, z.level), z.y_0_top)
         } else {
             let Some(s) = sub.cbufs.iter().flatten().next() else {
@@ -2238,6 +2275,8 @@ impl Context {
     ) -> Result<BoundSurface, Fault> {
         let s = self.sub().surface(cmd, h)?;
         let res = host.resource(cmd, s.resource)?;
+        let textures =
+            res.texture().ok_or(Fault::IllegalResource { cmd, handle: s.resource })?.clone();
         Ok(BoundSurface {
             resource: s.resource,
             format: s.format,
@@ -2247,6 +2286,8 @@ impl Context {
             nr_samples: s.nr_samples,
             tex_height: res.args.height,
             y_0_top: res.y_0_top(),
+            attachment: transfer::attachment_for(res, host.formats),
+            textures,
         })
     }
 
@@ -2262,25 +2303,25 @@ impl Context {
             host.todo.note("implicit multisample surfaces");
             return Err(Fault::Unimplemented { cmd, what: "a multisampled surface" });
         }
-        let res = host.resource(cmd, s.resource)?;
-        let Storage::Texture { name, target, .. } = res.storage else {
-            return Err(Fault::IllegalResource { cmd, handle: s.resource });
-        };
-        let mut attachment = transfer::attachment_for(res, host.formats);
+        let mut attachment = s.attachment;
         if attachment == GL_COLOR_ATTACHMENT0 {
             attachment += idx;
         }
-        // The view was minted when the surface was created, so this only reads it back.
+        // Everything this needs is in the slot, including a share of the storage -- so a guest
+        // that freed the resource between the bind and here cannot leave the framebuffer naming
+        // a texture that is gone. The view was minted when the surface was created, so this only
+        // reads it back.
         let name = match s.view {
-            None => name,
-            Some(key) => {
-                res.view_texture(key).ok_or(Fault::IllegalResource { cmd, handle: s.resource })?
-            }
+            None => s.textures.name,
+            Some(key) => s
+                .textures
+                .view_texture(key)
+                .ok_or(Fault::IllegalResource { cmd, handle: s.resource })?,
         };
         transfer::attach_texture(
             host.gl,
             host.features,
-            target,
+            s.textures.target,
             name,
             attachment,
             s.level as GLint,
@@ -2384,8 +2425,8 @@ impl Context {
             let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
             match &mut res.storage {
-                Storage::Texture { name, target, .. } if view.view.is_none() => {
-                    let (name, target) = (*name, *target);
+                Storage::Texture(t) if view.view.is_none() => {
+                    let (name, target) = (t.name, t.target);
                     gl.bind_texture(view.target, Some(name));
                     let desc = view.format.describe();
                     if desc.is_some_and(|d| d.is_depth_or_stencil())
@@ -2684,7 +2725,7 @@ impl Context {
             return;
         }
         let samples =
-            self.sub().cbufs.first().copied().flatten().map_or(0, |s| s.nr_samples).max(1);
+            self.sub().cbufs.first().and_then(Option::as_ref).map_or(0, |s| s.nr_samples).max(1);
         host.gl.min_sample_shading(min_samples as f32 / samples as f32);
     }
 
@@ -2768,24 +2809,21 @@ impl Context {
     fn clear_prepare(
         &mut self,
         host: &mut Host<'_>,
-        surf: Option<(ResourceHandle, Format)>,
+        fixup: ColorFixup,
         buffers: u32,
         mut color: [f32; 4],
         depth: f64,
         stencil: u32,
-    ) -> Result<(), Fault> {
+    ) {
         let gl = host.gl;
         let indep = host.has(Feature::indep_blend);
-        if let Some((handle, format)) = surf {
-            let res = host.resource(Cmd::Clear, handle)?;
-            if !res.supports_view() && format.describe().is_some_and(|d| d.is_srgb()) {
-                for c in &mut color[..3] {
-                    *c = encode_srgb(*c);
-                }
+        if fixup.srgb_encode {
+            for c in &mut color[..3] {
+                *c = encode_srgb(*c);
             }
-            if res.needs_redblue_swizzle(format) {
-                color.swap(0, 2);
-            }
+        }
+        if fixup.swap_red_blue {
+            color.swap(0, 2);
         }
         let sub = self.sub_mut();
         if buffers & PIPE_CLEAR_COLOR != 0 {
@@ -2809,7 +2847,6 @@ impl Context {
         if sub.hw_rs.rasterizer_discard {
             gl.disable(GL_RASTERIZER_DISCARD);
         }
-        Ok(())
     }
 
     /// `vrend_clear_finish`: restore the masks the clear lifted.
@@ -2858,12 +2895,15 @@ impl Context {
         gl.use_program_none();
         gl.disable(GL_SCISSOR_TEST);
         let colorf = color.map(f32::from_bits);
-        let surf = self.sub().cbufs.first().copied().flatten().map(|s| (s.resource, s.format));
-        if let Err(e) = self.clear_prepare(host, surf, buffers, colorf, depth, stencil) {
-            // A bound surface names a resource that is gone: the C clears on regardless, with
-            // no conversion, and so does this.
-            eprintln!("[virglrs] vrend: clear on a surface whose resource is gone: {e:?}");
-        }
+        // What attachment 0 needs done to the colour, decided when it was bound. The C asks its
+        // resource here instead, which is a second reading of a question the bind already
+        // answered -- and one the guest can make unanswerable by freeing the resource meanwhile.
+        let sub = self.sub();
+        let fixup = ColorFixup {
+            srgb_encode: sub.needs_manual_srgb_encode & 1 != 0,
+            swap_red_blue: sub.swizzle_output_rgb_to_bgr & 1 != 0,
+        };
+        self.clear_prepare(host, fixup, buffers, colorf, depth, stencil);
         let sub = self.sub();
         let mut bits: GLbitfield = 0;
         let mask: u32 =
@@ -2903,7 +2943,7 @@ impl Context {
     ) -> Result<(), Fault> {
         let cmd = Cmd::ClearTexture;
         let res = host.resource(cmd, resource)?;
-        let Storage::Texture { name, .. } = res.storage else {
+        let Storage::Texture(t) = &res.storage else {
             return Err(Fault::IllegalResource { cmd, handle: resource });
         };
         let entry =
@@ -2916,7 +2956,7 @@ impl Context {
             return Err(Fault::NoFeature { cmd, feature: Feature::clear_texture });
         }
         host.gl.clear_tex_sub_image(
-            name,
+            t.name,
             level as GLint,
             [region.x, region.y, region.z],
             [region.width, region.height, region.depth],
@@ -3198,7 +3238,7 @@ mod tests {
         assert!(!evict_view(&mut views, &mut dirty, h(9)));
     }
 
-    fn bound(view: Option<ViewKey>) -> BoundSurface {
+    fn bound(view: Option<ViewKey>, textures: &Arc<resource::Texture>) -> BoundSurface {
         BoundSurface {
             resource: ResourceHandle::new(1).unwrap(),
             format: format("B8G8R8A8_UNORM"),
@@ -3208,6 +3248,8 @@ mod tests {
             nr_samples: 0,
             tex_height: 16,
             y_0_top: false,
+            attachment: GL_COLOR_ATTACHMENT0,
+            textures: textures.clone(),
         }
     }
 
@@ -3215,13 +3257,18 @@ mod tests {
     fn a_bound_surface_is_told_apart_by_what_it_attaches() {
         let key =
             |first_layer| ViewKey { format: format("B8G8R8X8_UNORM"), first_layer, layers: 1 };
+        let one = Arc::new(resource::Texture::unbacked(TextureName::unbacked(1)));
+        let two = Arc::new(resource::Texture::unbacked(TextureName::unbacked(2)));
         // The framebuffer skips re-attaching a slot whose description is unchanged, so the
         // description has to name every difference that changes the attachment. A surface the
         // guest destroyed and recreated under the same handle is the same attachment only if it
         // describes the same thing -- which is why the slot holds no handle to compare instead.
-        assert_eq!(bound(Some(key(0))), bound(Some(key(0))));
-        assert_ne!(bound(Some(key(0))), bound(Some(key(1))));
-        assert_ne!(bound(Some(key(0))), bound(None));
+        assert_eq!(bound(Some(key(0)), &one), bound(Some(key(0)), &one));
+        assert_ne!(bound(Some(key(0)), &one), bound(Some(key(1)), &one));
+        assert_ne!(bound(Some(key(0)), &one), bound(None, &one));
+        // And a resource handle the guest freed and reused names different storage, however
+        // exactly the description of it repeats.
+        assert_ne!(bound(Some(key(0)), &one), bound(Some(key(0)), &two));
     }
 
     #[test]

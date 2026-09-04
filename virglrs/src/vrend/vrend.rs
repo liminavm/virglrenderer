@@ -29,6 +29,7 @@ use crate::ids::{CtxId, ResourceHandle};
 use crate::metal;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 /// Why the classic renderer could not come up.
 #[derive(Debug)]
@@ -73,6 +74,12 @@ pub struct Vrend {
     /// The shader blitter and its GL context, built on the first blit that needs one. A renderer
     /// that never takes the blitter's path never pays for it.
     blitter: Option<blitter::Blitter>,
+    /// Texture storage the guest has freed that something else still holds a share of.
+    ///
+    /// The share cannot delete itself when the last holder lets go, because deleting needs a
+    /// current GL context and the driver, and a drop has neither. So it is parked here and swept
+    /// from the next place that has both.
+    doomed: Vec<Arc<resource::Texture>>,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -127,6 +134,7 @@ impl Vrend {
             contexts: BTreeMap::new(),
             todo: Todo::default(),
             blitter: None,
+            doomed: Vec::new(),
         })
     }
 
@@ -169,6 +177,7 @@ impl Vrend {
             contexts,
             todo,
             blitter,
+            doomed: _,
         } = self;
         let host = Host {
             gl,
@@ -204,6 +213,9 @@ impl Vrend {
             c.destroy(&mut host);
         }
         self.switch_ctx0();
+        // The framebuffers that went with the context were the last holders of any storage the
+        // guest freed while they drew into it.
+        self.sweep_doomed();
     }
 
     pub fn has_context(&self, id: CtxId) -> bool {
@@ -279,7 +291,23 @@ impl Vrend {
     pub fn resource_destroy(&mut self, handle: ResourceHandle) {
         if let Some(res) = self.resources.remove(&handle) {
             self.switch_ctx0();
-            res.destroy(&self.gl);
+            if let Some(still_attached) = res.destroy(&self.gl) {
+                self.doomed.push(still_attached);
+            }
+            self.sweep_doomed();
+        }
+    }
+
+    /// Delete the parked texture storage nothing holds any more. Called where ctx0 is current.
+    fn sweep_doomed(&mut self) {
+        let mut i = 0;
+        while i < self.doomed.len() {
+            if Arc::strong_count(&self.doomed[i]) == 1 {
+                let t = self.doomed.swap_remove(i);
+                Arc::into_inner(t).expect("the only share").destroy(&self.gl);
+            } else {
+                i += 1;
+            }
         }
     }
 

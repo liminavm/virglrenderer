@@ -966,9 +966,10 @@ impl Context {
                     // luminance-style swizzles must not apply: the texture goes back to
                     // identity and the view's swizzle becomes a mask and an add.
                     if let Some(res) = res
-                        && let Storage::Texture { name, target, .. } = res.storage
+                        && let Storage::Texture(t) = &res.storage
                     {
-                        gl.bind_texture(target, Some(name));
+                        let target = t.target;
+                        gl.bind_texture(target, Some(t.name));
                         for (c, sw) in [GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA].iter().enumerate() {
                             gl.tex_parameter_i(
                                 target,
@@ -990,8 +991,8 @@ impl Context {
                 if let Some(res) = res {
                     let (id, target, is_buffer, multisampled) = match &res.storage {
                         Storage::Buffer { tbo, .. } => (*tbo, GL_TEXTURE_BUFFER, true, false),
-                        Storage::Texture { name, .. } => (
-                            Some(view.view.unwrap_or(*name)),
+                        Storage::Texture(t) => (
+                            Some(view.view.unwrap_or(t.name)),
                             view.target,
                             false,
                             res.args.nr_samples > 1,
@@ -1150,7 +1151,7 @@ impl Context {
                     }
                     (tbo_tex, 0, 0, true)
                 }
-                Storage::Texture { name, .. } => {
+                Storage::Texture(t) => {
                     let level = iview.level_size;
                     let first = iview.layer_offset & 0xffff;
                     let last = (iview.layer_offset >> 16) & 0xffff;
@@ -1162,7 +1163,7 @@ impl Context {
                         host.todo.note("image views of a layer subset");
                         continue;
                     }
-                    (*name, level as GLint, first as GLint, layered)
+                    (t.name, level as GLint, first as GLint, layered)
                 }
                 _ => continue,
             };
