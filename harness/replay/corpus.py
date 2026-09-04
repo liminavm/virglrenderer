@@ -51,6 +51,8 @@ BIND_SAMPLER_VIEW = 1 << 3
 BIND_VERTEX_BUFFER = 1 << 4
 BIND_SCANOUT = 1 << 18
 
+SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W = 0, 1, 2, 3
+
 PIPE_MASK_RGBA = 0xF
 FILTER_NEAREST, FILTER_LINEAR = 0, 1
 PRIM_TRIANGLE_STRIP = 5
@@ -170,8 +172,9 @@ class Corpus:
                   [handle, s0, 0, 0, 0, 0, 0, 0, 0])
 
     def sampler_view(self, handle, res, fmt, target, first_layer=0, last_layer=0,
-                     first_level=0, last_level=0):
-        swizzle = 0 | (1 << 3) | (2 << 6) | (3 << 9)   # X, Y, Z, W
+                     first_level=0, last_level=0, swizzle=(0, 1, 2, 3)):
+        """`swizzle` is four of PIPE_SWIZZLE_X/Y/Z/W/0/1 (0..5), defaulting to identity."""
+        swizzle = sum(s << (3 * i) for i, s in enumerate(swizzle))
         self.emit(CCMD_CREATE_OBJECT, OBJ_SAMPLER_VIEW,
                   [handle, res, fmt | (target << 24),
                    first_layer | (last_layer << 16),
