@@ -167,6 +167,15 @@ pub struct Features {
 }
 
 impl Features {
+    /// Whether this host can make an IOSurface a texture's storage at all.
+    ///
+    /// A property of the driver, answered once by the extension probe and never per resource:
+    /// a host that has neither entry point has them for no surface, and asking again at each
+    /// import would find that out at the first client window instead of at startup.
+    pub fn adopts_iosurfaces(&self) -> bool {
+        self.has(Feature::egl_image) || self.has(Feature::egl_image_storage)
+    }
+
     /// Decide every feature from a context's version and the extensions it advertises.
     pub fn probe(gles_version: u32, extensions: impl IntoIterator<Item = String>) -> Features {
         let extensions: BTreeSet<String> = extensions.into_iter().collect();

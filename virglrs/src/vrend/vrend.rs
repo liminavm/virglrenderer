@@ -115,9 +115,15 @@ impl Vrend {
         let formats = Table::probe(&gl, &features);
         let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats);
         eprintln!(
-            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features",
+            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
+             iosurface storage {}",
             formats.entries().count(),
             features.present().count(),
+            if features.adopts_iosurfaces() {
+                "available"
+            } else {
+                "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
+            },
         );
         Ok(Vrend {
             winsys,

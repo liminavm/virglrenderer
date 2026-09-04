@@ -285,18 +285,20 @@ impl Untyped {
     /// A refusal hands the storage back, so a rejected upgrade leaves the handle exactly as it
     /// was rather than deleting it: there is no path that loses a resource by failing to type it.
     ///
-    /// Two kinds of refusal meet here and only one of them is a fault. [`check`] asks the
-    /// guest's half -- whether these arguments describe an image at all -- and a guest that
-    /// describes none has erred, so that is the fault. Everything after it asks the *host's*
-    /// half: whether this driver can alias these particular bytes. It is entitled to say no,
-    /// about a resource that is perfectly well described, and a compositor that asked to import
-    /// something this host cannot adopt must keep running. So every answer there degrades to a
-    /// blank texture instead, at either place adoption can fail -- making the image, and binding
-    /// it. The C's comment on this path records what the alternative cost: a context poisoned
-    /// permanently, every later submit failing, reproduced against a real desktop.
+    /// Three outcomes, and each answers to whoever caused it.
     ///
-    /// The one refusal past `check` that is still a fault is a texture that cannot be allocated
-    /// even with no image to bind, because then there is nothing left to degrade to.
+    /// [`check`] asks the guest's half -- whether these arguments describe an image at all. A
+    /// guest that describes none has erred, and gets a refusal that stops its own context and
+    /// nobody else's.
+    ///
+    /// A host that cannot adopt IOSurfaces at all, or a blob whose share is not a surface,
+    /// is neither party's error: the resource gets a blank texture and the log says the
+    /// contents are wrong. That is a limitation, answered once at init for the first and
+    /// carried by the storage for the second.
+    ///
+    /// A host that said it adopts IOSurfaces and then refuses this one is a host bug, and it
+    /// crashes. Degrading there would hide our own defect behind a window that renders the
+    /// wrong thing, which is the one outcome worth less than stopping.
     pub fn upgrade(
         self,
         gl: &Gl,
@@ -309,37 +311,33 @@ impl Untyped {
         if let Err(e) = check(features, formats, limits, &args) {
             return Err((self, e));
         }
-        let image = self.surface.and_then(|held| match winsys.image_from_iosurface(held) {
-            Ok(image) => Some(image),
-            Err(e) => {
+        let image = match self.surface {
+            Some(held) if features.adopts_iosurfaces() => match winsys.image_from_iosurface(held) {
+                Ok(image) => Some(image),
+                // The host takes IOSurfaces and would not take this one. See above: ours.
+                Err(e) => panic!(
+                    "the driver imports IOSurfaces but refused an exported {}x{} {} one: {e}",
+                    args.width,
+                    args.height,
+                    args.format.name()
+                ),
+            },
+            // Either this host adopts no surfaces -- said once at init -- or these bytes are
+            // not one, which the storage that minted them already said. Neither is news here.
+            Some(_) | None => {
                 eprintln!(
-                    "[virglrs] vrend: the driver refused an EGL image of an exported {}x{} {} \
-                     surface ({e}); it gets a blank texture and its contents will be wrong",
+                    "[virglrs] vrend: resource {}x{} {} has no surface to adopt; it gets a blank \
+                     texture and its contents will be wrong",
                     args.width,
                     args.height,
                     args.format.name()
                 );
                 None
             }
-        });
-        let adopted = image.is_some();
+        };
         // The share is gone into the image, or was never there; a refusal past this point has
         // nothing left to hand back but an empty slot, which is what the handle already was.
-        let mut storage = alloc_texture(gl, features, formats, &args, image);
-        if let (Err(why), true) = (&storage, adopted) {
-            // The image was made and would not bind. Nothing about the resource is wrong, only
-            // the adoption, so it falls back to the blank texture a resource with no surface
-            // gets rather than taking the context down with it.
-            eprintln!(
-                "[virglrs] vrend: an exported {}x{} {} surface imported but would not bind \
-                 ({why:?}); it gets a blank texture and its contents will be wrong",
-                args.width,
-                args.height,
-                args.format.name()
-            );
-            storage = alloc_texture(gl, features, formats, &args, None);
-        }
-        let storage = match storage {
+        let storage = match alloc_texture(gl, features, formats, &args, image) {
             Ok(s) => s,
             Err(e) => return Err((Untyped { surface: None }, e)),
         };
@@ -519,7 +517,7 @@ impl Resource {
         let storage = if args.target == TextureTarget::Buffer {
             alloc_buffer(gl, features, &args)?
         } else {
-            let image = mint_surface(winsys, &args);
+            let image = mint_surface(winsys, features, &args);
             alloc_texture(gl, features, formats, &args, image)?
         };
         Ok(Resource { args, storage })
@@ -848,7 +846,7 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
 /// Only a single-level, single-sample 2D texture in a 32-bit format IOSurface and Metal both
 /// name. Anything else keeps ordinary GL storage and the CPU readback path, as does a surface
 /// the system or the driver refuses: the fallback is never removed, only reported.
-fn mint_surface(winsys: &Winsys, a: &Args) -> Option<Image> {
+fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image> {
     let scanout = a.bind.has(Bind::SCANOUT);
     if !scanout && !a.bind.has(Bind::SHARED) {
         return None;
@@ -874,6 +872,10 @@ fn mint_surface(winsys: &Winsys, a: &Args) -> Option<Image> {
             return None;
         }
     };
+    if !features.adopts_iosurfaces() {
+        // Known at init and reported there; the resource keeps ordinary GL storage.
+        return None;
+    }
     match winsys.image_from_iosurface(Arc::new(surface)) {
         Ok(image) => {
             if scanout {
@@ -888,16 +890,15 @@ fn mint_surface(winsys: &Winsys, a: &Args) -> Option<Image> {
             }
             Some(image)
         }
-        Err(e) => {
-            eprintln!(
-                "[virglrs] vrend: the driver refused an EGL image of a {}x{} {} IOSurface ({e}); \
-                 the resource keeps GL storage",
-                a.width,
-                a.height,
-                a.format.name()
-            );
-            None
-        }
+        // The driver said it imports IOSurfaces and then would not import one of the formats
+        // and extents it accepts. That is the host contradicting itself, not the guest asking
+        // for anything, and a blank window would hide it.
+        Err(e) => panic!(
+            "the driver imports IOSurfaces but refused a {}x{} {} one: {e}",
+            a.width,
+            a.height,
+            a.format.name()
+        ),
     }
 }
 
@@ -966,11 +967,19 @@ fn alloc_texture(
             false
         };
         let err = gl.drain_errors();
-        if !bound || err != GL_NO_ERROR {
-            gl.bind_texture(target, None);
-            gl.delete_texture(name);
-            return Err(if bound { Refusal::GlError(err) } else { Refusal::NoEglImage });
-        }
+        // Nobody makes an EGL image without `Features::adopts_iosurfaces` first saying the host
+        // takes them, so reaching here means the driver accepted the image and then would not
+        // attach it. That is a host bug, and a resource that quietly kept GL storage instead
+        // would hide it behind a window that merely renders the wrong thing.
+        assert!(bound, "an EGL image with no entry point to bind it, past the feature probe");
+        assert_eq!(
+            err,
+            GL_NO_ERROR,
+            "the driver imported a {}x{} {} IOSurface and then would not bind it",
+            a.width,
+            a.height,
+            a.format.name()
+        );
         gl.bind_texture(target, None);
         return Ok(Storage::Texture(Arc::new(Texture {
             name,
