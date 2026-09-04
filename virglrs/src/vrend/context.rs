@@ -23,7 +23,8 @@ use super::formats::{Desc, Table};
 use super::gl::gles::*;
 use super::gl::{
     BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, ProgramName,
-    QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, VertexArrayName,
+    QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, UniformLocation,
+    VertexArrayName,
 };
 use super::pipe::slots::{MAX_COLOR_BUFS, MAX_VIEWPORTS};
 use super::pipe::*;
@@ -33,6 +34,7 @@ use super::transfer::{self, Info};
 use super::{debug, shader, tgsi};
 use crate::guest_mem::{HostSpan, Iov};
 use crate::ids::{CtxId, ResourceHandle};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -43,7 +45,7 @@ mod draw;
 #[path = "context/select.rs"]
 mod select;
 
-pub use draw::{HwBlend, LinkedProgram, Sysval, Xfb};
+pub use draw::{HwBlend, LinkedProgram, ProgramSerial, Sysval, Xfb};
 pub use select::{Bound, Program, Variant, VariantId};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
@@ -496,8 +498,8 @@ pub struct SubCtx {
     prim_mode: PrimType,
     /// Every program linked for this sub-context, and the one the draws run.
     programs: Vec<LinkedProgram>,
-    prog: Option<u64>,
-    next_program_serial: u64,
+    prog: Option<ProgramSerial>,
+    next_program_serial: Cell<u64>,
     next_variant_id: u64,
     /// The `VirglBlock` contents. Each program remembers the block it last uploaded and
     /// compares by value, so there is no second record of whether this changed.
@@ -566,7 +568,7 @@ impl SubCtx {
             prim_mode: PrimType::Points,
             programs: Vec::new(),
             prog: None,
-            next_program_serial: 0,
+            next_program_serial: Cell::new(0),
             next_variant_id: 0,
             sysval: Sysval::default(),
             ssbos: Default::default(),
