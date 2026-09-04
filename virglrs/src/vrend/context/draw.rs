@@ -96,7 +96,7 @@ pub enum Xfb {
 /// and every location the draw path writes through.
 pub struct LinkedProgram {
     /// Names this program in the sub-context's list; stable while the program lives.
-    pub serial: u64,
+    pub serial: ProgramSerial,
     pub id: ProgramName,
     /// The variant of each stage, in stage order, compute excluded.
     pub stages: [Option<VariantId>; 5],
@@ -106,18 +106,19 @@ pub struct LinkedProgram {
     pub samplers_used_mask: [u32; ShaderStage::COUNT],
     pub shadow_samp_mask: [u32; ShaderStage::COUNT],
     /// One location per set bit of `samplers_used_mask`, in bit order.
-    pub sampler_locs: [Vec<GLint>; ShaderStage::COUNT],
-    pub shadow_samp_mask_locs: [Vec<GLint>; ShaderStage::COUNT],
-    pub shadow_samp_add_locs: [Vec<GLint>; ShaderStage::COUNT],
-    pub const_location: [GLint; ShaderStage::COUNT],
+    pub sampler_locs: [Vec<Option<UniformLocation>>; ShaderStage::COUNT],
+    pub shadow_samp_mask_locs: [Vec<Option<UniformLocation>>; ShaderStage::COUNT],
+    pub shadow_samp_add_locs: [Vec<Option<UniformLocation>>; ShaderStage::COUNT],
+    pub const_location: [Option<UniformLocation>; ShaderStage::COUNT],
     pub num_consts: [usize; ShaderStage::COUNT],
     pub ssbo_used_mask: [u32; ShaderStage::COUNT],
     pub ssbo_binding_offset: [u32; ShaderStage::COUNT],
     pub images_used_mask: [u32; ShaderStage::COUNT],
-    /// One location per image slot up to the highest used, -1 where none.
-    pub img_locs: [Vec<GLint>; ShaderStage::COUNT],
+    /// One location per image slot up to the highest used; `None` where the compiler dropped
+    /// the image and the draw has nothing to write.
+    pub img_locs: [Vec<Option<UniformLocation>>; ShaderStage::COUNT],
     pub image_binding_offset: [u32; ShaderStage::COUNT],
-    pub tex_levels_uniform_id: [GLint; ShaderStage::COUNT],
+    pub tex_levels_uniform_id: [Option<UniformLocation>; ShaderStage::COUNT],
     /// The `VirglBlock` binding and the buffer behind it, once a stage declared the block.
     pub virgl_block_bind: Option<GLuint>,
     pub sysval_buffer: Option<BufferName>,
@@ -336,7 +337,20 @@ struct Linked<'a> {
     gl: ShaderName,
 }
 
+/// A linked program's name for as long as its sub-context lives: minted once and never reused,
+/// so a sub-context pointing at one cannot come to mean a later program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProgramSerial(u64);
+
 impl SubCtx {
+    /// The next name, taken through a `Cell` so minting one does not need the whole
+    /// sub-context: the program being named is built from a borrow of it.
+    fn mint_program_serial(&self) -> ProgramSerial {
+        let serial = self.next_program_serial.get();
+        self.next_program_serial.set(serial + 1);
+        ProgramSerial(serial)
+    }
+
     fn program(&self) -> Option<&LinkedProgram> {
         let serial = self.prog?;
         self.programs.iter().find(|p| p.serial == serial)
@@ -408,7 +422,7 @@ pub(super) fn release_shader(sub: &mut SubCtx, gl: &Gl, shader: Shader) {
 fn add_shader_program(
     host: &mut Host<'_>,
     cmd: Cmd,
-    serial: u64,
+    serial: ProgramSerial,
     linked: &[Linked<'_>],
     dual_src: bool,
 ) -> Result<LinkedProgram, Fault> {
@@ -482,14 +496,14 @@ fn add_shader_program(
         sampler_locs: Default::default(),
         shadow_samp_mask_locs: Default::default(),
         shadow_samp_add_locs: Default::default(),
-        const_location: [-1; ShaderStage::COUNT],
+        const_location: [None; ShaderStage::COUNT],
         num_consts: [0; ShaderStage::COUNT],
         ssbo_used_mask: [0; ShaderStage::COUNT],
         ssbo_binding_offset: [0; ShaderStage::COUNT],
         images_used_mask: [0; ShaderStage::COUNT],
         img_locs: Default::default(),
         image_binding_offset: [0; ShaderStage::COUNT],
-        tex_levels_uniform_id: [-1; ShaderStage::COUNT],
+        tex_levels_uniform_id: [None; ShaderStage::COUNT],
         virgl_block_bind: None,
         sysval_buffer: None,
         sysval_uploaded: None,
@@ -517,7 +531,7 @@ fn add_shader_program(
         let mask = l.info.images_used_mask;
         if (mask != 0 || !l.info.image_arrays.is_empty()) && features.has(Feature::images) {
             let nsamp = (32 - mask.leading_zeros()) as usize;
-            let mut locs = vec![-1; nsamp];
+            let mut locs = vec![None; nsamp];
             if !l.info.image_arrays.is_empty() {
                 for arr in &l.info.image_arrays {
                     for j in 0..arr.array_size {
@@ -526,7 +540,7 @@ fn add_shader_program(
                         let loc = gl.get_uniform_location(id, &name);
                         let slot = (arr.first + j) as usize;
                         if slot >= locs.len() {
-                            locs.resize(slot + 1, -1);
+                            locs.resize(slot + 1, None);
                         }
                         locs[slot] = loc;
                     }
@@ -576,7 +590,7 @@ fn add_shader_program(
                     gl.get_uniform_location(id, &format!("{prefix}shadadd{i}")),
                 )
             } else {
-                (-1, -1)
+                (None, None)
             };
             prog.shadow_samp_mask_locs[s].push(mask_loc);
             prog.shadow_samp_add_locs[s].push(add_loc);
@@ -680,11 +694,9 @@ impl Context {
         let serial = match found {
             Some(s) => s,
             None => {
-                let serial = sub.next_program_serial;
+                let serial = sub.mint_program_serial();
                 let prog = add_shader_program(host, cmd, serial, &linked, dual_src)?;
-                let sub = self.sub_mut();
-                sub.next_program_serial += 1;
-                sub.programs.push(prog);
+                self.sub_mut().programs.push(prog);
                 serial
             }
         };
@@ -886,11 +898,10 @@ impl Context {
         let Some(prog) = sub.program() else {
             return;
         };
-        let loc = prog.const_location[s];
         let num_consts = prog.num_consts[s];
-        if !sub.consts[s].is_empty()
+        if let Some(loc) = prog.const_location[s]
+            && !sub.consts[s].is_empty()
             && sub.shaders[s].is_some()
-            && loc != -1
             && (sub.const_dirty[s] || new_program)
         {
             let n = (num_consts * 4).min(sub.consts[s].len());
@@ -935,7 +946,9 @@ impl Context {
                 && let Some(view) = view
             {
                 gl.active_texture(next_sampler_id);
-                gl.uniform_1i(sampler_locs[sampler_index], next_sampler_id as GLint);
+                if let Some(loc) = sampler_locs[sampler_index] {
+                    gl.uniform_1i(loc, next_sampler_id as GLint);
+                }
                 let res = host.resources.get(&view.resource);
                 if shadow_mask & (1 << i) != 0 {
                     // A depth texture read through a shadow sampler compares, and the
@@ -956,8 +969,12 @@ impl Context {
                     let one_or_zero = |g: GLint| g == GL_ZERO as GLint || g == GL_ONE as GLint;
                     let m = view.gl_swizzle.map(|g| if one_or_zero(g) { 0.0 } else { 1.0 });
                     let a = view.gl_swizzle.map(|g| if g == GL_ONE as GLint { 1.0 } else { 0.0 });
-                    gl.uniform_4f(mask_locs[sampler_index], m);
-                    gl.uniform_4f(add_locs[sampler_index], a);
+                    if let Some(loc) = mask_locs[sampler_index] {
+                        gl.uniform_4f(loc, m);
+                    }
+                    if let Some(loc) = add_locs[sampler_index] {
+                        gl.uniform_4f(loc, a);
+                    }
                 }
                 if let Some(res) = res {
                     let (id, target, is_buffer, multisampled) = match &res.storage {
@@ -1087,7 +1104,7 @@ impl Context {
                 continue;
             }
             let image_unit = i + offset;
-            if prog.img_locs[s].get(i as usize).copied().unwrap_or(-1) == -1 {
+            if prog.img_locs[s].get(i as usize).copied().flatten().is_none() {
                 continue;
             }
             let Some(res) = host.resources.get_mut(&iview.resource) else {
@@ -1194,11 +1211,10 @@ impl Context {
             self.draw_bind_images(host, stage);
             self.draw_bind_ssbo(host, stage);
             let sub = self.sub();
-            if let Some(prog) = sub.program() {
-                let loc = prog.tex_levels_uniform_id[stage.index()];
-                if loc != -1 {
-                    gl.uniform_1iv(loc, &sub.texture_levels[stage.index()]);
-                }
+            if let Some(prog) = sub.program()
+                && let Some(loc) = prog.tex_levels_uniform_id[stage.index()]
+            {
+                gl.uniform_1iv(loc, &sub.texture_levels[stage.index()]);
             }
         }
         let sub = self.sub();

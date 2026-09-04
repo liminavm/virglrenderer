@@ -74,6 +74,12 @@ pub struct ShaderName(GLuint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ProgramName(GLuint);
 
+/// Where a uniform lives in a linked program. GL spells "the program has no such uniform" as
+/// -1 and then ignores a write through it, which is a silent no-op three call sites deep; here
+/// it is `None` from [`Gl::get_uniform_location`] onwards, and the -1 never exists.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct UniformLocation(GLint);
+
 impl ShaderName {
     pub fn raw(self) -> GLuint {
         self.0
@@ -1578,11 +1584,17 @@ impl Gl {
         unsafe { self.t.glUseProgram()(program.map_or(0, |p| p.0)) };
     }
 
-    /// `glGetUniformLocation`; -1 when the program has no such uniform.
-    pub fn get_uniform_location(&self, program: ProgramName, name: &str) -> GLint {
+    /// `glGetUniformLocation`; `None` when the program has no such uniform.
+    pub fn get_uniform_location(
+        &self,
+        program: ProgramName,
+        name: &str,
+    ) -> Option<UniformLocation> {
         let name = std::ffi::CString::new(name).expect("a uniform name has no NUL");
         // SAFETY: a NUL-terminated string, live for the call.
-        unsafe { self.t.glGetUniformLocation()(program.0, name.as_ptr().cast::<GLchar>()) }
+        let loc =
+            unsafe { self.t.glGetUniformLocation()(program.0, name.as_ptr().cast::<GLchar>()) };
+        (loc >= 0).then_some(UniformLocation(loc))
     }
 
     /// `glGetUniformBlockIndex`; `None` when the program has no such block.
@@ -1652,27 +1664,27 @@ impl Gl {
         unsafe { f(program.0, color, index, name.as_ptr().cast::<GLchar>()) };
     }
 
-    pub fn uniform_1i(&self, location: GLint, v: GLint) {
+    pub fn uniform_1i(&self, location: UniformLocation, v: GLint) {
         // SAFETY: plain scalars.
-        unsafe { self.t.glUniform1i()(location, v) };
+        unsafe { self.t.glUniform1i()(location.0, v) };
     }
 
-    pub fn uniform_1iv(&self, location: GLint, v: &[GLint]) {
+    pub fn uniform_1iv(&self, location: UniformLocation, v: &[GLint]) {
         let count = GLsizei::try_from(v.len()).expect("a uniform count fits a GLsizei");
         // SAFETY: the driver reads `count` integers from a slice of that length.
-        unsafe { self.t.glUniform1iv()(location, count, v.as_ptr()) };
+        unsafe { self.t.glUniform1iv()(location.0, count, v.as_ptr()) };
     }
 
-    pub fn uniform_4f(&self, location: GLint, v: [f32; 4]) {
+    pub fn uniform_4f(&self, location: UniformLocation, v: [f32; 4]) {
         // SAFETY: plain scalars.
-        unsafe { self.t.glUniform4f()(location, v[0], v[1], v[2], v[3]) };
+        unsafe { self.t.glUniform4f()(location.0, v[0], v[1], v[2], v[3]) };
     }
 
     /// `glUniform4uiv` over `v`, which holds `count` vectors of four.
-    pub fn uniform_4uiv(&self, location: GLint, v: &[u32]) {
+    pub fn uniform_4uiv(&self, location: UniformLocation, v: &[u32]) {
         let count = GLsizei::try_from(v.len() / 4).expect("a uniform count fits a GLsizei");
         // SAFETY: the driver reads `count` vectors of four, which the slice holds.
-        unsafe { self.t.glUniform4uiv()(location, count, v.as_ptr()) };
+        unsafe { self.t.glUniform4uiv()(location.0, count, v.as_ptr()) };
     }
 
     pub fn active_texture(&self, unit: GLuint) {
