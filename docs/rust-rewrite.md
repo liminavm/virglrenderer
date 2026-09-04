@@ -542,8 +542,8 @@ buildable throughout as the A-side reference.
   when a stream asks: tessellation without a control shader (the C's injected TCS),
   advanced blend equations, a layered image bound as a subset of its levels or layers,
   the C's bridge of UBO 0 into the constant array,
-  implicit-multisample surfaces, the resource-copy fallback through guest memory, blob
-  resources, video. The shader blitter is in, both paths: a blit whose ends disagree
+  implicit-multisample surfaces, the resource-copy fallback through guest memory,
+  video. The shader blitter is in, both paths: a blit whose ends disagree
   about their swizzle, that swaps red and blue for an IOSurface-backed end, or that has
   to convert a colourspace by hand, runs as a textured quad in the blitter's own shared
   GL context, and `blit.score` pins five such blits against the C. A blit whose two ends
@@ -561,6 +561,22 @@ buildable throughout as the A-side reference.
   a guest-side race in the extension, so a frame diff has to be read against a second boot
   of the reference before a difference is charged to the port. That session, wallpaper
   included, is now the classic corpus: `vrend.bin` and the `vrend.score` pinned from it.
+
+  **Blob resources are what P3 owes next, and they are a blocker rather than a gap.**
+  `PipeResourceSetType` is where a blob becomes a typed image: it carries the format, bind,
+  extent, modifier and per-plane stride and offset that the blob's own creation does not. The
+  decoder reads all of it; only the dispatch refuses, and the refusal poisons the context that
+  asked. On the enhanced image that context is gnome-shell's, at session start and with no
+  Vulkan client involved -- one refusal, then every submit for the rest of the boot fails and
+  the desktop never presents again. The stock guest does not reach the command, which is why
+  its pixel gate passes; both images render through vrend, so serving this has to leave the
+  one that works untouched.
+
+  It is also the whole of the cross-import gap. The venus half already works on a real
+  workload: a client's swapchain is exported, held as a share, and survives the death of the
+  context that made it. There is exactly one refusal in the chain and it is vrend's -- so this
+  is one consumer to build, not a pipeline. `Storage` is the currency, `image_from_iosurface`
+  the adoption point, and the boot is the gate, because replay cannot reach any of it.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
