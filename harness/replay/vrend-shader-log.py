@@ -18,13 +18,16 @@ Record it with the debug C prefix, which is the only one that compiles the dump 
     VIRGL_PREFIX=.../harness/vm/prefix-debug VREND_DEBUG=shader \\
         ./vrend-replay.sh ../vm/captures/vrend.bin --score /dev/null 2> shader.log
     ./vrend-shader-log.py shader.log > fixtures/vrend-shaders.txt
+
+The Rust prefix prints the same blocks under `VIRGLRS_DEBUG=shader`, with the mark on its own
+line already; this reads either, so the two runs diff after the same pass.
 """
 
 import re
 import sys
 
 PREFIX = re.compile(r"^limina-replay: ", re.M)
-MARK = re.compile(r"^(TGSI received:|GLSL:)", re.M)
+MARK = re.compile(r"^(TGSI received:|GLSL:)\n?", re.M)
 
 
 def main() -> int:

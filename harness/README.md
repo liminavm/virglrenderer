@@ -171,7 +171,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   compiles the dump out) as `VREND_DEBUG=shader ./vrend-replay.sh ../vm/captures/vrend.bin`,
   normalised by `vrend-shader-log.py`. The Rust tests in `virglrs/src/vrend/tgsi/fixture.rs`
   read it and hold the parser to the TGSI half: every dump parses and prints back byte for
-  byte. The GLSL half is the translator's oracle.
+  byte; those in `virglrs/src/vrend/shader/glsl/mod.rs` hold the translator to the GLSL half.
+  The fixture cannot say which *key* a block was translated under, so the live differential is
+  the same replay against the Rust prefix with `VIRGLRS_DEBUG=shader`, normalised by the same
+  script: the two logs must diff empty, block for block and in order, which holds the key
+  construction to the C as well as the translation. Under `--nodraw` that is the 28 blocks of
+  shader creation and `LINK_SHADER`.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
