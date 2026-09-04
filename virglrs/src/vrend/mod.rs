@@ -32,5 +32,6 @@ pub mod resource;
 pub mod shader;
 pub mod tgsi;
 pub mod transfer;
+pub mod video;
 #[allow(clippy::module_inception)]
 pub mod vrend;

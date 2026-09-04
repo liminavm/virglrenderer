@@ -128,50 +128,6 @@ impl Support {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The FourCCs are the load-bearing numbers in this file: get one wrong and VideoToolbox
-    /// answers about a codec nobody asked for. Spell them the other way and compare.
-    #[test]
-    fn each_codec_is_the_fourcc_coremedia_names_it_by() {
-        for (codec, fourcc) in [
-            (Codec::H264, b"avc1"),
-            (Codec::Hevc, b"hvc1"),
-            (Codec::Vp9, b"vp09"),
-            (Codec::Av1, b"av01"),
-        ] {
-            assert_eq!(codec as u32, u32::from_be_bytes(*fourcc), "{codec:?}");
-        }
-    }
-
-    /// Every codec has its own slot, so one's answer can never be read as another's.
-    #[test]
-    fn no_two_codecs_share_a_slot() {
-        let mut slots: Vec<usize> = Codec::ALL.iter().map(|c| c.slot()).collect();
-        slots.sort_unstable();
-        assert_eq!(slots, (0..Codec::ALL.len()).collect::<Vec<_>>());
-    }
-
-    /// H.264 needs no registration to be visible and VP9 does, so the pair separates "probing
-    /// works" from "probing registered first". A regression that dropped the registration would
-    /// leave H.264 answering yes and VP9 answering no, which is exactly the state that pinned a
-    /// caps fixture claiming this host has no VP9 decoder.
-    ///
-    /// Both are facts about this machine's silicon, so both are also the reason the video gate
-    /// is not vacuous: a host answering no to VP9 advertises nothing and decodes nothing.
-    #[test]
-    fn probing_registers_the_supplemental_decoders_first() {
-        let support = Support::probe();
-        assert!(support.decodes(Codec::H264), "no H.264 silicon");
-        assert!(
-            support.decodes(Codec::Vp9),
-            "no VP9 -- silicon, or a probe that skipped registration"
-        );
-    }
-}
-
 // ------------------------------------------------------------------ CoreFoundation
 
 /// An opaque CoreFoundation object. Every foreign handle below is one, distinguished by the
@@ -273,6 +229,14 @@ impl Owned {
         self.0.as_ptr()
     }
 }
+
+// SAFETY: a CoreFoundation reference may be held by whichever thread owns it. Retain and release
+// are atomic, so moving one between threads cannot lose or double a reference, and the objects
+// this module holds -- a decompression session, a format description, a pixel buffer -- are all
+// documented as usable from any thread when access to them is serialized. It is: the renderer's
+// root is behind a mutex, so exactly one thread reaches a Session at a time. Send and not Sync,
+// because that is the whole of the claim -- ownership may move, and two threads may not share.
+unsafe impl Send for Owned {}
 
 impl Drop for Owned {
     fn drop(&mut self) {
@@ -838,8 +802,47 @@ impl Drop for Session {
 }
 
 #[cfg(test)]
-mod session_tests {
+mod tests {
     use super::*;
+
+    /// The FourCCs are the load-bearing numbers in this file: get one wrong and VideoToolbox
+    /// answers about a codec nobody asked for. Spell them the other way and compare.
+    #[test]
+    fn each_codec_is_the_fourcc_coremedia_names_it_by() {
+        for (codec, fourcc) in [
+            (Codec::H264, b"avc1"),
+            (Codec::Hevc, b"hvc1"),
+            (Codec::Vp9, b"vp09"),
+            (Codec::Av1, b"av01"),
+        ] {
+            assert_eq!(codec as u32, u32::from_be_bytes(*fourcc), "{codec:?}");
+        }
+    }
+
+    /// Every codec has its own slot, so one's answer can never be read as another's.
+    #[test]
+    fn no_two_codecs_share_a_slot() {
+        let mut slots: Vec<usize> = Codec::ALL.iter().map(|c| c.slot()).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..Codec::ALL.len()).collect::<Vec<_>>());
+    }
+
+    /// H.264 needs no registration to be visible and VP9 does, so the pair separates "probing
+    /// works" from "probing registered first". A regression that dropped the registration would
+    /// leave H.264 answering yes and VP9 answering no, which is exactly the state that pinned a
+    /// caps fixture claiming this host has no VP9 decoder.
+    ///
+    /// Both are facts about this machine's silicon, so both are also the reason the video gate
+    /// is not vacuous: a host answering no to VP9 advertises nothing and decodes nothing.
+    #[test]
+    fn probing_registers_the_supplemental_decoders_first() {
+        let support = Support::probe();
+        assert!(support.decodes(Codec::H264), "no H.264 silicon");
+        assert!(
+            support.decodes(Codec::Vp9),
+            "no VP9 -- silicon, or a probe that skipped registration"
+        );
+    }
 
     /// The vpcC bytes reach VideoToolbox as the description of the stream, so a wrong one is a
     /// decoder configured for a stream nobody sent. Spelled out here against the C's
