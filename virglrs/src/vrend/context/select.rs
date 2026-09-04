@@ -39,13 +39,20 @@ impl Program {
     }
 }
 
+/// A variant's name for as long as its sub-context lives: minted once and never reused, so a
+/// program keyed on it cannot mean a later variant. The GL shader name is not that: the driver
+/// hands a deleted name to the next shader it makes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VariantId(u64);
+
 /// `vrend_shader`: one translation of a program, under one key.
 pub struct Variant {
+    pub id: VariantId,
     pub key: shader::Key,
     pub strings: shader::Strings,
     pub var_info: shader::VarInfo,
     /// The compiled shader, once a program has been assembled with it.
-    pub id: Option<ShaderName>,
+    pub gl: Option<ShaderName>,
 }
 
 /// What a sub-context has bound at a stage. The C holds a reference, so a shader the guest
@@ -144,7 +151,7 @@ fn compile(gl: &Gl, stage: ShaderStage, variant: &mut Variant) -> bool {
     let source = variant.strings.source();
     match gl.compile_shader(id, &source) {
         Ok(()) => {
-            variant.id = Some(id);
+            variant.gl = Some(id);
             true
         }
         Err(log) => {
@@ -160,6 +167,12 @@ fn compile(gl: &Gl, stage: ShaderStage, variant: &mut Variant) -> bool {
 }
 
 impl SubCtx {
+    fn mint_variant_id(&mut self) -> VariantId {
+        let id = VariantId(self.next_variant_id);
+        self.next_variant_id += 1;
+        id
+    }
+
     /// The program bound at `stage`, when a shader is bound there and its text is whole.
     pub(super) fn bound_program(&self, stage: ShaderStage) -> Option<&Program> {
         let shader = match self.shaders[stage.index()].as_ref()? {
@@ -382,6 +395,7 @@ fn translate(
     cmd: Cmd,
     shader: &mut Shader,
     key: shader::Key,
+    id: VariantId,
 ) -> Result<(), Fault> {
     let stage = shader.stage;
     let ShaderText::Whole(program) = &mut shader.text else {
@@ -402,7 +416,7 @@ fn translate(
                 eprint!("GLSL:\n{}\n", strings.source());
             }
             program.info = info;
-            program.variants.insert(0, Variant { key, strings, var_info, id: None });
+            program.variants.insert(0, Variant { id, key, strings, var_info, gl: None });
             Ok(())
         }
         Err(error) => {
@@ -443,13 +457,14 @@ impl Context {
         };
         let key = sub.fill_shader_key(host, Some(handle), shader.stage);
         let sub = self.sub_mut();
+        let id = sub.mint_variant_id();
         let Some(Object::Shader(shader)) = sub.objects.get_mut(&handle) else {
             unreachable!("looked up a moment ago");
         };
         if select_variant(shader, &key) {
             return Ok(());
         }
-        translate(host, cmd, shader, key)
+        translate(host, cmd, shader, key, id)
     }
 
     /// `vrend_shader_select` on the shader bound at `stage`.
@@ -461,14 +476,16 @@ impl Context {
             None => return Ok(()),
         };
         let key = sub.fill_shader_key(host, handle, stage);
-        let Some(shader) = self.sub_mut().bound_shader_mut(stage) else {
+        let sub = self.sub_mut();
+        let id = sub.mint_variant_id();
+        let Some(shader) = sub.bound_shader_mut(stage) else {
             let handle = handle.expect("a bound shader that is not owned is in the table");
             return Err(Fault::IllegalHandle { cmd, handle });
         };
         if select_variant(shader, &key) {
             return Ok(());
         }
-        translate(host, cmd, shader, key)
+        translate(host, cmd, shader, key, id)
     }
 
     /// `vrend_select_program`, as far as the variants: every bound stage selected under the
@@ -514,7 +531,7 @@ impl Context {
             let Some(current) = program.variants.first_mut() else {
                 return Err(Fault::Shader { cmd, what: "a stage with no variant to compile" });
             };
-            if current.id.is_none() && !compile(gl, stage, current) {
+            if current.gl.is_none() && !compile(gl, stage, current) {
                 return Err(Fault::Shader { cmd, what: "a shader the driver refused to compile" });
             }
         }

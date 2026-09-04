@@ -43,7 +43,7 @@ mod draw;
 mod select;
 
 pub use draw::{HwBlend, LinkedProgram, Sysval, Xfb};
-pub use select::{Bound, Program, Variant};
+pub use select::{Bound, Program, Variant, VariantId};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
@@ -499,6 +499,7 @@ pub struct SubCtx {
     programs: Vec<LinkedProgram>,
     prog: Option<u64>,
     next_program_serial: u64,
+    next_variant_id: u64,
     /// The `VirglBlock` contents. Each program remembers the block it last uploaded and
     /// compares by value, so there is no second record of whether this changed.
     sysval: Sysval,
@@ -567,6 +568,7 @@ impl SubCtx {
             programs: Vec::new(),
             prog: None,
             next_program_serial: 0,
+            next_variant_id: 0,
             sysval: Sysval::default(),
             ssbos: Default::default(),
             images: Default::default(),
@@ -601,11 +603,14 @@ impl SubCtx {
         }
         let objects = std::mem::take(&mut self.objects);
         for (_, obj) in objects {
-            release(gl, obj);
+            match obj {
+                Object::Shader(s) => draw::release_shader(&mut self, gl, s),
+                other => release(gl, other),
+            }
         }
         for b in std::mem::take(&mut self.shaders) {
             if let Some(Bound::Owned(s)) = b {
-                release(gl, Object::Shader(s));
+                draw::release_shader(&mut self, gl, s);
             }
         }
         self.gl_ctx
@@ -680,16 +685,7 @@ fn release(gl: &Gl, obj: Object) {
             }
         }
         Object::Query(q) => gl.delete_query(q.id),
-        Object::Shader(s) => {
-            // The programs linking its variants went with the sub-context (`draw::release_shader`).
-            if let ShaderText::Whole(p) = s.text {
-                for v in p.variants {
-                    if let Some(id) = v.id {
-                        gl.delete_shader(id);
-                    }
-                }
-            }
-        }
+        Object::Shader(_) => unreachable!("a shader leaves through draw::release_shader"),
         Object::Blend(_) | Object::Rasterizer(_) | Object::Dsa(_) | Object::StreamoutTarget(_) => {}
     }
 }
