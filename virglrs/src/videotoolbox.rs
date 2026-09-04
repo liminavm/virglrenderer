@@ -288,6 +288,14 @@ unsafe extern "C" {
         extensions: CfTypeRef,
         out: *mut CfTypeRef,
     ) -> Status;
+    fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        allocator: CfTypeRef,
+        parameter_set_count: usize,
+        parameter_set_pointers: *const *const u8,
+        parameter_set_sizes: *const usize,
+        nal_unit_header_length: i32,
+        out: *mut CfTypeRef,
+    ) -> Status;
     fn CMBlockBufferCreateWithMemoryBlock(
         structure_allocator: CfTypeRef,
         memory_block: *mut c_void,
@@ -345,6 +353,10 @@ unsafe extern "C" {
         out: *mut CfTypeRef,
     ) -> Status;
     fn VTDecompressionSessionInvalidate(session: CfTypeRef);
+    fn VTDecompressionSessionCanAcceptFormatDescription(
+        session: CfTypeRef,
+        format_description: CfTypeRef,
+    ) -> CfBoolean;
     fn VTDecompressionSessionDecodeFrame(
         session: CfTypeRef,
         sample_buffer: CfTypeRef,
@@ -486,6 +498,12 @@ impl Plane<'_> {
 pub enum Configuration {
     /// A VP9 codec configuration record, the twelve bytes of a `vpcC` FullBox.
     Vpcc([u8; 12]),
+    /// An H.264 SPS and PPS, as NAL units without framing.
+    ///
+    /// H.264 goes through no configuration atom at all: VideoToolbox takes the parameter set
+    /// NALs themselves and derives the whole format description -- the dimensions included --
+    /// from them.
+    H264 { sps: Vec<u8>, pps: Vec<u8> },
 }
 
 impl Configuration {
@@ -509,22 +527,109 @@ impl Configuration {
         Configuration::Vpcc(box_)
     }
 
-    fn codec(&self) -> Codec {
+    /// The H.264 record for a stream these parameter sets describe.
+    pub fn h264(sps: Vec<u8>, pps: Vec<u8>) -> Configuration {
+        Configuration::H264 { sps, pps }
+    }
+
+    /// Whether this configuration is carried as parameter set NALs rather than as an atom.
+    ///
+    /// The two are not interchangeable and only the parameter-set kind can be swapped under a
+    /// live session, so the distinction is asked for by name rather than inferred from a codec.
+    pub fn is_parameter_sets(&self) -> bool {
         match self {
-            Configuration::Vpcc(_) => Codec::Vp9,
+            Configuration::Vpcc(_) => false,
+            Configuration::H264 { .. } => true,
         }
     }
 
-    /// The extension atom key this record is filed under in the format description.
-    fn atom_key(&self) -> &'static CStr {
+    /// Build the format description a session for this configuration decodes against.
+    ///
+    /// `width` and `height` are the extent the atom path has to be told; the parameter-set path
+    /// reads its own out of the SPS and ignores them.
+    fn format(&self, width: u32, height: u32) -> Result<Owned, Status> {
         match self {
-            Configuration::Vpcc(_) => c"vpcC",
+            Configuration::Vpcc(bytes) => Configuration::atom_format(
+                c"vpcC",
+                bytes,
+                Codec::Vp9 as CmVideoCodecType,
+                width,
+                height,
+            ),
+            Configuration::H264 { sps, pps } => {
+                let sets = [sps.as_ptr(), pps.as_ptr()];
+                let sizes = [sps.len(), pps.len()];
+                let mut format = std::ptr::null();
+                // SAFETY: two pointers and two lengths reconciled here, from slices that outlive
+                // the call; the constructor copies what it reads. The result is wrapped at once.
+                unsafe {
+                    CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        std::ptr::null(),
+                        sets.len(),
+                        sets.as_ptr(),
+                        sizes.as_ptr(),
+                        // The framing `annexb_to_avcc` produces: a big-endian 32-bit length.
+                        4,
+                        &mut format,
+                    )
+                    .ok()?;
+                    Owned::from_created(format).ok_or(Status(-1))
+                }
+            }
         }
     }
 
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Configuration::Vpcc(b) => b,
+    /// The format description for a codec configured by an extension atom.
+    fn atom_format(
+        key: &CStr,
+        bytes: &[u8],
+        codec: CmVideoCodecType,
+        width: u32,
+        height: u32,
+    ) -> Result<Owned, Status> {
+        // SAFETY: every call below is a CoreFoundation constructor over bytes and objects this
+        // function owns; each result is wrapped in `Owned` at once, so every path out of here --
+        // including the `?`s -- releases exactly what it created.
+        unsafe {
+            let data = Owned::from_created(CFDataCreate(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as CfIndex,
+            ))
+            .ok_or(Status(-1))?;
+            let atoms = Owned::from_created(CFDictionaryCreateMutable(
+                std::ptr::null(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            ))
+            .ok_or(Status(-1))?;
+            CFDictionarySetValue(atoms.as_ref(), cf_string(key).as_ref(), data.as_ref());
+
+            let extensions = Owned::from_created(CFDictionaryCreateMutable(
+                std::ptr::null(),
+                1,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            ))
+            .ok_or(Status(-1))?;
+            CFDictionarySetValue(
+                extensions.as_ref(),
+                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+                atoms.as_ref(),
+            );
+
+            let mut format = std::ptr::null();
+            CMVideoFormatDescriptionCreate(
+                std::ptr::null(),
+                codec,
+                width as i32,
+                height as i32,
+                extensions.as_ref(),
+                &mut format,
+            )
+            .ok()?;
+            Owned::from_created(format).ok_or(Status(-1))
         }
     }
 }
@@ -614,55 +719,7 @@ impl Session {
     /// before reaching for a new one, because the caller is what knows when the old one's
     /// reference pictures may be thrown away.
     pub fn create(key: SessionKey) -> Result<Session, Status> {
-        let config = &key.config;
-        // SAFETY: every call below is a CoreFoundation constructor over bytes and objects this
-        // function owns; each result is wrapped in `Owned` at once, so every path out of here --
-        // including the `?`s -- releases exactly what it created.
-        let format = unsafe {
-            let data = Owned::from_created(CFDataCreate(
-                std::ptr::null(),
-                config.bytes().as_ptr(),
-                config.bytes().len() as CfIndex,
-            ))
-            .ok_or(Status(-1))?;
-            let atoms = Owned::from_created(CFDictionaryCreateMutable(
-                std::ptr::null(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            ))
-            .ok_or(Status(-1))?;
-            CFDictionarySetValue(
-                atoms.as_ref(),
-                cf_string(config.atom_key()).as_ref(),
-                data.as_ref(),
-            );
-
-            let extensions = Owned::from_created(CFDictionaryCreateMutable(
-                std::ptr::null(),
-                1,
-                &raw const kCFTypeDictionaryKeyCallBacks,
-                &raw const kCFTypeDictionaryValueCallBacks,
-            ))
-            .ok_or(Status(-1))?;
-            CFDictionarySetValue(
-                extensions.as_ref(),
-                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
-                atoms.as_ref(),
-            );
-
-            let mut format = std::ptr::null();
-            CMVideoFormatDescriptionCreate(
-                std::ptr::null(),
-                config.codec() as CmVideoCodecType,
-                key.width as i32,
-                key.height as i32,
-                extensions.as_ref(),
-                &mut format,
-            )
-            .ok()?;
-            Owned::from_created(format).ok_or(Status(-1))?
-        };
+        let format = key.config.format(key.width, key.height)?;
 
         // The target's own layout, with an IOSurface behind it: the planes map straight onto the
         // guest's resources, and the surface is what a future zero-copy import would need.
@@ -726,6 +783,37 @@ impl Session {
     /// Whether this session decodes frames of that shape, or a new one is needed.
     pub fn serves(&self, key: &SessionKey) -> bool {
         self.key == *key
+    }
+
+    /// Take on a new shape without tearing the session down, if VideoToolbox will have it.
+    ///
+    /// Only the parameter-set codecs, and only when the pixel layout is unchanged: the layout is
+    /// a property of the session's destination attributes rather than of the format description,
+    /// so it is not something `VTDecompressionSessionCanAcceptFormatDescription` can judge.
+    /// Everything the description does carry -- the extent among it -- is left to that call
+    /// rather than re-derived here.
+    ///
+    /// `false` leaves the session exactly as it was, still serving its old key.
+    pub fn adopt(&mut self, key: &SessionKey) -> bool {
+        if !key.config.is_parameter_sets() || key.pixels != self.key.pixels {
+            return false;
+        }
+        let Ok(fresh) = key.config.format(key.width, key.height) else {
+            return false;
+        };
+        // SAFETY: both references are live and owned here; the call only reads them.
+        let accepted = unsafe {
+            VTDecompressionSessionCanAcceptFormatDescription(self.session.as_ref(), fresh.as_ref())
+                != 0
+        };
+        if !accepted {
+            return false;
+        }
+        // `decode` hangs the current description on each sample buffer, so the next frame is the
+        // first to see this one -- which is exactly the frame the new parameter sets describe.
+        self.format = fresh;
+        self.key = key.clone();
+        true
     }
 
     /// Decode one access unit, and return the picture it produced.
@@ -849,7 +937,9 @@ mod tests {
     /// `build_vpcc`, byte for byte, for a profile-0 8-bit 4:2:0 frame.
     #[test]
     fn the_vp9_configuration_record_is_the_box_videotoolbox_expects() {
-        let Configuration::Vpcc(box_) = Configuration::vp9(0, 8, 1);
+        let Configuration::Vpcc(box_) = Configuration::vp9(0, 8, 1) else {
+            panic!("vp9 builds a vpcC record");
+        };
         assert_eq!(
             box_,
             [
@@ -867,7 +957,9 @@ mod tests {
     /// record that is not a constant or a straight copy.
     #[test]
     fn bit_depth_and_subsampling_share_a_byte() {
-        let Configuration::Vpcc(box_) = Configuration::vp9(2, 12, 3);
+        let Configuration::Vpcc(box_) = Configuration::vp9(2, 12, 3) else {
+            panic!("vp9 builds a vpcC record");
+        };
         assert_eq!(box_[4], 2);
         assert_eq!(box_[6], (12 << 4) | (3 << 1));
     }
