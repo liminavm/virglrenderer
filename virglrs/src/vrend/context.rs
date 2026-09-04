@@ -1137,8 +1137,10 @@ impl Context {
             Command::ClearTexture { resource, level, region, data } => {
                 self.clear_texture(host, resource, level, region, data)
             }
+            Command::PipeResourceSetType { resource, format, bind, width, height, .. } => {
+                self.set_resource_type(host, resource, format, bind, width, height)
+            }
             Command::PipeResourceCreate { .. }
-            | Command::PipeResourceSetType { .. }
             | Command::GetMemoryInfo(_)
             | Command::GetPipeResourceLayout { .. } => {
                 host.todo.note(kind.name());
@@ -2951,6 +2953,56 @@ impl Context {
             gl.clear(bits);
         }
         self.clear_finish(host, buffers);
+    }
+
+    /// `vrend_renderer_pipe_resource_set_type`: say what an attached blob is.
+    ///
+    /// This is the upgrade, and the only command an untyped handle answers. Always a plain 2D
+    /// image -- one level, one sample, one layer -- which is what the wire can describe here and
+    /// what every path reading the result assumes.
+    ///
+    /// Describing a resource that is already typed succeeds and does nothing, as the C does: the
+    /// guest may name a buffer twice, and the second telling asks for nothing new.
+    fn set_resource_type(
+        &mut self,
+        host: &mut Host<'_>,
+        resource: ResourceHandle,
+        format: Format,
+        bind: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::PipeResourceSetType;
+        if host.slot(cmd, resource)?.resource().is_some() {
+            return Ok(());
+        }
+        let args = resource::Args {
+            target: TextureTarget::Texture2d,
+            format,
+            bind: resource::Bind(bind),
+            width,
+            height,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags(0),
+        };
+        let Some(resource::Slot::Untyped(untyped)) = host.resources.remove(&resource) else {
+            unreachable!("the slot was read as untyped a statement ago, under one borrow");
+        };
+        match untyped.upgrade(host.gl, host.winsys, host.features, host.formats, host.limits, args)
+        {
+            Ok(res) => {
+                host.resources.insert(resource, resource::Slot::Resource(res));
+                Ok(())
+            }
+            Err((untyped, why)) => {
+                host.resources.insert(resource, resource::Slot::Untyped(untyped));
+                eprintln!("[virglrs] vrend: resource {resource} cannot be typed: {why:?}");
+                Err(Fault::IllegalResource { cmd, handle: resource })
+            }
+        }
     }
 
     /// `vrend_clear_texture`, the GLES leg: `glClearTexSubImageEXT`, with BGRA's bytes swapped.

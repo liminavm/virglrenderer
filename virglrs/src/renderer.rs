@@ -870,6 +870,25 @@ impl Renderer {
                 r.attached.push(ctx);
             }
         });
+        // A blob has no host side until something types it, so this is where vrend hears about
+        // one. The share travels rather than an id: an id stops naming this surface the moment
+        // the surface dies, and the whole point of holding storage across contexts is that it
+        // cannot. `None` is a blob with no surface to adopt -- the reason stays with the storage
+        // that refused, which says it once itself.
+        let blob = self
+            .with_resource(handle, |r| match &r.backing {
+                Backing::Blob { storage: BlobStorage::Shared { storage, .. }, .. } => {
+                    Some(storage.held())
+                }
+                Backing::Blob { .. } => Some(None),
+                Backing::Classic(_) | Backing::Imported { .. } => None,
+            })
+            .flatten();
+        if let Some(held) = blob
+            && let Some(v) = self.vrend.as_mut()
+        {
+            v.resource_attach_blob(handle, held);
+        }
     }
 
     pub fn ctx_detach_resource(&mut self, ctx: ContextId, handle: ResourceHandle) {

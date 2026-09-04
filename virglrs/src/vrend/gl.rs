@@ -210,7 +210,13 @@ pub fn pixel_bytes(format: GLenum, ty: GLenum) -> Option<usize> {
 
 /// The bytes a `w`×`h`×`d` image of `format`/`ty` takes tightly packed, or `None` when the pair is
 /// unknown or the product overflows.
-fn image_bytes(format: GLenum, ty: GLenum, w: GLsizei, h: GLsizei, d: GLsizei) -> Option<usize> {
+pub(super) fn image_bytes(
+    format: GLenum,
+    ty: GLenum,
+    w: GLsizei,
+    h: GLsizei,
+    d: GLsizei,
+) -> Option<usize> {
     let px = pixel_bytes(format, ty)?;
     let dim = |v: GLsizei| usize::try_from(v).ok();
     px.checked_mul(dim(w)?)?.checked_mul(dim(h)?)?.checked_mul(dim(d)?)
