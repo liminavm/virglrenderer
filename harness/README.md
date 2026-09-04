@@ -50,6 +50,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the gate no recorded session provides (see `fixtures/blit.score` below).
 - `make-sampled-corpus.py` — the same, for the blits whose destination the sweep cannot read
   back; it scores them through a draw (see `fixtures/sampled.score` below).
+- `make-surface-corpus.py` — writes a synthetic classic corpus that destroys a surface the
+  framebuffer is still drawing through (see `fixtures/surface.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -235,6 +237,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   keeps it off the copy path. The blitted depth is sampled into a colour target, and so is the
   blit's SOURCE through the same shader and the same view shape, so a wrong number in the
   destination cannot be blamed on the depth sampling path.
+  `surface.score` gates a surface's lifetime against its framebuffer. A guest may destroy a
+  surface it has bound, and the C's framebuffer holds a reference: the attachment goes on taking
+  pixels until the next `SET_FRAMEBUFFER_STATE`. No recorded session does this — a desktop unbinds
+  before it destroys — so the ordering that matters is never sampled, and a renderer that deletes
+  the surface's texture view at `DESTROY_OBJECT` scores green everywhere else. `surface.bin`
+  destroys a bound surface and then CLEARS to a flat colour, over a resource pre-filled with a
+  pattern, so a clear that lands nowhere is a different hash from one that lands and neither is
+  uninitialised storage. Its second case destroys the surface, creates another under the same
+  handle, and rebinds: a slot that compared handles rather than descriptions would answer "already
+  bound" and skip re-attaching a different texture.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).

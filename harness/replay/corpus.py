@@ -19,9 +19,11 @@ RES_CREATE, RES_UNREF = 0, 2
 # virgl_context_cmd
 CCMD_CREATE_OBJECT = 1
 CCMD_BIND_OBJECT = 2
+CCMD_DESTROY_OBJECT = 3
 CCMD_SET_VIEWPORT_STATE = 4
 CCMD_SET_FRAMEBUFFER_STATE = 5
 CCMD_SET_VERTEX_BUFFERS = 6
+CCMD_CLEAR = 7
 CCMD_DRAW_VBO = 8
 CCMD_INLINE_WRITE = 9
 CCMD_SET_SAMPLER_VIEWS = 10
@@ -56,6 +58,7 @@ SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W = 0, 1, 2, 3
 
 PIPE_MASK_RGBA = 0xF
 PIPE_MASK_Z = 0x10
+PIPE_CLEAR_COLOR0 = 1 << 2
 FILTER_NEAREST, FILTER_LINEAR = 0, 1
 PRIM_TRIANGLE_STRIP = 5
 
@@ -187,6 +190,13 @@ class Corpus:
                   [handle, res, fmt, level, first_layer | (last_layer << 16)])
 
     # ---- state and the draw ----
+
+    def destroy_object(self, kind, handle):
+        self.emit(CCMD_DESTROY_OBJECT, kind, [handle])
+
+    def clear(self, rgba, buffers=PIPE_CLEAR_COLOR0):
+        """CLEAR with a float colour. Depth and stencil travel too and are ignored unless named."""
+        self.emit(CCMD_CLEAR, 0, [buffers] + [f32(c) for c in rgba] + [0, 0, 0])
 
     def bind_object(self, kind, handle):
         self.emit(CCMD_BIND_OBJECT, kind, [handle])
