@@ -452,6 +452,12 @@ impl CapsV2 {
         for raw in 0..FORMAT_MAX {
             let format = Format::from_wire(raw).expect("below FORMAT_MAX");
             let Some(entry) = formats.get(format) else { continue };
+            // A multi-plane format is samplable only as a composite decode target, and only
+            // where this build can back one. The guest reads the bit as "I may create the
+            // composite shape" and cannot survive being told yes and then refused.
+            if video::guest_planes(format) > 1 && !video::composite_target_backable(format) {
+                continue;
+            }
             if entry.bindings.sampler_view {
                 v1.sampler.set(format);
                 if entry.can_render() {
@@ -693,13 +699,15 @@ impl CapsV2 {
             *slot = VideoCaps::decode(profile, profile.max_level());
             c.num_video_caps = i as u32 + 1;
         }
-        if c.num_video_caps > 0 {
-            // Both gated on there being a decoder at all. A guest that allocated real guest
-            // memory for a decode target against a host that never writes it back would export
-            // an honest-looking fd naming a black frame, which is worse for it than refusing and
-            // falling back.
-            c.capability_bits_v2 |= cap2::VIDEO_GUEST_PLANES | cap2::VIDEO_PLANAR_TARGET;
-        }
+        // VIDEO_GUEST_PLANES and VIDEO_PLANAR_TARGET stay clear. The C gates both on there
+        // being a decoder at all, which is right for the C because it serves both shapes; here
+        // each is a promise this build cannot keep. GUEST_PLANES tells the guest that backing a
+        // decode target's planes with its own memory is worthwhile, which is true only if the
+        // host writes the frame back there -- and a guest that does it against a host that does
+        // not exports an honest-looking fd naming a black frame, strictly worse for it than
+        // never being offered. PLANAR_TARGET is the composite shape, which
+        // `video::composite_target_backable` says this build cannot back. Both turn on with the
+        // path, not with the decoder.
         c
     }
 }

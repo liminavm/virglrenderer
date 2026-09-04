@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::formats::GlFormat;
 use super::gl::Gl;
 use super::gl::gles::GL_TEXTURE_2D;
-use super::proto::{VideoBufferHandle, VideoCodecHandle};
+use super::proto::{Format, VideoBufferHandle, VideoCodecHandle};
 use super::resource::Texture;
 use crate::videotoolbox::{self, Configuration, PixelFormat, Session, SessionKey};
 
@@ -502,6 +502,33 @@ impl core::fmt::Display for Refusal {
 /// hardware from the bitstream the guest also sent.
 pub const DESCRIPTOR_BYTES: usize = Vp9Frame::BIT_DEPTH + 1;
 
+/// How many planes a guest lays a format out in when it hands the whole picture over as one
+/// resource: two for the interleaved-chroma layouts, three for the fully planar ones, and one
+/// for everything that is not a planar YUV layout at all.
+pub fn guest_planes(format: Format) -> u32 {
+    match TargetFormat::from_wire(format.wire()) {
+        Some(TargetFormat::Nv12 | TargetFormat::Nv21) => 2,
+        Some(TargetFormat::Iyuv | TargetFormat::Yv12) => 3,
+        None => 1,
+    }
+}
+
+/// Whether this build can back a composite planar decode target -- one resource holding every
+/// plane -- in `format`.
+///
+/// Nothing, yet. Backing one needs a two-plane IOSurface and the plane views laid over it, and
+/// this build has neither; the stock per-plane shape, one resource per plane, is what it serves.
+///
+/// The capset has to say so rather than leave it to a refusal at create, because **the sampler
+/// bitmask is the guest's permission to take the shape**. By the time the host is asked, the
+/// kernel has already handed the guest its handle, so a refusal never reaches it: it attaches
+/// backing and builds plane views on a resource that does not exist, and its context is poisoned
+/// for the rest of its life. A format advertised here that create then refuses is not a
+/// degraded guest, it is a dead one.
+pub fn composite_target_backable(_format: Format) -> bool {
+    false
+}
+
 /// The profiles this host advertises decode for, in the order the capset lists them.
 ///
 /// Two conditions, and both are necessary. The host must have the silicon, and this build must
@@ -777,5 +804,85 @@ impl Gate {
                 // what the C did before the freeze was added.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The descriptor offsets are the load-bearing numbers in this file: read one wrong and the
+    /// session is built for a frame nobody sent. They were measured with `offsetof` against
+    /// `struct virgl_vp9_picture_desc`, so the test builds a descriptor the same way -- by
+    /// planting each field at its offset -- and checks it reads back.
+    #[test]
+    fn the_descriptor_fields_are_where_offsetof_put_them() {
+        let mut blob = vec![0u8; DESCRIPTOR_BYTES];
+        blob[Vp9Frame::FRAME_WIDTH..][..2].copy_from_slice(&640u16.to_le_bytes());
+        blob[Vp9Frame::FRAME_HEIGHT..][..2].copy_from_slice(&480u16.to_le_bytes());
+        // subsampling_x and subsampling_y set, frame_type clear: a 4:2:0 key frame.
+        blob[Vp9Frame::PIC_FIELDS..][..4].copy_from_slice(&0b011u32.to_le_bytes());
+        blob[Vp9Frame::PROFILE] = 2;
+        blob[Vp9Frame::BIT_DEPTH] = 10;
+
+        let frame = Vp9Frame::read(&blob, 1, 1);
+        assert_eq!(
+            frame,
+            Vp9Frame {
+                key: true,
+                profile: 2,
+                bit_depth: 10,
+                subsampling: 1,
+                width: 640,
+                height: 480
+            }
+        );
+
+        // frame_type set is an inter frame, and it is the bit the keyframe gate turns on.
+        blob[Vp9Frame::PIC_FIELDS] = 0b111;
+        assert!(!Vp9Frame::read(&blob, 1, 1).key);
+    }
+
+    /// A guest need not fill the prefix, and a descriptor shorter than the fields we read must
+    /// not panic -- it reads as zeros, and zero means "take it from the codec".
+    #[test]
+    fn a_short_descriptor_falls_back_to_the_codec() {
+        for len in [0, 1, Vp9Frame::PIC_FIELDS, DESCRIPTOR_BYTES - 1] {
+            let frame = Vp9Frame::read(&vec![0u8; len], 352, 240);
+            assert_eq!(frame.width, 352, "len {len}");
+            assert_eq!(frame.height, 240, "len {len}");
+            assert_eq!(frame.bit_depth, 8, "len {len}: profile 0 has only one depth");
+            assert!(frame.key, "len {len}: frame_type zero is a key frame");
+        }
+    }
+
+    /// The two halves of the composite-target promise have to move together. A format that
+    /// reports more than one plane is one the capset offers only if this build can back it, so
+    /// making one backable without the path behind it is what this test is here to catch.
+    #[test]
+    fn no_planar_layout_is_offered_before_it_can_be_backed() {
+        let planar = [163, 165, 166, 167];
+        for raw in planar {
+            let format = Format::from_wire(raw).expect("a planar format is on the wire");
+            assert!(guest_planes(format) > 1, "format {raw} is planar");
+            assert!(
+                !composite_target_backable(format),
+                "format {raw} is offered as a composite target, so this build must back one"
+            );
+        }
+        // Everything else is one plane, and so is offered on its own merits.
+        for raw in [1, 64, 65, 134, 314] {
+            let format = Format::from_wire(raw).expect("on the wire");
+            assert_eq!(guest_planes(format), 1, "format {raw}");
+        }
+    }
+
+    /// A profile is advertised only where the silicon and the leg agree, and a host that was
+    /// never asked for video advertises nothing at all.
+    #[test]
+    fn nothing_is_advertised_without_a_probe() {
+        assert!(advertised(None).is_empty());
+        let support = crate::videotoolbox::Support::probe();
+        assert_eq!(advertised(Some(&support)), vec![Profile::Vp9Profile0]);
     }
 }

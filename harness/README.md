@@ -185,20 +185,34 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   line, and the same against the Rust prefix diffs against the fixture. The guest's virgl driver
   configures itself from nothing else -- a format missing from `sampler` is a format the guest
   never creates, a wrong `glsl_level` is a whole feature set switched off -- and none of it is a
-  pixel, so a score cannot see it. Three lines are expected to differ, all by design.
+  pixel, so a score cannot see it. Four lines are expected to differ, all by design, and every
+  one of them is this build declining to promise something it does not yet serve. **The capset
+  is a promise, not a summary.** A guest reads it before it allocates anything, and the kernel
+  has already handed it the handle by the time the host is asked -- so a host that advertises
+  what it will later refuse does not degrade that guest, it poisons it for the life of its
+  context. Advertising less than the C is therefore the safe direction and advertising more is
+  never one; each line below closes when its path lands, not before.
+
   `num_video_caps`/`video_caps` carry only the profiles this build both has silicon for and has
-  a decode path for, which today is VP9 alone against the C's six -- the VP9 entry itself is
-  byte-identical, and each H.264 and HEVC line closes as its leg lands. Advertising a profile
-  ahead of its leg is not a smaller deviation but a worse one: a guest picks hardware decode out
-  of the capset and has its context poisoned by the first frame it sends.
-  `sampler` differs for two separate reasons: it carries the fourteen `ASTC_*_SRGB` formats the
-  C's `ASTC_FORMAT` macro never registers (`virglrs/vrend-gen/gl_formats.py`), and it still
-  advertises `Y8_U8_V8_420_UNORM` and `Y8_V8_U8_420_UNORM` as samplable, which the C stopped
-  doing: only NV12 and NV21 can back a composite target, and a guest told otherwise creates a
-  resource the host then refuses -- after the kernel has already handed it the handle, so the
-  guest attaches backing and builds views on a resource that does not exist and has its context
-  poisoned for the rest of its life. The planar half of `sampler` closes with video; the ASTC
-  half is deliberate and permanent. A fourth line is a regression.
+  a decode path for: VP9 alone, against the C's six. The VP9 entry itself is byte-identical, and
+  each H.264 and HEVC line closes as its leg lands.
+
+  `capability_bits_v2` is short `VIDEO_GUEST_PLANES` and `VIDEO_PLANAR_TARGET` (1<<19, 1<<20).
+  The C gates both on there being a decoder at all, which is right for the C because it serves
+  both target shapes. `GUEST_PLANES` tells the guest that backing a decode target's planes with
+  its own memory is worthwhile, which is true only where the host writes the frame back there;
+  this build does not, and a guest that took the offer would export an honest-looking dmabuf fd
+  naming a black frame. `PLANAR_TARGET` is the composite shape, which needs a two-plane
+  IOSurface and the plane views over it, and this build has neither.
+
+  `sampler` differs for two separate reasons. It carries the fourteen `ASTC_*_SRGB` formats the
+  C's `ASTC_FORMAT` macro never registers (`virglrs/vrend-gen/gl_formats.py`), which is
+  deliberate and permanent. And it advertises none of the four planar YUV layouts, where the C
+  advertises `NV12` and `NV21`: a multi-plane format is samplable only as a composite decode
+  target, the bitmask *is* the guest's permission to create one, and this build backs none. The
+  C's own rule is the same one (`vrend_planar_target_backable`); it just answers yes for two
+  formats where `video::composite_target_backable` answers no for all four. The planar half
+  closes with the composite target path. A fifth line is a regression.
   `vrend-vp9stock.score` is VP9 hardware decode, 963 pictures through VideoToolbox, scored the
   ordinary way: the decoded planes land in guest resources and the sweep reads them back, so 240
   of the 243 decode-target resources carry pixels with a distinct hash per frame. It was recorded
