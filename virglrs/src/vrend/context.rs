@@ -3139,13 +3139,28 @@ impl Context {
         let ctx = host.ctx;
         let guest = host.guest;
         let res = host.resource_mut(cmd, resource)?;
-        if let Storage::Host(buf) = &mut res.storage
-            && buf.len() >= 16
+        let mut wrote_shadow = false;
+        if let Storage::Host(shadow) = &mut res.storage
+            && shadow.bytes().len() >= 16
         {
-            buf[..16].copy_from_slice(&state);
+            shadow.bytes_mut()[..16].copy_from_slice(&state);
+            wrote_shadow = true;
         }
-        if let Some(pages) = guest.pages(ctx, resource) {
-            let _ = pages.copy_in(0, &state);
+        // The result goes to both sides, so they agree afterwards -- unless there are no pages,
+        // in which case the shadow is ahead and says so.
+        match guest.pages(ctx, resource) {
+            Some(pages) => {
+                let _ = pages.copy_in(0, &state);
+                if let Storage::Host(shadow) = &mut res.storage {
+                    shadow.mirrored();
+                }
+            }
+            None if wrote_shadow => {
+                if let Storage::Host(shadow) = &mut res.storage {
+                    shadow.unmirrored();
+                }
+            }
+            None => {}
         }
         Ok(())
     }

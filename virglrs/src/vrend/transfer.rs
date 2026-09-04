@@ -304,11 +304,21 @@ pub fn write(
             }
             Ok(())
         }
-        Storage::Host(buf) => {
+        Storage::Host(shadow) => {
             let (x, w) = (b.x as usize, b.width as usize);
-            let dst = buf.get_mut(x..x + w).ok_or(Error::BoxOutOfRange)?;
+            let from_own_backing = own.is_some_and(|own| own.same_pages(pages));
+            let dst = shadow.bytes_mut().get_mut(x..x + w).ok_or(Error::BoxOutOfRange)?;
             if !pages.copy_out(info.offset, dst) {
                 return Err(Error::IovOutOfRange);
+            }
+            // Where the bytes came from decides who holds the truth now. Written from the
+            // resource's own backing, the pages already have them; written from anywhere else --
+            // another resource's pages, or an iov the API path supplied to a resource with no
+            // backing at all -- they do not, and the next attach owes them.
+            if from_own_backing {
+                shadow.mirrored();
+            } else {
+                shadow.unmirrored();
             }
             Ok(())
         }
@@ -605,9 +615,9 @@ pub fn read(
             }
             Ok(())
         }
-        Storage::Host(buf) => {
+        Storage::Host(shadow) => {
             let (x, w) = (b.x as usize, b.width as usize);
-            let src = buf.get(x..x + w).ok_or(Error::BoxOutOfRange)?;
+            let src = shadow.bytes().get(x..x + w).ok_or(Error::BoxOutOfRange)?;
             if !pages.copy_in(info.offset, src) {
                 return Err(Error::IovOutOfRange);
             }

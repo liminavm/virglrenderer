@@ -15,6 +15,7 @@ use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
 use super::pipe::TextureTarget;
 use super::proto::Format;
+use crate::guest_mem::Iov;
 use crate::metal::{Held, PixelFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -358,12 +359,84 @@ impl Untyped {
     }
 }
 
+/// The host buffer behind a `VIRGL_BIND_CUSTOM` resource, and which side of it holds the truth.
+///
+/// The buffer and the guest's pages are two containers for one fact, so exactly one of them is
+/// authoritative at a time and the other is refreshed from it. Which one is a *state*, not a flag
+/// beside the bytes, because the refresh must not run in the state a fresh resource is in: the
+/// guest kernel queues `RESOURCE_CREATE` and `ATTACH_BACKING` and hands the handle back without
+/// waiting for either, so the guest is usually already writing through its mapping while we
+/// process the attach. Pushing a fresh buffer's zeros then lands on top of what it wrote -- the
+/// whole buffer, or everything up to wherever its copy had reached.
+///
+/// So the push is reachable only from [`Shadow::Unmirrored`], and nothing constructs that except
+/// a detach or a transfer the pages did not receive. A newly created resource is
+/// [`Shadow::Mirrored`] and there is no path from there to a push, which is the bug made
+/// unrepresentable rather than guarded against.
+pub enum Shadow {
+    /// The guest's pages already hold everything this buffer does, so an attach owes them
+    /// nothing. Where a resource starts, and where every paid attach returns it.
+    Mirrored(Vec<u8>),
+    /// This buffer holds bytes the guest's pages do not: a detach pulled them out of pages that
+    /// then went away, or a transfer wrote them with no backing attached to receive them. The
+    /// next attach pays that debt and the buffer is mirrored again.
+    Unmirrored(Vec<u8>),
+}
+
+impl Shadow {
+    /// A newly created resource's buffer: zeroed, and owing the guest nothing.
+    pub fn fresh(size: usize) -> Shadow {
+        Shadow::Mirrored(vec![0; size])
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Shadow::Mirrored(b) | Shadow::Unmirrored(b) => b,
+        }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Shadow::Mirrored(b) | Shadow::Unmirrored(b) => b,
+        }
+    }
+
+    /// The guest's pages now hold what this buffer does -- they were just written from it, or
+    /// they are where its bytes came from.
+    pub fn mirrored(&mut self) {
+        if let Shadow::Unmirrored(b) = self {
+            *self = Shadow::Mirrored(std::mem::take(b));
+        }
+    }
+
+    /// This buffer now holds bytes the guest's pages do not, and owes them to the next attach.
+    pub fn unmirrored(&mut self) {
+        if let Shadow::Mirrored(b) = self {
+            *self = Shadow::Unmirrored(std::mem::take(b));
+        }
+    }
+
+    /// Pay what the pages are owed, if anything. `false` if the pages could not hold it.
+    ///
+    /// A mirrored buffer writes nothing, which is the whole point: the attach that races the
+    /// guest's first write through its own mapping has nothing to clobber it with.
+    #[must_use]
+    pub fn mirror_into(&mut self, pages: &Iov<'_>) -> bool {
+        let Shadow::Unmirrored(b) = self else {
+            return true;
+        };
+        let ok = pages.copy_in(0, b);
+        self.mirrored();
+        ok
+    }
+}
+
 /// What backs a resource. Exactly one for its whole life.
 pub enum Storage {
     /// `VIRGL_BIND_STAGING`: the guest's pages and nothing on the host.
     Guest,
     /// `VIRGL_BIND_CUSTOM`: a host buffer the guest's pages mirror at attach and detach.
-    Host(Vec<u8>),
+    Host(Shadow),
     Buffer {
         name: BufferName,
         /// The binding target the buffer is created and mapped through, from its bind.
@@ -770,7 +843,7 @@ fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Res
 fn alloc_buffer(gl: &Gl, features: &Features, a: &Args) -> Result<Storage, Refusal> {
     let size = a.width as usize;
     let target = match a.bind {
-        Bind::CUSTOM => return Ok(Storage::Host(vec![0; size])),
+        Bind::CUSTOM => return Ok(Storage::Host(Shadow::fresh(size))),
         Bind::STAGING => return Ok(Storage::Guest),
         Bind::INDEX_BUFFER => GL_ELEMENT_ARRAY_BUFFER,
         Bind::STREAM_OUTPUT => GL_TRANSFORM_FEEDBACK_BUFFER,
@@ -1089,6 +1162,76 @@ fn alloc_texture(
 mod tests {
     use super::*;
     use crate::vrend::formats::{Bindings, Entry, GlFormat, ViewClass};
+
+    /// Guest pages a test can both hand to a `Shadow` and read back afterwards.
+    ///
+    /// The entry holds a raw pointer, exactly as one from the VMM does, so the buffer it points
+    /// at has to outlive it -- which in each test below it does, being a local declared first.
+    fn pages(buf: &mut [u8]) -> [crate::abi::GuestIov; 1] {
+        [crate::abi::GuestIov { base: crate::abi::VmmPtr(buf.as_mut_ptr().cast()), len: buf.len() }]
+    }
+
+    /// The race this type exists for: the guest queues `RESOURCE_CREATE` and `ATTACH_BACKING`
+    /// and starts writing without waiting for either, so a fresh resource's zeroed buffer must
+    /// not be pushed on top of what it wrote.
+    #[test]
+    fn attaching_backing_to_a_fresh_resource_leaves_the_guest_bytes_alone() {
+        let mut shadow = Shadow::fresh(4096);
+        let mut guest = vec![0xa5u8; 4096];
+        let entries = pages(&mut guest);
+
+        assert!(shadow.mirror_into(&Iov::new(&entries)), "the pages hold the buffer");
+        assert!(guest.iter().all(|&b| b == 0xa5), "the guest's own bytes are still there");
+    }
+
+    /// The one write-back that is owed: bytes that reached the host while no pages were there
+    /// to receive them.
+    #[test]
+    fn attaching_backing_restores_what_the_guest_cannot_have() {
+        let mut shadow = Shadow::fresh(4096);
+        shadow.bytes_mut().fill(0x5a);
+        shadow.unmirrored();
+
+        let mut guest = vec![0u8; 4096];
+        let entries = pages(&mut guest);
+        assert!(shadow.mirror_into(&Iov::new(&entries)));
+        assert!(guest.iter().all(|&b| b == 0x5a), "the host-only content is restored");
+    }
+
+    /// Paying the debt clears it, so the *next* attach is back to writing nothing -- the fresh
+    /// case again, reached from a resource that has been round the loop.
+    #[test]
+    fn a_paid_attach_owes_the_next_one_nothing() {
+        let mut shadow = Shadow::fresh(16);
+        shadow.bytes_mut().fill(0x5a);
+        shadow.unmirrored();
+
+        let mut first = vec![0u8; 16];
+        let entries = pages(&mut first);
+        assert!(shadow.mirror_into(&Iov::new(&entries)));
+        assert_eq!(first, [0x5a; 16], "the first attach is paid");
+
+        let mut second = vec![0x3cu8; 16];
+        let entries = pages(&mut second);
+        assert!(shadow.mirror_into(&Iov::new(&entries)));
+        assert_eq!(second, [0x3c; 16], "and the second is owed nothing");
+    }
+
+    /// A detach is what makes the buffer authoritative: the pages it captured are going away.
+    #[test]
+    fn what_a_detach_captured_reaches_the_next_backing() {
+        let mut shadow = Shadow::fresh(16);
+
+        let mut old = vec![0x3cu8; 16];
+        let entries = pages(&mut old);
+        assert!(Iov::new(&entries).copy_out(0, shadow.bytes_mut()));
+        shadow.unmirrored();
+
+        let mut new = vec![0u8; 16];
+        let entries = pages(&mut new);
+        assert!(shadow.mirror_into(&Iov::new(&entries)));
+        assert_eq!(new, [0x3c; 16], "the detached bytes land in the fresh backing");
+    }
 
     fn features() -> Features {
         Features::probe(31, Vec::new())
