@@ -585,6 +585,22 @@ buildable throughout as the A-side reference.
   minted at the upgrade would be a second copy of the frame the client is presenting, and the
   guest would composite the one nobody draws into.
 
+  **The blank-texture case is reachable and unwanted, and filling it waits for a workload that
+  needs it.** A share that is not a surface -- an export that is not a dedicated, linear image in
+  a format IOSurface has -- gets a zeroed texture. No session produces one: a real GNOME desktop
+  with a Vulkan client logs none, because the two external-memory extensions this tree injects
+  are what steer mesa's WSI onto the dedicated-image path and away from prime-blit, whose
+  staging buffer is exactly the linear-with-no-image shape that would land here. Forced (by
+  making every share report itself surfaceless) it behaves as designed: `vkcube`'s window is
+  black, the desktop stays live, nothing poisons and nothing aborts, and the reason is said once
+  per storage rather than per frame. Black rather than garbage is the zeroing doing its job.
+
+  So uploading the exporter's bytes into that texture is not the next thing to build. The C
+  names a workload that would need it -- a software-decoded video frame reaching the GPU through
+  a guest-memory blob's iovecs, which is every GStreamer `glupload` whose buffers qualify -- and
+  that arrives with video, not before it. Building the upload now would be a copy path with no
+  caller and no way to score it.
+
   Three outcomes there, each answering to whoever caused it, because conflating them is how a
   host bug ends up wearing a guest's clothes. Arguments describing no image are the guest's
   error and refuse its own context. A blob whose share is not a surface, or a host that adopts
