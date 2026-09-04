@@ -23,13 +23,13 @@ use super::formats::{Desc, Table};
 use super::gl::gles::*;
 use super::gl::{
     FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, QueryName, SamplerName,
-    TextureName, TransformFeedbackName, VertexArrayName,
+    ShaderName, TextureName, TransformFeedbackName, VertexArrayName,
 };
 use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage};
 use super::transfer::{self, Info};
-use super::{debug, tgsi};
+use super::{debug, shader, tgsi};
 use crate::guest_mem::{HostSpan, Iov};
 use crate::ids::{CtxId, ResourceHandle};
 use std::collections::BTreeMap;
@@ -37,6 +37,10 @@ use std::fmt;
 
 #[path = "context/blit.rs"]
 mod blit;
+#[path = "context/select.rs"]
+mod select;
+
+pub use select::{Bound, Program, Variant};
 
 const PIPE_CLEAR_DEPTH: u32 = 1 << 0;
 const PIPE_CLEAR_STENCIL: u32 = 1 << 1;
@@ -92,6 +96,7 @@ pub struct Host<'a> {
     pub features: &'a Features,
     pub formats: &'a Table,
     pub limits: &'a Limits,
+    pub shader_cfg: &'a shader::Cfg,
     pub resources: &'a mut BTreeMap<ResourceHandle, Resource>,
     pub guest: &'a dyn Guest,
     pub ctx: CtxId,
@@ -165,6 +170,12 @@ pub enum Fault {
         cmd: Cmd,
         error: tgsi::Refusal,
     },
+    /// A program the translator refused under the key the state made for it.
+    Glsl {
+        cmd: Cmd,
+        stage: ShaderStage,
+        error: shader::Failure,
+    },
     /// A vertex format with no GL type.
     IllegalVertexFormat(Format),
     UnsupportedTexWrap(TexWrap),
@@ -205,6 +216,9 @@ impl fmt::Display for Fault {
             Fault::OutOfRange { cmd, what } => write!(f, "{}: {what} out of range", cmd.name()),
             Fault::Shader { cmd, what } => write!(f, "{}: {what}", cmd.name()),
             Fault::Tgsi { cmd, error } => write!(f, "{}: {error}", cmd.name()),
+            Fault::Glsl { cmd, stage, error } => {
+                write!(f, "{}: {} shader: {error}", cmd.name(), stage.name())
+            }
             Fault::IllegalVertexFormat(fmt) => {
                 write!(f, "vertex format {} has no GL type", fmt.name())
             }
@@ -233,6 +247,7 @@ pub struct Shader {
 /// A shader's text arrives in one command or, past a command's size, in several; the object
 /// exists from the first. Nothing reads a program until it is parsed, so the two are one state
 /// each rather than a buffer and a flag.
+#[allow(clippy::large_enum_variant)]
 pub enum ShaderText {
     Arriving {
         /// The text so far, dword-padded as sent.
@@ -240,9 +255,9 @@ pub enum ShaderText {
         /// How long the whole is, in bytes rounded up to a dword.
         total: usize,
     },
-    /// Parsed and scanned, as the C does the moment the text completes. Translated nowhere yet:
-    /// the GLSL lands with draws.
-    Parsed(tgsi::Program),
+    /// Parsed, scanned and translated the moment the text completed, as the C does, and again
+    /// under every key it is selected with.
+    Whole(Program),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +271,9 @@ pub struct Element {
 
 pub struct VertexElements {
     pub elements: Vec<Element>,
+    /// The elements whose format is stored blue first: the vertex shader reads them `.zyxw`,
+    /// since GLES has no `GL_BGRA` attribute size.
+    pub zyxw_bitmask: u32,
     /// The vertex array object the elements are laid out in, made at the first bind.
     pub vao: Option<VertexArrayName>,
 }
@@ -265,6 +283,9 @@ pub struct View {
     pub resource: ResourceHandle,
     pub format: Format,
     pub target: GLenum,
+    /// A rectangle view served by a 2D texture, GLES having no rectangle target: the shader
+    /// scales the coordinates.
+    pub emulated_rect: bool,
     /// A texture view of the resource, when one was needed and could be made.
     pub view: Option<TextureName>,
     pub first_layer: u32,
@@ -452,7 +473,10 @@ pub struct SubCtx {
     ubos: [BTreeMap<u32, Ubo>; ShaderStage::COUNT],
     views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
     samplers: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
-    shaders: [Option<ObjectHandle>; ShaderStage::COUNT],
+    shaders: [Option<Bound>; ShaderStage::COUNT],
+    /// The last draw's primitive mode, which the fragment shader's key reads; the C's is zero
+    /// until a draw, and zero is points.
+    prim_mode: PrimType,
     ssbos: [BTreeMap<u32, Ssbo>; ShaderStage::COUNT],
     images: [BTreeMap<u32, ImageView>; ShaderStage::COUNT],
     abos: BTreeMap<u32, Ssbo>,
@@ -508,7 +532,8 @@ impl SubCtx {
             ubos: Default::default(),
             views: Default::default(),
             samplers: Default::default(),
-            shaders: [None; ShaderStage::COUNT],
+            shaders: Default::default(),
+            prim_mode: PrimType::Points,
             ssbos: Default::default(),
             images: Default::default(),
             abos: BTreeMap::new(),
@@ -592,11 +617,16 @@ fn release(gl: &Gl, obj: Object) {
             }
         }
         Object::Query(q) => gl.delete_query(q.id),
-        Object::Blend(_)
-        | Object::Rasterizer(_)
-        | Object::Dsa(_)
-        | Object::Shader(_)
-        | Object::StreamoutTarget(_) => {}
+        Object::Shader(s) => {
+            if let ShaderText::Whole(p) = s.text {
+                for v in p.variants {
+                    if let Some(id) = v.id {
+                        gl.delete_shader(id);
+                    }
+                }
+            }
+        }
+        Object::Blend(_) | Object::Rasterizer(_) | Object::Dsa(_) | Object::StreamoutTarget(_) => {}
     }
 }
 
@@ -773,7 +803,8 @@ impl Context {
                 self.clear(host, buffers, color, depth, stencil);
                 Ok(())
             }
-            Command::DrawVbo(_) => {
+            Command::DrawVbo(draw) => {
+                self.sub_mut().prim_mode = draw.mode;
                 host.todo.note("DRAW_VBO");
                 Err(Fault::Unimplemented { cmd: kind, what: "draws" })
             }
@@ -873,7 +904,7 @@ impl Context {
                 Ok(())
             }
             Command::BindShader { handle, stage } => {
-                self.bind_shader(handle, stage);
+                self.bind_shader(host, handle, stage);
                 Ok(())
             }
             Command::SetTessState(_) => Ok(()),
@@ -949,10 +980,7 @@ impl Context {
                 Err(Fault::Unimplemented { cmd: kind, what: "blob resources" })
             }
             Command::SendStringMarker { .. } => Ok(()),
-            Command::LinkShader(_) => {
-                host.todo.note("LINK_SHADER");
-                Ok(())
-            }
+            Command::LinkShader(handles) => self.link_shader(host, handles),
             Command::CreateVideoCodec(_)
             | Command::DestroyVideoCodec(_)
             | Command::CreateVideoBuffer { .. }
@@ -1118,12 +1146,20 @@ impl Context {
                     gl.bind_transform_feedback(Some(sub.streamouts[c].id));
                 }
             }
-            Object::Shader(_) => {
+            Object::Shader(shader) => {
                 let sub = self.sub_mut();
                 for s in sub.long_shader.iter_mut() {
                     if *s == Some(handle) {
                         *s = None;
                     }
+                }
+                // The C holds a reference from the bound slot, so the shader outlives its
+                // handle there: the slot takes it over.
+                let slot = &mut sub.shaders[shader.stage.index()];
+                if slot.as_ref().is_some_and(|b| b.is(handle)) {
+                    let Object::Shader(shader) = old else { unreachable!() };
+                    *slot = Some(Bound::Owned(shader));
+                    return;
                 }
             }
             _ => {}
@@ -1305,16 +1341,24 @@ impl Context {
         Ok(())
     }
 
-    /// `vrend_bind_shader`: a handle that is not a shader is ignored, as the C ignores it.
-    fn bind_shader(&mut self, handle: Option<ObjectHandle>, stage: ShaderStage) {
+    /// `vrend_bind_shader`: a handle that is not a shader of the stage is ignored, as the C
+    /// ignores it. A shader the slot owned is released with the bind that replaces it.
+    fn bind_shader(
+        &mut self,
+        host: &mut Host<'_>,
+        handle: Option<ObjectHandle>,
+        stage: ShaderStage,
+    ) {
         let sub = self.sub_mut();
-        let Some(h) = handle else {
-            sub.shaders[stage.index()] = None;
-            return;
+        let bound = match handle {
+            None => None,
+            Some(h) => match sub.objects.get(&h) {
+                Some(Object::Shader(s)) if s.stage == stage => Some(Bound::Object(h)),
+                _ => return,
+            },
         };
-        match sub.objects.get(&h) {
-            Some(Object::Shader(s)) if s.stage == stage => sub.shaders[stage.index()] = Some(h),
-            _ => {}
+        if let Some(Bound::Owned(s)) = std::mem::replace(&mut sub.shaders[stage.index()], bound) {
+            release(host.gl, Object::Shader(s));
         }
     }
 
@@ -1349,14 +1393,18 @@ impl Context {
                 if total < bytes.len() {
                     return Err(Fault::Shader { cmd, what: "more text than the declared length" });
                 }
-                let text = if total == bytes.len() {
-                    ShaderText::Parsed(read_shader(&bytes, s.num_tokens)?)
+                let whole = total == bytes.len();
+                let text = if whole {
+                    ShaderText::Whole(read_shader(&bytes, s.num_tokens)?)
                 } else {
                     self.sub_mut().long_shader[s.stage.index()] = Some(handle);
                     ShaderText::Arriving { text: bytes, total }
                 };
                 let shader = Shader { stage: s.stage, kind: s.kind, text };
                 self.insert_object(host, handle, Object::Shader(shader));
+                if whole {
+                    self.select_new(host, handle)?;
+                }
             }
             ShaderChunk::Continuation { offset } => {
                 if in_progress != Some(handle) {
@@ -1382,14 +1430,26 @@ impl Context {
                     let parsed = read_shader(text, s.num_tokens);
                     sub.long_shader[s.stage.index()] = None;
                     match parsed {
-                        Ok(program) => shader.text = ShaderText::Parsed(program),
+                        Ok(program) => shader.text = ShaderText::Whole(program),
                         Err(e) => {
                             self.destroy_object(host, handle);
                             return Err(e);
                         }
                     }
+                    self.select_new(host, handle)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `vrend_finish_shader`'s selection: the first translation, under whatever is bound when
+    /// the text completes. A program the translator refuses is destroyed with its handle, as
+    /// the C destroys it.
+    fn select_new(&mut self, host: &mut Host<'_>, handle: ObjectHandle) -> Result<(), Fault> {
+        if let Err(e) = self.select_object(host, Cmd::CreateObject, handle) {
+            self.destroy_object(host, handle);
+            return Err(e);
         }
         Ok(())
     }
@@ -1513,6 +1573,9 @@ impl Context {
             resource: v.resource,
             format: v.format,
             target,
+            // No format can be a rectangle target on GLES (`vrend_formats.c` probes only
+            // desktop GL for it), so every rectangle view is served by a 2D texture.
+            emulated_rect: !is_buffer && v.target == TextureTarget::Rect,
             view,
             first_layer,
             last_layer,
@@ -1592,20 +1655,17 @@ impl Context {
     }
 }
 
-/// `vrend_shader_assign_tgsi` through `vrend_shader_create`: a complete text -- which ends in
-/// a NUL somewhere in its last dword, as the C requires -- parsed and scanned, and printed on
-/// the way when asked, in the C's format so the two logs diff.
-fn read_shader(text: &[u8], num_tokens: u32) -> Result<tgsi::Program, Fault> {
+/// `vrend_shader_assign_tgsi` up to the translation: a complete text -- which ends in a NUL
+/// somewhere in its last dword, as the C requires -- parsed and scanned.
+fn read_shader(text: &[u8], num_tokens: u32) -> Result<Program, Fault> {
     let cmd = Cmd::CreateObject;
     if text.len() < 4 || !text[text.len() - 4..].contains(&0) {
         return Err(Fault::Shader { cmd, what: "text without a terminator" });
     }
     let shader =
         tgsi::Program::parse(text, num_tokens).map_err(|error| Fault::Tgsi { cmd, error })?;
-    if debug::enabled(debug::Switch::Shader) {
-        eprint!("TGSI received:\n{}\n", tgsi::dump::dump(&shader));
-    }
-    tgsi::Program::scan(shader).map_err(|error| Fault::Tgsi { cmd, error })
+    let tgsi = tgsi::Program::scan(shader).map_err(|error| Fault::Tgsi { cmd, error })?;
+    Ok(Program { tgsi, info: shader::Info::default(), variants: Vec::new() })
 }
 
 fn to_gl_swizzle(s: Swizzle) -> GLenum {
@@ -1622,7 +1682,8 @@ fn to_gl_swizzle(s: Swizzle) -> GLenum {
 /// `vrend_create_vertex_elements_state`: the GL type of each element from its format.
 fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> {
     let mut out = Vec::with_capacity(elements.len());
-    for e in elements {
+    let mut zyxw_bitmask = 0;
+    for (i, e) in elements.iter().enumerate() {
         let desc = e.src_format.describe().ok_or(Fault::IllegalVertexFormat(e.src_format))?;
         let c0 = desc.channels[0];
         let by_channel = match (c0.ty, c0.bits) {
@@ -1648,6 +1709,9 @@ fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> 
             _ => None,
         };
         let gl_type = by_channel.or(by_name).ok_or(Fault::IllegalVertexFormat(e.src_format))?;
+        if desc.nr_channels == 4 && desc.swizzle[0] == Some(Swizzle::Z) {
+            zyxw_bitmask |= 1 << i;
+        }
         out.push(Element {
             base: *e,
             gl_type,
@@ -1656,7 +1720,7 @@ fn vertex_elements(elements: &[VertexElement]) -> Result<VertexElements, Fault> 
             pure_integer: desc.is_pure_integer(),
         });
     }
-    Ok(VertexElements { elements: out, vao: None })
+    Ok(VertexElements { elements: out, zyxw_bitmask, vao: None })
 }
 
 /// `vrend_create_sampler_state`: two sampler objects with the state applied.

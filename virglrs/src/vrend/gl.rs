@@ -65,6 +65,10 @@ pub struct TransformFeedbackName(GLuint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct QueryName(GLuint);
 
+/// A shader object the driver handed out. Never zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ShaderName(GLuint);
+
 impl TextureName {
     pub fn raw(self) -> GLuint {
         self.0
@@ -1321,6 +1325,50 @@ impl Gl {
         // SAFETY: every name asked for writes exactly one integer.
         unsafe { self.t.glGetQueryObjectuiv()(q.0, name, &mut v) };
         v
+    }
+
+    // ---- shaders ----
+
+    /// `glCreateShader`; `None` when the driver refused the kind.
+    pub fn create_shader(&self, kind: GLenum) -> Option<ShaderName> {
+        // SAFETY: plain scalar.
+        let id = unsafe { self.t.glCreateShader()(kind) };
+        (id != 0).then_some(ShaderName(id))
+    }
+
+    pub fn delete_shader(&self, shader: ShaderName) {
+        // SAFETY: plain scalar.
+        unsafe { self.t.glDeleteShader()(shader.0) };
+    }
+
+    /// `glShaderSource` and `glCompileShader`, and the driver's log when it refused the source.
+    pub fn compile_shader(&self, shader: ShaderName, source: &str) -> Result<(), String> {
+        let ptr = source.as_ptr().cast::<GLchar>();
+        let len = GLint::try_from(source.len()).expect("a shader's source fits a GLint");
+        // SAFETY: one string, with its length given, so the driver reads exactly `source`.
+        unsafe { self.t.glShaderSource()(shader.0, 1, &ptr, &len) };
+        // SAFETY: plain scalar.
+        unsafe { self.t.glCompileShader()(shader.0) };
+        let mut status: GLint = 0;
+        // SAFETY: `GL_COMPILE_STATUS` writes exactly one integer.
+        unsafe { self.t.glGetShaderiv()(shader.0, GL_COMPILE_STATUS, &mut status) };
+        if status != 0 {
+            return Ok(());
+        }
+        let mut log = vec![0u8; 65536];
+        let mut written: GLsizei = 0;
+        // SAFETY: the driver writes at most the capacity given, NUL included, and reports how
+        // many bytes it wrote without the NUL.
+        unsafe {
+            self.t.glGetShaderInfoLog()(
+                shader.0,
+                log.len() as GLsizei,
+                &mut written,
+                log.as_mut_ptr().cast::<GLchar>(),
+            )
+        };
+        log.truncate(written.max(0) as usize);
+        Err(String::from_utf8_lossy(&log).into_owned())
     }
 
     // ---- misc ----

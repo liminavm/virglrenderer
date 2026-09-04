@@ -20,6 +20,7 @@ use super::formats::Table;
 use super::gl::Gl;
 use super::gl::gles::GL_VERSION;
 use super::resource::{self, Args, Limits, Refusal, Resource};
+use super::shader;
 use super::transfer::{self, Info};
 use crate::guest_mem::Iov;
 use crate::ids::{CtxId, ResourceHandle};
@@ -56,6 +57,8 @@ pub struct Vrend {
     pub features: Features,
     pub formats: Table,
     pub limits: Limits,
+    /// What the translator may assume of the host, read once alongside the limits.
+    shader_cfg: shader::Cfg,
     ctx0: egl::Context,
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
@@ -93,6 +96,7 @@ impl Vrend {
             features.clear(Feature::srgb_write_control);
         }
         let limits = Limits::query(&gl, &features);
+        let shader_cfg = shader::Cfg::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
         eprintln!(
             "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features",
@@ -105,6 +109,7 @@ impl Vrend {
             features,
             formats,
             limits,
+            shader_cfg,
             ctx0,
             version,
             current: Current::Ctx0,
@@ -139,6 +144,7 @@ impl Vrend {
             features,
             formats,
             limits,
+            shader_cfg,
             ctx0,
             version,
             current,
@@ -154,6 +160,7 @@ impl Vrend {
             features,
             formats,
             limits,
+            shader_cfg,
             resources,
             guest,
             ctx,

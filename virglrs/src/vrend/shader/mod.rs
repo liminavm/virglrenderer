@@ -23,8 +23,12 @@
 
 pub mod glsl;
 
+use super::features::{Feature, Features};
+use super::gl::Gl;
+use super::gl::gles::{GL_MAX_TESS_PATCH_COMPONENTS, GL_SHADING_LANGUAGE_VERSION};
 use super::pipe::{CompareFunc, LogicOp, PrimType};
 use super::proto::StreamOutput;
+use super::resource::Limits;
 use super::tgsi::{self, Interpolate, Location, Semantic};
 
 pub use glsl::{Failure, Strings, convert, create_passthrough_tcs};
@@ -142,6 +146,48 @@ pub struct Cfg {
     pub has_texture_shadow_lod: bool,
     pub has_vs_layer: bool,
     pub has_vs_viewport_index: bool,
+}
+
+impl Cfg {
+    /// The C's `shader_cfg` fill at context creation, from the probed features and limits and
+    /// the driver's `GL_SHADING_LANGUAGE_VERSION`.
+    pub fn probe(gl: &Gl, features: &Features, limits: &Limits) -> Cfg {
+        let has = |f| features.has(f);
+        Cfg {
+            glsl_version: glsl_es_version(&gl.get_string(GL_SHADING_LANGUAGE_VERSION)),
+            max_draw_buffers: limits.max_draw_buffers,
+            max_shader_patch_varyings: if has(Feature::tessellation) {
+                gl.get_integer(GL_MAX_TESS_PATCH_COMPONENTS).max(0) as u32 / 4
+            } else {
+                0
+            },
+            has_arrays_of_arrays: has(Feature::arrays_of_arrays),
+            has_gpu_shader5: has(Feature::gpu_shader5),
+            has_es31_compat: has(Feature::gles31_compatibility),
+            has_conservative_depth: has(Feature::conservative_depth),
+            has_dual_src_blend: has(Feature::dual_src_blend),
+            has_fbfetch_coherent: has(Feature::framebuffer_fetch),
+            has_cull_distance: has(Feature::cull_distance),
+            has_nopersective: has(Feature::shader_noperspective_interpolation),
+            has_texture_shadow_lod: has(Feature::texture_shadow_lod),
+            has_vs_layer: has(Feature::vs_layer_viewport),
+            has_vs_viewport_index: has(Feature::vs_viewport_index),
+        }
+    }
+}
+
+/// `get_glsl_version`, the GLES leg: "OpenGL ES GLSL ES 3.10" is 310. The C's `sscanf` skips
+/// four words and reads `major.minor`; a string that does not fit is version 0, which the C
+/// refuses at context creation and the translator would refuse at the first shader.
+fn glsl_es_version(s: &str) -> u32 {
+    let mut words = s.split_whitespace().skip(4);
+    let Some(v) = words.next() else {
+        return 0;
+    };
+    let mut parts = v.split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    major * 100 + minor
 }
 
 /// `vrend_interp_info`: how a fragment shader input is interpolated, as the stage before it
@@ -417,4 +463,16 @@ pub fn sampler_type_conv(target: tgsi::Texture) -> Option<&'static str> {
         ShadowCubeArray => "CubeArrayShadow",
         Unknown => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_glsl_es_version_is_read_as_the_c_reads_it() {
+        assert_eq!(glsl_es_version("OpenGL ES GLSL ES 3.10"), 310);
+        assert_eq!(glsl_es_version("OpenGL ES GLSL ES 3.20 (zink)"), 320);
+        assert_eq!(glsl_es_version("3.10"), 0);
+    }
 }
