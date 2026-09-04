@@ -159,6 +159,12 @@ impl TextureName {
     pub fn raw(self) -> GLuint {
         self.0
     }
+
+    /// A name no driver handed out, for tests that never call GL with it.
+    #[cfg(test)]
+    pub fn unbacked(id: GLuint) -> TextureName {
+        TextureName(id)
+    }
 }
 
 impl BufferName {
@@ -496,6 +502,18 @@ impl Gl {
     pub fn delete_framebuffer(&self, fb: FramebufferName) {
         // SAFETY: one name, read from a live local.
         unsafe { self.t.glDeleteFramebuffers()(1, &fb.0) };
+    }
+
+    /// What is bound to `GL_FRAMEBUFFER` right now, `None` for the default one.
+    ///
+    /// Read back from the driver rather than tracked here: a cached copy would be a second
+    /// version of a truth GL already holds, and the two would part company at the first bind
+    /// this wrapper did not make.
+    pub fn framebuffer_binding(&self) -> Option<FramebufferName> {
+        match self.get_integer(GL_FRAMEBUFFER_BINDING) {
+            0 => None,
+            id => Some(FramebufferName(id as GLuint)),
+        }
     }
 
     pub fn bind_framebuffer(&self, target: GLenum, fb: Option<FramebufferName>) {

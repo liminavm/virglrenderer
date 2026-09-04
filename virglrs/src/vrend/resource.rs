@@ -18,7 +18,7 @@ use super::proto::Format;
 use crate::metal::{PixelFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// `VIRGL_BIND_*`: what the guest intends to do with a resource.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -232,22 +232,38 @@ pub enum Storage {
         /// such view (`tbo_tex_id`).
         tbo: Option<TextureName>,
     },
-    Texture {
-        name: TextureName,
-        /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
-        /// 2D array, and a RECT a 2D.
-        target: GLenum,
-        immutable: bool,
-        /// The EGL image that is the texture's storage, when that storage is an IOSurface: a
-        /// scanout or a shared buffer, rendered into directly and presented from without a copy.
-        /// The image owns the surface, so the surface's id is good exactly as long as the
-        /// texture is.
-        image: Option<Image>,
-    },
+    Texture(Arc<Texture>),
 }
 
-/// A resource the host holds. Its GL object is deleted by [`Resource::destroy`], never by drop:
-/// deleting needs the driver and a current context, which a drop does not have.
+/// The GL textures a resource's storage is: the texture itself, and the render-target views taken
+/// of it.
+///
+/// It is shared so that whatever uses a texture can hold it directly instead of holding a handle
+/// and looking the resource up again. The guest may free a resource a framebuffer is still drawing
+/// into, and a lookup at that moment finds nothing; a share is always there. GL would keep the
+/// texture's storage alive on its own while an attachment names it -- deleting a texture releases
+/// the name, not the object -- but leaning on that means every user must stay attached for its
+/// whole life to stay correct, which is not a property any of them state. The share says it.
+pub struct Texture {
+    pub name: TextureName,
+    /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
+    /// 2D array, and a RECT a 2D.
+    pub target: GLenum,
+    pub immutable: bool,
+    /// The EGL image that is the texture's storage, when that storage is an IOSurface: a
+    /// scanout or a shared buffer, rendered into directly and presented from without a copy.
+    /// The image owns the surface, so the surface's id is good exactly as long as the
+    /// texture is.
+    pub image: Option<Image>,
+    /// The render-target views taken of this texture, one per distinct [`ViewKey`].
+    ///
+    /// They live here rather than on the surface objects that ask for them because a view
+    /// outlives the surface, and here rather than on the [`Resource`] because it outlives that
+    /// too. The lock is uncontended -- a renderer's classic side is one thread -- and buys the
+    /// share the `Send` a `RefCell` would cost it.
+    views: Mutex<BTreeMap<ViewKey, TextureName>>,
+}
+
 /// What a render target's texture view is a function of: the format it reinterprets the resource
 /// in, and the layer range it restricts to. The level range is not part of it -- a surface's view
 /// always spans the resource's whole mip chain -- and neither is anything the guest sets on the
@@ -263,17 +279,11 @@ pub struct ViewKey {
     pub layers: u32,
 }
 
+/// A resource the host holds. Its GL objects are deleted by [`Resource::destroy`], never by drop:
+/// deleting needs the driver and a current context, which a drop does not have.
 pub struct Resource {
     pub args: Args,
     pub storage: Storage,
-    /// The render-target views taken of this resource, one per distinct [`ViewKey`].
-    ///
-    /// They live here rather than on the surface objects that ask for them because a view outlives
-    /// the surface: the guest may destroy a surface the framebuffer is still drawing through, and
-    /// a texture deleted underneath a live attachment is a lifetime bug that no amount of purging
-    /// at destroy sites can close. Held by the one thing a view cannot outlive, it needs no purge
-    /// at all -- the views go when the storage does.
-    views: BTreeMap<ViewKey, TextureName>,
 }
 
 impl Resource {
@@ -315,7 +325,7 @@ impl Resource {
     /// The IOSurface this resource is presented from, if its storage is one.
     pub fn surface(&self) -> Option<&Surface> {
         match &self.storage {
-            Storage::Texture { image: Some(image), .. } => Some(image.surface()),
+            Storage::Texture(t) => t.image.as_ref().map(|i| i.surface()),
             _ => None,
         }
     }
@@ -369,53 +379,92 @@ impl Resource {
         } else {
             alloc_texture(gl, winsys, features, formats, &args)?
         };
-        Ok(Resource { args, storage, views: BTreeMap::new() })
+        Ok(Resource { args, storage })
     }
 
+    /// The texture storage, for the operations only a texture has.
+    pub fn texture(&self) -> Option<&Arc<Texture>> {
+        match &self.storage {
+            Storage::Texture(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Delete what only this resource holds. Texture storage a framebuffer is still attached to
+    /// is handed back instead: the caller keeps it until the last attachment lets go.
+    #[must_use = "texture storage still attached somewhere has to be kept, not dropped"]
+    pub fn destroy(self, gl: &Gl) -> Option<Arc<Texture>> {
+        match self.storage {
+            Storage::Guest | Storage::Host(_) => None,
+            Storage::Buffer { name, tbo, .. } => {
+                if let Some(t) = tbo {
+                    gl.delete_texture(t);
+                }
+                gl.delete_buffer(name);
+                None
+            }
+            Storage::Texture(t) => match Arc::try_unwrap(t) {
+                Ok(t) => {
+                    t.destroy(gl);
+                    None
+                }
+                Err(t) => Some(t),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl Texture {
+    /// Texture storage that names no GL object, for tests about identity and nothing else.
+    pub fn unbacked(name: TextureName) -> Texture {
+        Texture { name, target: 0, immutable: true, image: None, views: Mutex::default() }
+    }
+}
+
+impl fmt::Debug for Texture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Texture").field("name", &self.name).field("target", &self.target).finish()
+    }
+}
+
+impl Texture {
     /// The render-target view for `key`, minted the first time it is asked for.
     ///
-    /// `internalformat` is the format table's answer for `key.format`; the caller has the table
-    /// and this does not.
-    pub fn view(&mut self, gl: &Gl, key: ViewKey, internalformat: GLenum) -> Option<TextureName> {
-        let Storage::Texture { name, target, .. } = self.storage else { return None };
-        Some(*self.views.entry(key).or_insert_with(|| {
+    /// `internalformat` is the format table's answer for `key.format`, and `levels` the texture's
+    /// mip count: the caller has the format table and the resource's args, and this has neither.
+    pub fn view(&self, gl: &Gl, key: ViewKey, internalformat: GLenum, levels: u32) -> TextureName {
+        let mut views = self.views.lock().expect("the classic side never panics under this lock");
+        *views.entry(key).or_insert_with(|| {
             let v = gl.gen_texture();
             gl.texture_view(
                 v,
-                target,
-                name,
+                self.target,
+                self.name,
                 internalformat,
                 0,
-                self.args.last_level + 1,
+                levels,
                 key.first_layer,
                 key.layers,
             );
             v
-        }))
+        })
     }
 
     /// The render-target view for `key`, if it has already been minted. Every surface mints its
     /// view at creation, so an attach only ever reads one back.
     pub fn view_texture(&self, key: ViewKey) -> Option<TextureName> {
-        self.views.get(&key).copied()
+        self.views.lock().expect("the classic side never panics under this lock").get(&key).copied()
     }
 
-    /// Delete the GL object, on a current context that shares with the one that made it.
+    /// Delete the GL objects, on a current context that shares with the one that made them. Only
+    /// the last share does this, which is why it consumes the texture rather than taking `&self`.
     pub fn destroy(self, gl: &Gl) {
-        for v in self.views.into_values() {
-            gl.delete_texture(v);
+        for v in self.views.into_inner().expect("the classic side never panics under this lock") {
+            gl.delete_texture(v.1);
         }
-        match self.storage {
-            Storage::Guest | Storage::Host(_) => {}
-            Storage::Buffer { name, tbo, .. } => {
-                if let Some(t) = tbo {
-                    gl.delete_texture(t);
-                }
-                gl.delete_buffer(name)
-            }
-            // The image, and the surface it owns, go with the storage the texture was.
-            Storage::Texture { name, .. } => gl.delete_texture(name),
-        }
+        // The image, and the surface it owns, go with the texture they were the storage of.
+        gl.delete_texture(self.name);
     }
 }
 
@@ -747,7 +796,13 @@ fn alloc_texture(
             return Err(if bound { Refusal::GlError(err) } else { Refusal::NoEglImage });
         }
         gl.bind_texture(target, None);
-        return Ok(Storage::Texture { name, target, immutable, image: Some(image) });
+        return Ok(Storage::Texture(Arc::new(Texture {
+            name,
+            target,
+            immutable,
+            image: Some(image),
+            views: Mutex::default(),
+        })));
     }
     match target {
         _ if a.nr_samples > 1 => {
@@ -836,7 +891,13 @@ fn alloc_texture(
         gl.tex_parameter_i(target, GL_TEXTURE_MAX_LEVEL, a.last_level as GLint);
     }
     gl.bind_texture(target, None);
-    Ok(Storage::Texture { name, target, immutable, image: None })
+    Ok(Storage::Texture(Arc::new(Texture {
+        name,
+        target,
+        immutable,
+        image: None,
+        views: Mutex::default(),
+    })))
 }
 
 #[cfg(test)]
