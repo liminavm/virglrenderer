@@ -648,9 +648,59 @@ buildable throughout as the A-side reference.
   should aim at: **when purpose arrives after existence, "not yet known" is a typed state with
   one owner, carrying what is known and why it is unresolved -- never a side table, never a
   silent guess, never success reported for wrong contents.**
-- **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
-  synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
-  the VPP legs.
+- **P4 — video.** Hardware decode of H.264, HEVC, VP9 and AV1 through VideoToolbox.
+  Ends with a video playing in the guest on virglrs, sampled twice and moving.
+
+  **Ported from this tree, not rebased onto upstream.** The video code here is two things
+  with different provenance. `virgl_video.c` is upstream's, and it is the VA-API layer.
+  Everything that makes video work on this platform -- the VideoToolbox backend, the AV1 OBU
+  synthesiser, the H.264 and HEVC parameter-set builders, the dav1d fallback -- was written
+  here, and upstream has no VideoToolbox backend and no reason to grow one. A rebase would
+  therefore import churn in the one file we are about to stop using and none of the ~4,600
+  lines we are actually porting. If a bug is ever fixed upstream in `virgl_video.c`, the tool
+  is a cherry-pick.
+
+  **Decode only.** `virgl_video_encode_bitstream` is a stub returning -1 and `fill_caps`
+  advertises no encode entrypoint, so the guest cannot reach it. `EncodeBitstream` is refused
+  and counted, like any other command this build does not serve, and the encode callbacks are
+  not ported. Porting a dead seam would be porting the C's layering rather than its semantics.
+
+  **What scores it.** Both legs call the same VideoToolbox on the same host, so a golden is
+  exact -- not because these codecs are normatively bit-exact, though they are, but because
+  even a quirky VT produces the same bytes twice. The decoded planes land in guest resources
+  and leave by the ordinary readback path, so a replay corpus scores video with no harness
+  surgery. What can break that equivalence is not the decoder: it is **choosing a different
+  decoder**. dav1d is not a peer backend -- it is a mid-stream fallback inside the AV1 codec,
+  entered only for frames the hardware returns wrongly (super-resolution). If the Rust leg
+  switches at a different unit than the C, the hashes diverge for a reason that is not a bug,
+  so the switch rule is ported exactly and the switch point is logged and compared. rav1d
+  standing in for dav1d bit-for-bit is a claim to verify while implementing, not to assume.
+
+  **Order, and why.** *The corpus first*: only the C leg can record it, the end gate needs it
+  regardless, and it carries real `virgl_picture_desc` inputs -- synthetic descriptors
+  exercise paths no player takes. *Then the builders*: `virgl_h264_build_parameter_sets`,
+  `annexb_to_avcc`, `virgl_av1_build_temporal_unit` and their HEVC counterparts are pure
+  bytes-in/bytes-out, roughly 2,600 lines with an exact oracle that needs no GL, no VT and no
+  VM, so they are ordinary `cargo test` work against fixtures dumped from the C by a small
+  generator linking the builder objects. *Then* the command path and buffer lifetime, *then*
+  VT decode and delivery, *then* AV1, which is the only codec needing synthesis of a header
+  the guest's parser already destroyed.
+
+  **`create_buffer` resolves its planes once.** It takes up to three guest resource handles,
+  one per plane. They become shares at create, not handles re-looked-up at delivery, because
+  the guest can free a plane mid-decode and a delivery path consulting a table the guest can
+  empty is the lifetime bug this tree keeps refusing to write. Same shape as the resource
+  work already landed.
+
+  **One new unsafe module.** VideoToolbox, CoreMedia and CoreVideo are C APIs, so no `objc2`
+  and no second Objective-C file -- `metal.rs` stays the only one. The new module goes on
+  `CLAUDE.md`'s unsafe list, which is exhaustive on purpose.
+
+  **Three gates, all of them already built.** The caps deviation the replay gate prints every
+  run (`num_video_caps`, `video_caps`) closes when video caps are served, and is a free
+  regression line from the first commit. The corpus score is exact. The end gate is a video
+  playing in the guest, read under the liveness discipline -- a playing video is its own
+  moving element.
 - **P5 — snapshot.** Journal export, `memory_write`, sync export/restore, classic
   content export/restore. Ends at suspend/resume parity.
 - **P6 — cutover.** Rust becomes the default prefix; limina's manifest and
