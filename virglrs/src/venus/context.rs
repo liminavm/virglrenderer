@@ -11327,7 +11327,10 @@ mod tests {
             reset: Vec<u32>,
             waited: Vec<(u32, u32, u64)>,
             imported: u32,
-            /// The descriptor the export handed over, so the test can ask whether it was closed.
+            /// The read end of each pipe the export handed the write end of. Asking whether a
+            /// descriptor number is still open would be asking the wrong question: the tests run
+            /// in one process, and another thread's open takes the number the moment it is free.
+            /// A read end at EOF says the write end was closed, whoever holds that number now.
             exported: Vec<core::ffi::c_int>,
         }
         thread_local! {
@@ -11373,12 +11376,17 @@ mod tests {
             _info: *const VkSemaphoreGetFdInfoKHR,
             out: *mut core::ffi::c_int,
         ) -> VkResult {
-            // A real descriptor, so the close the handler owes it is a thing the test can see.
-            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-            assert!(fd >= 0, "the test needs a descriptor to watch");
+            // A pipe, so the close the handler owes the descriptor is a thing the test can
+            // see: the read end reaches EOF exactly when the write end is closed.
+            let mut ends = [0 as core::ffi::c_int; 2];
+            // SAFETY: `pipe` writes two descriptors into the array it is given.
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "the test needs a pipe");
+            // SAFETY: a flag on a descriptor this test owns; a read must not block if the
+            // write end is still open, which is the failure being tested for.
+            unsafe { libc::fcntl(ends[0], libc::F_SETFL, libc::O_NONBLOCK) };
             // SAFETY: the caller is `export_semaphore_sync_fd`, which passes a live `c_int`.
-            unsafe { *out = fd };
-            SAW.with_borrow_mut(|s| s.exported.push(fd));
+            unsafe { *out = ends[1] };
+            SAW.with_borrow_mut(|s| s.exported.push(ends[0]));
             VkResult::VK_SUCCESS
         }
 
@@ -11469,16 +11477,16 @@ mod tests {
         };
         h.vkWaitSemaphoreResourceMESA(&mut args);
         assert!(h.reject.is_none());
-        let fd = SAW.with_borrow(|s| {
+        let read_end = SAW.with_borrow(|s| {
             assert_eq!(s.exported.len(), 1);
             s.exported[0]
         });
-        // SAFETY: a plain query on a descriptor number; it is closed, which is what is asserted.
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_GETFD) },
-            -1,
-            "the exported descriptor must not outlive the command that made it"
-        );
+        let mut byte = 0u8;
+        // SAFETY: a one-byte read from a descriptor this test owns, into a live byte.
+        let n = unsafe { libc::read(read_end, (&raw mut byte).cast(), 1) };
+        assert_eq!(n, 0, "the exported descriptor must not outlive the command that made it");
+        // SAFETY: the read end, which nothing else holds.
+        unsafe { libc::close(read_end) };
 
         // A resource id the C asserts on. The number is the guest's, so it is a rejection here --
         // an assert would hand a guest the power to abort the process.
