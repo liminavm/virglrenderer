@@ -151,10 +151,18 @@ pub struct Job {
     pub filter: TexFilter,
     pub src_box: (Point, i32, i32),
     pub src_z: i32,
+    /// The depth of the source *box*: how many slices this blit reads.
     pub src_depth: i32,
+    /// The depth of the source *texture* at `src_level`, which is what a 3D texture's layer
+    /// coordinate is normalised by. Not the same number as `src_depth`, and dividing by that one
+    /// makes a sub-range blit sample the wrong slices.
+    pub src_texture_depth: u32,
 
     pub dst: TextureName,
     pub dst_gl_target: GLenum,
+    /// The destination's gallium target, which decides whether the attached layer is the one the
+    /// guest named or this pass's slice.
+    pub dst_target: TextureTarget,
     pub dst_w: u32,
     pub dst_h: u32,
     pub dst_level: u32,
@@ -226,7 +234,7 @@ fn set_vertex_param(gl: &Gl, prog: ProgramName) {
 /// The vertex buffer's bytes. GL wants the floats as the host stores them, and a `&[f32]` cannot
 /// become a `&[u8]` without unsafe -- which this module does not have and does not need for
 /// thirty-two floats.
-fn little_endian(
+fn vertex_bytes(
     floats: &[f32; FLOATS_PER_VERTEX * VERTICES],
 ) -> [u8; FLOATS_PER_VERTEX * VERTICES * 4] {
     let mut out = [0u8; FLOATS_PER_VERTEX * VERTICES * 4];
@@ -312,14 +320,15 @@ impl Blitter {
         gl.viewport(0, 0, job.dst_w as GLsizei, job.dst_h as GLsizei);
         let normalized = job.src_gl_target != GL_TEXTURE_RECTANGLE && job.src_samples < 1;
         let mut vertices = [0f32; FLOATS_PER_VERTEX * VERTICES];
-        for dst_z in 0..job.dst_depth.max(1) {
+        for dst_z in 0..job.dst_depth {
             // The layer sampled for this destination slice, at the middle of the source's share
             // of it -- what the C's dst2src_scale and dst_offset compute.
-            let scale = job.src_depth as f32 / job.dst_depth.max(1) as f32;
-            let offset =
-                ((job.src_depth - 1) as f32 - (job.dst_depth.max(1) - 1) as f32 * scale) * 0.5;
+            let scale = job.src_depth as f32 / job.dst_depth as f32;
+            let offset = ((job.src_depth - 1) as f32 - (job.dst_depth - 1) as f32 * scale) * 0.5;
             let src_z = (dst_z as f32 + offset) * scale;
-            let layer = match job.src_target {
+            // The DESTINATION's target decides this: a layered destination is attached at the
+            // layer the guest named, and only a plain one walks its slices.
+            let layer = match job.dst_target {
                 TextureTarget::Cube | TextureTarget::Array1d | TextureTarget::Array2d => {
                     job.dst_layer
                 }
@@ -350,14 +359,16 @@ impl Blitter {
                 v[6] = 0.0;
                 v[7] = 0.0;
                 match job.src_target {
-                    TextureTarget::Texture3d => v[6] = layer_coord / job.src_depth.max(1) as f32,
+                    TextureTarget::Texture3d => {
+                        v[6] = layer_coord / job.src_texture_depth.max(1) as f32
+                    }
                     TextureTarget::Array1d => v[5] = layer_coord,
                     TextureTarget::Array2d => v[6] = layer_coord,
                     _ => {}
                 }
             }
             gl.bind_buffer(GL_ARRAY_BUFFER, Some(self.vbo));
-            gl.buffer_data(GL_ARRAY_BUFFER, &little_endian(&vertices), GL_STATIC_DRAW);
+            gl.buffer_data(GL_ARRAY_BUFFER, &vertex_bytes(&vertices), GL_STATIC_DRAW);
             gl.draw_arrays(GL_TRIANGLE_FAN, 0, VERTICES as GLsizei);
         }
         gl.use_program(None);
