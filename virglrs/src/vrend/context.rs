@@ -17,6 +17,7 @@
 //! resource the context does not have, a shape the host cannot serve -- each is a [`Fault`].
 
 use super::decode::Batch;
+use super::dirty::Dirty;
 use super::egl::{self, EglError, Version, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Desc, Table};
@@ -26,7 +27,7 @@ use super::gl::{
     QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, UniformLocation,
     VertexArrayName,
 };
-use super::pipe::slots::{MAX_COLOR_BUFS, MAX_VIEWPORTS};
+use super::pipe::slots::{MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_VIEWPORTS};
 use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage};
@@ -453,10 +454,10 @@ pub struct SubCtx {
     stencil_dirty: bool,
 
     viewports: [ViewportHw; MAX_VIEWPORTS],
-    viewport_dirty: u32,
+    viewport_dirty: Dirty<MAX_VIEWPORTS>,
     viewport_is_negative: bool,
     scissors: [Scissor; MAX_VIEWPORTS],
-    scissor_dirty: u32,
+    scissor_dirty: Dirty<MAX_VIEWPORTS>,
 
     zsurf: Option<BoundSurface>,
     cbufs: Vec<Option<BoundSurface>>,
@@ -482,10 +483,12 @@ pub struct SubCtx {
     consts: [Vec<u32>; ShaderStage::COUNT],
     const_dirty: [bool; ShaderStage::COUNT],
     ubos: [BTreeMap<u32, Ubo>; ShaderStage::COUNT],
-    ubos_dirty: [u32; ShaderStage::COUNT],
+    ubos_dirty: [Dirty<MAX_CONSTANT_BUFFERS>; ShaderStage::COUNT],
     views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
     /// The view slots re-bound at the next draw, one bit each.
-    views_dirty: [u32; ShaderStage::COUNT],
+    /// A sampler unit is what a shader names, and there are [`MAX_SAMPLERS`] of them -- fewer
+    /// than the view slots the decoder admits. A view set above them is held and never sampled.
+    views_dirty: [Dirty<MAX_SAMPLERS>; ShaderStage::COUNT],
     /// The level count of each view the last draw bound, in sampler order, for the GLES
     /// `textureQueryLevels` emulation.
     texture_levels: [Vec<GLint>; ShaderStage::COUNT],
@@ -538,10 +541,10 @@ impl SubCtx {
             stencil_refs: [0; 2],
             stencil_dirty: false,
             viewports: [vp; MAX_VIEWPORTS],
-            viewport_dirty: 0,
+            viewport_dirty: Dirty::none(),
             viewport_is_negative: false,
             scissors: [Scissor { minx: 0, miny: 0, maxx: 0, maxy: 0 }; MAX_VIEWPORTS],
-            scissor_dirty: 0,
+            scissor_dirty: Dirty::none(),
             zsurf: None,
             cbufs: Vec::new(),
             fb_height: 0,
@@ -558,9 +561,9 @@ impl SubCtx {
             consts: Default::default(),
             const_dirty: [false; ShaderStage::COUNT],
             ubos: Default::default(),
-            ubos_dirty: [0; ShaderStage::COUNT],
+            ubos_dirty: [Dirty::none(); ShaderStage::COUNT],
             views: Default::default(),
-            views_dirty: [0; ShaderStage::COUNT],
+            views_dirty: [Dirty::none(); ShaderStage::COUNT],
             texture_levels: Default::default(),
             samplers: Default::default(),
             shaders: Default::default(),
@@ -643,7 +646,7 @@ impl SubCtx {
 /// Empty every view slot naming `handle` and mark each for rebinding. Whether any did.
 fn evict_view(
     views: &mut [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
-    views_dirty: &mut [u32; ShaderStage::COUNT],
+    views_dirty: &mut [Dirty<MAX_SAMPLERS>; ShaderStage::COUNT],
     handle: ObjectHandle,
 ) -> bool {
     let mut held = false;
@@ -651,8 +654,9 @@ fn evict_view(
         let gone: Vec<u32> = slots.iter().filter(|(_, h)| **h == handle).map(|(s, _)| *s).collect();
         for slot in gone {
             slots.remove(&slot);
-            if slot < 32 {
-                views_dirty[stage] |= 1 << slot;
+            // A view above the sampler units is held but never sampled, so nothing rebinds it.
+            if (slot as usize) < MAX_SAMPLERS {
+                views_dirty[stage].mark(slot);
             }
             held = true;
         }
@@ -913,7 +917,7 @@ impl Context {
                 for (i, s) in scissors.iter().enumerate() {
                     let idx = start_slot as usize + i;
                     sub.scissors[idx] = *s;
-                    sub.scissor_dirty |= 1 << idx;
+                    sub.scissor_dirty.mark(idx as u32);
                 }
                 Ok(())
             }
@@ -1979,7 +1983,7 @@ impl Context {
                 near,
                 far,
             };
-            sub.viewport_dirty |= 1 << idx;
+            sub.viewport_dirty.mark(idx as u32);
             if idx == 0 && sub.viewport_is_negative != negative {
                 sub.viewport_is_negative = negative;
                 sub.sysval.winsys_adjust_y = if negative { -1.0 } else { 1.0 };
@@ -2049,9 +2053,9 @@ impl Context {
                 }
             }
         }
-        if sub.scissor_dirty != 0 {
+        if !sub.scissor_dirty.is_empty() {
             for idx in 0..MAX_VIEWPORTS {
-                if sub.scissor_dirty & (1 << idx) == 0 {
+                if !sub.scissor_dirty.contains(idx as u32) {
                     continue;
                 }
                 let s = sub.scissors[idx];
@@ -2066,11 +2070,11 @@ impl Context {
                     );
                 }
             }
-            sub.scissor_dirty = 0;
+            sub.scissor_dirty.clear();
         }
-        if sub.viewport_dirty != 0 {
+        if !sub.viewport_dirty.is_empty() {
             for idx in 0..MAX_VIEWPORTS {
-                if sub.viewport_dirty & (1 << idx) == 0 || idx != 0 {
+                if !sub.viewport_dirty.contains(idx as u32) || idx != 0 {
                     continue;
                 }
                 let v = sub.viewports[idx];
@@ -2078,7 +2082,7 @@ impl Context {
                 gl.viewport(v.x, cy, v.width, v.height);
                 gl.depth_range_f(v.near as f32, v.far as f32);
             }
-            sub.viewport_dirty = 0;
+            sub.viewport_dirty.clear();
         }
     }
 
@@ -2167,7 +2171,7 @@ impl Context {
         if sub.fb_height != height || sub.fbo_origin_upper_left != upper_left {
             sub.fb_height = height;
             sub.fbo_origin_upper_left = upper_left;
-            sub.viewport_dirty |= 1;
+            sub.viewport_dirty.mark(0);
         }
         // `vrend_hw_emit_framebuffer_state`.
         let srgb_control = host.features.has(Feature::srgb_write_control);
@@ -2315,9 +2319,8 @@ impl Context {
                 ubos.insert(index, Ubo { resource: r, offset, length });
             }
         }
-        if index < 32 {
-            sub.ubos_dirty[stage.index()] |= 1 << index;
-        }
+        // The decoder refuses a constant-buffer index past MAX_CONSTANT_BUFFERS.
+        sub.ubos_dirty[stage.index()].mark(index);
         Ok(())
     }
 
@@ -2344,8 +2347,9 @@ impl Context {
             if sub.views[stage.index()].get(&slot) == Some(h) {
                 continue;
             }
-            if slot < 32 {
-                sub.views_dirty[stage.index()] |= 1 << slot;
+            // A view above the sampler units is held but never sampled.
+            if (slot as usize) < MAX_SAMPLERS {
+                sub.views_dirty[stage.index()].mark(slot);
             }
             let (gl, features, formats) = (host.gl, host.features, host.formats);
             let mut buffer_view = false;
@@ -3149,11 +3153,13 @@ mod tests {
         views[1].insert(0, h(9));
         views[1].insert(1, h(4));
         views[1].insert(7, h(9));
-        let mut dirty = [0u32; ShaderStage::COUNT];
+        let mut dirty = [Dirty::<MAX_SAMPLERS>::none(); ShaderStage::COUNT];
         assert!(evict_view(&mut views, &mut dirty, h(9)));
         assert!(views[0].is_empty());
         assert_eq!(views[1].keys().copied().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(dirty, [1 << 3, (1 << 0) | (1 << 7), 0, 0, 0, 0]);
+        assert!(dirty[0].contains(3));
+        assert!(dirty[1].contains(0) && dirty[1].contains(7) && !dirty[1].contains(1));
+        assert!(dirty[2..].iter().all(|d| d.is_empty()));
         // A handle the guest reuses for a new view then binds afresh, instead of reading as
         // already bound.
         assert!(!evict_view(&mut views, &mut dirty, h(9)));

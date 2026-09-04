@@ -403,7 +403,7 @@ impl Context {
                 s.maxx as GLsizei - s.minx as GLsizei,
                 s.maxy as GLsizei - s.miny as GLsizei,
             );
-            self.sub_mut().scissor_dirty = 1;
+            self.sub_mut().scissor_dirty = Dirty::just(0);
             gl.enable(GL_SCISSOR_TEST);
         } else {
             gl.disable(GL_SCISSOR_TEST);
@@ -639,7 +639,7 @@ impl Context {
         }
         gl.scissor(rect[0] as GLint, rect[1] as GLint, rect[2] as GLsizei, rect[3] as GLsizei);
         gl.enable(GL_SCISSOR_TEST);
-        self.sub_mut().scissor_dirty = 1;
+        self.sub_mut().scissor_dirty = Dirty::just(0);
         let fb0 = self.sub().blit_fbs[0];
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb0));
         let res = host.resource(cmd, resource)?;
