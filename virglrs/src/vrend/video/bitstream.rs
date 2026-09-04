@@ -103,6 +103,17 @@ impl Writer {
         self.ue(code as u32);
     }
 
+    /// Zeros to the byte boundary, if the accumulator holds a partial byte.
+    ///
+    /// AV1's `byte_alignment()`. Unlike [`Writer::rbsp_trailing`] it writes nothing at all when
+    /// already aligned, which is the difference between a frame header inside an `OBU_FRAME` and
+    /// one standing alone.
+    pub fn align(&mut self) {
+        while self.nbits != 0 {
+            self.flag(false);
+        }
+    }
+
     /// `rbsp_trailing_bits()`: a 1 bit, then zeros to the byte boundary.
     pub fn rbsp_trailing(&mut self) {
         self.flag(true);

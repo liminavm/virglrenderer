@@ -449,3 +449,111 @@ int virgl_oracle_h265_slice_inspect(const uint8_t *annexb, size_t len, const uin
    return virgl_h265_slice_inspect(annexb, len,
                                    (const struct virgl_h265_picture_desc *)desc, out_id);
 }
+
+/* ---------------------------------------------------------------- AV1 OBU synthesis */
+
+#include "virgl_video_av1_obu.h"
+
+size_t virgl_oracle_av1_desc_bytes(void)
+{
+   return sizeof(struct virgl_av1_picture_desc);
+}
+
+/*
+ * Report where each field the Rust reader looks for actually sits, bit-fields included.
+ *
+ * A bit-field has no `offsetof`, and its packing is ABI rather than anything a reader may assume,
+ * so it is measured instead: the field is set to all ones in an otherwise zeroed descriptor and
+ * the containing storage unit is read back, which gives the offset, the unit's size, the shift
+ * and the width without anyone counting bits. Four values per field, in the order the Rust `at`
+ * module declares them; a plain member reports its offset with size, shift and width all zero.
+ */
+size_t virgl_oracle_av1_layout(uint32_t *out, size_t cap)
+{
+   static struct virgl_av1_picture_desc d;
+   size_t n = 0;
+
+#define PLAIN(path) do {                                                             \
+      if (n + 4 > cap) return 0;                                                     \
+      out[n++] = (uint32_t)offsetof(struct virgl_av1_picture_desc, path);            \
+      out[n++] = 0; out[n++] = 0; out[n++] = 0;                                      \
+   } while (0)
+
+#define BITS(container, field) do {                                                  \
+      if (n + 4 > cap) return 0;                                                     \
+      memset(&d, 0, sizeof d);                                                       \
+      d.container.field = ~0u;                                                       \
+      size_t off = offsetof(struct virgl_av1_picture_desc, container);               \
+      size_t sz = sizeof(d.container);                                               \
+      unsigned long long v = 0;                                                      \
+      memcpy(&v, (char *)&d + off, sz);                                              \
+      uint32_t shift = 0, width = 0;                                                 \
+      while (shift < 64 && !((v >> shift) & 1)) shift++;                             \
+      while (shift + width < 64 && ((v >> (shift + width)) & 1)) width++;            \
+      out[n++] = (uint32_t)off; out[n++] = (uint32_t)sz;                             \
+      out[n++] = shift; out[n++] = width;                                            \
+   } while (0)
+
+   PLAIN(picture_parameter.profile);
+   PLAIN(picture_parameter.order_hint_bits_minus_1);
+   PLAIN(picture_parameter.bit_depth_idx);
+   PLAIN(picture_parameter.frame_width);
+   PLAIN(picture_parameter.frame_height);
+   PLAIN(picture_parameter.max_width);
+   PLAIN(picture_parameter.max_height);
+
+   BITS(picture_parameter.seq_info_fields, use_128x128_superblock);
+   BITS(picture_parameter.seq_info_fields, enable_filter_intra);
+   BITS(picture_parameter.seq_info_fields, enable_intra_edge_filter);
+   BITS(picture_parameter.seq_info_fields, enable_interintra_compound);
+   BITS(picture_parameter.seq_info_fields, enable_masked_compound);
+   BITS(picture_parameter.seq_info_fields, enable_dual_filter);
+   BITS(picture_parameter.seq_info_fields, enable_order_hint);
+   BITS(picture_parameter.seq_info_fields, enable_jnt_comp);
+   BITS(picture_parameter.seq_info_fields, enable_cdef);
+   BITS(picture_parameter.seq_info_fields, mono_chrome);
+   BITS(picture_parameter.seq_info_fields, ref_frame_mvs);
+   BITS(picture_parameter.seq_info_fields, film_grain_params_present);
+
+#undef PLAIN
+#undef BITS
+   return n / 4;
+}
+
+/*
+ * Fill a descriptor. Noise everywhere first, so a field read from the wrong place shows up rather
+ * than passing by luck, then the fields whose values change the *shape* of what is written set to
+ * something a guest would send.
+ */
+void virgl_oracle_av1_desc_fill(uint8_t *out, uint64_t seed)
+{
+   struct virgl_av1_picture_desc *d = (struct virgl_av1_picture_desc *)out;
+   uint64_t s = seed;
+
+   for (size_t i = 0; i < sizeof(*d); i++)
+      out[i] = (uint8_t)oracle_rng(&s);
+
+   d->picture_parameter.profile = 0;
+   d->picture_parameter.bit_depth_idx = oracle_rng(&s) % 2;   /* 8 or 10 bit */
+   d->picture_parameter.order_hint_bits_minus_1 = oracle_rng(&s) % 8;
+
+   /* Sizes across the level table, and zero sometimes so the max/frame fallback is exercised. */
+   static const uint16_t widths[]  = { 0, 512, 640, 1280, 1920, 3840, 8192 };
+   static const uint16_t heights[] = { 0, 288, 480,  720, 1080, 2160, 4352 };
+   const unsigned i = oracle_rng(&s) % 7;
+   d->picture_parameter.max_width = widths[i];
+   d->picture_parameter.max_height = heights[i];
+   d->picture_parameter.frame_width = widths[1 + oracle_rng(&s) % 6];
+   d->picture_parameter.frame_height = heights[1 + oracle_rng(&s) % 6];
+}
+
+ssize_t virgl_oracle_av1_build_av1c(const uint8_t *desc, uint8_t *out, size_t out_size)
+{
+   struct virgl_av1_obu_state state;
+   ssize_t n;
+
+   virgl_av1_obu_state_init(&state);
+   n = virgl_av1_build_av1c(&state, (const struct virgl_av1_picture_desc *)desc, out, out_size);
+   virgl_av1_obu_state_fini(&state);
+   return n;
+}
