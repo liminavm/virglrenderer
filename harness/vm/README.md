@@ -7,7 +7,7 @@ scripts and this file — the bundle, the disks, the build and the captures are 
 ```sh
 ./build-renderer.sh          # this tree -> harness/vm/prefix
 ./make-rig.sh                # clone limina's bundle + two disks, swap our renderer in
-./capture.sh venus --mb 256  # boot the enhanced guest with the venus recorder armed
+./capture.sh venus  # boot the enhanced guest with the venus recorder armed
 ./dump.sh venus              # ask for the dump, then check it
 ```
 
@@ -102,7 +102,7 @@ for clients, so stopping the target runs its drops and puts real `vkDestroy*` tr
 instead of a bare fd close at exit.
 
 ```sh
-./capture.sh synoik --mb 256 --out synoik-lifecycle    # boot; synoik starts itself
+./capture.sh synoik --out synoik-lifecycle       # boot; synoik starts itself
 # let it render for a couple of minutes, then, in the guest:
 #   ssh -p <port from the boot log> claude@127.0.0.1 \
 #     'XDG_RUNTIME_DIR=/run/user/1000 systemctl --user stop graphical-session.target'
