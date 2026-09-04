@@ -273,6 +273,57 @@ impl Untyped {
         Untyped { surface }
     }
 
+    /// Say what this storage is, which is the one thing that may be done to it.
+    ///
+    /// Consuming, so the untyped value cannot outlive the transition: there is no path that
+    /// types a handle and leaves the old entry standing, because after this there is no old
+    /// entry to leave.
+    ///
+    /// The surface is *adopted*, never minted. These bytes belong to whoever exported them and
+    /// are the frame a client is presenting; a surface minted here would be a second copy of it,
+    /// and the guest would composite the one nobody draws into.
+    /// A refusal hands the storage back, so a rejected upgrade leaves the handle exactly as it
+    /// was rather than deleting it: there is no path that loses a resource by failing to type it.
+    pub fn upgrade(
+        self,
+        gl: &Gl,
+        winsys: &Winsys,
+        features: &Features,
+        formats: &Table,
+        limits: &Limits,
+        args: Args,
+    ) -> Result<Resource, (Untyped, Refusal)> {
+        if let Err(e) = check(features, formats, limits, &args) {
+            return Err((self, e));
+        }
+        let image = self.surface.and_then(|held| match winsys.image_from_iosurface(held) {
+            Ok(image) => Some(image),
+            Err(e) => {
+                eprintln!(
+                    "[virglrs] vrend: the driver refused an EGL image of an exported {}x{} {} \
+                     surface ({e}); it gets a blank texture and its contents will be wrong",
+                    args.width,
+                    args.height,
+                    args.format.name()
+                );
+                None
+            }
+        });
+        let adopted = image.is_some();
+        // The share is gone into the image, or was never there; a refusal past this point has
+        // nothing left to hand back but an empty slot, which is what the handle already was.
+        let storage = match alloc_texture(gl, features, formats, &args, image) {
+            Ok(s) => s,
+            Err(e) => return Err((Untyped { surface: None }, e)),
+        };
+        if !adopted {
+            // `glTexStorage` leaves contents undefined, which is another context's memory read
+            // as pixels -- wrong, and a leak. Blank is still wrong; it is not also a leak.
+            zero_texture(gl, formats, &args, &storage);
+        }
+        Ok(Resource { args, storage })
+    }
+
     /// A share of the surface these bytes are, if they are one.
     pub fn surface(&self) -> Option<&Arc<dyn Held>> {
         self.surface.as_ref()
@@ -438,7 +489,8 @@ impl Resource {
         let storage = if args.target == TextureTarget::Buffer {
             alloc_buffer(gl, features, &args)?
         } else {
-            alloc_texture(gl, winsys, features, formats, &args)?
+            let image = mint_surface(winsys, &args);
+            alloc_texture(gl, features, formats, &args, image)?
         };
         Ok(Resource { args, storage })
     }
@@ -820,12 +872,46 @@ fn mint_surface(winsys: &Winsys, a: &Args) -> Option<Image> {
 }
 
 /// `vrend_resource_alloc_texture`.
+/// Write zeros over a texture's first level.
+///
+/// For storage nothing filled: an adopted surface carries the exporter's pixels, but a texture
+/// that stood in for one carries whatever the driver's allocator last held there.
+fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {
+    let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
+        return;
+    };
+    let Some(bytes) = crate::vrend::gl::image_bytes(
+        entry.gl.glformat,
+        entry.gl.gltype,
+        a.width as GLsizei,
+        a.height as GLsizei,
+        1,
+    ) else {
+        return;
+    };
+    let zeros = vec![0u8; bytes];
+    gl.bind_texture(t.target, Some(t.name));
+    gl.unpack_tight();
+    gl.tex_sub_image_2d(
+        t.target,
+        0,
+        0,
+        0,
+        a.width as GLsizei,
+        a.height as GLsizei,
+        entry.gl.glformat,
+        entry.gl.gltype,
+        &zeros,
+    );
+    gl.bind_texture(t.target, None);
+}
+
 fn alloc_texture(
     gl: &Gl,
-    winsys: &Winsys,
     features: &Features,
     formats: &Table,
     a: &Args,
+    image: Option<Image>,
 ) -> Result<Storage, Refusal> {
     let entry = formats.get(a.format).ok_or(Refusal::UnsupportedFormat)?;
     let mut immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
@@ -833,7 +919,6 @@ fn alloc_texture(
     let (ifmt, glformat, gltype) = (entry.gl.internalformat, entry.gl.glformat, entry.gl.gltype);
     let levels = (a.last_level + 1) as GLsizei;
     let (w, h) = (a.width as GLsizei, a.height as GLsizei);
-    let image = mint_surface(winsys, a);
     let name = gl.gen_texture();
     gl.bind_texture(target, Some(name));
     gl.drain_errors();

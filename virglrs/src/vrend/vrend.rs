@@ -251,6 +251,26 @@ impl Vrend {
         Ok(())
     }
 
+    /// A blob attached to a classic context: storage, and nothing yet that says what it is.
+    ///
+    /// A blob reaches vrend only here. It is created without a type -- no format, no extent --
+    /// so there is nothing for `resource_create` to make, and the `SET_TYPE` that describes it
+    /// arrives later in the command stream. Holding the storage from the attach is what gives
+    /// that command something to adopt, and what lets a handle touched in between fault as
+    /// untyped rather than as absent.
+    ///
+    /// Idempotent: the guest may attach one resource to several contexts, and a later attach
+    /// must not un-type what an earlier one's `SET_TYPE` already settled.
+    pub fn resource_attach_blob(
+        &mut self,
+        handle: ResourceHandle,
+        surface: Option<Arc<dyn metal::Held>>,
+    ) {
+        self.resources
+            .entry(handle)
+            .or_insert_with(|| resource::Slot::Untyped(resource::Untyped::new(surface)));
+    }
+
     /// The IOSurface a resource is presented from, if its storage is one. Asked of the resource
     /// every time: the surface goes with the resource, and there is no other place to hold one.
     pub fn resource_surface(&self, handle: ResourceHandle) -> Option<&metal::Surface> {
