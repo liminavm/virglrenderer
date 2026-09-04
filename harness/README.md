@@ -264,11 +264,38 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   ./dump.sh vrend-h264
   ```
 
-  **These two are scored with `--ctx 8`, and that is not optional.** They were captured with a
+  `vrend-av1.score` is 400 pictures across six clips, and it is **not scored on this host**: AV1
+  decode needs M3-or-later silicon, so a machine without it advertises no AV1 and the corpus
+  measures nothing on either leg. It is recorded and scored on the AV1 machine, against a rig
+  copied there rather than rebuilt: the bundles are self-contained after `make-rig.sh`, the two
+  renderer prefixes and the KosmicKrisp/epoxy prefixes are a few tens of MB, and only the guest
+  disk is large. What the copy does need is the prefixes' own dependencies present at the paths
+  they were linked against -- `install_name_tool -id` onto the new path so the replayer links
+  what is there, Homebrew's `vulkan-loader`, `dav1d` and `spirv-tools`, and the *same* `libLLVM`
+  the mesa prefix was built against, dropped beside it so `DYLD_LIBRARY_PATH` finds it ahead of
+  the other machine's.
+
+  The clips are limina's own AV1 spike set (`spikes/av1-obu-serializer/clips`), which is what the
+  serializer was developed against: baseline, global motion, tiles, low delay, aom pyramid, pan.
+  Two of the eight are deliberately left out. `superres` because **this build refuses
+  super-resolution frames** -- the hardware returns them wrongly and there is no software decoder
+  here -- so it would diverge by design. `filmgrain` because its hardware decode **is not
+  reproducible run to run**: three consecutive decodes of the same file give three different
+  md5s, which is a golden that grades the weather.
+
+  **The reference decoder for AV1 is libaom, not dav1d.** `dav1ddec` tags its output
+  `chroma-site=jpeg, colorimetry=bt709` where the VA path tags nothing, so `videoconvert` does
+  different work on the two and every clip's md5 differs for a reason that is not the decode --
+  which reads exactly like a broken decoder. `av1dec` (libaom) and `vaav1dec` agree byte for byte
+  on all six.
+
+  **These three are scored with `--ctx 8`, and that is not optional.** They were captured with a
   whole guest booted, so the decode is one context of four; the replayer with no `--ctx` picks the
   busiest, which is the console's, and scores 2317 empty resources and not one picture -- a clean
   exit, a full score file, and no measurement of the thing the corpus exists for. The context to
-  name is the one holding `DECODE_BITSTREAM`.
+  name is the one holding `DECODE_BITSTREAM`. Six clips played one after another still land in
+  one context -- GStreamer's VA elements share the render node's -- so six codecs' worth of
+  create, decode and destroy score as one run.
 
   **A resource is zeroed when it is created, so a score line is the renderer's answer and not
   its allocator's.** A texture's contents are undefined until something writes them, and this
