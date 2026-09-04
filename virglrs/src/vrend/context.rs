@@ -499,18 +499,15 @@ pub struct SubCtx {
     programs: Vec<LinkedProgram>,
     prog: Option<u64>,
     next_program_serial: u64,
-    /// The `VirglBlock` contents, and a cookie that moves with every change so a program
-    /// uploads it once per change.
+    /// The `VirglBlock` contents. Each program remembers the block it last uploaded and
+    /// compares by value, so there is no second record of whether this changed.
     sysval: Sysval,
-    sysval_cookie: u32,
     ssbos: [BTreeMap<u32, Ssbo>; ShaderStage::COUNT],
     images: [BTreeMap<u32, ImageView>; ShaderStage::COUNT],
     abos: BTreeMap<u32, Ssbo>,
     streamouts: Vec<Streamout>,
     current_so: Option<usize>,
     render_condition: Option<(ObjectHandle, bool, RenderCondMode)>,
-    polygon_stipple: [u32; 32],
-    clip_state: [[f32; 4]; 8],
 }
 
 impl SubCtx {
@@ -571,15 +568,12 @@ impl SubCtx {
             prog: None,
             next_program_serial: 0,
             sysval: Sysval::default(),
-            sysval_cookie: 0,
             ssbos: Default::default(),
             images: Default::default(),
             abos: BTreeMap::new(),
             streamouts: Vec::new(),
             current_so: None,
             render_condition: None,
-            polygon_stipple: [0; 32],
-            clip_state: [[0.0; 4]; 8],
         }
     }
 
@@ -953,17 +947,11 @@ impl Context {
             Command::EndQuery(h) => self.end_query(host, h),
             Command::GetQueryResult { query, wait } => self.get_query_result(host, query, wait),
             Command::SetPolygonStipple(rows) => {
-                let sub = self.sub_mut();
-                sub.polygon_stipple = rows;
-                sub.sysval.stipple = rows;
-                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
+                self.sub_mut().sysval.stipple = rows;
                 Ok(())
             }
             Command::SetClipState(planes) => {
-                let sub = self.sub_mut();
-                sub.clip_state = planes;
-                sub.sysval.clip_planes = planes;
-                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
+                self.sub_mut().sysval.clip_planes = planes;
                 Ok(())
             }
             Command::SetSampleMask(mask) => {
@@ -1345,9 +1333,8 @@ impl Context {
         }
         sub.dsa = state;
         let s = sub.dsa_state();
-        if state.is_some() && sub.sysval.alpha_ref_val != s.alpha.ref_value {
+        if state.is_some() {
             sub.sysval.alpha_ref_val = s.alpha.ref_value;
-            sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
         }
         if s.depth.enabled {
             if !sub.depth_test_enabled {
@@ -1404,7 +1391,6 @@ impl Context {
         if s.clip_plane_enable != sub.hw_rs.clip_plane_enable {
             sub.hw_rs.clip_plane_enable = s.clip_plane_enable;
             sub.sysval.clip_plane_enabled = if s.clip_plane_enable != 0 { 1.0 } else { 0.0 };
-            sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
         }
         if features.has(Feature::multisample) {
             if features.has(Feature::sample_mask) {
@@ -2007,7 +1993,6 @@ impl Context {
             if idx == 0 && sub.viewport_is_negative != negative {
                 sub.viewport_is_negative = negative;
                 sub.sysval.winsys_adjust_y = if negative { -1.0 } else { 1.0 };
-                sub.sysval_cookie = sub.sysval_cookie.wrapping_add(1);
             }
         }
     }
