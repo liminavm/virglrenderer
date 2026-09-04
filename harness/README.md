@@ -37,7 +37,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   same `--score`/`--expect` contract as the venus side.
   Run it with `vrend-replay.sh <corpus>`, which supplies the zink-on-KosmicKrisp environment the
   renderer needs; `build.sh` alone builds it, pointing `VIRGL_PREFIX` at the implementation under
-  test.
+  test. Two switches bisect a score line that differs: `--until <seq>` stops the stream there
+  and scores what the surfaces hold at that point, and `--readback <res>` on a resource still
+  alive at the end reads its texture as well, so a scanout's surface and its texture can be
+  compared — the pair disagreeing is how a stale surface read was told from a wrong render.
+  `REPLAY_DUMP_DIR` (narrowed by `REPLAY_DUMP_W`) writes every scored readback and surface as raw
+  BGRA, for `rgba2png.py` and a pixel diff.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
@@ -176,7 +181,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the same replay against the Rust prefix with `VIRGLRS_DEBUG=shader`, normalised by the same
   script: the two logs must diff empty, block for block and in order, which holds the key
   construction to the C as well as the translation. Under `--nodraw` that is the 28 blocks of
-  shader creation and `LINK_SHADER`.
+  shader creation and `LINK_SHADER`; with draws it is all 34, the six more being the variants selected at draw
+  time.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
