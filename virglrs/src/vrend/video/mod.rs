@@ -15,6 +15,8 @@
 //! live codec so that destroying a buffer can go and null out the pointers to it. Neither exists
 //! here: a share keeps what names it alive, and a destroy is a table drop.
 
+pub mod bitstream;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
 use std::sync::Arc;

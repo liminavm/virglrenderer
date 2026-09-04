@@ -23,6 +23,11 @@ panic = "abort"
 # C in it, and keeping it that way is the point of the rewrite.
 reply-oracle = ["dep:cc"]
 
+# Build the C tree's video bitstream serializers and link them into the tests, so the Rust ports
+# can be diffed against them byte for byte. The C is the only reference these have -- there is no
+# conformance vector for a synthesized parameter set -- so agreeing with it is the whole standard.
+video-oracle = ["dep:cc"]
+
 [dependencies]
 bumpalo = "3.20"
 bytemuck = { version = "1.25.2", features = ["derive"] }
