@@ -185,10 +185,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   line, and the same against the Rust prefix diffs against the fixture. The guest's virgl driver
   configures itself from nothing else -- a format missing from `sampler` is a format the guest
   never creates, a wrong `glsl_level` is a whole feature set switched off -- and none of it is a
-  pixel, so a score cannot see it. Two lines are expected to differ, both by design: `sampler`
-  carries the fourteen `ASTC_*_SRGB` formats the C's `ASTC_FORMAT` macro never registers
-  (`virglrs/vrend-gen/gl_formats.py`), and `num_video_caps`/`video_caps` are empty until video
-  is ported. A third line is a regression.
+  pixel, so a score cannot see it. Four lines are expected to differ, all by design.
+  `num_video_caps`/`video_caps` are empty until video is ported, and `capability_bits_v2` is
+  short the two bits the C sets for it -- `VIDEO_GUEST_PLANES` and `VIDEO_PLANAR_TARGET`, which
+  a guest reads as permission to hand us a decode target in the composite planar shape.
+  `sampler` differs for two separate reasons: it carries the fourteen `ASTC_*_SRGB` formats the
+  C's `ASTC_FORMAT` macro never registers (`virglrs/vrend-gen/gl_formats.py`), and it still
+  advertises `Y8_U8_V8_420_UNORM` and `Y8_V8_U8_420_UNORM` as samplable, which the C stopped
+  doing: only NV12 and NV21 can back a composite target, and a guest told otherwise creates a
+  resource the host then refuses -- after the kernel has already handed it the handle, so the
+  guest attaches backing and builds views on a resource that does not exist and has its context
+  poisoned for the rest of its life. Both `sampler` reasons close with video; the ASTC one does
+  not, and stays. A fifth line is a regression.
   `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 33
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
