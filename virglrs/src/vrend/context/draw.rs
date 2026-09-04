@@ -522,10 +522,8 @@ fn add_shader_program(
                 for arr in &l.info.image_arrays {
                     for j in 0..arr.array_size {
                         let name = format!("{prefix}img{}[{j}]", arr.first);
+                        // An image the compiler dropped has no location; the draw skips it.
                         let loc = gl.get_uniform_location(id, &name);
-                        if loc == -1 {
-                            eprintln!("[virglrs] vrend: no uniform location for image {name}");
-                        }
                         let slot = (arr.first + j) as usize;
                         if slot >= locs.len() {
                             locs.resize(slot + 1, -1);
@@ -538,9 +536,6 @@ fn add_shader_program(
                     if mask & (1 << i) != 0 {
                         let name = format!("{prefix}img{i}");
                         *loc = gl.get_uniform_location(id, &name);
-                        if *loc == -1 {
-                            eprintln!("[virglrs] vrend: no uniform location for image {name}");
-                        }
                     }
                 }
             }
@@ -1104,30 +1099,21 @@ impl Context {
             let (tex_id, level, first_layer, layered) = match &mut res.storage {
                 Storage::Buffer { name, tbo, .. } => {
                     let tbo_tex = *tbo.get_or_insert_with(|| gl.gen_texture());
-                    let bits = iview.format.describe().map_or(8, |d| d.block_bytes() * 8);
-                    let format = match bits {
-                        128 => GL_RGBA32UI,
-                        64 => GL_RG32UI,
-                        32 => GL_R32UI,
-                        16 => GL_R16UI,
-                        8 => GL_R8UI,
-                        _ => {
-                            eprintln!("[virglrs] vrend: unsupported image block size {bits}");
-                            GL_R8UI
-                        }
+                    // `set_shader_images` admits a buffer image only with one of these widths.
+                    let bs = iview.format.describe().map_or(1, |d| d.block_bytes());
+                    let format = match bs {
+                        16 => GL_RGBA32UI,
+                        8 => GL_RG32UI,
+                        4 => GL_R32UI,
+                        2 => GL_R16UI,
+                        _ => GL_R8UI,
                     };
                     gl.bind_buffer(GL_TEXTURE_BUFFER, Some(*name));
                     gl.bind_texture(GL_TEXTURE_BUFFER, Some(tbo_tex));
                     if features.has(Feature::arb_or_gles_ext_texture_buffer) {
                         let range = if features.has(Feature::texture_buffer_range) {
-                            let bs =
-                                iview.format.describe().map_or(1, |d| d.block_bytes()) as usize;
-                            let offset = iview.layer_offset as usize / bs;
-                            let mut size = iview.level_size as usize / bs;
-                            let max = host.limits.max_texture_buffer_size as usize;
-                            if offset + size > max {
-                                size = max.saturating_sub(offset);
-                            }
+                            let bs = bs as usize;
+                            let size = iview.level_size as usize / bs;
                             Some((iview.layer_offset as usize, size * bs))
                         } else {
                             None
@@ -1287,6 +1273,25 @@ impl Context {
                 return Err(Fault::Unimplemented { cmd, what: "an indirect draw count" });
             }
         }
+        // GL takes every count as a signed 32-bit value. Past that, GL would raise an error the
+        // batch turns into a fault at its end; saying so here names the draw that asked.
+        let sized = |v: u32, what: &'static str| -> Result<GLsizei, Fault> {
+            GLsizei::try_from(v).map_err(|_| Fault::OutOfRange { cmd, what })
+        };
+        let start = sized(draw.start, "a draw start")?;
+        let count = sized(draw.count, "a draw count")?;
+        let instances = sized(draw.instance_count, "an instance count")?;
+        let indirect_counts = match indirect {
+            Some(ind) => Some((
+                sized(ind.draw_count, "an indirect draw count")?,
+                sized(ind.stride, "an indirect stride")?,
+            )),
+            None => None,
+        };
+        let vertices_per_patch = match draw.tess {
+            Some(t) => sized(t.vertices_per_patch, "a patch size")?,
+            None => 0,
+        };
         let indirect_buffer = match indirect {
             Some(ind) => match host.resource(cmd, ind.resource)?.storage {
                 Storage::Buffer { name, .. } => Some(name),
@@ -1318,9 +1323,9 @@ impl Context {
         {
             new_program = self.select_linked_program(host, cmd)?;
         }
+        // The C drops the draw with a warning; a draw with nothing to run it is a fault here.
         let Some(prog) = self.sub().program() else {
-            eprintln!("[virglrs] vrend: dropping rendering due to missing shaders");
-            return Ok(());
+            return Err(Fault::Shader { cmd, what: "a draw with no program" });
         };
         let prog_id = prog.id;
         let reads_drawid = prog.reads_drawid;
@@ -1343,20 +1348,20 @@ impl Context {
         let mut index_type = GL_UNSIGNED_INT;
         let mut ib_offset = 0;
         if draw.indexed {
+            // The C skips an indexed draw with no index buffer, or one that reads past it,
+            // with a warning and success. Both are the guest's claim about its own buffer,
+            // and a claim the buffer cannot meet is refused.
             let Some(ib) = self.sub().ib else {
-                eprintln!("[virglrs] vrend: VBO missing indexed array buffer");
-                return Ok(());
+                return Err(Fault::OutOfRange {
+                    cmd,
+                    what: "an indexed draw with no index buffer",
+                });
             };
             let res = host.resource(cmd, ib.resource)?;
             if indirect.is_none() {
-                let expected =
-                    ib.index_type.bytes() as u64 * draw.count as u64 + ib.offset as u64;
+                let expected = ib.index_type.bytes() as u64 * draw.count as u64 + ib.offset as u64;
                 if expected > res.args.width as u64 {
-                    eprintln!(
-                        "[virglrs] vrend: indexed array buffer ({}) not large enough for draw operation (req. {expected})",
-                        res.args.width
-                    );
-                    return Ok(());
+                    return Err(Fault::OutOfRange { cmd, what: "a draw past its index buffer" });
                 }
             }
             let Storage::Buffer { name, .. } = res.storage else {
@@ -1401,11 +1406,8 @@ impl Context {
         if features.has(Feature::indirect_draw) {
             gl.bind_buffer(GL_DRAW_INDIRECT_BUFFER, indirect_buffer);
         }
-        if let Some(t) = draw.tess
-            && t.vertices_per_patch > 0
-            && features.has(Feature::tessellation)
-        {
-            gl.patch_parameter_i(GL_PATCH_VERTICES, t.vertices_per_patch as GLint);
+        if vertices_per_patch > 0 && features.has(Feature::tessellation) {
+            gl.patch_parameter_i(GL_PATCH_VERTICES, vertices_per_patch);
         }
 
         // A host with advanced blend equations but no framebuffer fetch takes the equation the
@@ -1423,19 +1425,18 @@ impl Context {
         if !draw.indexed {
             // The C draws `cso` vertices from zero when the wire names a stream-out object to
             // count from -- the handle's number, as it is: the count is never read from the
-            // object. Kept as the C has it.
-            let (start, count) = match draw.count_from_so {
-                Some(h) => (0, h.get() as GLsizei),
-                None => (draw.start as GLint, draw.count as GLsizei),
-            };
+            // object. A handle is not a count, and no corpus has asked; refused until one does.
+            if draw.count_from_so.is_some() {
+                host.todo.note("a draw counted from a stream-out object");
+                return Err(Fault::Unimplemented {
+                    cmd,
+                    what: "a draw counted from a stream-out object",
+                });
+            }
             if let Some(ind) = indirect {
-                if ind.draw_count > 1 {
-                    gl.multi_draw_arrays_indirect(
-                        mode,
-                        ind.offset,
-                        ind.draw_count as GLsizei,
-                        ind.stride as GLsizei,
-                    );
+                let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
+                if draw_count > 1 {
+                    gl.multi_draw_arrays_indirect(mode, ind.offset, draw_count, stride);
                 } else {
                     gl.draw_arrays_indirect(mode, ind.offset);
                 }
@@ -1445,26 +1446,22 @@ impl Context {
                         mode,
                         start,
                         count,
-                        draw.instance_count as GLsizei,
+                        instances,
                         draw.start_instance,
                     );
                 } else {
-                    gl.draw_arrays_instanced(mode, start, count, draw.instance_count as GLsizei);
+                    gl.draw_arrays_instanced(mode, start, count, instances);
                 }
             } else {
                 gl.draw_arrays(mode, start, count);
             }
         } else {
-            let count = draw.count as GLsizei;
             let ranged = draw.min_index != 0 || draw.max_index != u32::MAX;
             if let Some(ind) = indirect {
-                if ind.draw_count > 1 {
+                let (draw_count, stride) = indirect_counts.expect("counted with the buffer");
+                if draw_count > 1 {
                     gl.multi_draw_elements_indirect(
-                        mode,
-                        index_type,
-                        ind.offset,
-                        ind.draw_count as GLsizei,
-                        ind.stride as GLsizei,
+                        mode, index_type, ind.offset, draw_count, stride,
                     );
                 } else {
                     gl.draw_elements_indirect(mode, index_type, ind.offset);
@@ -1477,7 +1474,7 @@ impl Context {
                             count,
                             index_type,
                             ib_offset,
-                            draw.instance_count as GLsizei,
+                            instances,
                             draw.index_bias,
                             draw.start_instance,
                         );
@@ -1487,7 +1484,7 @@ impl Context {
                             count,
                             index_type,
                             ib_offset,
-                            draw.instance_count as GLsizei,
+                            instances,
                             draw.index_bias,
                         );
                     }
@@ -1517,17 +1514,11 @@ impl Context {
                         count,
                         index_type,
                         ib_offset,
-                        draw.instance_count as GLsizei,
+                        instances,
                         draw.start_instance,
                     );
                 } else {
-                    gl.draw_elements_instanced(
-                        mode,
-                        count,
-                        index_type,
-                        ib_offset,
-                        draw.instance_count as GLsizei,
-                    );
+                    gl.draw_elements_instanced(mode, count, index_type, ib_offset, instances);
                 }
             } else if ranged {
                 gl.draw_range_elements(

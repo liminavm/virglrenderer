@@ -1608,6 +1608,15 @@ impl Context {
         let mut target = resource::gl_target(v.target, res.args.nr_samples);
         if is_buffer {
             target = tex_target;
+            // A buffer view is an element range, first to last inclusive. The C binds one
+            // past the host's texel limit shortened to fit and reports the view made; the
+            // range is the guest's claim about the resource, and a claim past the limit is
+            // refused here instead.
+            let (first, last) = (v.first_element_or_layers, v.last_element_or_levels);
+            let count = u64::from(last.wrapping_sub(first)).wrapping_add(1);
+            if u64::from(first) + count > u64::from(host.limits.max_texture_buffer_size) {
+                return Err(Fault::OutOfRange { cmd, what: "buffer view range" });
+            }
         }
         let (mut first_layer, mut last_layer, first_level, last_level) = (
             v.first_element_or_layers & 0xffff,
@@ -2358,8 +2367,7 @@ impl Context {
             if slot < 32 {
                 sub.views_dirty[stage.index()] |= 1 << slot;
             }
-            let (gl, features, formats, limits) =
-                (host.gl, host.features, host.formats, host.limits);
+            let (gl, features, formats) = (host.gl, host.features, host.formats);
             let mut buffer_view = false;
             let res = host.resource_mut(cmd, view.resource)?;
             match &mut res.storage {
@@ -2394,14 +2402,10 @@ impl Context {
                         ifmt = arb_format(view.format);
                     }
                     let range = if features.has(Feature::texture_buffer_range) {
+                        // Within the host's limit: `create_sampler_view` refused any other.
                         let bs = view.format.describe().map_or(1, |d| d.block_bytes()) as usize;
                         let offset = view.first_element as usize;
-                        let mut size =
-                            (view.last_element as usize).wrapping_sub(offset).wrapping_add(1);
-                        let max = limits.max_texture_buffer_size as usize;
-                        if offset + size > max {
-                            size = max.saturating_sub(offset);
-                        }
+                        let size = (view.last_element as usize) - offset + 1;
                         Some((offset * bs, size * bs))
                     } else {
                         None
