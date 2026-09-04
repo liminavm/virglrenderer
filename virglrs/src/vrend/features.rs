@@ -153,6 +153,9 @@ features! {
     nv_read_depth = (Unavail, ["GL_NV_read_depth"]),
     nv_read_depth_stencil = (Unavail, ["GL_NV_read_depth_stencil"]),
     nv_read_stencil = (Unavail, ["GL_NV_read_stencil"]),
+    // Two the C calls without a feature: epoxy would abort on the missing symbol.
+    texture_3d_attach = (Unavail, ["GL_OES_texture_3D"]),
+    storage_multisample_2d_array = (Gles(32), ["GL_OES_texture_storage_multisample_2d_array"]),
 }
 
 /// The features this host has.
@@ -189,6 +192,20 @@ impl Features {
     /// control without `EGL_KHR_gl_colorspace`, as `vrend_renderer_init` withdraws it.
     pub fn clear(&mut self, f: Feature) {
         self.have.remove(&f);
+    }
+
+    /// Withdraw every feature whose entry points the driver did not actually hand over: what a
+    /// driver advertises and what it exports are two answers to one question, and this is where
+    /// they are made one, so a `Gl` wrapper behind a feature can take its proc for granted.
+    pub fn reconcile(&mut self, gl: &super::gl::Gl) {
+        for (feature, proc_name) in gl.missing_procs() {
+            if self.have.remove(&feature) {
+                eprintln!(
+                    "[virglrs] vrend: {} advertised without {proc_name}: withdrawn",
+                    feature.name()
+                );
+            }
+        }
     }
 
     pub fn has_extension(&self, name: &str) -> bool {

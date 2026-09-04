@@ -1253,20 +1253,21 @@ impl Context {
         let cmd = Cmd::DrawVbo;
         let gl = host.gl;
         let features = host.features;
-        if draw.instance_count > 0 && !features.has(Feature::draw_instance) {
-            return Err(Fault::Unimplemented { cmd, what: "instanced draws" });
+        let need = |feature: Feature| {
+            if features.has(feature) { Ok(()) } else { Err(Fault::NoFeature { cmd, feature }) }
+        };
+        if draw.instance_count > 0 {
+            need(Feature::draw_instance)?;
         }
-        if draw.start_instance > 0 && !features.has(Feature::base_instance) {
-            return Err(Fault::Unimplemented { cmd, what: "a base instance" });
+        if draw.start_instance > 0 {
+            need(Feature::base_instance)?;
         }
         let indirect = draw.indirect;
         if let Some(ind) = indirect {
-            if ind.draw_count > 1 && !features.has(Feature::multi_draw_indirect) {
-                return Err(Fault::Unimplemented { cmd, what: "multi-draw indirect" });
+            if ind.draw_count > 1 {
+                need(Feature::multi_draw_indirect)?;
             }
-            if !features.has(Feature::indirect_draw) {
-                return Err(Fault::Unimplemented { cmd, what: "indirect draws" });
-            }
+            need(Feature::indirect_draw)?;
             if ind.draw_count_resource.is_some() {
                 // `feat_indirect_params` is desktop-only.
                 return Err(Fault::Unimplemented { cmd, what: "an indirect draw count" });

@@ -98,6 +98,7 @@ impl Vrend {
         if !winsys.has_extension("EGL_KHR_gl_colorspace") {
             features.clear(Feature::srgb_write_control);
         }
+        features.reconcile(&gl);
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Cfg::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
@@ -339,7 +340,7 @@ impl Vrend {
         if to_host {
             transfer::write(&self.gl, &self.formats, res, own, pages, info)
         } else {
-            transfer::read(&self.gl, &self.formats, res, own, pages, info)
+            transfer::read(&self.gl, &self.features, &self.formats, res, own, pages, info)
         }
     }
 }

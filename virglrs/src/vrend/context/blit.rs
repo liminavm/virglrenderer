@@ -130,7 +130,7 @@ fn make_view(
         return Some(base);
     }
     let view = gl.gen_texture();
-    if !gl.texture_view(
+    gl.texture_view(
         view,
         target,
         name,
@@ -139,23 +139,29 @@ fn make_view(
         res.args.last_level + 1,
         0,
         res.args.array_size,
-    ) {
-        gl.delete_texture(view);
-        return Some(base);
-    }
+    );
     Some(End { name: view, target, temporary: true })
+}
+
+fn unattachable(cmd: Cmd, handle: ResourceHandle, e: transfer::Unattachable) -> Fault {
+    match e {
+        transfer::Unattachable::NotATexture => Fault::IllegalResource { cmd, handle },
+        transfer::Unattachable::NoFeature(feature) => Fault::NoFeature { cmd, feature },
+    }
 }
 
 /// `vrend_fb_bind_texture_id` for a named texture of a resource, on the bound framebuffer.
 fn bind_fb_texture(
     host: &Host<'_>,
+    cmd: Cmd,
     res: &Resource,
     end: &End,
     level: i32,
     layer: Option<GLint>,
-) -> bool {
+) -> Result<(), Fault> {
     let attachment = transfer::attachment_for(res, host.formats);
-    transfer::attach_texture(host.gl, end.target, end.name, attachment, level, layer)
+    transfer::attach_texture(host.gl, host.features, end.target, end.name, attachment, level, layer)
+        .map_err(|feature| Fault::NoFeature { cmd, feature })
 }
 
 fn detach_all(gl: &Gl) {
@@ -248,7 +254,7 @@ impl Context {
         else {
             return Err(Fault::IllegalResource { cmd, handle: dst });
         };
-        if !host.gl.copy_image_sub_data(
+        host.gl.copy_image_sub_data(
             *sn,
             *st,
             src_level as GLint,
@@ -258,9 +264,7 @@ impl Context {
             dst_level as GLint,
             dst_origin,
             [src_box.width, src_box.height, src_box.depth],
-        ) {
-            return Err(Fault::NoEntryPoint { cmd, name: "glCopyImageSubData" });
-        }
+        );
         Ok(())
     }
 
@@ -441,26 +445,24 @@ impl Context {
         for i in 0..n_layers {
             gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb0));
             let src_res = host.resource(cmd, b.src.resource)?;
-            if !bind_fb_texture(
+            bind_fb_texture(
                 host,
+                cmd,
                 src_res,
                 src_end,
                 b.src.level as GLint,
                 Some(b.src.region.z + i),
-            ) {
-                return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-            }
+            )?;
             gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb1));
             let dst_res = host.resource(cmd, b.dst.resource)?;
-            if !bind_fb_texture(
+            bind_fb_texture(
                 host,
+                cmd,
                 dst_res,
                 dst_end,
                 b.dst.level as GLint,
                 Some(b.dst.region.z + i),
-            ) {
-                return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-            }
+            )?;
             gl.bind_framebuffer(GL_DRAW_FRAMEBUFFER, Some(fb1));
             if srgb_control {
                 gl.set_enabled(GL_FRAMEBUFFER_SRGB_EXT, any_srgb);
@@ -560,27 +562,27 @@ impl Context {
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb0));
         gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
         let src_res = host.resource(cmd, src)?;
-        if !transfer::attach(
+        transfer::attach(
             gl,
+            host.features,
             src_res,
             transfer::attachment_for(src_res, formats),
             src_level as GLint,
             Some(src_box.z),
-        ) {
-            return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-        }
+        )
+        .map_err(|e| unattachable(cmd, src, e))?;
         gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb1));
         gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
         let dst_res = host.resource(cmd, dst)?;
-        if !transfer::attach(
+        transfer::attach(
             gl,
+            host.features,
             dst_res,
             transfer::attachment_for(dst_res, formats),
             dst_level as GLint,
             Some(dst_origin[2] as GLint),
-        ) {
-            return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-        }
+        )
+        .map_err(|e| unattachable(cmd, dst, e))?;
         gl.bind_framebuffer(GL_DRAW_FRAMEBUFFER, Some(fb1));
         gl.bind_framebuffer(GL_READ_FRAMEBUFFER, Some(fb0));
         gl.disable(GL_SCISSOR_TEST);
@@ -647,9 +649,7 @@ impl Context {
             _ => return Err(Fault::IllegalResource { cmd, handle: resource }),
         };
         let end = End { name, target, temporary: false };
-        if !bind_fb_texture(host, res, &end, level as GLint, layer) {
-            return Err(Fault::NoEntryPoint { cmd, name: "glFramebufferTexture" });
-        }
+        bind_fb_texture(host, cmd, res, &end, level as GLint, layer)?;
         let colorf = color.map(f32::from_bits);
         let depth = f64::from_bits(color[0] as u64 | (color[1] as u64) << 32);
         let stencil = color[3];
