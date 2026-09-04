@@ -246,9 +246,14 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   pattern, so a clear that lands nowhere is a different hash from one that lands and neither is
   uninitialised storage. Its second case destroys the surface, creates another under the same
   handle, and rebinds: a slot that compared handles rather than descriptions would answer "already
-  bound" and skip re-attaching a different texture. Unmeasured, and unhandled since before the
-  slot held a description: a resource unrefed while a surface of it is bound leaves the
-  framebuffer attached to storage that is gone.
+  bound" and skip re-attaching a different texture. Its third frees the resource under a bound
+  surface and clears again into a second colour buffer, which is what reads back once the first is
+  gone. The attachment survives on its own -- deleting a texture releases its name, not the object
+  an attachment still holds -- so what this case actually scores is everything the renderer does
+  *around* the freed resource: a readback must put the framebuffer binding back the way it found
+  it, and a clear must already know its colour fixup rather than ask a resource that is no longer
+  there. Still unmeasured: *re-binding* a surface whose resource was freed, which the C serves from
+  its refcount and this tree refuses.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
