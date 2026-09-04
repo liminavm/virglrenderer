@@ -168,6 +168,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
+  `vrend.caps` is the classic capsets, `virgl_caps_v1` and `virgl_caps_v2`, as the C fills
+  them on this host: `./vrend-replay.sh ../vm/captures/vrend.bin --caps FILE` writes them a field a
+  line, and the same against the Rust prefix diffs against the fixture. The guest's virgl driver
+  configures itself from nothing else -- a format missing from `sampler` is a format the guest
+  never creates, a wrong `glsl_level` is a whole feature set switched off -- and none of it is a
+  pixel, so a score cannot see it. Two lines are expected to differ, both by design: `sampler`
+  carries the fourteen `ASTC_*_SRGB` formats the C's `ASTC_FORMAT` macro never registers
+  (`virglrs/vrend-gen/gl_formats.py`), and `num_video_caps`/`video_caps` are empty until video
+  is ported. A third line is a regression.
   `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 34
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares

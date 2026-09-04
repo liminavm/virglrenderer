@@ -100,8 +100,15 @@ install_name_tool -id "@rpath/libvirglrenderer.1.dylib" "$FW/libvirglrenderer.1.
 otool -L "$FW/libvirglrenderer.1.dylib" | awk 'NR>1 {print $1}' | while read -r dep; do
   case "$dep" in
     /Users/*|/Volumes/*|/opt/homebrew/*)
-      install_name_tool -change "$dep" "@rpath/$(basename "$dep")" "$FW/libvirglrenderer.1.dylib"
-      echo "    $dep -> @rpath/$(basename "$dep")" ;;
+      name="$(basename "$dep")"
+      # limina bundles Mesa's libraries under their unversioned names (libEGL.dylib for
+      # libEGL.1.dylib); the Rust build links the versioned one. Name what the bundle has.
+      if [ ! -f "$FW/$name" ]; then
+        bare="$(echo "$name" | sed -E 's/\.[0-9]+\.dylib$/.dylib/')"
+        [ -f "$FW/$bare" ] && name="$bare"
+      fi
+      install_name_tool -change "$dep" "@rpath/$name" "$FW/libvirglrenderer.1.dylib"
+      echo "    $dep -> @rpath/$name" ;;
   esac
 done
 

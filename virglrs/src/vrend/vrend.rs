@@ -13,6 +13,7 @@
 //! `vrend_hw_switch_context` does: every entry point names the context it needs, and the switch
 //! is one place rather than a habit.
 
+use super::caps;
 use super::context::{Context, Current, Fault, Guest, Host, Todo};
 use super::egl::{self, EglError, Flavour, Version, Winsys};
 use super::features::{Feature, Features};
@@ -59,6 +60,8 @@ pub struct Vrend {
     pub limits: Limits,
     /// What the translator may assume of the host, read once alongside the limits.
     shader_cfg: shader::Cfg,
+    /// What the guest's driver is told of the host, probed once from the same answers.
+    caps: caps::CapsV2,
     ctx0: egl::Context,
     /// The version guest contexts are made with: the newest the driver gave ctx0.
     version: Version,
@@ -98,6 +101,7 @@ impl Vrend {
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Cfg::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
+        let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats);
         eprintln!(
             "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features",
             formats.entries().count(),
@@ -110,6 +114,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
+            caps,
             ctx0,
             version,
             current: Current::Ctx0,
@@ -117,6 +122,11 @@ impl Vrend {
             contexts: BTreeMap::new(),
             todo: Todo::default(),
         })
+    }
+
+    /// The classic capsets, as probed at init.
+    pub fn caps(&self) -> &caps::CapsV2 {
+        &self.caps
     }
 
     pub fn gl(&self) -> &Gl {
@@ -145,6 +155,7 @@ impl Vrend {
             formats,
             limits,
             shader_cfg,
+            caps: _,
             ctx0,
             version,
             current,

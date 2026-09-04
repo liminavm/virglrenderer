@@ -1198,14 +1198,16 @@ pub extern "C" fn virgl_renderer_fill_caps(set: u32, version: u32, caps: *mut c_
     if caps.is_null() {
         return;
     }
-    // The version is the C caller's request, and only this side has one: `get_cap_set` told it
-    // which version to ask for, and a different number names a layout we never described.
-    if version != crate::venus::capset::VERSION {
-        return;
-    }
     let Some(capset) = with(None, |r| r.capset(capset_of(set))) else {
         return;
     };
+    // The version is the C caller's request, and only this side has one: `get_cap_set` told it
+    // the newest version to ask for, and a newer number names a layout we never described. An
+    // older one is served the newest layout, as the C serves it -- every version is a prefix of
+    // the next.
+    if version > capset.version() {
+        return;
+    }
     let bytes = capset.as_bytes();
     // SAFETY: `caps` is the caller's buffer, which it sized from `virgl_renderer_get_cap_set` for
     // this same set -- and that reported exactly `bytes.len()`, the size of the capset struct.
