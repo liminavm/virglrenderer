@@ -213,6 +213,10 @@ impl Vp9Frame {
     const PROFILE: usize = 354;
     const BIT_DEPTH: usize = 355;
 
+    /// How much of a VP9 picture descriptor is read: through `bit_depth`, the last field this
+    /// backend consults.
+    const DESCRIPTOR_BYTES: usize = Vp9Frame::BIT_DEPTH + 1;
+
     /// `pic_fields` bit positions, measured the same way.
     const SUBSAMPLING_X: u32 = 1 << 0;
     const SUBSAMPLING_Y: u32 = 1 << 1;
@@ -422,6 +426,67 @@ impl Gate {
     }
 }
 
+/// What the descriptors so far said about the open frame.
+///
+/// One variant per codec because the codecs disagree about where each answer comes from -- VP9
+/// reads its extent and key-ness out of the descriptor, H.264 reads key-ness out of the
+/// bitstream and takes its extent from the codec -- and the three answers the rest of the frame
+/// needs are asked for by name rather than each caller knowing which codec it has.
+enum Shape {
+    Vp9(Vp9Frame),
+    /// H.264: the parameter sets the last descriptor was written into, and whether an IDR slice
+    /// has turned up in the access unit so far.
+    ///
+    /// The sets are kept rather than the descriptor they came from because they *are* the
+    /// session's configuration -- keeping the descriptor would leave two places holding one
+    /// fact, and the one the session was built from would be the derived copy.
+    H264 {
+        sets: h264::ParameterSets,
+        key: bool,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl Shape {
+    /// Whether this frame re-seeds the reference pictures.
+    fn key(&self) -> bool {
+        match self {
+            Shape::Vp9(frame) => frame.key,
+            Shape::H264 { key, .. } => *key,
+        }
+    }
+
+    /// The extent the decoded picture is expected to come back at.
+    fn extent(&self) -> (u32, u32) {
+        match self {
+            Shape::Vp9(frame) => (frame.width, frame.height),
+            Shape::H264 { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// The codec configuration record a session for this frame is built around.
+    fn configuration(&self) -> Configuration {
+        match self {
+            Shape::Vp9(frame) => frame.configuration(),
+            Shape::H264 { sets, .. } => Configuration::h264(sets.sps.clone(), sets.pps.clone()),
+        }
+    }
+
+    /// Re-frame the accumulated access unit into what VideoToolbox takes.
+    ///
+    /// VP9 is handed over as it arrives. H.264 arrives Annex-B -- mesa's frontend prepends a
+    /// start code per slice -- and VideoToolbox accepts only length-prefixed NALs, so the
+    /// framing is rewritten and nothing else: the emulation-prevention bytes inside each NAL
+    /// stay exactly as the encoder wrote them.
+    fn access_unit(&self, bitstream: Vec<u8>) -> Option<Vec<u8>> {
+        match self {
+            Shape::Vp9(_) => Some(bitstream),
+            Shape::H264 { .. } => h264::annexb_to_avcc(&bitstream),
+        }
+    }
+}
+
 /// A frame between its BEGIN_FRAME and its END_FRAME.
 ///
 /// The target lives here rather than being looked up again at each command: BEGIN_FRAME, every
@@ -437,10 +502,11 @@ enum Frame {
         /// DECODE_BITSTREAM only accumulates; the decode itself is END_FRAME, mirroring
         /// `vaEndPicture`.
         bitstream: Vec<u8>,
-        /// What the last descriptor said about the frame. `None` until the first
-        /// DECODE_BITSTREAM: an END_FRAME that arrives without one is the frame a snapshot cut
-        /// in half, whose slices reached the codec that was saved.
-        shape: Option<Vp9Frame>,
+        /// What the descriptors so far said about the frame. `None` until a DECODE_BITSTREAM
+        /// produces one: an END_FRAME that arrives without one is the frame a snapshot cut in
+        /// half, whose slices reached the codec that was saved -- or, for H.264, a frame whose
+        /// slice headers never arrived to say which parameter set they reference.
+        shape: Option<Shape>,
     },
 }
 
@@ -459,6 +525,37 @@ pub struct Codec {
     /// decode, and that arrives with the descriptor rather than with the creation arguments --
     /// a VP9 stream may change resolution or bit depth at a key frame.
     session: Option<Session>,
+}
+
+impl Codec {
+    /// Try to carry the live session across a change in the frame's shape.
+    ///
+    /// **H.264's parameter sets are not constant across a stream, and tearing the session down
+    /// when they change is not survivable.** `num_ref_idx_lX_active_minus1` reaches us as the
+    /// effective *per-slice* count, so a slice that overrides the PPS default changes the PPS
+    /// written for it by a byte or two mid-GOP. Keying the session on those bytes rebuilds the
+    /// decompression session there and takes the reference pictures with it: every frame after
+    /// the first override predicts from an empty buffer, which decodes "successfully" and puts
+    /// quietly wrong pixels on screen.
+    ///
+    /// So the parameter sets drive the format description, and the session is asked whether it
+    /// will take the new one. Falling through to a rebuild stays correct, just lossy -- and says
+    /// so, because a stream that does it every frame is worth knowing about.
+    fn adopt(&mut self, key: &SessionKey, handle: VideoCodecHandle) -> bool {
+        let Some(live) = self.session.as_mut() else {
+            return false;
+        };
+        if live.adopt(key) {
+            return true;
+        }
+        if key.config.is_parameter_sets() {
+            eprintln!(
+                "[virglrs] video codec {handle}: the parameter sets changed in a way the live \
+                 session would not take; its reference pictures are lost across the rebuild"
+            );
+        }
+        false
+    }
 }
 
 /// Why a video command could not be served.
@@ -499,13 +596,29 @@ impl core::fmt::Display for Refusal {
     }
 }
 
-/// How much of a picture descriptor is read.
+/// How much of a picture descriptor is read: the longest prefix any served codec asks for.
 ///
-/// The union on the wire is 5132 bytes and the VP9 arm is 528, but the fields this backend
-/// consults end at `bit_depth`. Reading the prefix that holds them is the whole of it -- the
-/// reference list, the segmentation probabilities and the loop-filter deltas are decoded by the
-/// hardware from the bitstream the guest also sent.
-pub const DESCRIPTOR_BYTES: usize = Vp9Frame::BIT_DEPTH + 1;
+/// One length for every codec rather than one per profile, because the read happens where the
+/// guest's resource is -- before the codec is looked up -- and a length that has to be paired
+/// with a profile is a pair. Every `read` below is total over a shorter blob, so a codec handed
+/// the union's full extent takes only its own prefix out of it.
+///
+/// The prefixes are short because the hardware parses the real bitstream: what the descriptor is
+/// consulted for is only what the *container* has to declare before the bytes can be handed over.
+pub const DESCRIPTOR_BYTES: usize = {
+    let mut most = Vp9Frame::DESCRIPTOR_BYTES;
+    if h264::DESCRIPTOR_BYTES > most {
+        most = h264::DESCRIPTOR_BYTES;
+    }
+    most
+};
+
+// A leg that forgets to widen the read gets a short descriptor and reads its own fields as
+// zeros -- so the build fails instead.
+const _: () = {
+    assert!(DESCRIPTOR_BYTES >= Vp9Frame::DESCRIPTOR_BYTES);
+    assert!(DESCRIPTOR_BYTES >= h264::DESCRIPTOR_BYTES);
+};
 
 /// How many planes a guest lays a format out in when it hands the whole picture over as one
 /// resource: two for the interleaved-chroma layouts, three for the fully planar ones, and one
@@ -545,7 +658,22 @@ pub fn advertised(support: Option<&videotoolbox::Support>) -> Vec<Profile> {
     let Some(support) = support else {
         return Vec::new();
     };
-    [Profile::Vp9Profile0].into_iter().filter(|profile| support.decodes(profile.codec())).collect()
+    // The order is the capset's, and it is the C's: VP9, then H.264 narrowest profile first,
+    // then AV1, then HEVC.
+    //
+    // Only the H.264 profiles the serializer can write a parameter set for are offered. High
+    // covers Baseline and Main streams too -- a decoder for High decodes both -- and offering
+    // High10/422/444 would promise bit depths and chroma formats it refuses.
+    [
+        Profile::Vp9Profile0,
+        Profile::H264ConstrainedBaseline,
+        Profile::H264Baseline,
+        Profile::H264Main,
+        Profile::H264High,
+    ]
+    .into_iter()
+    .filter(|profile| support.decodes(profile.codec()))
+    .collect()
 }
 
 /// The codecs and decode targets one context owns.
@@ -683,16 +811,60 @@ impl Video {
         descriptor: &[u8],
         bitstream: &[u8],
     ) -> Result<(), Refusal> {
+        let handle = codec;
         let codec = self.codec_mut(codec)?;
-        let (width, height) = (codec.width, codec.height);
-        let Frame::Open { handle, bitstream: accumulated, shape, .. } = &mut codec.frame else {
+        let (profile, width, height) = (codec.profile, codec.width, codec.height);
+        let Frame::Open { handle: began_on, bitstream: accumulated, shape, .. } = &mut codec.frame
+        else {
             return Err(Refusal::OutOfSequence("decode with no frame open"));
         };
-        if *handle != target {
+        if *began_on != target {
             return Err(Refusal::OutOfSequence("decode into a target the frame was not begun on"));
         }
-        *shape = Some(Vp9Frame::read(descriptor, width, height));
+        // Accumulated first: H.264 reads the shape back out of the slice headers, so the answer
+        // depends on the bytes this very call carried.
         accumulated.extend_from_slice(bitstream);
+
+        match profile {
+            Profile::Vp9Profile0 => {
+                *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height)))
+            }
+            Profile::H264Baseline
+            | Profile::H264ConstrainedBaseline
+            | Profile::H264Main
+            | Profile::H264High => {
+                let h264_profile = h264::H264Profile::of(profile).expect("an H.264 profile");
+                // Nothing on the wire says which `pic_parameter_set_id` the guest's slices
+                // reference, so it is read back out of them -- and until one arrives there is
+                // nothing to guess with: a PPS bearing an id the slices do not use is simply not
+                // found, and the frame decodes as nothing. A call that carried only a fragment
+                // leaves the shape alone and waits.
+                let Some(pps_id) = h264::slice_pps_id(accumulated) else {
+                    return Ok(());
+                };
+                let desc = h264::PictureDesc::read(descriptor);
+                let sets = match desc.parameter_sets(width, height, h264_profile, pps_id) {
+                    Ok(sets) => sets,
+                    // A stream this build's serializer has no parameter set for. The guest chose
+                    // H.264 from a capset that advertises progressive 8-bit 4:2:0 only, so this
+                    // is a stream outside what it was offered -- but one bad frame is not one bad
+                    // context, and the next may be inside it again.
+                    Err(why) => {
+                        eprintln!("[virglrs] video codec {handle}: no H.264 parameter set ({why})");
+                        return Err(Refusal::HostRefusedFrame);
+                    }
+                };
+                // Sticky across the calls that make up one access unit: an IDR seen in an earlier
+                // fragment is still an IDR in this frame.
+                let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
+                *shape = Some(Shape::H264 { sets, key, width, height });
+            }
+            // Unreachable: `create_codec` refuses a profile `advertised` does not list, and
+            // nothing is listed without a leg here.
+            Profile::HevcMain | Profile::Av1Main => {
+                return Err(Refusal::Unsupported("no decode path for that profile"));
+            }
+        }
         Ok(())
     }
 
@@ -728,7 +900,7 @@ impl Video {
             codec.gate.freeze(&buffer, gl);
             return Ok(());
         };
-        if !codec.gate.admits(shape.key, handle) {
+        if !codec.gate.admits(shape.key(), handle) {
             codec.gate.freeze(&buffer, gl);
             return Ok(());
         }
@@ -739,16 +911,12 @@ impl Video {
         let Some(pixels) = layout.pixels() else {
             return Err(Refusal::Unsupported("no CoreVideo layout for that decode target"));
         };
-        let key = SessionKey {
-            width: shape.width,
-            height: shape.height,
-            pixels,
-            config: shape.configuration(),
-        };
+        let (width, height) = shape.extent();
+        let key = SessionKey { width, height, pixels, config: shape.configuration() };
         // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
         // pictures with it, and every frame after one that did not need it then predicts from
         // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
-        if !codec.session.as_ref().is_some_and(|s| s.serves(&key)) {
+        if !codec.session.as_ref().is_some_and(|s| s.serves(&key)) && !codec.adopt(&key, handle) {
             codec.session = Some(Session::create(key).map_err(|status| {
                 // The probe advertised this codec, so a host that now says it has no such
                 // decoder is contradicting itself and every later frame will fail the same way.
@@ -763,7 +931,11 @@ impl Video {
         }
         let session = codec.session.as_mut().expect("a session was just built or kept");
 
-        let picture = match session.decode(&bitstream) {
+        let Some(unit) = shape.access_unit(bitstream) else {
+            eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
+            return Err(Refusal::HostRefusedFrame);
+        };
+        let picture = match session.decode(&unit) {
             Ok(picture) => picture,
             Err(why) => {
                 eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
@@ -773,12 +945,12 @@ impl Video {
         // The picture comes back at its coded width. A host returning some other width has
         // returned something that is not this frame, and delivering it puts visibly wrong
         // content on screen with nothing anywhere reporting a problem.
-        if picture.width() != shape.width {
+        if picture.width() != width {
             eprintln!(
                 "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame \
                  that declares {}; refusing it",
                 picture.width(),
-                shape.width,
+                width,
             );
             return Err(Refusal::HostRefusedFrame);
         }
@@ -884,10 +1056,54 @@ mod tests {
 
     /// A profile is advertised only where the silicon and the leg agree, and a host that was
     /// never asked for video advertises nothing at all.
+    ///
+    /// Written against the rule rather than against a list, because the list is a function of
+    /// the silicon under the test and a machine without VP9 or H.264 is not a failing build.
     #[test]
     fn nothing_is_advertised_without_a_probe() {
         assert!(advertised(None).is_empty());
         let support = crate::videotoolbox::Support::probe();
-        assert_eq!(advertised(Some(&support)), vec![Profile::Vp9Profile0]);
+        let list = advertised(Some(&support));
+
+        assert!(list.iter().all(|profile| support.decodes(profile.codec())));
+        for profile in [Profile::Vp9Profile0, Profile::H264Main] {
+            assert_eq!(list.contains(&profile), support.decodes(profile.codec()));
+        }
+        // No leg here yet, whatever the silicon says.
+        assert!(!list.contains(&Profile::HevcMain));
+        assert!(!list.contains(&Profile::Av1Main));
+    }
+
+    /// A frame's shape answers for its own codec: VP9 is handed on as it arrived, H.264 is
+    /// re-framed, and each reports its own extent and key-ness.
+    #[test]
+    fn a_shape_answers_for_its_own_codec() {
+        let vp9 = Shape::Vp9(Vp9Frame {
+            key: true,
+            profile: 0,
+            bit_depth: 8,
+            subsampling: 1,
+            width: 320,
+            height: 240,
+        });
+        assert!(vp9.key());
+        assert_eq!(vp9.extent(), (320, 240));
+        assert_eq!(vp9.access_unit(vec![1, 2, 3]), Some(vec![1, 2, 3]));
+
+        let h264 = Shape::H264 {
+            sets: h264::ParameterSets { sps: vec![0x67, 0x42], pps: vec![0x68, 0xce] },
+            key: false,
+            width: 176,
+            height: 144,
+        };
+        assert!(!h264.key());
+        assert_eq!(h264.extent(), (176, 144));
+        // Annex-B in, AVCC out: one four-byte length in place of the start code.
+        assert_eq!(
+            h264.access_unit(vec![0, 0, 0, 1, 0x65, 0xaa]),
+            Some(vec![0, 0, 0, 2, 0x65, 0xaa])
+        );
+        // Not Annex-B at all: nothing to guess at, and the caller refuses the frame.
+        assert_eq!(h264.access_unit(vec![0x65, 0xaa]), None);
     }
 }

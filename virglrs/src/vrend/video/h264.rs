@@ -61,6 +61,15 @@ pub fn slice_pps_id(annexb: &[u8]) -> Option<u32> {
     None
 }
 
+/// Whether the access unit carries an IDR slice, and so re-seeds the reference pictures.
+///
+/// This is the whole of "is it a key frame" for H.264: the descriptor has no field that says so,
+/// and an I slice that is not an IDR leaves the older reference pictures in place.
+pub fn has_idr(annexb: &[u8]) -> bool {
+    NalUnits::new(annexb)
+        .is_some_and(|nals| nals.into_iter().any(|nal| nal.unit[0] & 0x1f == NAL_SLICE_IDR))
+}
+
 /// The H.264 profiles this build serves, and the only thing an SPS needs from one.
 ///
 /// Three, not the wire's four: Baseline and Constrained Baseline write the same `profile_idc`,
@@ -261,6 +270,10 @@ mod at {
     /// would be reading whatever happened to be in the struct.
     pub const SCALING_8X8_BYTES: usize = 2 * 64;
 }
+
+/// How much of an H.264 picture descriptor is read: through the last field a parameter set needs,
+/// `num_ref_frames`, which is one byte.
+pub const DESCRIPTOR_BYTES: usize = at::NUM_REF_FRAMES + 1;
 
 impl PictureDesc {
     /// Read a descriptor the guest wrote.
@@ -501,6 +514,20 @@ impl PictureDesc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Key-ness is an IDR slice in the access unit, and nothing else: an I slice that is not an
+    /// IDR leaves the older reference pictures in place, and a stream that is not Annex-B frames
+    /// no NAL to find one in.
+    #[test]
+    fn a_key_frame_is_an_idr_slice() {
+        // SPS, then an IDR slice.
+        assert!(has_idr(&[0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65, 0x88]));
+        // A non-IDR slice and an SEI: no re-seed.
+        assert!(!has_idr(&[0, 0, 0, 1, 0x06, 0x00, 0, 0, 1, 0x41, 0x9a]));
+        // Framing nothing, and not framed at all.
+        assert!(!has_idr(&[]));
+        assert!(!has_idr(&[0x65, 0x88]));
+    }
 
     #[test]
     fn a_rewrite_replaces_each_start_code_with_the_length_that_follows_it() {
