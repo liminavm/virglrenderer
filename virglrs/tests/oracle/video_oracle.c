@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/types.h>
 
 #include "virgl_video_bitstream.h"
@@ -556,4 +557,357 @@ ssize_t virgl_oracle_av1_build_av1c(const uint8_t *desc, uint8_t *out, size_t ou
    n = virgl_av1_build_av1c(&state, (const struct virgl_av1_picture_desc *)desc, out, out_size);
    virgl_av1_obu_state_fini(&state);
    return n;
+}
+
+/* ------------------------------------------------- AV1 layout, in full, and the model */
+
+/* Every field the Rust reader looks for, in the order the Rust `at` module declares them. */
+size_t virgl_oracle_av1_full_layout(uint32_t *out, size_t cap)
+{
+   static struct virgl_av1_picture_desc d;
+   size_t n = 0;
+   unsigned ones = ~0u;
+
+#define PLAIN(path) do {                                                             \
+      if (n + 4 > cap) return 0;                                                     \
+      out[n++] = (uint32_t)offsetof(struct virgl_av1_picture_desc, path);            \
+      out[n++] = 0; out[n++] = 0; out[n++] = 0;                                      \
+   } while (0)
+
+#define BITS(container, field) do {                                                  \
+      if (n + 4 > cap) return 0;                                                     \
+      memset(&d, 0, sizeof d);                                                       \
+      d.container.field = ones;                                                      \
+      size_t off = offsetof(struct virgl_av1_picture_desc, container);               \
+      size_t sz = sizeof(d.container);                                               \
+      unsigned long long v = 0;                                                      \
+      memcpy(&v, (char *)&d + off, sz);                                              \
+      uint32_t shift = 0, width = 0;                                                 \
+      while (shift < 64 && !((v >> shift) & 1)) shift++;                             \
+      while (shift + width < 64 && ((v >> (shift + width)) & 1)) width++;            \
+      out[n++] = (uint32_t)off; out[n++] = (uint32_t)sz;                             \
+      out[n++] = shift; out[n++] = width;                                            \
+   } while (0)
+
+   PLAIN(picture_parameter.profile);
+   PLAIN(picture_parameter.order_hint_bits_minus_1);
+   PLAIN(picture_parameter.bit_depth_idx);
+   PLAIN(picture_parameter.frame_width);
+   PLAIN(picture_parameter.frame_height);
+   PLAIN(picture_parameter.max_width);
+   PLAIN(picture_parameter.max_height);
+   PLAIN(ref);
+   PLAIN(picture_parameter.ref_frame_idx);
+   PLAIN(picture_parameter.primary_ref_frame);
+   PLAIN(picture_parameter.order_hint);
+   PLAIN(picture_parameter.seg_info.feature_data);
+   PLAIN(picture_parameter.seg_info.feature_mask);
+   PLAIN(picture_parameter.film_grain_info.grain_seed);
+   PLAIN(picture_parameter.film_grain_info.num_y_points);
+   PLAIN(picture_parameter.film_grain_info.point_y_value);
+   PLAIN(picture_parameter.film_grain_info.point_y_scaling);
+   PLAIN(picture_parameter.film_grain_info.num_cb_points);
+   PLAIN(picture_parameter.film_grain_info.point_cb_value);
+   PLAIN(picture_parameter.film_grain_info.point_cb_scaling);
+   PLAIN(picture_parameter.film_grain_info.num_cr_points);
+   PLAIN(picture_parameter.film_grain_info.point_cr_value);
+   PLAIN(picture_parameter.film_grain_info.point_cr_scaling);
+   PLAIN(picture_parameter.film_grain_info.ar_coeffs_y);
+   PLAIN(picture_parameter.film_grain_info.ar_coeffs_cb);
+   PLAIN(picture_parameter.film_grain_info.ar_coeffs_cr);
+   PLAIN(picture_parameter.film_grain_info.cb_mult);
+   PLAIN(picture_parameter.film_grain_info.cb_luma_mult);
+   PLAIN(picture_parameter.film_grain_info.cb_offset);
+   PLAIN(picture_parameter.film_grain_info.cr_mult);
+   PLAIN(picture_parameter.film_grain_info.cr_luma_mult);
+   PLAIN(picture_parameter.film_grain_info.cr_offset);
+   PLAIN(picture_parameter.tile_cols);
+   PLAIN(picture_parameter.tile_rows);
+   PLAIN(picture_parameter.width_in_sbs);
+   PLAIN(picture_parameter.height_in_sbs);
+   PLAIN(picture_parameter.context_update_tile_id);
+   PLAIN(picture_parameter.superres_scale_denominator);
+   PLAIN(picture_parameter.interp_filter);
+   PLAIN(picture_parameter.filter_level);
+   PLAIN(picture_parameter.filter_level_u);
+   PLAIN(picture_parameter.filter_level_v);
+   PLAIN(picture_parameter.ref_deltas);
+   PLAIN(picture_parameter.mode_deltas);
+   PLAIN(picture_parameter.base_qindex);
+   PLAIN(picture_parameter.y_dc_delta_q);
+   PLAIN(picture_parameter.u_dc_delta_q);
+   PLAIN(picture_parameter.u_ac_delta_q);
+   PLAIN(picture_parameter.v_dc_delta_q);
+   PLAIN(picture_parameter.v_ac_delta_q);
+   PLAIN(picture_parameter.cdef_damping_minus_3);
+   PLAIN(picture_parameter.cdef_bits);
+   PLAIN(picture_parameter.cdef_y_strengths);
+   PLAIN(picture_parameter.cdef_uv_strengths);
+   PLAIN(picture_parameter.wm[0].wmtype);
+   PLAIN(picture_parameter.wm[0].wmmat);
+   PLAIN(picture_parameter.wm[1].wmtype);
+   PLAIN(slice_parameter.slice_data_size);
+   PLAIN(slice_parameter.slice_data_offset);
+   PLAIN(slice_parameter.slice_count);
+   BITS(picture_parameter.seq_info_fields, use_128x128_superblock);
+   BITS(picture_parameter.seq_info_fields, enable_filter_intra);
+   BITS(picture_parameter.seq_info_fields, enable_intra_edge_filter);
+   BITS(picture_parameter.seq_info_fields, enable_interintra_compound);
+   BITS(picture_parameter.seq_info_fields, enable_masked_compound);
+   BITS(picture_parameter.seq_info_fields, enable_dual_filter);
+   BITS(picture_parameter.seq_info_fields, enable_order_hint);
+   BITS(picture_parameter.seq_info_fields, enable_jnt_comp);
+   BITS(picture_parameter.seq_info_fields, enable_cdef);
+   BITS(picture_parameter.seq_info_fields, mono_chrome);
+   BITS(picture_parameter.seq_info_fields, ref_frame_mvs);
+   BITS(picture_parameter.seq_info_fields, film_grain_params_present);
+   BITS(picture_parameter.seg_info.segment_info_fields, enabled);
+   BITS(picture_parameter.seg_info.segment_info_fields, update_map);
+   BITS(picture_parameter.seg_info.segment_info_fields, temporal_update);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, apply_grain);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, chroma_scaling_from_luma);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, grain_scaling_minus_8);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, ar_coeff_lag);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, ar_coeff_shift_minus_6);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, grain_scale_shift);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, overlap_flag);
+   BITS(picture_parameter.film_grain_info.film_grain_info_fields, clip_to_restricted_range);
+   BITS(picture_parameter.pic_info_fields, frame_type);
+   BITS(picture_parameter.pic_info_fields, show_frame);
+   BITS(picture_parameter.pic_info_fields, showable_frame);
+   BITS(picture_parameter.pic_info_fields, error_resilient_mode);
+   BITS(picture_parameter.pic_info_fields, disable_cdf_update);
+   BITS(picture_parameter.pic_info_fields, allow_screen_content_tools);
+   BITS(picture_parameter.pic_info_fields, force_integer_mv);
+   BITS(picture_parameter.pic_info_fields, allow_intrabc);
+   BITS(picture_parameter.pic_info_fields, use_superres);
+   BITS(picture_parameter.pic_info_fields, allow_high_precision_mv);
+   BITS(picture_parameter.pic_info_fields, is_motion_mode_switchable);
+   BITS(picture_parameter.pic_info_fields, use_ref_frame_mvs);
+   BITS(picture_parameter.pic_info_fields, disable_frame_end_update_cdf);
+   BITS(picture_parameter.pic_info_fields, uniform_tile_spacing_flag);
+   BITS(picture_parameter.pic_info_fields, allow_warped_motion);
+   BITS(picture_parameter.loop_filter_info_fields, sharpness_level);
+   BITS(picture_parameter.loop_filter_info_fields, mode_ref_delta_enabled);
+   BITS(picture_parameter.qmatrix_fields, using_qmatrix);
+   BITS(picture_parameter.qmatrix_fields, qm_y);
+   BITS(picture_parameter.qmatrix_fields, qm_u);
+   BITS(picture_parameter.qmatrix_fields, qm_v);
+   BITS(picture_parameter.mode_control_fields, delta_q_present_flag);
+   BITS(picture_parameter.mode_control_fields, log2_delta_q_res);
+   BITS(picture_parameter.mode_control_fields, delta_lf_present_flag);
+   BITS(picture_parameter.mode_control_fields, log2_delta_lf_res);
+   BITS(picture_parameter.mode_control_fields, delta_lf_multi);
+   BITS(picture_parameter.mode_control_fields, tx_mode);
+   BITS(picture_parameter.mode_control_fields, reference_select);
+   BITS(picture_parameter.mode_control_fields, reduced_tx_set_used);
+   BITS(picture_parameter.mode_control_fields, skip_mode_present);
+   BITS(picture_parameter.loop_restoration_fields, yframe_restoration_type);
+   BITS(picture_parameter.loop_restoration_fields, cbframe_restoration_type);
+   BITS(picture_parameter.loop_restoration_fields, crframe_restoration_type);
+   BITS(picture_parameter.loop_restoration_fields, lr_unit_shift);
+   BITS(picture_parameter.loop_restoration_fields, lr_uv_shift);
+
+#undef PLAIN
+#undef BITS
+   return n / 4;
+}
+
+/* ---- the model, driven through identical call sequences on both sides ---- */
+
+void *virgl_oracle_av1_state_new(void)
+{
+   struct virgl_av1_obu_state *s = calloc(1, sizeof(*s));
+
+   if (s)
+      virgl_av1_obu_state_init(s);
+   return s;
+}
+
+void virgl_oracle_av1_state_free(void *state)
+{
+   if (state) {
+      virgl_av1_obu_state_fini(state);
+      free(state);
+   }
+}
+
+ssize_t virgl_oracle_av1_flush_held(void *state, const uint8_t *desc,
+                                    uint8_t *out, size_t cap, int *discard)
+{
+   bool d = false;
+   ssize_t n = virgl_av1_flush_held(state, (const struct virgl_av1_picture_desc *)desc,
+                                    out, cap, &d);
+   *discard = d;
+   return n;
+}
+
+ssize_t virgl_oracle_av1_build(void *state, const uint8_t *desc,
+                               const uint8_t *tiles, size_t tiles_size,
+                               uint8_t *out, size_t cap)
+{
+   return virgl_av1_build_temporal_unit(state, (const struct virgl_av1_picture_desc *)desc,
+                                        tiles, tiles_size, out, cap);
+}
+
+ssize_t virgl_oracle_av1_flush_unit(void *state, uint8_t *out, size_t cap)
+{
+   return virgl_av1_flush_temporal_unit(state, out, cap);
+}
+
+void virgl_oracle_av1_drop_held(void *state)
+{
+   virgl_av1_drop_held(state);
+}
+
+/* ---- a simulated guest ---- */
+
+/*
+ * The model's whole job is cross-frame relationships, so the descriptors have to come from
+ * something that behaves like a guest rather than from independent noise: a reference map that
+ * evolves consistently with what was stored, order hints that advance, and a primary reference
+ * that points at a slot actually holding something. Independent descriptors would collapse onto
+ * the everything-is-a-first-frame path and prove nothing about the part that is hard.
+ *
+ * Everything the writer does not turn on is still noise, so a field read from the wrong place
+ * shows up rather than passing by luck.
+ */
+struct oracle_av1_guest {
+   uint64_t s;
+   uint32_t ref[16];        /* the guest's own reference map */
+   uint32_t next_surface;
+   unsigned frame;
+   uint8_t order_hint;
+};
+
+void *virgl_oracle_av1_guest_new(uint64_t seed)
+{
+   struct oracle_av1_guest *g = calloc(1, sizeof(*g));
+
+   if (g) {
+      g->s = seed * 2654435761u + 1;
+      g->next_surface = 100;
+   }
+   return g;
+}
+
+void virgl_oracle_av1_guest_free(void *g) { free(g); }
+
+static size_t virgl_oracle_av1_guest_next(void *guest, uint8_t *desc_out)
+{
+   struct oracle_av1_guest *g = guest;
+   struct virgl_av1_picture_desc *d = (struct virgl_av1_picture_desc *)desc_out;
+   uint64_t *s = &g->s;
+   size_t tiles_size;
+   bool key;
+
+   for (size_t i = 0; i < sizeof(*d); i++)
+      desc_out[i] = (uint8_t)oracle_rng(s);
+
+   /* Every so often the stream restarts, which resets both models. */
+   key = g->frame == 0 || oracle_rng(s) % 24 == 0;
+
+   memcpy(d->ref, g->ref, sizeof(d->ref));
+
+   d->picture_parameter.profile = 0;
+   d->picture_parameter.bit_depth_idx = 0;
+   d->picture_parameter.order_hint_bits_minus_1 = 6;
+   d->picture_parameter.max_width = 1920;
+   d->picture_parameter.max_height = 1080;
+   d->picture_parameter.frame_width = 1920;
+   d->picture_parameter.frame_height = 1080;
+   d->picture_parameter.order_hint = g->order_hint;
+   d->picture_parameter.superres_scale_denominator = 9 + oracle_rng(s) % 8;
+   d->picture_parameter.interp_filter = oracle_rng(s) % 5;
+   d->picture_parameter.cdef_bits = oracle_rng(s) % 4;
+   d->picture_parameter.tile_cols = 1 + oracle_rng(s) % 4;
+   d->picture_parameter.tile_rows = 1 + oracle_rng(s) % 4;
+   for (unsigned i = 0; i < 64; i++) {
+      d->picture_parameter.width_in_sbs[i] = 1 + oracle_rng(s) % 8;
+      d->picture_parameter.height_in_sbs[i] = 1 + oracle_rng(s) % 8;
+   }
+   d->picture_parameter.context_update_tile_id = oracle_rng(s) % 4;
+   d->picture_parameter.base_qindex = oracle_rng(s) % 4 ? (oracle_rng(s) % 256) : 0;
+   d->picture_parameter.primary_ref_frame = oracle_rng(s) % 8;
+
+   /* Film grain, within the room the wire has for it. */
+   d->picture_parameter.film_grain_info.num_y_points = oracle_rng(s) % 15;
+   d->picture_parameter.film_grain_info.num_cb_points = oracle_rng(s) % 11;
+   d->picture_parameter.film_grain_info.num_cr_points = oracle_rng(s) % 11;
+
+   /* Warp models: a mix of identity, translation, rotzoom and affine, so the subexp delta
+    * against the primary reference's saved parameters is actually coded. */
+   for (unsigned r = 0; r < 7; r++) {
+      const uint32_t type = oracle_rng(s) % 4;
+
+      d->picture_parameter.wm[r].wmtype = type;
+      for (unsigned j = 0; j < 6; j++) {
+         int32_t base = (j == 2 || j == 5) ? (1 << 16) : 0;
+         d->picture_parameter.wm[r].wmmat[j] = base + (int32_t)(oracle_rng(s) % 4096) - 2048;
+      }
+      d->picture_parameter.ref_frame_idx[r] = oracle_rng(s) % 8;
+   }
+
+   d->picture_parameter.pic_info_fields.frame_type = key ? 0 : 1;
+   d->picture_parameter.pic_info_fields.show_frame = key ? 1 : (oracle_rng(s) % 4 != 0);
+   d->picture_parameter.pic_info_fields.showable_frame = 1;
+   d->picture_parameter.pic_info_fields.error_resilient_mode = oracle_rng(s) % 8 == 0;
+   d->picture_parameter.pic_info_fields.use_superres = oracle_rng(s) % 4 == 0;
+   d->picture_parameter.pic_info_fields.allow_intrabc = 0;
+   d->picture_parameter.pic_info_fields.uniform_tile_spacing_flag = oracle_rng(s) % 2;
+
+   /* Tiles: a handful, each with a size the payload actually holds. */
+   {
+      const uint16_t count = 1 + oracle_rng(s) % 4;
+      uint32_t off = 0;
+
+      for (uint16_t i = 0; i < count; i++) {
+         const uint32_t size = 1 + oracle_rng(s) % 40;
+
+         d->slice_parameter.slice_data_offset[i] = off;
+         d->slice_parameter.slice_data_size[i] = size;
+         off += size;
+      }
+      d->slice_parameter.slice_count = count;
+      tiles_size = off;
+   }
+
+   /* What the guest stored: the next descriptor's ref[] is where that becomes visible. Key
+    * frames refresh everything, so the whole map becomes this frame's surface. */
+   if (key) {
+      for (unsigned i = 0; i < 8; i++)
+         g->ref[i] = g->next_surface;
+      g->next_surface++;
+   } else if (oracle_rng(s) % 4 != 0) {
+      g->ref[oracle_rng(s) % 8] = g->next_surface++;
+   }
+
+   g->order_hint = (g->order_hint + 1) & 0x7f;
+   g->frame++;
+   return tiles_size;
+}
+
+/*
+ * The same descriptor, with one count pushed past the array it indexes.
+ *
+ * Each of these is a place the C reads past the end of what the wire carries; the values are kept
+ * moderate so the overread stays inside the descriptor and the test observes the bytes rather than
+ * the fault. The Rust refuses them by name instead, and the test pins that divergence.
+ */
+size_t virgl_oracle_av1_guest_break(void *guest, uint8_t *desc_out, int guard)
+{
+   struct virgl_av1_picture_desc *d = (struct virgl_av1_picture_desc *)desc_out;
+   const size_t tiles_size = virgl_oracle_av1_guest_next(guest, desc_out);
+
+   switch (guard) {
+   case 1: d->picture_parameter.cdef_bits = 4; break;             /* 16 strengths out of 8 */
+   case 2: d->slice_parameter.slice_count = 300; break;           /* 300 tiles out of 256 */
+   case 3: d->picture_parameter.film_grain_info.num_y_points = 20; break;   /* out of 14 */
+   case 4: d->picture_parameter.film_grain_info.num_cb_points = 16; break;  /* out of 10 */
+   case 5: d->picture_parameter.film_grain_info.num_cr_points = 16; break;  /* out of 10 */
+   case 6: d->picture_parameter.max_width = 0;
+           d->picture_parameter.frame_width = 0; break;
+   default: break;
+   }
+   return tiles_size;
 }
