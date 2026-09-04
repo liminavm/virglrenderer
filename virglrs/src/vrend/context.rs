@@ -727,6 +727,12 @@ impl Context {
         host.make_current(self.current, &self.sub().gl_ctx);
     }
 
+    /// Every sub-context's GL context, for the renderer to wait on. Each has its own command
+    /// queue, so work one of them rendered is not covered by a finish on any other.
+    pub fn gl_contexts(&self) -> impl Iterator<Item = (SubCtxId, &egl::Context)> {
+        self.subs.iter().map(|(id, sub)| (*id, &sub.gl_ctx))
+    }
+
     /// `vrend_destroy_context`: unbind what the C unbinds, then every sub-context.
     pub fn destroy(mut self, host: &mut Host<'_>) {
         let ids: Vec<SubCtxId> = self.subs.keys().rev().copied().collect();

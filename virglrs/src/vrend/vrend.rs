@@ -227,13 +227,28 @@ impl Vrend {
     }
 
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
-    /// before the surface is presented, on ctx0. The texture's storage *is* the surface, so
-    /// there is nothing to copy -- only the renders queued into it to complete, since the
-    /// present that follows reads the bytes on another queue. `false` for a resource with no
-    /// surface, which is the caller's cue to read the pixels back instead.
+    /// before the surface is presented. The texture's storage *is* the surface, so there is
+    /// nothing to copy -- only the renders queued into it to complete, since the present that
+    /// follows reads the bytes on another queue. `false` for a resource with no surface, which
+    /// is the caller's cue to read the pixels back instead.
+    ///
+    /// The renders live on the queue of whichever sub-context drew them, and a finish waits for
+    /// one context's queue only. The C finishes ctx0, which never draws, and the harness caught
+    /// it reading the frame before last off a scanout: every GL context this renderer owns is
+    /// finished, so the surface is whole whoever rendered into it.
     pub fn resource_sync_iosurface(&mut self, handle: ResourceHandle) -> bool {
         if self.resource_surface(handle).is_none() {
             return false;
+        }
+        for (id, ctx) in &self.contexts {
+            for (sub, gl_ctx) in ctx.gl_contexts() {
+                let want = Current::Sub(*id, sub);
+                if self.current != want {
+                    self.winsys.make_current(gl_ctx).expect("a sub-context's GL context exists");
+                    self.current = want;
+                }
+                self.gl.finish();
+            }
         }
         self.switch_ctx0();
         self.gl.finish();
