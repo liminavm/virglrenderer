@@ -74,6 +74,64 @@ pub struct ShaderName(GLuint);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ProgramName(GLuint);
 
+/// A binding point of an indexed buffer target: a uniform block, a shader storage block, an
+/// atomic counter buffer, a transform-feedback buffer. The target names the space, so an index
+/// means nothing on its own -- and it is not a texture unit, which the draw path counts beside
+/// it through the same stages.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BindingPoint(GLuint);
+
+impl BindingPoint {
+    /// The first point of a target, where each stage's walk starts.
+    pub const FIRST: Self = Self(0);
+
+    pub fn at(index: u32) -> Self {
+        Self(index)
+    }
+
+    /// The next point, as a stage claims one per block it declared.
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// `n` points on, where a stage's blocks start after the ones before it.
+    pub fn plus(self, n: u32) -> Self {
+        Self(self.0 + n)
+    }
+}
+
+/// A texture unit: what `glActiveTexture` selects, what a sampler object binds to, and the
+/// value a sampler uniform holds. Not a binding point, and not the slot the guest named.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TextureUnit(GLuint);
+
+impl TextureUnit {
+    pub const FIRST: Self = Self(0);
+
+    pub fn at(unit: u32) -> Self {
+        Self(unit)
+    }
+
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// What a sampler uniform is set to, which is the unit's number.
+    pub fn uniform_value(self) -> GLint {
+        self.0 as GLint
+    }
+}
+
+/// An image unit: what `glBindImageTexture` binds to. A separate space from [`TextureUnit`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ImageUnit(GLuint);
+
+impl ImageUnit {
+    pub fn at(unit: u32) -> Self {
+        Self(unit)
+    }
+}
+
 /// Where a uniform lives in a linked program. GL spells "the program has no such uniform" as
 /// -1 and then ignores a write through it, which is a silent no-op three call sites deep; here
 /// it is `None` from [`Gl::get_uniform_location`] onwards, and the -1 never exists.
@@ -1438,15 +1496,15 @@ impl Gl {
         unsafe { self.t.glEndTransformFeedback()() };
     }
 
-    pub fn bind_buffer_base(&self, target: GLenum, index: GLuint, buf: Option<BufferName>) {
+    pub fn bind_buffer_base(&self, target: GLenum, index: BindingPoint, buf: Option<BufferName>) {
         // SAFETY: plain scalars.
-        unsafe { self.t.glBindBufferBase()(target, index, buf.map_or(0, |b| b.0)) };
+        unsafe { self.t.glBindBufferBase()(target, index.0, buf.map_or(0, |b| b.0)) };
     }
 
     pub fn bind_buffer_range(
         &self,
         target: GLenum,
-        index: GLuint,
+        index: BindingPoint,
         buf: BufferName,
         offset: usize,
         size: usize,
@@ -1456,7 +1514,7 @@ impl Gl {
             return false;
         };
         // SAFETY: plain scalars.
-        unsafe { self.t.glBindBufferRange()(target, index, buf.0, offset, size) };
+        unsafe { self.t.glBindBufferRange()(target, index.0, buf.0, offset, size) };
         true
     }
 
@@ -1606,9 +1664,14 @@ impl Gl {
         (i != GL_INVALID_INDEX).then_some(i)
     }
 
-    pub fn uniform_block_binding(&self, program: ProgramName, block: GLuint, binding: GLuint) {
+    pub fn uniform_block_binding(
+        &self,
+        program: ProgramName,
+        block: GLuint,
+        binding: BindingPoint,
+    ) {
         // SAFETY: plain scalars.
-        unsafe { self.t.glUniformBlockBinding()(program.0, block, binding) };
+        unsafe { self.t.glUniformBlockBinding()(program.0, block, binding.0) };
     }
 
     /// `GL_UNIFORM_BLOCK_DATA_SIZE` of a block.
@@ -1687,20 +1750,20 @@ impl Gl {
         unsafe { self.t.glUniform4uiv()(location.0, count, v.as_ptr()) };
     }
 
-    pub fn active_texture(&self, unit: GLuint) {
+    pub fn active_texture(&self, unit: TextureUnit) {
         // SAFETY: plain scalar.
-        unsafe { self.t.glActiveTexture()(GL_TEXTURE0 + unit) };
+        unsafe { self.t.glActiveTexture()(GL_TEXTURE0 + unit.0) };
     }
 
-    pub fn bind_sampler(&self, unit: GLuint, sampler: Option<SamplerName>) {
+    pub fn bind_sampler(&self, unit: TextureUnit, sampler: Option<SamplerName>) {
         // SAFETY: plain scalars; zero is "no sampler".
-        unsafe { self.t.glBindSampler()(unit, sampler.map_or(0, |s| s.0)) };
+        unsafe { self.t.glBindSampler()(unit.0, sampler.map_or(0, |s| s.0)) };
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn bind_image_texture(
         &self,
-        unit: GLuint,
+        unit: ImageUnit,
         texture: TextureName,
         level: GLint,
         layered: bool,
@@ -1711,7 +1774,7 @@ impl Gl {
         // SAFETY: plain scalars.
         unsafe {
             self.t.glBindImageTexture()(
-                unit,
+                unit.0,
                 texture.0,
                 level,
                 layered as GLboolean,

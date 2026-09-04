@@ -120,7 +120,7 @@ pub struct LinkedProgram {
     pub image_binding_offset: [u32; ShaderStage::COUNT],
     pub tex_levels_uniform_id: [Option<UniformLocation>; ShaderStage::COUNT],
     /// The `VirglBlock` binding and the buffer behind it, once a stage declared the block.
-    pub virgl_block_bind: Option<GLuint>,
+    pub virgl_block_bind: Option<BindingPoint>,
     pub sysval_buffer: Option<BufferName>,
     /// The block the buffer holds, so a draw uploads only a block that changed.
     pub sysval_uploaded: Option<Sysval>,
@@ -568,7 +568,7 @@ fn add_shader_program(
     }
 
     // rebind_ubo_and_sampler_locs
-    let mut next_ubo_id: GLuint = 0;
+    let mut next_ubo_id = BindingPoint::FIRST;
     for l in &walk {
         let s = l.stage.index();
         let prefix = stage_prefix(l.stage);
@@ -610,7 +610,7 @@ fn add_shader_program(
             if let Some(block) = gl.get_uniform_block_index(id, &name) {
                 gl.uniform_block_binding(id, block, next_ubo_id);
             }
-            next_ubo_id += 1;
+            next_ubo_id = next_ubo_id.next();
         }
         prog.ubo_used_mask[s] = l.info.ubo_used_mask;
     }
@@ -852,8 +852,8 @@ impl Context {
         &mut self,
         host: &mut Host<'_>,
         stage: ShaderStage,
-        mut next_ubo_id: GLuint,
-    ) -> GLuint {
+        mut next_ubo_id: BindingPoint,
+    ) -> BindingPoint {
         let gl = host.gl;
         let s = stage.index();
         let sub = self.sub_mut();
@@ -869,7 +869,7 @@ impl Context {
         let mut dirty = sub.ubos_dirty[s];
         let update = dirty.intersect(used);
         if update.is_empty() {
-            return next_ubo_id + mask.count_ones();
+            return next_ubo_id.plus(mask.count_ones());
         }
         while mask != 0 {
             let i = mask.trailing_zeros();
@@ -888,7 +888,7 @@ impl Context {
                 );
                 dirty.unmark(i);
             }
-            next_ubo_id += 1;
+            next_ubo_id = next_ubo_id.next();
         }
         sub.ubos_dirty[s] = dirty;
         next_ubo_id
@@ -922,8 +922,8 @@ impl Context {
         &mut self,
         host: &mut Host<'_>,
         stage: ShaderStage,
-        mut next_sampler_id: GLuint,
-    ) -> GLuint {
+        mut next_sampler_id: TextureUnit,
+    ) -> TextureUnit {
         let gl = host.gl;
         let max_units = host.limits.max_texture_units;
         let s = stage.index();
@@ -951,7 +951,7 @@ impl Context {
             {
                 gl.active_texture(next_sampler_id);
                 if let Some(loc) = sampler_locs[sampler_index] {
-                    gl.uniform_1i(loc, next_sampler_id as GLint);
+                    gl.uniform_1i(loc, next_sampler_id.uniform_value());
                 }
                 let res = host.resources.get(&view.resource);
                 if shadow_mask & (1 << i) != 0 {
@@ -1016,7 +1016,7 @@ impl Context {
                 }
             }
             sampler_index += 1;
-            next_sampler_id += 1;
+            next_sampler_id = next_sampler_id.next();
         }
         let sub = self.sub_mut();
         let tl = &mut sub.texture_levels[s];
@@ -1031,7 +1031,7 @@ impl Context {
         }
         sub.views_dirty[s].clear();
         // A later glBindTexture for another reason must not disturb the units just bound.
-        gl.active_texture(max_units.saturating_sub(1));
+        gl.active_texture(TextureUnit::at(max_units.saturating_sub(1)));
         next_sampler_id
     }
 
@@ -1049,7 +1049,7 @@ impl Context {
         let offset = prog.ssbo_binding_offset[s];
         let prog_mask = prog.ssbo_used_mask[s];
         for (&i, ssbo) in &sub.ssbos[s] {
-            if i >= 32 || prog_mask & (1 << i) == 0 {
+            if i as usize >= MAX_SHADER_BUFFERS || prog_mask & (1 << i) == 0 {
                 continue;
             }
             if let Some(res) = host.resources.get(&ssbo.resource)
@@ -1057,7 +1057,7 @@ impl Context {
             {
                 gl.bind_buffer_range(
                     GL_SHADER_STORAGE_BUFFER,
-                    i + offset,
+                    BindingPoint::at(i + offset),
                     name,
                     ssbo.offset as usize,
                     ssbo.length as usize,
@@ -1078,7 +1078,7 @@ impl Context {
             {
                 gl.bind_buffer_range(
                     GL_ATOMIC_COUNTER_BUFFER,
-                    i,
+                    BindingPoint::at(i),
                     name,
                     abo.offset as usize,
                     abo.length as usize,
@@ -1104,10 +1104,10 @@ impl Context {
         let prog_mask = prog.images_used_mask[s];
         let offset = prog.image_binding_offset[s];
         for (&i, iview) in &sub.images[s] {
-            if i >= 32 || prog_mask & (1 << i) == 0 {
+            if i as usize >= MAX_SHADER_IMAGES || prog_mask & (1 << i) == 0 {
                 continue;
             }
-            let image_unit = i + offset;
+            let image_unit = ImageUnit::at(i + offset);
             if prog.img_locs[s].get(i as usize).copied().flatten().is_none() {
                 continue;
             }
@@ -1203,8 +1203,8 @@ impl Context {
             return;
         };
         let last = prog.last_stage;
-        let mut next_ubo_id = 0;
-        let mut next_sampler_id = 0;
+        let mut next_ubo_id = BindingPoint::FIRST;
+        let mut next_sampler_id = TextureUnit::FIRST;
         for stage in C_STAGE_ORDER {
             if stage.index() > last.index() {
                 continue;

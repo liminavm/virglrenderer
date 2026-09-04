@@ -23,11 +23,14 @@ use super::features::{Feature, Features};
 use super::formats::{Desc, Table};
 use super::gl::gles::*;
 use super::gl::{
-    BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, ProgramName,
-    QueryName, SamplerName, ShaderName, TextureName, TransformFeedbackName, UniformLocation,
-    VertexArrayName,
+    BindingPoint, BufferName, FramebufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl,
+    ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
+    TransformFeedbackName, UniformLocation, VertexArrayName,
 };
-use super::pipe::slots::{MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_VIEWPORTS};
+use super::pipe::slots::{
+    MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
+    MAX_VIEWPORTS,
+};
 use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage};
@@ -2594,7 +2597,7 @@ impl Context {
         gl.bind_transform_feedback(Some(id));
         for (i, t) in targets.iter().enumerate() {
             let Some(h) = t else {
-                gl.bind_buffer_base(GL_TRANSFORM_FEEDBACK_BUFFER, i as GLuint, None);
+                gl.bind_buffer_base(GL_TRANSFORM_FEEDBACK_BUFFER, BindingPoint::at(i as u32), None);
                 continue;
             };
             let target = match self.sub().objects.get(h) {
@@ -2610,11 +2613,15 @@ impl Context {
                 return Err(Fault::IllegalResource { cmd, handle: target.resource });
             };
             if target.buffer_offset == 0 && target.buffer_size == res.args.width {
-                gl.bind_buffer_base(GL_TRANSFORM_FEEDBACK_BUFFER, i as GLuint, Some(name));
+                gl.bind_buffer_base(
+                    GL_TRANSFORM_FEEDBACK_BUFFER,
+                    BindingPoint::at(i as u32),
+                    Some(name),
+                );
             } else {
                 gl.bind_buffer_range(
                     GL_TRANSFORM_FEEDBACK_BUFFER,
-                    i as GLuint,
+                    BindingPoint::at(i as u32),
                     name,
                     target.buffer_offset as usize,
                     target.buffer_size as usize,
