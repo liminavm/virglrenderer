@@ -343,12 +343,15 @@ impl Vrend {
         self.resources.get(&handle)?.resource()
     }
 
-    /// The guest attached pages to a resource: a host-memory buffer pushes its contents into
-    /// them (`vrend_pipe_resource_attach_iov`).
+    /// The guest attached pages to a resource: a host-memory buffer pays them whatever they are
+    /// owed (`vrend_pipe_resource_attach_iov`).
+    ///
+    /// A freshly created resource owes nothing, and that is what keeps this from racing the
+    /// guest -- see [`resource::Shadow`].
     pub fn resource_attached(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
-        if let Some(Resource { storage: resource::Storage::Host(buf), .. }) =
-            self.resources.get(&handle).and_then(resource::Slot::resource)
-            && !pages.copy_in(0, buf)
+        if let Some(Resource { storage: resource::Storage::Host(shadow), .. }) =
+            self.resources.get_mut(&handle).and_then(resource::Slot::resource_mut)
+            && !shadow.mirror_into(pages)
         {
             eprintln!(
                 "[virglrs] resource {handle}: the attached pages are smaller than the buffer"
@@ -359,13 +362,18 @@ impl Vrend {
     /// The guest is detaching a resource's pages: a host-memory buffer pulls them back first
     /// (`vrend_pipe_resource_detach_iov`).
     pub fn resource_detaching(&mut self, handle: ResourceHandle, pages: &Iov<'_>) {
-        if let Some(Resource { storage: resource::Storage::Host(buf), .. }) =
+        if let Some(Resource { storage: resource::Storage::Host(shadow), .. }) =
             self.resources.get_mut(&handle).and_then(resource::Slot::resource_mut)
-            && !pages.copy_out(0, buf)
         {
-            eprintln!(
-                "[virglrs] resource {handle}: the detached pages are smaller than the buffer"
-            );
+            // The pages are about to go away, so what they hold survives only here -- and is
+            // owed back to whatever pages arrive next.
+            let ok = pages.copy_out(0, shadow.bytes_mut());
+            shadow.unmirrored();
+            if !ok {
+                eprintln!(
+                    "[virglrs] resource {handle}: the detached pages are smaller than the buffer"
+                );
+            }
         }
     }
 
