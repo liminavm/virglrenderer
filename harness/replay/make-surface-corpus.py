@@ -22,15 +22,22 @@
 #                        the slot against the handle it is asked for, so a stale slot value can
 #                        skip a re-attach that has to happen -- the new surface's view is a
 #                        different texture from the dead one's.
+#   unref-while-bound    The resource under a bound surface, freed. The C's surface holds a
+#                        reference to it, so the framebuffer goes on taking pixels; the second
+#                        colour buffer is what says whether it did, since the first is gone.
 import sys, zlib
 
 from corpus import (Corpus, OBJ_SURFACE, BIND_RENDER_TARGET, BIND_SAMPLER_VIEW,
-                    B8G8R8A8_UNORM, B8G8R8X8_UNORM)
+                    PIPE_CLEAR_COLOR0, B8G8R8A8_UNORM, B8G8R8X8_UNORM)
 
 SIDE = 64   # the sweep scores 2D colour targets wider than 8
 
 DESTROY_RES, DESTROY_SURF = 10, 200
 REBIND_RES, REBIND_SURF = 11, 201
+UNREF_RES, UNREF_SURF = 12, 202
+SURVIVE_RES, SURVIVE_SURF = 13, 203
+
+BOTH_COLOURS = PIPE_CLEAR_COLOR0 | (PIPE_CLEAR_COLOR0 << 1)
 
 
 def fill_pixels(handle):
@@ -51,6 +58,8 @@ def build():
     c.submit()
     c.create(DESTROY_RES, B8G8R8A8_UNORM, tex, SIDE)
     c.create(REBIND_RES, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(UNREF_RES, B8G8R8A8_UNORM, tex, SIDE)
+    c.create(SURVIVE_RES, B8G8R8A8_UNORM, tex, SIDE)
 
     # The surfaces name the X spelling of their resource's A format. That mismatch is what mints
     # a texture view rather than attaching the resource's own texture, so the thing the destroy
@@ -71,12 +80,29 @@ def build():
     c.set_framebuffer([REBIND_SURF])
     c.clear((0.75, 0.5, 0.25, 1.0))
 
+    # Two resources under one framebuffer, so that freeing the first leaves a second whose
+    # pixels can still be read. A resource event applies after the record whose sequence number
+    # it carries, so each unref rides the SUBMIT that follows it.
+    c.inline_write(UNREF_RES, fill_pixels(UNREF_RES), SIDE, SIDE, SIDE * 4)
+    c.inline_write(SURVIVE_RES, fill_pixels(SURVIVE_RES), SIDE, SIDE, SIDE * 4)
+    c.surface(UNREF_SURF, UNREF_RES, B8G8R8X8_UNORM)
+    c.surface(SURVIVE_SURF, SURVIVE_RES, B8G8R8X8_UNORM)
+    c.set_framebuffer([UNREF_SURF, SURVIVE_SURF])
+    c.clear((0.125, 0.25, 0.375, 1.0), BOTH_COLOURS)
+    c.unref(UNREF_RES)   # read back here: the first clear
+    c.submit()
+    # The framebuffer still names a resource the guest has freed. The second clear is what says
+    # whether it kept taking pixels: the survivor carries this colour if it did, and the first
+    # colour if the attachment died with its neighbour.
+    c.clear((0.875, 0.75, 0.625, 1.0), BOTH_COLOURS)
+
     # Drop the framebuffer before the unrefs, so the readbacks are not racing an attachment.
     c.set_framebuffer([])
     c.submit()
 
     c.unref(DESTROY_RES)
     c.unref(REBIND_RES)
+    c.unref(SURVIVE_RES)
     c.submit()
     return c
 
