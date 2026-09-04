@@ -577,6 +577,30 @@ buildable throughout as the A-side reference.
   context that made it. There is exactly one refusal in the chain and it is vrend's -- so this
   is one consumer to build, not a pipeline. `Storage` is the currency, `image_from_iosurface`
   the adoption point, and the boot is the gate, because replay cannot reach any of it.
+
+  **Ported as the C has it, and owed a redesign.** What lands here is a workaround, adopted
+  deliberately so the desktop runs; three things under it are wrong, and all three are this
+  tree's own stated rules broken by the shape virgl hands us.
+
+  *An import that copies is not an import.* The classic path models a shared buffer as a dmabuf
+  the GL driver aliases. There is no dmabuf here, so a share that is not an IOSurface degrades
+  to a copy refreshed before every batch that samples it -- the guest's pages and the GL texture
+  are two containers holding one fact, reconciled on a schedule. That is the pair rule broken,
+  and the per-batch re-read is exactly the layer that quietly repairs a mismatch. The IOSurface
+  leg is a real alias; the other leg only looks like one.
+
+  *A resource exists before anything knows what it is.* `PipeResourceSetType` retro-types a
+  handle that was already created and attached, so there is a window in which a handle names an
+  untyped thing. Modelling that window as a storage state is the best local answer and still a
+  state that should not be representable. The question to reopen is whether the Rust API should
+  carry an imported buffer as shared storage from the start, with the wire's create-then-type
+  two-step translated in `ffi.rs` -- which is the "would this still make sense if `ffi.rs` were
+  deleted?" test, and it currently would not.
+
+  *A placeholder reports success for work it did not do.* When the adopt refuses, the fallback
+  is a texture whose contents are wrong, and the guest is told the command succeeded. The C's
+  own comment says as much. Zeroing keeps it from leaking another context's memory; it does not
+  make the answer true.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
