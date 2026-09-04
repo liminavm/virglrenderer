@@ -544,7 +544,15 @@ buildable throughout as the A-side reference.
   the C's bridge of UBO 0 into the constant array, the shader blitter (a blit whose
   formats swizzle differently, or that swaps red and blue for an IOSurface-backed end),
   implicit-multisample surfaces, the resource-copy fallback through guest memory, blob
-  resources, video. Next is the first pixel gate, kmscube against the C's frame.
+  resources, video. The first pixel gate has passed: the stock guest's GNOME session,
+  booted headless on virglrs and on the C and read from the presented frame, is
+  bit-identical between the two but for the clock's digits. (kmscube was the planned
+  workload; the stock guest autologs into GNOME, which holds DRM master, so the desktop
+  itself is the workload.) A caution the gate taught: the Fedora logo the background
+  extension draws is present or absent from one boot of the *same* renderer to the next,
+  a guest-side race in the extension, so a frame diff has to be read against a second boot
+  of the reference before a difference is charged to the port. `vrend-desktop.score`
+  pins the corpus of that session, wallpaper included.
 - **P4 — video.** Decode command path, VideoToolbox backend via `objc2`, AV1 OBU
   synthesis, H.264 parameter sets, `rav1d`. Ends at hardware decode per codec plus
   the VPP legs.
