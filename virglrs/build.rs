@@ -237,8 +237,15 @@ fn video_oracle(manifest: &std::path::Path) {
     println!("cargo::rerun-if-changed={}", oracle.display());
     println!("cargo::rerun-if-changed={}", tree.join("src/vrend").display());
 
-    cc::Build::new()
-        .file(oracle.join("video_oracle.c"))
+    let mut build = cc::Build::new();
+    build.file(oracle.join("video_oracle.c"));
+    for c in ["virgl_video_h264_ps.c", "virgl_video_h265_ps.c", "virgl_video_av1_obu.c"] {
+        build.file(tree.join("src/vrend").join(c));
+    }
+    build
+        // Ahead of `src`, so the stub `virgl_util.h` wins: see the header for why the real one
+        // cannot be on this path.
+        .include(oracle.join("stub"))
         .include(tree.join("src/vrend"))
         .include(tree.join("src/gallium/include"))
         .include(tree.join("src"))

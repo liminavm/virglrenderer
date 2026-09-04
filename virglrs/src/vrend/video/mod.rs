@@ -16,6 +16,7 @@
 //! here: a share keeps what names it alive, and a destroy is a table drop.
 
 pub mod bitstream;
+pub mod h264;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
