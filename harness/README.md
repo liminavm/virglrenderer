@@ -44,6 +44,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `REPLAY_DUMP_DIR` (narrowed by `REPLAY_DUMP_W`) writes every scored readback and surface as raw
   BGRA, for `rgba2png.py` and a pixel diff.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
+- `make-blit-corpus.py` — writes a synthetic classic corpus that forces the shader blitter, for
+  the gate no recorded session provides (see `fixtures/blit.score` below).
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
@@ -193,9 +195,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   The fixture cannot say which *key* a block was translated under, so the live differential is
   the same replay against the Rust prefix with `VIRGLRS_DEBUG=shader`, normalised by the same
   script: the two logs must diff empty, block for block and in order, which holds the key
-  construction to the C as well as the translation. Under `--nodraw` that is the 28 blocks of
-  shader creation and `LINK_SHADER`; with draws it is all 34, the six more being the variants
-  selected at draw time.
+  construction to the C as well as the translation. Under `--nodraw` that is the 16 blocks of
+  shader creation and `LINK_SHADER`; with draws it is all 33, the seventeen more being the
+  variants selected at draw time.
+  `blit.score` is the shader blitter's gate, and it is synthetic on purpose: no recorded session
+  reaches the blitter at all. A desktop's blits are format-matched mip-chain reductions, which
+  take `glBlitFramebuffer`, so a blitter could be ported, get every other fixture in this tree
+  green, and have been measured by none of them. `make-blit-corpus.py` writes
+  `vm/captures/blit.bin` — five blits, each a destination only the blitter can fill, four by a
+  swizzle disagreement between an X-channel format and its A-channel twin and one by the red/blue
+  swap an IOSurface-backed BGRA scanout forces. Its own comments carry which variants exist and
+  why the depth-writing ones do not. The corpus is generated rather than recorded, so it is
+  reproducible from the script and the score is pinned from the C the same way as the rest.
 - `vkr-record-decode.py` — decodes a venus full-stream capture (`--check` validates a capture
   structurally before it is pinned as a fixture, and reports how many records were recorded out of
   execution order — see the ordering rule in `src/venus/vkr_record.h`).
