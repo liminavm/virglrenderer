@@ -197,6 +197,22 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   guest attaches backing and builds views on a resource that does not exist and has its context
   poisoned for the rest of its life. The planar half of `sampler` closes with video; the ASTC
   half is deliberate and permanent. A fifth line is a regression.
+  `vrend-vp9stock.score` is VP9 hardware decode, 963 pictures through VideoToolbox, scored the
+  ordinary way: the decoded planes land in guest resources and the sweep reads them back, so 240
+  of the 243 decode-target resources carry pixels with a distinct hash per frame. It was recorded
+  from the **stock** guest, which is the per-plane decode target -- one resource per plane, the
+  shape a guest that never negotiates the composite planar target takes, and the shape the stock
+  tier keeps. The enhanced tier's delivered mesa takes the other shape (one composite resource,
+  planes chained behind it, one two-plane IOSurface), and that is a second contract needing its
+  own corpus, not a newer version of this one.
+
+  The corpus is `vrend-vp9stock.bin`, captured with `capture.sh vrend` while decoding
+  `spikes/vt-vp9-decode/vp90-2-09-aq2.webm` from the limina tree -- a real conformance clip, not
+  `videotestsrc`, which has no hidden frames and no reference management to get wrong. The decode
+  is checked against `avdec_vp9` before anything is pinned: VP9 is normatively exact, so the two
+  must agree byte for byte, and eight consecutive runs must agree with each other. A golden taken
+  from one run of an intermittently faulting leg grades the port against a bad frame.
+
   `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 33
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
