@@ -67,6 +67,16 @@ pub trait Guest {
     fn pages(&self, ctx: ContextId, handle: ResourceHandle) -> Option<Iov<'_>>;
 }
 
+/// Whether a bind may use what a handle names: attached to the asking context, and typed.
+///
+/// Free of [`Host`] so the rule can be tested without a GL context to build one against.
+fn bindable(attached: bool, slot: Option<&resource::Slot>) -> Option<&Resource> {
+    if !attached {
+        return None;
+    }
+    slot?.resource()
+}
+
 /// Which GL context the thread has current, by name, so a switch is one compare.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Current {
@@ -136,6 +146,24 @@ impl Host<'_> {
     fn resource(&self, cmd: Cmd, handle: ResourceHandle) -> Result<&Resource, Fault> {
         let slot = self.slot(cmd, handle)?;
         slot.resource().ok_or(Fault::UntypedResource { cmd, handle })
+    }
+
+    /// A resource a bind may use, or `None` for one it must skip.
+    ///
+    /// The bind paths take what they can find and drop what they cannot, so they want the answer
+    /// as an `Option` rather than a fault -- but they want the *same two questions* asked, which
+    /// is what going through here rather than straight to the table buys. Reaching the table
+    /// directly skips the attach check, and a resource this context never attached is another
+    /// context's to read.
+    fn bound_resource(&self, handle: ResourceHandle) -> Option<&Resource> {
+        bindable(self.guest.attached(self.ctx, handle), self.resources.get(&handle))
+    }
+
+    fn bound_resource_mut(&mut self, handle: ResourceHandle) -> Option<&mut Resource> {
+        if !self.guest.attached(self.ctx, handle) {
+            return None;
+        }
+        self.resources.get_mut(&handle)?.resource_mut()
     }
 
     /// What the handle names, typed or not. Only the upgrade wants this; everything else wants
@@ -3230,6 +3258,24 @@ mod tests {
             vertex_buffer_index: 0,
             src_format: format(name),
         }
+    }
+
+    #[test]
+    fn a_bind_uses_only_a_resource_this_context_attached_and_something_typed() {
+        let untyped = resource::Slot::Untyped(resource::Untyped::new(None));
+
+        // Attached but untyped: there is no resource yet, and a bind that took one would be
+        // binding storage whose format and extent nothing has stated.
+        assert!(bindable(true, Some(&untyped)).is_none());
+
+        // Not attached: another context's resource, whatever it holds. The table is global and
+        // the attach list is what makes it per-context, so skipping the question reads across
+        // the boundary it draws.
+        assert!(bindable(false, Some(&untyped)).is_none());
+
+        // And a handle naming nothing is nothing, attached or not.
+        assert!(bindable(true, None).is_none());
+        assert!(bindable(false, None).is_none());
     }
 
     #[test]
