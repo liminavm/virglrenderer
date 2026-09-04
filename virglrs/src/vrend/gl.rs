@@ -843,6 +843,50 @@ impl Gl {
         true
     }
 
+    /// Upload rows that are padded, rather than tightly packed.
+    ///
+    /// `row_pixels` is the source stride in *pixels*, which is what `GL_UNPACK_ROW_LENGTH`
+    /// wants; a decoded video plane is the one source here whose rows the producer padded. The
+    /// unpack state is set and restored around the call, so [`Gl::unpack_tight`] stays the
+    /// invariant every other upload relies on.
+    ///
+    /// `false` if the source is too short for the rectangle, which is a caller that clamped
+    /// wrongly rather than anything a guest can reach.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use = "a refused upload leaves the texture holding the previous frame"]
+    pub fn tex_sub_image_2d_padded(
+        &self,
+        target: GLenum,
+        level: GLint,
+        x: GLint,
+        y: GLint,
+        w: GLsizei,
+        h: GLsizei,
+        format: GLenum,
+        ty: GLenum,
+        data: &[u8],
+        row_pixels: GLsizei,
+    ) -> bool {
+        // The driver reads `row_pixels` per row for every row but the last, and `w` for it.
+        let (Some(stride), Some(last)) = (
+            image_bytes(format, ty, row_pixels, h.saturating_sub(1), 1),
+            image_bytes(format, ty, w, 1.min(h), 1),
+        ) else {
+            return false;
+        };
+        if row_pixels < w || data.len() < stride + last {
+            return false;
+        }
+        self.pixel_store_i(GL_UNPACK_ROW_LENGTH, row_pixels);
+        // SAFETY: with row length `row_pixels`, image height and skips zero and alignment 1, the
+        // driver reads `stride + last` bytes from `data`, and `data` holds at least that many.
+        unsafe {
+            self.t.glTexSubImage2D()(target, level, x, y, w, h, format, ty, data.as_ptr().cast())
+        };
+        self.pixel_store_i(GL_UNPACK_ROW_LENGTH, 0);
+        true
+    }
+
     /// Pin the unpack state to tightly packed rows, which is what every upload here assumes.
     pub fn unpack_tight(&self) {
         self.pixel_store_i(GL_UNPACK_ROW_LENGTH, 0);

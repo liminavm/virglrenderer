@@ -172,14 +172,28 @@ impl std::fmt::Display for ObjectHandle {
 pub struct SubContextId(pub u32);
 
 /// A video codec's handle, in the video context's own namespace.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
 pub struct VideoCodecHandle(pub u32);
 
+impl core::fmt::Display for VideoCodecHandle {
+    /// The number the guest chose, which is how every log line about it reads.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A video buffer's handle, in the video context's own namespace.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
 pub struct VideoBufferHandle(pub u32);
+
+impl core::fmt::Display for VideoBufferHandle {
+    /// The number the guest chose, which is how every log line about it reads.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// `pipe_box`: a region of a resource. Signed because a blit flips by sending a negative extent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]

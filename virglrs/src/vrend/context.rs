@@ -36,9 +36,10 @@ use super::pipe::*;
 use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage, ViewKey};
 use super::transfer::{self, Info};
-use super::{debug, shader, tgsi};
+use super::{debug, shader, tgsi, video};
 use crate::guest_mem::{HostSpan, Iov};
 use crate::ids::{ContextId, ResourceHandle};
+use crate::videotoolbox;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -129,6 +130,8 @@ pub struct Host<'a> {
     pub todo: &'a mut Todo,
     /// The shader blitter, built on the first blit that needs it.
     pub blitter: &'a mut Option<Blitter>,
+    /// What this host decodes in hardware, or `None` when the caller did not ask for video.
+    pub video: Option<&'a videotoolbox::Support>,
 }
 
 impl Host<'_> {
@@ -269,6 +272,13 @@ pub enum Fault {
         cmd: Cmd,
         what: &'static str,
     },
+    /// A video command the guest had no business sending: an unserved profile, a handle it never
+    /// created, a frame out of sequence. A host that merely fails to decode a frame is not here
+    /// -- that is logged and the stream continues.
+    Video {
+        cmd: Cmd,
+        why: video::Refusal,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -291,6 +301,7 @@ impl fmt::Display for Fault {
                 write!(f, "{}: format {} is not served", cmd.name(), format.name())
             }
             Fault::OutOfRange { cmd, what } => write!(f, "{}: {what} out of range", cmd.name()),
+            Fault::Video { cmd, why } => write!(f, "{}: {why}", cmd.name()),
             Fault::Shader { cmd, what } => write!(f, "{}: {what}", cmd.name()),
             Fault::Tgsi { cmd, error } => write!(f, "{}: {error}", cmd.name()),
             Fault::Glsl { cmd, stage, error } => {
@@ -895,12 +906,20 @@ pub struct Context {
     subs: BTreeMap<SubContextId, SubContext>,
     current: SubContextId,
     fault: Option<Fault>,
+    /// The codecs and decode targets this context owns. Context-global: the video handles are
+    /// not sub-scoped, so a sub-context switch does not change which codec a handle names.
+    video: video::Video,
 }
 
 impl Context {
     /// `vrend_create_context`: a context with sub-context 0, current on this thread.
     pub fn new(host: &mut Host<'_>) -> Result<Context, EglError> {
-        let mut ctx = Context { subs: BTreeMap::new(), current: SubContextId(0), fault: None };
+        let mut ctx = Context {
+            subs: BTreeMap::new(),
+            current: SubContextId(0),
+            fault: None,
+            video: video::Video::default(),
+        };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
     }
@@ -1187,17 +1206,34 @@ impl Context {
             }
             Command::SendStringMarker { .. } => Ok(()),
             Command::LinkShader(handles) => self.link_shader(host, handles),
-            Command::CreateVideoCodec(_)
-            | Command::DestroyVideoCodec(_)
-            | Command::CreateVideoBuffer { .. }
-            | Command::DestroyVideoBuffer(_)
-            | Command::BeginFrame { .. }
-            | Command::DecodeMacroblock(_)
-            | Command::DecodeBitstream { .. }
-            | Command::EncodeBitstream { .. }
-            | Command::EndFrame { .. } => {
+            Command::CreateVideoCodec(codec) => self.create_video_codec(host, codec),
+            Command::DestroyVideoCodec(handle) => {
+                self.video.destroy_codec(handle);
+                Ok(())
+            }
+            Command::CreateVideoBuffer { handle, format, width, height, planes } => {
+                self.create_video_buffer(host, handle, format, width, height, &planes)
+            }
+            Command::DestroyVideoBuffer(handle) => {
+                self.video.destroy_buffer(handle);
+                Ok(())
+            }
+            Command::BeginFrame { codec, target } => {
+                video_result(kind, self.video.begin_frame(codec, target))
+            }
+            Command::DecodeBitstream { codec, target, descriptor, buffer, buffer_size } => {
+                self.decode_bitstream(host, codec, target, descriptor, buffer, buffer_size)
+            }
+            Command::EndFrame { codec, target } => {
+                self.make_current(host);
+                video_result(kind, self.video.end_frame(host.gl, codec, target))
+            }
+            // The C decodes none of its payload and does nothing with it, and reports success.
+            // A guest sending one is asking for an entrypoint no capset advertises.
+            Command::DecodeMacroblock(_) => Ok(()),
+            Command::EncodeBitstream { .. } => {
                 host.todo.note(kind.name());
-                Err(Fault::Unimplemented { cmd: kind, what: "video" })
+                Err(Fault::Unimplemented { cmd: kind, what: "video encode" })
             }
             Command::ClearSurface {
                 render_condition_enable: _,
@@ -3262,6 +3298,145 @@ impl Context {
         let info = Self::info(&t, 0, false);
         transfer::write(gl, formats, res, own.as_ref(), &span.iov(), &info)
             .map_err(|error| Fault::Transfer { cmd, error })
+    }
+}
+
+/// Video handlers: the guest's codecs and decode targets, and the frames they decode.
+///
+/// What is here is resolution and nothing else -- every handle the wire carries is turned into
+/// the thing it names, once, and [`video::Video`] never sees a handle it would have to look up
+/// again later. That is the whole division: this module can reach the resource table and that
+/// one cannot, so the lifetime question is settled here or not at all.
+impl Context {
+    fn create_video_codec(
+        &mut self,
+        host: &mut Host<'_>,
+        codec: proto::VideoCodec,
+    ) -> Result<(), Fault> {
+        video_result(
+            Cmd::CreateVideoCodec,
+            self.video.create_codec(
+                codec.handle,
+                codec.profile,
+                codec.entrypoint,
+                codec.width,
+                codec.height,
+                host.video,
+            ),
+        )
+    }
+
+    /// CREATE_VIDEO_BUFFER: resolve every plane resource into a share of its texture.
+    ///
+    /// The resolution is the point. The C stores the plane's resource *handle* and looks it up
+    /// again when a picture arrives, which is a lookup the guest can empty by freeing the plane
+    /// mid-decode -- and the C's own delivery path logs "res not found" and drops the plane when
+    /// it does. A share cannot be emptied.
+    fn create_video_buffer(
+        &mut self,
+        host: &mut Host<'_>,
+        handle: VideoBufferHandle,
+        format: u32,
+        width: u32,
+        height: u32,
+        planes: &[ResourceHandle],
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::CreateVideoBuffer;
+        let mut resolved = Vec::with_capacity(planes.len());
+        for &plane in planes {
+            let resource = host.resource(cmd, plane)?;
+            let texture =
+                resource.texture().ok_or(Fault::UntypedResource { cmd, handle: plane })?.clone();
+            // The GL triple comes from how the resource was actually created, never from the
+            // decoded plane's size: an R8 luma plane and an RG8 chroma plane are the same bytes
+            // at different widths, and a guessed format uploads them silently wrong.
+            let format = resource.args.format;
+            let entry = resource.entry(host.formats).ok_or(Fault::IllegalFormat { cmd, format })?;
+            let description = format.describe().ok_or(Fault::IllegalFormat { cmd, format })?;
+            resolved.push(video::Plane::new(
+                texture,
+                entry.gl,
+                description.block_bytes(),
+                resource.args.width,
+                resource.args.height,
+            ));
+        }
+        video_result(cmd, self.video.create_buffer(handle, format, width, height, resolved))
+    }
+
+    /// DECODE_BITSTREAM: read the descriptor and the bitstream out of the guest's own pages.
+    ///
+    /// Out of the *pages*, not out of the host mirror, because the guest writes both directly
+    /// and sends no transfer for either -- the host copy is only whatever a previous read left
+    /// there.
+    ///
+    /// The wire carries the bitstream as a resource handle beside a length, which is a pair the
+    /// layers below must never see: what reaches [`video::Video`] is a slice, reconciled here
+    /// against the resource that is supposed to hold it.
+    fn decode_bitstream(
+        &mut self,
+        host: &mut Host<'_>,
+        codec: VideoCodecHandle,
+        target: VideoBufferHandle,
+        descriptor: ResourceHandle,
+        buffer: ResourceHandle,
+        buffer_size: u32,
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::DecodeBitstream;
+        let descriptor = self.read_guest_bytes(
+            host,
+            cmd,
+            descriptor,
+            u32::try_from(video::DESCRIPTOR_BYTES).expect("the descriptor prefix fits a u32"),
+            false,
+        )?;
+        let bitstream = self.read_guest_bytes(host, cmd, buffer, buffer_size, true)?;
+        video_result(cmd, self.video.decode_bitstream(codec, target, &descriptor, &bitstream))
+    }
+
+    /// The first `want` bytes of a resource's guest pages.
+    ///
+    /// `exact` says what a resource smaller than `want` means. For the bitstream it is the guest
+    /// declaring a length its own buffer cannot hold, which is refused; for the descriptor it is
+    /// only a guest that wrote less of a fixed prefix than the prefix has room for, which is
+    /// allowed and reads as zeros.
+    fn read_guest_bytes(
+        &self,
+        host: &Host<'_>,
+        cmd: Cmd,
+        handle: ResourceHandle,
+        want: u32,
+        exact: bool,
+    ) -> Result<Vec<u8>, Fault> {
+        let resource = host.resource(cmd, handle)?;
+        let capacity = resource.args.width;
+        if exact && want > capacity {
+            return Err(Fault::OutOfRange { cmd, what: "the declared bitstream length" });
+        }
+        let mut bytes = vec![0u8; want.min(capacity) as usize];
+        if bytes.is_empty() {
+            return Ok(bytes);
+        }
+        let pages =
+            host.guest.pages(host.ctx, handle).ok_or(Fault::IllegalResource { cmd, handle })?;
+        if !pages.copy_out(0, &mut bytes) {
+            // The size came from the descriptor and the bytes come from guest memory, and the
+            // two fail independently: pages shorter than the resource they back is the guest
+            // having attached less than it declared.
+            return Err(Fault::OutOfRange { cmd, what: "the attached pages" });
+        }
+        Ok(bytes)
+    }
+}
+
+/// Turn a video refusal into a fault, or into the silence a lost frame gets.
+///
+/// A host that would not decode a frame is not the guest's fault and does not poison its
+/// context: the frame is gone, the log said so, and the stream carries on to the next one.
+fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Fault> {
+    match result {
+        Ok(()) | Err(video::Refusal::HostRefusedFrame) => Ok(()),
+        Err(why) => Err(Fault::Video { cmd, why }),
     }
 }
 

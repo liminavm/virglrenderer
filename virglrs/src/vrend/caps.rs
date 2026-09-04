@@ -20,6 +20,8 @@ use super::pipe::slots;
 use super::pipe::{PrimType, ShaderStage};
 use super::proto::{FORMAT_MAX, Format};
 use super::resource::Limits;
+use super::video;
+use crate::videotoolbox;
 
 /// `virgl_supported_format_mask`: one bit per wire format, 512 of them.
 #[repr(C)]
@@ -140,6 +142,12 @@ pub mod cap2 {
     pub const MIRROR_CLAMP_TO_EDGE: u32 = 1 << 16;
     pub const MIRROR_CLAMP: u32 = 1 << 17;
     pub const RESOURCE_LAYOUT: u32 = 1 << 18;
+    /// The guest may back a decode target's planes with its own memory, which is what lets it
+    /// export the decoded frame as a dmabuf rather than only sample it.
+    pub const VIDEO_GUEST_PLANES: u32 = 1 << 19;
+    /// The guest may hand over one composite planar resource as a decode target, instead of one
+    /// resource per plane.
+    pub const VIDEO_PLANAR_TARGET: u32 = 1 << 20;
 }
 
 /// `virgl_caps_v1`.
@@ -165,11 +173,46 @@ pub struct CapsV1 {
     pub max_texture_gather_components: u32,
 }
 
-/// `virgl_video_caps`: four words of bitfields, carried as words since this build fills none.
+/// `virgl_video_caps`: four words of bitfields.
+///
+/// Carried as words because that is what crosses to the guest, and built only by
+/// [`VideoCaps::decode`], so the packing lives in one place and a caller names fields rather than
+/// shifts. A bitfield struct written by hand at four call sites is four chances to put a level in
+/// the width.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct VideoCaps {
     pub words: [u32; 4],
+}
+
+impl VideoCaps {
+    /// The ceiling this build advertises for every profile. VideoToolbox goes higher on current
+    /// silicon and nothing we can query says by how much; the guest only uses it to size its
+    /// surfaces, and 4K fits comfortably below.
+    const MAX_WIDTH: u32 = 4096;
+    const MAX_HEIGHT: u32 = 4096;
+
+    /// `PIPE_FORMAT_NV12`. The layout the guest is told to prefer -- it may allocate another,
+    /// and the decode session is built around whatever it chose.
+    const PREFERRED_FORMAT: u32 = 166;
+
+    /// One advertised decode entry.
+    ///
+    /// Everything this build does not vary is fixed here rather than repeated at call sites:
+    /// bitstream is the only entrypoint, nothing is interlaced (the serializers refuse field
+    /// coding), and there are no stacked frames or temporal layers.
+    pub fn decode(profile: video::Profile, max_level: u32) -> VideoCaps {
+        /// `PIPE_VIDEO_ENTRYPOINT_BITSTREAM`.
+        const BITSTREAM: u32 = 1;
+        VideoCaps {
+            words: [
+                (profile as u32 & 0xff) | (BITSTREAM << 8) | ((max_level & 0xff) << 16),
+                VideoCaps::MAX_WIDTH | (VideoCaps::MAX_HEIGHT << 16),
+                VideoCaps::PREFERRED_FORMAT | (1 << 16), // max_macroblocks
+                1 | (1 << 1),                            // npot_texture, supports_progressive
+            ],
+        }
+    }
 }
 
 /// `virgl_caps_v2`. `v1` is its head, so a caller asking for capset 1 reads the same bytes.
@@ -261,7 +304,13 @@ impl CapsV2 {
     /// `vrend_renderer_fill_caps` for a GLES host, ctx0 current: `vrend_fill_caps_glsl_version`,
     /// `vrend_renderer_fill_caps_v1` and `vrend_renderer_fill_caps_v2`, with the desktop-GL
     /// branches dropped -- this host is GLES, and every `gl_ver > 0` leg of the C is dead here.
-    pub fn probe(gl: &Gl, features: &Features, limits: &Limits, formats: &Table) -> CapsV2 {
+    pub fn probe(
+        gl: &Gl,
+        features: &Features,
+        limits: &Limits,
+        formats: &Table,
+        video_support: Option<&videotoolbox::Support>,
+    ) -> CapsV2 {
         let has = |f: Feature| features.has(f);
         let get = |name: GLenum| gl.get_integer(name);
         let getu = |name: GLenum| gl.get_integer(name).max(0) as u32;
@@ -633,8 +682,24 @@ impl CapsV2 {
             ],
         )
         .map(|n| n.saturating_mul(4));
-        // Video arrives with P4: no codec caps until then.
-        c.num_video_caps = 0;
+        // Only what this build both has silicon for and has a decode path for. A host that
+        // advertises neither is left with num_video_caps zero and the two bits clear, and the
+        // guest's virgl_get_video_param() then reports no profiles -- the driver still loads, it
+        // just offers no hardware decode, which is the whole of the fallback.
+        for (i, profile) in video::advertised(video_support).into_iter().enumerate() {
+            let Some(slot) = c.video_caps.get_mut(i) else {
+                break;
+            };
+            *slot = VideoCaps::decode(profile, profile.max_level());
+            c.num_video_caps = i as u32 + 1;
+        }
+        if c.num_video_caps > 0 {
+            // Both gated on there being a decoder at all. A guest that allocated real guest
+            // memory for a decode target against a host that never writes it back would export
+            // an honest-looking fd naming a black frame, which is worse for it than refusing and
+            // falling back.
+            c.capability_bits_v2 |= cap2::VIDEO_GUEST_PLANES | cap2::VIDEO_PLANAR_TARGET;
+        }
         c
     }
 }

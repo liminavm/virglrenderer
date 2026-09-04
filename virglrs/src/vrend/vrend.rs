@@ -120,18 +120,6 @@ impl Vrend {
         let limits = Limits::query(&gl, &features);
         let shader_cfg = shader::Config::probe(&gl, &features, &limits);
         let formats = Table::probe(&gl, &features);
-        let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats);
-        eprintln!(
-            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
-             iosurface storage {}",
-            formats.entries().count(),
-            features.present().count(),
-            if features.adopts_iosurfaces() {
-                "available"
-            } else {
-                "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
-            },
-        );
         let video = config.video.then(videotoolbox::Support::probe);
         if let Some(support) = video {
             let names: Vec<&str> = videotoolbox::Codec::ALL
@@ -148,6 +136,18 @@ impl Vrend {
                 },
             );
         }
+        let caps = caps::CapsV2::probe(&gl, &features, &limits, &formats, video.as_ref());
+        eprintln!(
+            "[virglrs] vrend: {version_string} (gles {gles_version}), {} formats, {} features, \
+             iosurface storage {}",
+            formats.entries().count(),
+            features.present().count(),
+            if features.adopts_iosurfaces() {
+                "available"
+            } else {
+                "UNAVAILABLE -- no scanout              or shared buffer can be imported without a copy, and every one will be blank"
+            },
+        );
         Ok(Vrend {
             winsys,
             gl,
@@ -208,7 +208,7 @@ impl Vrend {
             limits,
             shader_cfg,
             caps: _,
-            video: _,
+            video,
             ctx0,
             version,
             current,
@@ -233,6 +233,7 @@ impl Vrend {
             current,
             todo,
             blitter,
+            video: video.as_ref(),
         };
         (host, contexts)
     }

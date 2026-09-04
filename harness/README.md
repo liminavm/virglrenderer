@@ -185,10 +185,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   line, and the same against the Rust prefix diffs against the fixture. The guest's virgl driver
   configures itself from nothing else -- a format missing from `sampler` is a format the guest
   never creates, a wrong `glsl_level` is a whole feature set switched off -- and none of it is a
-  pixel, so a score cannot see it. Four lines are expected to differ, all by design.
-  `num_video_caps`/`video_caps` are empty until video is ported, and `capability_bits_v2` is
-  short the two bits the C sets for it -- `VIDEO_GUEST_PLANES` and `VIDEO_PLANAR_TARGET`, which
-  a guest reads as permission to hand us a decode target in the composite planar shape.
+  pixel, so a score cannot see it. Three lines are expected to differ, all by design.
+  `num_video_caps`/`video_caps` carry only the profiles this build both has silicon for and has
+  a decode path for, which today is VP9 alone against the C's six -- the VP9 entry itself is
+  byte-identical, and each H.264 and HEVC line closes as its leg lands. Advertising a profile
+  ahead of its leg is not a smaller deviation but a worse one: a guest picks hardware decode out
+  of the capset and has its context poisoned by the first frame it sends.
   `sampler` differs for two separate reasons: it carries the fourteen `ASTC_*_SRGB` formats the
   C's `ASTC_FORMAT` macro never registers (`virglrs/vrend-gen/gl_formats.py`), and it still
   advertises `Y8_U8_V8_420_UNORM` and `Y8_V8_U8_420_UNORM` as samplable, which the C stopped
@@ -196,7 +198,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   resource the host then refuses -- after the kernel has already handed it the handle, so the
   guest attaches backing and builds views on a resource that does not exist and has its context
   poisoned for the rest of its life. The planar half of `sampler` closes with video; the ASTC
-  half is deliberate and permanent. A fifth line is a regression.
+  half is deliberate and permanent. A fourth line is a regression.
   `vrend-vp9stock.score` is VP9 hardware decode, 963 pictures through VideoToolbox, scored the
   ordinary way: the decoded planes land in guest resources and the sweep reads them back, so 240
   of the 243 decode-target resources carry pixels with a distinct hash per frame. It was recorded
@@ -205,6 +207,17 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   tier keeps. The enhanced tier's delivered mesa takes the other shape (one composite resource,
   planes chained behind it, one two-plane IOSurface), and that is a second contract needing its
   own corpus, not a newer version of this one.
+
+  Twenty-two of its lines are expected to differ, and none of them is a decoded picture. They are
+  the plane resources of one decode target the guest creates nine times without ever destroying
+  it and never decodes into; the eight targets that do receive frames match the C on all 963.
+  Nothing in either renderer writes those planes, so what the sweep reads back is whatever the
+  driver last left in that texture memory -- undefined, stable per renderer, and different
+  between them. The signature is plain in the fixture: the generation the buffer actually holds
+  matches, and of one later generation two planes match while the third does not, which no
+  decoded frame would do. The real fix belongs in the scorer, which should not hash a resource
+  the renderer never wrote; until it does, a diff confined to those resources is the expected
+  state and a line outside them is a regression.
 
   The corpus is `vrend-vp9stock.bin`, captured with `capture.sh vrend` while decoding
   `spikes/vt-vp9-decode/vp90-2-09-aq2.webm` from the limina tree -- a real conformance clip, not
