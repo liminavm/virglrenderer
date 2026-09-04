@@ -432,6 +432,7 @@ impl Gate {
 /// reads its extent and key-ness out of the descriptor, H.264 reads key-ness out of the
 /// bitstream and takes its extent from the codec -- and the three answers the rest of the frame
 /// needs are asked for by name rather than each caller knowing which codec it has.
+#[derive(Clone)]
 enum Shape {
     Vp9(Vp9Frame),
     /// H.264: the parameter sets the last descriptor was written into, and whether an IDR slice
@@ -455,6 +456,18 @@ enum Shape {
         width: u32,
         height: u32,
     },
+    /// AV1: the frame's own descriptor, because the serializer writes the whole bitstream out of
+    /// it, and the `av1C` box the session is configured by.
+    ///
+    /// Boxed: the descriptor is a kilobyte, and every open frame would otherwise carry that much
+    /// whatever its codec.
+    Av1 {
+        desc: Box<av1::FrameDesc>,
+        config: Vec<u8>,
+        key: bool,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Shape {
@@ -462,7 +475,7 @@ impl Shape {
     fn key(&self) -> bool {
         match self {
             Shape::Vp9(frame) => frame.key,
-            Shape::H264 { key, .. } | Shape::Hevc { key, .. } => *key,
+            Shape::H264 { key, .. } | Shape::Hevc { key, .. } | Shape::Av1 { key, .. } => *key,
         }
     }
 
@@ -470,9 +483,9 @@ impl Shape {
     fn extent(&self) -> (u32, u32) {
         match self {
             Shape::Vp9(frame) => (frame.width, frame.height),
-            Shape::H264 { width, height, .. } | Shape::Hevc { width, height, .. } => {
-                (*width, *height)
-            }
+            Shape::H264 { width, height, .. }
+            | Shape::Hevc { width, height, .. }
+            | Shape::Av1 { width, height, .. } => (*width, *height),
         }
     }
 
@@ -484,6 +497,7 @@ impl Shape {
             Shape::Hevc { sets, .. } => {
                 Configuration::hevc(sets.vps.clone(), sets.sps.clone(), sets.pps.clone())
             }
+            Shape::Av1 { config, .. } => Configuration::av1c(config.clone()),
         }
     }
 
@@ -500,6 +514,9 @@ impl Shape {
         match self {
             Shape::Vp9(_) => Some(bitstream),
             Shape::H264 { .. } | Shape::Hevc { .. } => h264::annexb_to_avcc(&bitstream),
+            // AV1 never arrives here: what the guest sends is tile data, and the temporal unit
+            // around it is synthesized rather than re-framed.
+            Shape::Av1 { .. } => unreachable!("an AV1 unit is built by the serializer"),
         }
     }
 }
@@ -527,6 +544,43 @@ enum Frame {
     },
 }
 
+impl Frame {
+    /// The open frame's accumulator and shape, if it is open on that target.
+    ///
+    /// The target is checked here rather than at each caller: BEGIN_FRAME, every
+    /// DECODE_BITSTREAM and END_FRAME all name it, and three checks of one handle are three
+    /// chances to disagree.
+    fn open_on(
+        &mut self,
+        target: VideoBufferHandle,
+    ) -> Result<(&mut Vec<u8>, &mut Option<Shape>), Refusal> {
+        let Frame::Open { handle, bitstream, shape, .. } = self else {
+            return Err(Refusal::OutOfSequence("decode with no frame open"));
+        };
+        if *handle != target {
+            return Err(Refusal::OutOfSequence("decode into a target the frame was not begun on"));
+        }
+        Ok((bitstream, shape))
+    }
+}
+
+/// What the AV1 serializer needs kept between frames.
+///
+/// Only AV1 has one: the other codecs hand the guest's own bitstream over and keep nothing but a
+/// session.
+struct Av1 {
+    obu: av1::ObuState,
+    /// The shape of the last frame ended, which is the shape any unit the model is still holding
+    /// was built from -- the model holds at most one frame, and it is always the most recent.
+    last: Option<Shape>,
+    /// Where a held *hidden* frame's picture goes.
+    ///
+    /// A share, because by the time the frame goes out the guest is several frames on and may
+    /// have destroyed the buffer. `None` for a shown frame held only for its reference slot: its
+    /// picture went out when it was built, and the re-emission is decoded for the slot alone.
+    held_target: Option<Arc<Buffer>>,
+}
+
 /// One decoder the guest created.
 pub struct Codec {
     pub profile: Profile,
@@ -542,9 +596,190 @@ pub struct Codec {
     /// decode, and that arrives with the descriptor rather than with the creation arguments --
     /// a VP9 stream may change resolution or bit depth at a key frame.
     session: Option<Session>,
+    /// The AV1 serializer's state. `None` for every other profile, which needs none.
+    av1: Option<Av1>,
 }
 
 impl Codec {
+    /// Decode one unit and put the picture it produced where it belongs.
+    ///
+    /// `target` is `None` for a unit decoded for its reference value alone: an AV1 frame
+    /// re-emitted to claim its reference slot, whose picture went out a submission earlier into
+    /// a target the guest may since have recycled.
+    fn submit(
+        &mut self,
+        gl: &Gl,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        unit: &[u8],
+        target: Option<&Arc<Buffer>>,
+    ) -> Result<(), Refusal> {
+        let unserved = || Refusal::Unsupported("no CoreVideo layout for that decode target");
+        let destination = match target {
+            Some(buffer) => {
+                let Layout::Served(layout) = buffer.format else {
+                    return Err(unserved());
+                };
+                Some((buffer, layout, layout.pixels().ok_or_else(unserved)?))
+            }
+            None => None,
+        };
+        // A unit with no target expresses no opinion about the pixel layout, so the session
+        // keeps the one it has: rebuilding it around a default would tear a live session down
+        // mid-stream on any layout but NV12.
+        let pixels = match destination {
+            Some((_, _, pixels)) => pixels,
+            None => self.session.as_ref().map_or(PixelFormat::BiPlanar420, Session::pixels),
+        };
+
+        let (width, height) = shape.extent();
+        let key = SessionKey { width, height, pixels, config: shape.configuration() };
+        // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
+        // pictures with it, and every frame after one that did not need it then predicts from
+        // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
+        if !self.session.as_ref().is_some_and(|s| s.serves(&key)) && !self.adopt(&key, handle) {
+            let profile = self.profile;
+            self.session = Some(Session::create(key).map_err(|status| {
+                // The probe advertised this codec, so a host that now says it has no such
+                // decoder is contradicting itself and every later frame will fail the same way.
+                assert!(
+                    !status.is_no_such_decoder(),
+                    "VideoToolbox advertised {profile:?} and then had no decoder for it",
+                );
+                eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
+                Refusal::HostRefusedFrame
+            })?);
+        }
+        let session = self.session.as_mut().expect("a session was just built or kept");
+
+        let picture = match session.decode(unit) {
+            Ok(picture) => picture,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
+                return Err(Refusal::HostRefusedFrame);
+            }
+        };
+        // The picture comes back at its coded width. A host returning some other width has
+        // returned something that is not this frame, and delivering it puts visibly wrong
+        // content on screen with nothing anywhere reporting a problem.
+        if picture.width() != width {
+            eprintln!(
+                "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame \
+                 that declares {}; refusing it",
+                picture.width(),
+                width,
+            );
+            return Err(Refusal::HostRefusedFrame);
+        }
+        let Some((buffer, layout, _)) = destination else {
+            return Ok(());
+        };
+        let Some(locked) = picture.lock() else {
+            eprintln!("[virglrs] video codec {handle}: the decoded picture could not be mapped");
+            return Err(Refusal::HostRefusedFrame);
+        };
+        buffer.deliver(gl, layout, &locked);
+        Ok(())
+    }
+
+    /// DECODE_BITSTREAM for AV1.
+    ///
+    /// Nothing the guest sends is a bitstream: VA-API hands over a parsed frame header and the
+    /// tile data, and the whole temporal unit around it is written from the descriptor. The
+    /// descriptor is also what settles the *previous* frame's reference slot -- which slot the
+    /// guest chose is visible only in the next frame's `ref[]` -- so a held frame goes out here.
+    fn decode_av1(
+        &mut self,
+        gl: &Gl,
+        handle: VideoCodecHandle,
+        target: VideoBufferHandle,
+        descriptor: &[u8],
+        bitstream: &[u8],
+    ) -> Result<(), Refusal> {
+        let desc = match av1::FrameDesc::read(descriptor) {
+            Ok(desc) => desc,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: AV1 frame refused ({why})");
+                return Err(Refusal::HostRefusedFrame);
+            }
+        };
+        // VideoToolbox returns super-resolution frames wrongly and there is no software decoder
+        // here to fall back to, so the frame is refused rather than delivered wrong.
+        if desc.use_superres {
+            eprintln!(
+                "[virglrs] video codec {handle}: this host does not return super-resolution \
+                 frames correctly"
+            );
+            return Err(Refusal::HostRefusedFrame);
+        }
+        let config = match av1::SeqParams::read(descriptor).av1c() {
+            Ok(config) => config,
+            Err(why) => {
+                eprintln!("[virglrs] video codec {handle}: no AV1 configuration record ({why})");
+                return Err(Refusal::HostRefusedFrame);
+            }
+        };
+
+        // The held frame first, under its own shape: decode order is preserved, and it is this
+        // descriptor's reference map that makes its refresh exact.
+        let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
+        if let Some(unit) = av1.obu.flush_held(&desc) {
+            let shape = av1.last.clone().expect("a held frame was ended, so its shape was kept");
+            // `discard` says the picture was delivered when the frame first went out; the copy
+            // exists only to reach the reference slots, and its target may since have been
+            // recycled for a different frame.
+            let into = if unit.discard { None } else { av1.held_target.take() };
+            self.submit(gl, handle, &shape, &unit.bytes, into.as_ref())?;
+        }
+
+        let (accumulated, shape) = self.frame.open_on(target)?;
+        accumulated.extend_from_slice(bitstream);
+        let width = if desc.frame_width == 0 { self.width } else { u32::from(desc.frame_width) };
+        let height =
+            if desc.frame_height == 0 { self.height } else { u32::from(desc.frame_height) };
+        *shape = Some(Shape::Av1 {
+            key: desc.starts_dpb(),
+            desc: Box::new(desc),
+            config,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
+    /// END_FRAME for AV1: build the frame's temporal unit, or hold it.
+    fn end_av1_frame(
+        &mut self,
+        gl: &Gl,
+        handle: VideoCodecHandle,
+        shape: &Shape,
+        tiles: &[u8],
+        buffer: Arc<Buffer>,
+    ) -> Result<(), Refusal> {
+        let Shape::Av1 { desc, .. } = shape else {
+            unreachable!("an AV1 codec's frames carry an AV1 shape");
+        };
+        let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
+        av1.last = Some(shape.clone());
+        match av1.obu.build_temporal_unit(desc, tiles) {
+            // Nothing emitted: the serializer is holding this frame until the next descriptor
+            // says which slot the guest stored it in. Its target is held with it.
+            Ok(None) => {
+                av1.held_target = Some(buffer);
+                Ok(())
+            }
+            Ok(Some(bytes)) => self.submit(gl, handle, shape, &bytes, Some(&buffer)),
+            // A frame was built while one was still held: two temporal units would reach the
+            // decoder as one sample and lose a picture, which is what the hold exists to
+            // prevent. It cannot happen -- every descriptor flushes first -- but a broken model
+            // must not become a lost picture.
+            Err(av1::StillHolding) => {
+                eprintln!("[virglrs] video codec {handle}: an AV1 frame is still held");
+                Err(Refusal::HostRefusedFrame)
+            }
+        }
+    }
+
     /// Try to carry the live session across a change in the frame's shape.
     ///
     /// **H.264's parameter sets are not constant across a stream, and tearing the session down
@@ -630,6 +865,9 @@ pub const DESCRIPTOR_BYTES: usize = {
     if h265::DESCRIPTOR_BYTES > most {
         most = h265::DESCRIPTOR_BYTES;
     }
+    if av1::DESCRIPTOR_BYTES > most {
+        most = av1::DESCRIPTOR_BYTES;
+    }
     most
 };
 
@@ -639,6 +877,7 @@ const _: () = {
     assert!(DESCRIPTOR_BYTES >= Vp9Frame::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= h264::DESCRIPTOR_BYTES);
     assert!(DESCRIPTOR_BYTES >= h265::DESCRIPTOR_BYTES);
+    assert!(DESCRIPTOR_BYTES >= av1::DESCRIPTOR_BYTES);
 };
 
 /// How many planes a guest lays a format out in when it hands the whole picture over as one
@@ -691,6 +930,7 @@ pub fn advertised(support: Option<&videotoolbox::Support>) -> Vec<Profile> {
         Profile::H264Baseline,
         Profile::H264Main,
         Profile::H264High,
+        Profile::Av1Main,
         Profile::HevcMain,
     ]
     .into_iter()
@@ -748,6 +988,11 @@ impl Video {
             gate: Gate::AwaitingKey { dropped: 0, freeze: None },
             frame: Frame::Idle,
             session: None,
+            av1: (profile == Profile::Av1Main).then(|| Av1 {
+                obu: av1::ObuState::new(),
+                last: None,
+                held_target: None,
+            }),
         });
         Ok(())
     }
@@ -828,6 +1073,7 @@ impl Video {
     /// the guest actually attached.
     pub fn decode_bitstream(
         &mut self,
+        gl: &Gl,
         codec: VideoCodecHandle,
         target: VideoBufferHandle,
         descriptor: &[u8],
@@ -836,13 +1082,15 @@ impl Video {
         let handle = codec;
         let codec = self.codec_mut(codec)?;
         let (profile, width, height) = (codec.profile, codec.width, codec.height);
-        let Frame::Open { handle: began_on, bitstream: accumulated, shape, .. } = &mut codec.frame
-        else {
-            return Err(Refusal::OutOfSequence("decode with no frame open"));
-        };
-        if *began_on != target {
-            return Err(Refusal::OutOfSequence("decode into a target the frame was not begun on"));
+        // AV1 is the odd one and takes the whole call: its descriptor settles the *previous*
+        // frame's reference slot, so a frame the serializer is holding goes out here rather than
+        // at END_FRAME -- and a stream may display a hidden frame just one decode later, which
+        // leaves no margin.
+        if profile == Profile::Av1Main {
+            return codec.decode_av1(gl, handle, target, descriptor, bitstream);
         }
+
+        let (accumulated, shape) = codec.frame.open_on(target)?;
         // Accumulated first: H.264 reads the shape back out of the slice headers, so the answer
         // depends on the bytes this very call carried.
         accumulated.extend_from_slice(bitstream);
@@ -907,11 +1155,8 @@ impl Video {
                 let key = shape.as_ref().is_some_and(Shape::key) || desc.key;
                 *shape = Some(Shape::Hevc { sets, key, width, height });
             }
-            // Unreachable: `create_codec` refuses a profile `advertised` does not list, and
-            // nothing is listed without a leg here.
-            Profile::Av1Main => {
-                return Err(Refusal::Unsupported("no decode path for that profile"));
-            }
+            // Handled above, before the frame was even reached.
+            Profile::Av1Main => unreachable!("AV1 takes the whole call"),
         }
         Ok(())
     }
@@ -953,61 +1198,16 @@ impl Video {
             return Ok(());
         }
 
-        let Layout::Served(layout) = buffer.format else {
-            return Err(Refusal::Unsupported("no CoreVideo layout for that decode target"));
-        };
-        let Some(pixels) = layout.pixels() else {
-            return Err(Refusal::Unsupported("no CoreVideo layout for that decode target"));
-        };
-        let (width, height) = shape.extent();
-        let key = SessionKey { width, height, pixels, config: shape.configuration() };
-        // Rebuilt only when the frame's shape actually changes: a rebuild takes the reference
-        // pictures with it, and every frame after one that did not need it then predicts from
-        // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
-        if !codec.session.as_ref().is_some_and(|s| s.serves(&key)) && !codec.adopt(&key, handle) {
-            codec.session = Some(Session::create(key).map_err(|status| {
-                // The probe advertised this codec, so a host that now says it has no such
-                // decoder is contradicting itself and every later frame will fail the same way.
-                assert!(
-                    !status.is_no_such_decoder(),
-                    "VideoToolbox advertised {:?} and then had no decoder for it",
-                    codec.profile,
-                );
-                eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
-                Refusal::HostRefusedFrame
-            })?);
+        // AV1's unit is synthesized from the descriptor rather than re-framed from what the
+        // guest sent, and may be held rather than submitted at all.
+        if let Shape::Av1 { .. } = shape {
+            return codec.end_av1_frame(gl, handle, &shape, &bitstream, buffer);
         }
-        let session = codec.session.as_mut().expect("a session was just built or kept");
-
         let Some(unit) = shape.access_unit(bitstream) else {
             eprintln!("[virglrs] video codec {handle}: the access unit is not Annex-B framed");
             return Err(Refusal::HostRefusedFrame);
         };
-        let picture = match session.decode(&unit) {
-            Ok(picture) => picture,
-            Err(why) => {
-                eprintln!("[virglrs] video codec {handle}: the host decoded no picture ({why:?})");
-                return Err(Refusal::HostRefusedFrame);
-            }
-        };
-        // The picture comes back at its coded width. A host returning some other width has
-        // returned something that is not this frame, and delivering it puts visibly wrong
-        // content on screen with nothing anywhere reporting a problem.
-        if picture.width() != width {
-            eprintln!(
-                "[virglrs] video codec {handle}: the host returned a {}-wide picture for a frame \
-                 that declares {}; refusing it",
-                picture.width(),
-                width,
-            );
-            return Err(Refusal::HostRefusedFrame);
-        }
-        let Some(locked) = picture.lock() else {
-            eprintln!("[virglrs] video codec {handle}: the decoded picture could not be mapped");
-            return Err(Refusal::HostRefusedFrame);
-        };
-        buffer.deliver(gl, layout, &locked);
-        Ok(())
+        codec.submit(gl, handle, &shape, &unit, Some(&buffer))
     }
 }
 
@@ -1114,11 +1314,11 @@ mod tests {
         let list = advertised(Some(&support));
 
         assert!(list.iter().all(|profile| support.decodes(profile.codec())));
-        for profile in [Profile::Vp9Profile0, Profile::H264Main, Profile::HevcMain] {
+        for profile in
+            [Profile::Vp9Profile0, Profile::H264Main, Profile::HevcMain, Profile::Av1Main]
+        {
             assert_eq!(list.contains(&profile), support.decodes(profile.codec()));
         }
-        // No leg here yet, whatever the silicon says.
-        assert!(!list.contains(&Profile::Av1Main));
     }
 
     /// A frame's shape answers for its own codec: VP9 is handed on as it arrived, H.264 is
@@ -1166,5 +1366,20 @@ mod tests {
             hevc.access_unit(vec![0, 0, 1, 0x26, 0x01, 0xaf]),
             Some(vec![0, 0, 0, 3, 0x26, 0x01, 0xaf])
         );
+
+        // AV1's configuration is an av1C box, and its extent comes from the descriptor the
+        // serializer writes the whole unit out of.
+        let blob = av1::test_descriptor(640, 360);
+        let desc = av1::FrameDesc::read(&blob).expect("a Main frame");
+        let av1 = Shape::Av1 {
+            key: desc.starts_dpb(),
+            desc: Box::new(desc),
+            config: av1::SeqParams::read(&blob).av1c().expect("a Main sequence header"),
+            width: 640,
+            height: 360,
+        };
+        assert!(!av1.key());
+        assert_eq!(av1.extent(), (640, 360));
+        assert!(matches!(av1.configuration(), Configuration::Av1c(_)));
     }
 }

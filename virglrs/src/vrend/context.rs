@@ -3391,7 +3391,8 @@ impl Context {
             false,
         )?;
         let bitstream = self.read_guest_bytes(host, cmd, buffer, buffer_size, true)?;
-        video_result(cmd, self.video.decode_bitstream(codec, target, &descriptor, &bitstream))
+        let out = self.video.decode_bitstream(host.gl, codec, target, &descriptor, &bitstream);
+        video_result(cmd, out)
     }
 
     /// The first `want` bytes of a resource's guest pages.
