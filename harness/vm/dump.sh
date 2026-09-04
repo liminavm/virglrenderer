@@ -18,7 +18,7 @@ RIG="$(pwd)"
 # do not have to overwrite each other.
 case "${1:-}" in
   '') echo "usage: dump.sh {synoik|venus|vrend|<name>}" >&2; exit 2 ;;
-  vrend) FIFO="$RIG/captures/vrend.fifo"; OUT="$RIG/captures/vrend.bin" ;;
+  vrend*) FIFO="$RIG/captures/$1.fifo"; OUT="$RIG/captures/$1.bin" ;;
   *) FIFO="$RIG/captures/$1.fifo"; OUT="$RIG/captures/$1.vkrc" ;;
 esac
 
@@ -32,7 +32,8 @@ done
 [ -s "$OUT" ] || { echo "nothing written to $OUT" >&2; exit 1; }
 
 ls -lh "$OUT"
-if [ "$1" != vrend ]; then
+case "$1" in vrend*) is_vrend=1 ;; *) is_vrend=0 ;; esac
+if [ "$is_vrend" = 0 ]; then
   python3 "$RIG/../replay/vkr-record-decode.py" "$OUT" --check
   python3 "$RIG/../replay/vkr-record-decode.py" "$OUT"
 else

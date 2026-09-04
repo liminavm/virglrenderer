@@ -160,7 +160,13 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
   the diff between the two is the positive control: 19 offscreens lose their ink, and all three
   1280x800 scanout IOSurfaces go from distinct fully-inked hashes to one shared all-zero hash. An
-  empty diff would mean the oracle measures nothing. `synoik.score` is the venus content fixture:
+  empty diff would mean the oracle measures nothing. `vrend-desktop.score` is the same guest's
+  GNOME session with its wallpaper: 316 offscreens from `vrend-desktop.bin`, captured with a
+  512 MB tracer (`capture.sh vrend --mb 512 --out desktop`) because the wallpaper is one 64 MiB
+  transfer, and the corpus that carries it also carries the mip chain the guest builds from it
+  with eleven blits and the overview composited over it. The tracer once dropped any transfer
+  past 1 MiB, and that corpus replayed to a flat-colour desktop that measured none of this.
+  `synoik.score` is the venus content fixture:
   its capture was taken mid-workload, so 22 device allocations are still live and half of them
   carry GPU-written bytes. `venus.score` and `synoik-lifecycle.score` are the lifecycle fixtures:
   vkmark runs to completion and the synoik session is stopped before its dump, so every context

@@ -18,6 +18,7 @@
 #                 capture under the same name silently replaces what a fixture was measured
 #                 against — give a new capture its own name rather than the one already spoken
 #                 for. `synoik` and `synoik-lifecycle` are two such corpora of one workload.
+#                 A vrend capture is named vrend-NAME and written as a .bin.
 #   --window      show the guest in a window (default: headless, so a capture does not take over
 #                 the screen). Headless still attaches a virtio-gpu and drives the whole renderer
 #                 -- presented frames go to a PNG instead of a window. Omitting BOTH would attach
@@ -68,9 +69,11 @@ case "$MODE" in
     OUT="$LIMINA_VKR_RECORD_OUT" ;;
   vrend)
     DISK="$RIG/disks/Fedora-Workstation-44.stock.test.raw"
+    # A classic corpus is named vrend*, which is how dump.sh knows to write a .bin.
+    case "$NAME" in vrend*) ;; *) NAME="vrend-$NAME" ;; esac
     export LIMINA_VREND_TRACE="$MB"
-    export LIMINA_VREND_TRACE_OUT="$RIG/captures/vrend.bin"
-    export LIMINA_VREND_TRACE_FIFO="$RIG/captures/vrend.fifo"
+    export LIMINA_VREND_TRACE_OUT="$RIG/captures/$NAME.bin"
+    export LIMINA_VREND_TRACE_FIFO="$RIG/captures/$NAME.fifo"
     OUT="$LIMINA_VREND_TRACE_OUT" ;;
   *) echo "usage: capture.sh {synoik|venus|vrend} [--mb N] [--out NAME] [--window] [--seconds N]" >&2
      exit 2 ;;

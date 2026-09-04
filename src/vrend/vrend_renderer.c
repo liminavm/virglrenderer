@@ -10698,10 +10698,12 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                               : util_format_get_2d_size(res->base.format, stride,
                                                         u_minify(res->base.height0, info->level));
       uint64_t size = vrend_transfer_size(res, info, stride, layer_stride);
-      /* Bounded: a stray huge transfer must not evict the whole ring. The buffers this spike
-       * needs are kilobytes; anything past the cap is recorded truncated and says so via its
-       * payload length being short of the transfer's own extent. */
-      if (size > 0 && size <= (1u << 20)) {
+      /* The only bound is the ring's own: trace_put refuses a record past half the ring. A
+       * desktop's wallpaper is one 64 MiB transfer, and a corpus that drops it replays to a
+       * flat-colour background -- which draws differently enough (a mip chain, the blits that
+       * build it, what is composited over it) that the replay stops measuring the desktop. Size
+       * the ring for the workload (--mb) rather than truncating what it carries. */
+      if (size > 0 && size <= UINT32_MAX) {
          void *tmp = malloc((size_t)size);
          if (tmp) {
             vrend_read_from_iovec(iov, num_iovs, info->offset, tmp, (size_t)size);
