@@ -206,6 +206,14 @@ pub enum Fault {
         cmd: Cmd,
         handle: ResourceHandle,
     },
+    /// Arguments that describe no image the host can make. The guest's half of a failed
+    /// upgrade, and the only half of one that is a fault: whether the host can *adopt* a
+    /// resource's bytes is the host's own answer and degrades rather than faulting.
+    RefusedResource {
+        cmd: Cmd,
+        handle: ResourceHandle,
+        why: resource::Refusal,
+    },
     /// A handle that is attached and carries storage, but that nothing has typed yet. Distinct
     /// from [`Fault::IllegalResource`] on purpose: the guest is owed the difference between a
     /// resource it never attached and one it attached and has not described.
@@ -272,6 +280,9 @@ impl fmt::Display for Fault {
             }
             Fault::IllegalResource { cmd, handle } => {
                 write!(f, "{}: no such resource {handle}", cmd.name())
+            }
+            Fault::RefusedResource { cmd, handle, why } => {
+                write!(f, "{}: resource {handle} cannot be made: {why:?}", cmd.name())
             }
             Fault::UntypedResource { cmd, handle } => {
                 write!(f, "{}: resource {handle} is attached but nothing has typed it", cmd.name())
@@ -3027,8 +3038,7 @@ impl Context {
             }
             Err((untyped, why)) => {
                 host.resources.insert(resource, resource::Slot::Untyped(untyped));
-                eprintln!("[virglrs] vrend: resource {resource} cannot be typed: {why:?}");
-                Err(Fault::IllegalResource { cmd, handle: resource })
+                Err(Fault::RefusedResource { cmd, handle: resource, why })
             }
         }
     }
