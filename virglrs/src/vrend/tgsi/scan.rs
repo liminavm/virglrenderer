@@ -11,15 +11,14 @@
 //! rule, before any translation.
 
 use super::*;
+use crate::vrend::pipe::slots;
 use std::fmt;
 
-/// `PIPE_MAX_SHADER_INPUTS` and `PIPE_MAX_SHADER_OUTPUTS`.
-const MAX_SHADER_INPUTS: u32 = 80;
-const MAX_SHADER_OUTPUTS: u32 = 80;
-/// `PIPE_MAX_SAMPLERS`.
-const MAX_SAMPLERS: u32 = 32;
-/// `PIPE_MAX_CONSTANT_BUFFERS`.
-const MAX_CONSTANT_BUFFERS: u32 = 32;
+// The scan compares against register indices, which are `unsigned` in the C.
+const MAX_SHADER_INPUTS: u32 = slots::MAX_SHADER_INPUTS as u32;
+const MAX_SHADER_OUTPUTS: u32 = slots::MAX_SHADER_OUTPUTS as u32;
+const MAX_SAMPLERS: u32 = slots::MAX_SAMPLERS as u32;
+const MAX_CONSTANT_BUFFERS: u32 = slots::MAX_CONSTANT_BUFFERS as u32;
 
 /// Why the scan said no, in the C's words.
 #[derive(Clone, PartialEq, Eq, Debug)]

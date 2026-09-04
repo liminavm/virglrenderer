@@ -16,6 +16,7 @@ use super::formats::Table;
 use super::gl::Gl;
 use super::gl::gles::*;
 use super::gl::{GLenum, GLsizei, GLuint};
+use super::pipe::slots;
 use super::pipe::{PrimType, ShaderStage};
 use super::proto::{FORMAT_MAX, Format};
 use super::resource::Limits;
@@ -239,12 +240,12 @@ pub struct CapsV2 {
 pub const VIRGL_VERSION: u32 = 1;
 pub const VIRGL2_VERSION: u32 = 2;
 
-/// `PIPE_MAX_SHADER_BUFFERS`, `PIPE_MAX_SHADER_IMAGES`, `PIPE_MAX_SAMPLERS`,
-/// `VREND_MAX_COMBINED_SSBO_BINDING_POINTS`.
-const PIPE_MAX_SHADER_BUFFERS: u32 = 32;
-const PIPE_MAX_SHADER_IMAGES: u32 = 64;
-const PIPE_MAX_SAMPLERS: u32 = 32;
-const MAX_COMBINED_SSBO_BINDING_POINTS: u32 = 32;
+/// What the guest is told it has is what the decoder admits and what the state can hold: the
+/// gallium slot caps, as a caps field's `u32`.
+const PIPE_MAX_SHADER_BUFFERS: u32 = slots::MAX_SHADER_BUFFERS as u32;
+const PIPE_MAX_SHADER_IMAGES: u32 = slots::MAX_SHADER_IMAGES as u32;
+const PIPE_MAX_SAMPLERS: u32 = slots::MAX_SAMPLERS as u32;
+const MAX_COMBINED_SSBO_BINDING_POINTS: u32 = slots::MAX_COMBINED_SSBO_BINDING_POINTS;
 
 impl CapsV2 {
     /// The bytes a caller asking for capset 2 reads.

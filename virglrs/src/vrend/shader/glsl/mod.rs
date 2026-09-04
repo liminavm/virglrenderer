@@ -123,7 +123,7 @@ pub(super) const MAX_IO: usize = 64;
 /// The C's `system_values[32]`.
 const MAX_SYSTEM_VALUES: usize = 32;
 /// The C's `samplers[32]`.
-pub(super) const MAX_SAMPLERS: usize = 32;
+pub(super) use crate::vrend::pipe::slots::MAX_SAMPLERS;
 /// `MAX_IMMEDIATE`.
 const MAX_IMMEDIATE: usize = 1024;
 

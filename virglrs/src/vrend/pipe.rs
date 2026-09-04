@@ -12,6 +12,47 @@
 //! Values are gallium's own (`p_defines.h`), because the wire is defined by them: renumbering one
 //! would silently change what a guest's stream means.
 
+/// How many slots of each kind a gallium context has (`p_state.h`), which is the same number
+/// three ways: what the decoder admits from the guest, what the state a stage carries is sized
+/// for, and what the capset advertises. Each is one constant here, because a decoder that admits
+/// a slot the state cannot hold drops it silently, and a capset that advertises more than the
+/// decoder admits invites a guest to be refused for taking us at our word.
+pub mod slots {
+    /// `PIPE_MAX_ATTRIBS`.
+    pub const MAX_ATTRIBS: usize = 32;
+    /// `PIPE_MAX_COLOR_BUFS`.
+    pub const MAX_COLOR_BUFS: usize = 8;
+    /// `PIPE_MAX_CONSTANT_BUFFERS`.
+    pub const MAX_CONSTANT_BUFFERS: usize = 32;
+    /// `PIPE_MAX_HW_ATOMIC_BUFFERS`.
+    pub const MAX_HW_ATOMIC_BUFFERS: usize = 32;
+    /// `PIPE_MAX_SAMPLERS`. A sampler index is what a translated shader names, so this is also
+    /// the width of every per-sampler mask the draw path carries.
+    pub const MAX_SAMPLERS: usize = 32;
+    /// `PIPE_MAX_SHADER_BUFFERS`.
+    pub const MAX_SHADER_BUFFERS: usize = 32;
+    /// `PIPE_MAX_SHADER_IMAGES`.
+    pub const MAX_SHADER_IMAGES: usize = 32;
+    /// `PIPE_MAX_SHADER_INPUTS`.
+    pub const MAX_SHADER_INPUTS: usize = 80;
+    /// `PIPE_MAX_SHADER_OUTPUTS`.
+    pub const MAX_SHADER_OUTPUTS: usize = 80;
+    /// `PIPE_MAX_SHADER_SAMPLER_VIEWS`. Larger than [`MAX_SAMPLERS`] on purpose: a guest may set
+    /// a view in any of these slots, and only the first `MAX_SAMPLERS` can be sampled from.
+    pub const MAX_SHADER_SAMPLER_VIEWS: usize = 128;
+    /// `PIPE_MAX_SO_OUTPUTS`.
+    pub const MAX_SO_OUTPUTS: usize = 64;
+    /// `PIPE_MAX_VIEWPORTS`.
+    pub const MAX_VIEWPORTS: usize = 16;
+    /// `VIRGL_NUM_CLIP_PLANES`.
+    pub const NUM_CLIP_PLANES: usize = 8;
+    /// `VREND_POLYGON_STIPPLE_SIZE`.
+    pub const POLYGON_STIPPLE_SIZE: usize = 32;
+    /// `VREND_MAX_COMBINED_SSBO_BINDING_POINTS`: the SSBO binding points share one 32-bit mask
+    /// across every stage.
+    pub const MAX_COMBINED_SSBO_BINDING_POINTS: u32 = 32;
+}
+
 /// An enum whose values are the wire's integers, parsed by `from_wire` and written by `wire`.
 macro_rules! wire_enum {
     ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $variant:ident = $val:literal),+ $(,)? }) => {

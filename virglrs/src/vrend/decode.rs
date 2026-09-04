@@ -17,21 +17,12 @@
 //! guest that mis-framed one command has forfeited the claim that the next header is a header.
 //! What the caller does with the context afterwards is its business -- the C poisons it.
 
+use super::pipe::slots::*;
 use super::pipe::*;
 use super::proto::*;
 use crate::ids::{BlobId, ResourceHandle};
 
 /// Gallium's limits, from `p_state.h`, as the C decoder applies them.
-const MAX_SO_OUTPUTS: usize = 64;
-const MAX_VIEWPORTS: usize = 16;
-const MAX_ATTRIBS: usize = 32;
-const MAX_COLOR_BUFS: usize = 8;
-const MAX_SHADER_SAMPLER_VIEWS: usize = 128;
-const MAX_SAMPLERS: usize = 32;
-const MAX_CONSTANT_BUFFERS: u32 = 32;
-const MAX_SHADER_BUFFERS: usize = 32;
-const MAX_HW_ATOMIC_BUFFERS: usize = 32;
-const MAX_SHADER_IMAGES: usize = 32;
 const MAX_STREAMOUT_TARGETS: usize = 16;
 /// `VIRGL_GBM_MAX_PLANES`.
 const MAX_PLANES: usize = 4;
@@ -432,7 +423,7 @@ pub fn decode<'a>(cmd: Cmd, obj: u32, words: &'a [u32]) -> Result<Command<'a>, R
         Cmd::SetUniformBuffer => {
             w.exact(5)?;
             let index = w.u(2);
-            if index >= MAX_CONSTANT_BUFFERS {
+            if index as usize >= MAX_CONSTANT_BUFFERS {
                 return Err(w.refuse("index", index));
             }
             Command::SetUniformBuffer {
