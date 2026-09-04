@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 pub(crate) use super::gl::types;
 use super::gl::{Gles, ProcAddr};
-use crate::metal::Surface;
+use crate::metal::{Held, Surface};
 
 #[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code, clippy::all)]
 pub mod proc {
@@ -171,13 +171,16 @@ const EGL_IOSURFACE_LIMINA: EGLenum = 0x3B9A;
 
 /// An EGL image over an IOSurface, which is the surface's bytes seen as a GL texture's storage.
 ///
-/// Owns the surface it was made from, so the image cannot outlive what it images: the driver
-/// keeps its own reference to the IOSurface, but ours is what keeps the id the compositor was
-/// handed naming this surface and not a stranger's minted after it.
+/// Holds a share of the surface it was made from, so the image cannot outlive what it images:
+/// the driver keeps its own reference to the IOSurface, but ours is what keeps the id the
+/// compositor was handed naming this surface and not a stranger's minted after it.
+///
+/// The share is the owner's, whoever that is -- see [`Held`]. An image over a venus allocation's
+/// surface keeps that allocation's charge standing for exactly as long as the texture does.
 pub struct Image {
     shared: Arc<Shared>,
     image: EGLImageKHR,
-    surface: Arc<Surface>,
+    held: Arc<dyn Held>,
 }
 
 // SAFETY: `image` is an EGL token, for the reason `Shared`'s impl gives, and the surface is
@@ -189,7 +192,7 @@ unsafe impl Sync for Image {}
 impl Image {
     /// The surface this images.
     pub fn surface(&self) -> &Surface {
-        &self.surface
+        self.held.surface()
     }
 
     /// The token GL binds as texture storage (`GLeglImageOES`). For the GL bindings only, which
@@ -409,7 +412,7 @@ impl Winsys {
     /// Made against no context: the image belongs to the display, and any context on it may
     /// bind it. Fails, naming the call, when the driver will not import the surface -- the
     /// resource then keeps ordinary GL storage, and the caller says so.
-    pub fn image_from_iosurface(&self, surface: Arc<Surface>) -> Result<Image, EglError> {
+    pub fn image_from_iosurface(&self, held: Arc<dyn Held>) -> Result<Image, EglError> {
         let egl = &self.shared.egl;
         // SAFETY: the display is initialised; the target is the one limina's Mesa defines for an
         // `IOSurfaceRef` client buffer, and `surface` is held by the `Image` for as long as the
@@ -420,14 +423,14 @@ impl Winsys {
                 self.shared.display,
                 proc::EGL_NO_CONTEXT,
                 EGL_IOSURFACE_LIMINA,
-                surface.client_buffer(),
+                held.surface().client_buffer(),
                 core::ptr::null(),
             )
         };
         if image.is_null() {
             return Err(self.shared.error("eglCreateImageKHR"));
         }
-        Ok(Image { shared: Arc::clone(&self.shared), image, surface })
+        Ok(Image { shared: Arc::clone(&self.shared), image, held })
     }
 
     /// The GLES entry points. Resolved through `eglGetProcAddress`, which for Mesa answers the

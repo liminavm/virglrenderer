@@ -3611,7 +3611,26 @@ pub struct Charged<T> {
     charge: Charge,
 }
 
+impl crate::metal::Held for Charged<Surface> {
+    fn surface(&self) -> &Surface {
+        &self.it
+    }
+}
+
 impl Storage {
+    /// A share of this storage, as the keepalive an EGL image over its surface must hold.
+    ///
+    /// `None` when the storage is pages: there is no surface to image, and the reason is the
+    /// storage's own to give. Handing out the `Charged` share rather than a fresh one over the
+    /// same surface is what keeps this allocation's charge standing for as long as the image
+    /// does -- see [`crate::metal::Held`].
+    pub fn held(&self) -> Option<Arc<dyn crate::metal::Held>> {
+        match self {
+            Storage::Texture(t) => Some(Arc::clone(t) as Arc<dyn crate::metal::Held>),
+            Storage::Linear(_) => None,
+        }
+    }
+
     /// A share over a real surface, charged to `account`, for a test outside this module.
     #[cfg(test)]
     pub(crate) fn minted_for_test(surface: Surface, account: &Account) -> Storage {
