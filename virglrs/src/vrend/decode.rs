@@ -328,7 +328,7 @@ pub fn decode<'a>(cmd: Cmd, obj: u32, words: &'a [u32]) -> Result<Command<'a>, R
             }
             3 => Command::SetIndexBuffer(Some(IndexBuffer {
                 resource: w.resource("index buffer", 1)?,
-                index_size: w.u(2),
+                index_type: w.parse("index size", w.u(2), IndexType::from_wire)?,
                 offset: w.u(3),
             })),
             _ => return Err(w.length()),
@@ -488,15 +488,23 @@ pub fn decode<'a>(cmd: Cmd, obj: u32, words: &'a [u32]) -> Result<Command<'a>, R
                 w.slots(start_slot, n, MAX_SHADER_IMAGES)?;
             }
             let images = (0..n)
-                .map(|i| -> Result<ShaderImage, Refused> {
+                .map(|i| -> Result<Option<ShaderImage>, Refused> {
                     let at = 3 + i * 5;
-                    Ok(ShaderImage {
+                    let Some(resource) = w.resource_or_none(at + 4) else {
+                        // An unbind is all zeros; anything else in its dwords would not
+                        // reproduce.
+                        if w.w[at..at + 4].iter().any(|&d| d != 0) {
+                            return Err(w.refuse("unbound image", w.u(at + 1)));
+                        }
+                        return Ok(None);
+                    };
+                    Ok(Some(ShaderImage {
                         format: w.format("image format", at)?,
-                        access: w.u(at + 1),
+                        access: w.parse("image access", w.u(at + 1), ImageAccess::from_wire)?,
                         layer_offset: w.u(at + 2),
                         level_size: w.u(at + 3),
-                        resource: w.resource_or_none(at + 4),
-                    })
+                        resource,
+                    }))
                 })
                 .collect::<Result<_, _>>()?;
             Command::SetShaderImages { stage, start_slot, images }
@@ -1124,7 +1132,11 @@ fn shader<'a>(w: &Words<'a>) -> Result<ShaderCreate<'a>, Refused> {
                     register_index: o as u8,
                     start_component: ((o >> 8) & 0x3) as u8,
                     num_components: ((o >> 10) & 0x7) as u8,
-                    output_buffer: ((o >> 13) & 0x7) as u8,
+                    output_buffer: w.parse(
+                        "output buffer",
+                        (o >> 13) & 0x7,
+                        SoBuffer::from_wire,
+                    )?,
                     dst_offset: (o >> 16) as u16,
                     stream: s as u8,
                 });
@@ -1195,7 +1207,7 @@ mod tests {
                             register_index: 3,
                             start_component: 1,
                             num_components: 2,
-                            output_buffer: 2,
+                            output_buffer: SoBuffer::from_wire(2).unwrap(),
                             dst_offset: 4,
                             stream: 1,
                         },
@@ -1203,7 +1215,7 @@ mod tests {
                             register_index: 0,
                             start_component: 0,
                             num_components: 4,
-                            output_buffer: 0,
+                            output_buffer: SoBuffer::from_wire(0).unwrap(),
                             dst_offset: 0,
                             stream: 0,
                         },
@@ -1459,7 +1471,11 @@ mod tests {
                 views: vec![Some(o(6)), None, Some(o(6))],
             },
             Command::SetIndexBuffer(None),
-            Command::SetIndexBuffer(Some(IndexBuffer { resource: r(7), index_size: 2, offset: 8 })),
+            Command::SetIndexBuffer(Some(IndexBuffer {
+                resource: r(7),
+                index_type: IndexType::U16,
+                offset: 8,
+            })),
             Command::SetConstantBuffer { stage: ShaderStage::Vertex, index: 0, data: text },
             Command::SetConstantBuffer { stage: ShaderStage::Geometry, index: 1, data: &[] },
             Command::SetStencilRef { front: 0x12, back: 0x34 },
@@ -1533,13 +1549,16 @@ mod tests {
             Command::SetShaderImages {
                 stage: ShaderStage::Fragment,
                 start_slot: 0,
-                images: vec![ShaderImage {
-                    format: fmt(67),
-                    access: 3,
-                    layer_offset: 1,
-                    level_size: 2,
-                    resource: Some(r(9)),
-                }],
+                images: vec![
+                    Some(ShaderImage {
+                        format: fmt(67),
+                        access: ImageAccess::ReadWrite,
+                        layer_offset: 1,
+                        level_size: 2,
+                        resource: r(9),
+                    }),
+                    None,
+                ],
             },
             Command::MemoryBarrier(0x3),
             Command::LaunchGrid {
@@ -1999,9 +2018,26 @@ mod tests {
             refused(&[1 | (6 << 8) | (6 << 16), 1, 9, 67, 0, 0, 6]),
             Refused::Field { field: "swizzle", value: 6, .. }
         ));
-        // An index buffer with a handle but no size, and one with a size but no handle.
+        // An index buffer with a handle but no size, and one with a size but no handle; and
+        // a width that is not one, two or four bytes, which the C drew as four while sizing its
+        // bounds check by the value as sent.
         assert!(matches!(refused(&[11 | (1 << 16), 7]), Refused::Field { .. }));
         assert!(matches!(refused(&[11 | (3 << 16), 0, 2, 0]), Refused::Field { .. }));
+        assert!(matches!(
+            refused(&[11 | (3 << 16), 7, 3, 0]),
+            Refused::Field { field: "index size", value: 3, .. }
+        ));
+        // An image with no access, which the C refused only at the draw, abandoning the rest of
+        // the stage's images with it.
+        assert!(matches!(
+            refused(&[35 | (7 << 16), 1, 0, 67, 0, 0, 0, 9]),
+            Refused::Field { field: "image access", value: 0, .. }
+        ));
+        // A stream output naming a buffer past the four the strides describe: three wire bits
+        // for a four-entry table, which the C indexed as sent.
+        let mut so = vec![1 | (4 << 8) | (14 << 16), 5, 0, 8, 1, 1, 16, 0, 0, 0, 4 << 13, 0, 0, 0];
+        so.push(0);
+        assert!(matches!(refused(&so), Refused::Field { field: "output buffer", value: 4, .. }));
         // A draw whose flags are not 0 or 1 would not reproduce through `!!`.
         let mut draw = vec![8 | (12 << 16), 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(matches!(refused(&draw), Refused::Field { field: "indexed", value: 2, .. }));

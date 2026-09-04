@@ -425,7 +425,7 @@ pub struct Ssbo {
 pub struct ImageView {
     pub resource: ResourceHandle,
     pub format: Format,
-    pub access: u32,
+    pub access: ImageAccess,
     pub layer_offset: u32,
     pub level_size: u32,
 }
@@ -638,6 +638,26 @@ impl SubCtx {
             _ => unreachable!("looked up as a surface"),
         }
     }
+}
+
+/// Empty every view slot naming `handle` and mark each for rebinding. Whether any did.
+fn evict_view(
+    views: &mut [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT],
+    views_dirty: &mut [u32; ShaderStage::COUNT],
+    handle: ObjectHandle,
+) -> bool {
+    let mut held = false;
+    for (stage, slots) in views.iter_mut().enumerate() {
+        let gone: Vec<u32> = slots.iter().filter(|(_, h)| **h == handle).map(|(s, _)| *s).collect();
+        for slot in gone {
+            slots.remove(&slot);
+            if slot < 32 {
+                views_dirty[stage] |= 1 << slot;
+            }
+            held = true;
+        }
+    }
+    held
 }
 
 /// Release an object's GL side. The sub-context that made it is current.
@@ -1176,6 +1196,18 @@ impl Context {
                 let sub = self.sub_mut();
                 if sub.ve == Some(handle) {
                     sub.ve = None;
+                }
+            }
+            Object::SamplerView(_) => {
+                // The C's slot holds a reference, so a view destroyed while bound keeps
+                // sampling until the slot is rebound. A slot here names the view by handle,
+                // and a handle the guest has freed is reused by its next create: left in
+                // place, the slot would answer "already bound" to the new view and keep the
+                // old texture on the unit. Every slot holding it is emptied and marked, so
+                // the next draw rebinds the unit and reselects the key the view fed.
+                let sub = self.sub_mut();
+                if evict_view(&mut sub.views, &mut sub.views_dirty, handle) {
+                    sub.shader_dirty = true;
                 }
             }
             Object::SamplerState(_) => {
@@ -2481,26 +2513,50 @@ impl Context {
         host: &mut Host<'_>,
         stage: ShaderStage,
         start_slot: u32,
-        images: &[ShaderImage],
+        images: &[Option<ShaderImage>],
     ) -> Result<(), Fault> {
         let cmd = Cmd::SetShaderImages;
         for (i, im) in images.iter().enumerate() {
             let slot = start_slot + i as u32;
-            match im.resource {
+            match im {
                 None => {
                     self.sub_mut().images[stage.index()].remove(&slot);
                 }
-                Some(r) => {
+                Some(im) => {
+                    let r = im.resource;
                     if !host.has(Feature::images) {
                         return Err(Fault::Unimplemented { cmd, what: "shader images" });
                     }
                     let res = host.resource(cmd, r)?;
-                    if matches!(res.storage, Storage::Texture { .. }) {
-                        let (first, last) =
-                            (im.layer_offset & 0xffff, (im.layer_offset >> 16) & 0xffff);
-                        if last.wrapping_sub(first).wrapping_add(1) & 0xffff == 0 {
-                            return Err(Fault::OutOfRange { cmd, what: "image layers" });
+                    match res.storage {
+                        Storage::Texture { .. } => {
+                            let (first, last) =
+                                (im.layer_offset & 0xffff, (im.layer_offset >> 16) & 0xffff);
+                            if last.wrapping_sub(first).wrapping_add(1) & 0xffff == 0 {
+                                return Err(Fault::OutOfRange { cmd, what: "image layers" });
+                            }
                         }
+                        Storage::Buffer { .. } => {
+                            // A buffer image is a texel range: `layer_offset` and `level_size`
+                            // are its byte offset and length. The C binds a range past the
+                            // host's texel limit shortened to fit, reporting success for a
+                            // view it did not make; the range is the guest's claim about the
+                            // resource, and a claim past the limit is refused here instead.
+                            let Some(bs) = im
+                                .format
+                                .describe()
+                                .map(|d| d.block_bytes())
+                                .filter(|bs| matches!(bs, 1 | 2 | 4 | 8 | 16))
+                            else {
+                                return Err(Fault::IllegalFormat { cmd, format: im.format });
+                            };
+                            let texels =
+                                u64::from(im.layer_offset / bs) + u64::from(im.level_size / bs);
+                            if texels > u64::from(host.limits.max_texture_buffer_size) {
+                                return Err(Fault::OutOfRange { cmd, what: "image buffer range" });
+                            }
+                        }
+                        _ => {}
                     }
                     self.sub_mut().images[stage.index()].insert(
                         slot,
@@ -3090,6 +3146,24 @@ mod tests {
             read_shader(b"VERT\nDCL IN[80]\n0: END\n\0", 20),
             Err(Fault::Tgsi { error: tgsi::Refusal::Scan(_), .. })
         ));
+    }
+
+    #[test]
+    fn a_destroyed_view_leaves_every_slot_it_held_and_marks_them() {
+        let h = |n| ObjectHandle::new(n).unwrap();
+        let mut views: [BTreeMap<u32, ObjectHandle>; ShaderStage::COUNT] = Default::default();
+        views[0].insert(3, h(9));
+        views[1].insert(0, h(9));
+        views[1].insert(1, h(4));
+        views[1].insert(7, h(9));
+        let mut dirty = [0u32; ShaderStage::COUNT];
+        assert!(evict_view(&mut views, &mut dirty, h(9)));
+        assert!(views[0].is_empty());
+        assert_eq!(views[1].keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(dirty, [1 << 3, (1 << 0) | (1 << 7), 0, 0, 0, 0]);
+        // A handle the guest reuses for a new view then binds afresh, instead of reading as
+        // already bound.
+        assert!(!evict_view(&mut views, &mut dirty, h(9)));
     }
 
     #[test]
