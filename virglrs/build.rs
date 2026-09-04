@@ -40,6 +40,9 @@ fn main() {
 
     #[cfg(feature = "reply-oracle")]
     reply_oracle(&manifest, &protocol, &out);
+
+    #[cfg(feature = "video-oracle")]
+    video_oracle(&manifest);
 }
 
 /// Run the GLES/EGL binding generator into `OUT_DIR/gl`, from the vendored Khronos registries.
@@ -217,4 +220,28 @@ fn reply_oracle(manifest: &std::path::Path, protocol: &std::path::Path, out: &st
         // From the generated dispatch functions, which the oracle pulls in but never calls.
         .flag_if_supported("-Wno-uninitialized-const-pointer")
         .compile("vn_reply_oracle");
+}
+
+/// Build the C tree's video bitstream serializers for the tests to diff against.
+///
+/// These are the reference the Rust ports have: a synthesized H.264 parameter set has no
+/// conformance vector to check against, only the bytes the C emits for the streams it has played.
+/// So the differential is the standard, and it wants the C in the test binary.
+///
+/// The writer and reader themselves are `static inline` in a header, with nothing to link against;
+/// `tests/oracle/video_oracle.c` is the shim that gives them entry points.
+#[cfg(feature = "video-oracle")]
+fn video_oracle(manifest: &std::path::Path) {
+    let tree = manifest.parent().unwrap();
+    let oracle = manifest.join("tests/oracle");
+    println!("cargo::rerun-if-changed={}", oracle.display());
+    println!("cargo::rerun-if-changed={}", tree.join("src/vrend").display());
+
+    cc::Build::new()
+        .file(oracle.join("video_oracle.c"))
+        .include(tree.join("src/vrend"))
+        .include(tree.join("src/gallium/include"))
+        .include(tree.join("src"))
+        .flag("-std=c11")
+        .compile("virgl_video_oracle");
 }

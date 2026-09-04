@@ -164,6 +164,11 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   and the answers are diffed. It caught a real one on its first run: the model reorders a struct's
   members to put a length before its array, which is what the wire wants and not what the layout
   is, and `VkHostAddressRangeEXT` reached the driver with its address and size swapped.
+- The video oracle is the same idea for the parameter sets the VideoToolbox backend synthesizes:
+  `cargo test --features video-oracle` in `virglrs/`, which builds the C tree's serializers into
+  the test binary and drives both sides from one script. These have no other reference — there is
+  no conformance vector for an SPS we invented, only the bytes that have played — so agreeing with
+  the C is the whole standard, and it is checked byte for byte rather than asserted.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens and
   5 IOSurfaces from the classic corpus: the stock guest's GNOME session with its wallpaper, which
   arrives as one 64 MiB transfer and is why the recorder's default capacity is 512 MB. That one
