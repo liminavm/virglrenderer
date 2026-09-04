@@ -668,9 +668,12 @@ buildable throughout as the A-side reference.
   **What scores it.** Both legs call the same VideoToolbox on the same host, so a golden is
   exact -- not because these codecs are normatively bit-exact, though they are, but because
   even a quirky VT produces the same bytes twice. The decoded planes land in guest resources
-  and leave by the ordinary readback path, so a replay corpus should score video with no
-  harness surgery -- confirmed while pinning the first corpus, not assumed, since it rests
-  on the decoded planes passing the sweep predicate. What can break that equivalence is not the decoder: it is **choosing a different
+  and leave by the ordinary readback path, so a replay corpus scores video through the sweep
+  like anything else -- measured while pinning the first corpus: 240 of 243 decode targets carry
+  pixels, a distinct hash per frame, three replays byte-identical. It cost one flag. The replay
+  harness never passed `USE_VIDEO`, and that flag is what registers VP9 and AV1 as supplemental
+  VideoToolbox decoders, without which every session create fails and the targets score empty
+  while everything else looks clean. What can break that equivalence is not the decoder: it is **choosing a different
   decoder**. dav1d is not a peer backend -- it is a mid-stream fallback inside the AV1 codec,
   entered only for frames the hardware returns wrongly (super-resolution). If the Rust leg
   switches at a different unit than the C, the hashes diverge for a reason that is not a bug,
@@ -703,11 +706,17 @@ buildable throughout as the A-side reference.
   for a spike built from the same tree, never a persisted format. Descriptors come from the
   wire corpus, which is one.
 
-  **A decoded frame is delivered twice, and that is a negotiation.** VideoToolbox hands back a
-  CVPixelBuffer, never a dmabuf, so there is nothing for the guest to import. The C therefore
-  writes each plane into the *guest's pages* as well as into its own texture, and says so with
-  `VIRGL_CAP_V2_VIDEO_GUEST_PLANES`; without that bit the guest has to keep allocating
-  one-page stub BOs whose fd cannot honestly be exported. A second bit,
+  **A decoded frame is delivered twice, and only the second half is negotiated.** VideoToolbox
+  hands back a CVPixelBuffer, never a dmabuf. The unconditional half puts the pixels in the host
+  GL texture, and that is all a guest that *samples* the target needs -- which is why VP9
+  hardware decode works on a stock guest, byte-identical to the software decoder, with the
+  writeback never firing once. The negotiated half writes each plane into the *guest's pages*
+  too, announced by `VIRGL_CAP_V2_VIDEO_GUEST_PLANES`, and it exists for a guest that **exports**
+  the target as a dmabuf: the fd has to name storage that actually holds the frame, and a
+  one-page stub does not. Firefox's zero-copy import is the caller. A writeback that falls short
+  is therefore a steady state and stays silent -- storage being big enough *is* the test for
+  "the guest wants the frame here" -- so a log full of skips is not a fault to chase. A second
+  bit,
   `VIRGL_CAP_V2_VIDEO_PLANAR_TARGET`, says the host will take a decode target as **one**
   resource in a planar format with its planes chained behind it, rather than one resource per
   plane -- backed by a planar IOSurface where it can be, and an RGBA conversion everywhere
@@ -738,8 +747,17 @@ buildable throughout as the A-side reference.
   **Three gates, all of them already built.** The caps deviation the replay gate prints every
   run -- `num_video_caps`, `video_caps`, `capability_bits_v2`, and the planar half of
   `sampler` -- closes as video lands, and is a free regression line from the first commit. The
-  corpus score is exact. The end gate is a video playing in the guest, read under the liveness
-  discipline: a playing video is its own moving element.
+  corpus score is exact and pinned (`fixtures/vrend-vp9stock.score`). The end gate is a video
+  playing in the guest, read under the liveness discipline: a playing video is its own moving
+  element.
+
+  **What a decode golden has to survive before it is pinned.** VP9 is normatively exact, so the
+  hardware decode must agree byte for byte with `avdec_vp9` -- a verdict rather than a smell
+  test, and one that catches "the pipeline ran and drew grey", which a buffer count does not.
+  And it must agree with *itself*: this tree has already been bitten by a fault that fired two to
+  four runs in twenty, which reads as "it never works" from a short streak and as "it works" from
+  a lucky one. A golden taken from a single run of an intermittently faulting leg is worse than
+  no golden, because the port is then graded against a bad frame. N runs, one hash.
 - **P5 — snapshot.** Journal export, `memory_write`, sync export/restore, classic
   content export/restore. Ends at suspend/resume parity.
 - **P6 — cutover.** Rust becomes the default prefix; limina's manifest and
