@@ -660,6 +660,13 @@ buildable throughout as the A-side reference.
   lines we are actually porting. If a bug is ever fixed upstream in `virgl_video.c`, the tool
   is a cherry-pick.
 
+  **The descriptor is read, never rewritten.** The C translates every `ref[i]` in a picture
+  descriptor from a guest buffer handle into a host buffer id before passing it on, and the
+  VideoToolbox backend then reads none of them -- it keeps its own reference-picture buffer and
+  parses the real bitstream. So the Rust leg decodes the handful of fields the *container* needs
+  before a bitstream can be handed over, out of a fixed prefix, and carries no translation step
+  and no host-side buffer ids at all.
+
   **Decode only.** `virgl_video_encode_bitstream` is a stub returning -1 and `fill_caps`
   advertises no encode entrypoint, so the guest cannot reach it. `EncodeBitstream` is refused
   and counted, like any other command this build does not serve, and the encode callbacks are
@@ -694,7 +701,8 @@ buildable throughout as the A-side reference.
   it regardless, and it carries real `virgl_picture_desc` inputs -- synthetic descriptors
   exercise paths no player takes. *Then the whole VP9 leg*: caps, codec and buffer lifetime,
   command path, VT session, delivery. That is a scoring, end-to-end video renderer, and every
-  later codec is bitstream work behind an interface it has already proven. *Then the
+  later codec is bitstream work behind an interface it has already proven -- **both are done,
+  and every later codec now needs only its bitstream work and its capset line.** *Then the
   builders*: `virgl_h264_build_parameter_sets`, `annexb_to_avcc`,
   `virgl_av1_build_temporal_unit` and their HEVC counterparts are pure bytes-in/bytes-out,
   roughly 2,600 lines with an exact oracle that needs no GL, no VT and no VM -- ordinary
