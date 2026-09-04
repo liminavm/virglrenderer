@@ -213,6 +213,27 @@ pub struct Surface {
 unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
+/// Whatever keeps a [`Surface`] alive, seen as the surface.
+///
+/// A surface is adopted as GL storage by whoever renders through it, and that is not always
+/// whoever minted it: a venus allocation's surface is imported by a classic context compositing
+/// the client that owns it. What the importer holds has to be the *owner's* share, because the
+/// owner's share carries more than the pixels -- venus's also carries the memory charge, whose
+/// release is the share going away. A fresh share over the same surface would keep the pixels
+/// and drop the charge, and the ledger would report as free memory that is still held.
+///
+/// So the importer names what it holds by what it can do with it -- yield the surface -- and the
+/// owner decides what holding means.
+pub trait Held: Send + Sync {
+    fn surface(&self) -> &Surface;
+}
+
+impl Held for Surface {
+    fn surface(&self) -> &Surface {
+        self
+    }
+}
+
 impl Surface {
     /// Mint a scanout surface whose rows are laid out exactly as `bytes_per_row` says.
     ///
