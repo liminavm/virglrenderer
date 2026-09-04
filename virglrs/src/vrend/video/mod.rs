@@ -15,6 +15,7 @@
 //! live codec so that destroying a buffer can go and null out the pointers to it. Neither exists
 //! here: a share keeps what names it alive, and a destroy is a table drop.
 
+pub mod av1;
 pub mod bitstream;
 pub mod h264;
 pub mod h265;
