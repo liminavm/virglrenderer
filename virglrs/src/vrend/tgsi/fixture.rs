@@ -31,7 +31,7 @@ pub fn blocks() -> Vec<Block> {
 
 #[test]
 fn the_corpus_has_its_shaders() {
-    assert_eq!(blocks().len(), 34);
+    assert_eq!(blocks().len(), 33);
 }
 
 /// A dump is text `tgsi_text` reads back; parsing the C's dump and dumping the result must print

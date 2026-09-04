@@ -71,7 +71,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   wire shows up as one. And the decoder is exact where the C is loose (a trailing partial element,
   dwords past the ones a command reads), because a decoder that ignores dwords cannot reproduce
   them and the comparison would be blind exactly there; `END_TRANSFERS` keeps the slack mesa pads
-  the transfer prologue with for the same reason. All 13,646 commands of `vrend.bin` reproduce.
+  the transfer prologue with for the same reason. All 13,726 commands of `vrend.bin` reproduce.
   Like `venus-roundtrip` it never calls a handler: it proves the wire is read where it lives,
   not what is done with it.
 - `rs/` builds `venus-reply-oracle` for the half `venus-roundtrip` cannot reach. The corpus asks
@@ -156,16 +156,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   and the answers are diffed. It caught a real one on its first run: the model reorders a struct's
   members to put a length before its array, which is what the wire wants and not what the layout
   is, and `VkHostAddressRangeEXT` reached the driver with its address and size swapped.
-- `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens
-  from the classic corpus; `vrend-nodraw.score` is the same run with every `DRAW_VBO` dropped, and
-  the diff between the two is the positive control: 19 offscreens lose their ink, and all three
-  1280x800 scanout IOSurfaces go from distinct fully-inked hashes to one shared all-zero hash. An
-  empty diff would mean the oracle measures nothing. `vrend-desktop.score` is the same guest's
-  GNOME session with its wallpaper: 316 offscreens from `vrend-desktop.bin`, captured with a
-  512 MB tracer (`capture.sh vrend --mb 512 --out desktop`) because the wallpaper is one 64 MiB
-  transfer, and the corpus that carries it also carries the mip chain the guest builds from it
-  with eleven blits and the overview composited over it. The tracer once dropped any transfer
-  past 1 MiB, and that corpus replayed to a flat-colour desktop that measured none of this.
+- `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens and
+  5 IOSurfaces from the classic corpus: the stock guest's GNOME session with its wallpaper, which
+  is one 64 MiB transfer, so the capture takes a 512 MB tracer
+  (`capture.sh vrend --mb 512`). The corpus that carries the wallpaper also carries the mip chain
+  the guest builds from it with eleven blits and the overview composited over it; the tracer once
+  dropped any transfer past 1 MiB, and a corpus recorded that way replayed to a flat-colour
+  desktop that measured none of this. `vrend-nodraw.score` is the same run with every `DRAW_VBO`
+  dropped, and the diff between the two is the positive control: 19 offscreens lose their ink, and
+  all three 1280x800 scanout IOSurfaces go from fully inked to one shared all-zero hash. An empty
+  diff would mean the oracle measures nothing.
   `synoik.score` is the venus content fixture:
   its capture was taken mid-workload, so 22 device allocations are still live and half of them
   carry GPU-written bytes. `venus.score` and `synoik-lifecycle.score` are the lifecycle fixtures:
@@ -183,7 +183,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   carries the fourteen `ASTC_*_SRGB` formats the C's `ASTC_FORMAT` macro never registers
   (`virglrs/vrend-gen/gl_formats.py`), and `num_video_caps`/`video_caps` are empty until video
   is ported. A third line is a regression.
-  `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 34
+  `vrend-shaders.txt` is the classic corpus's shaders as the C saw them: for each of the 33
   shaders created, `tgsi_dump` of the tokens the C parsed from the guest's text and the GLSL
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
   pixels, which cannot say *which* line of a 200-line shader went wrong; the GLSL can. It is
