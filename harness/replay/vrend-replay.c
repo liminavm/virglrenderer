@@ -1312,7 +1312,8 @@ int main(int argc, char **argv)
                if (!getenv("REPLAY_DUMP_DIR"))
                   fprintf(stderr,
                           "  (a hash names no pixels: re-run with REPLAY_DUMP_DIR=<dir> to write "
-                          "the readbacks, then rgba2png.py <dir>/*.rgba and look at them)\n");
+                          "the readbacks, then look at them -- rgba2png.py for the 8-bit BGRA "
+                          "offscreens, half2png.py for a half-float one such as a blob window)\n");
                ok = 0;
             }
          }

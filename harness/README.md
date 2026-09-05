@@ -215,7 +215,11 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `ink=0/250000` means the content records did not land**, and the fixture is then measuring only
   its own structure again — the failure to watch for, because a zero texture is a weak oracle
   where every wrong answer is also zero. The guest declares a stride of 4096 for a packed row of
-  4000, so a leg that assumes packed rows shears every frame and says so in the hash. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
+  4000, so a leg that assumes packed rows shears every frame and says so in the hash. A mismatch
+  says two renderers disagree and nothing about how: `REPLAY_DUMP_DIR=<dir>` writes the readbacks,
+  and `rgba2png.py` renders the 8-bit BGRA offscreens while `half2png.py` renders a half-float one
+  such as a blob window. Reading half floats as bytes shows noise, which looks exactly like the
+  corruption one would be hunting. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
   with H.264 and VP9 played one after the other in Showtime.
