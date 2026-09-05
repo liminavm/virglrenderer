@@ -4,7 +4,13 @@
 #
 # Replay a classic (vrend) corpus against a renderer build, with no VM.
 #
-#   vrend-replay.sh <corpus.bin> [replayer options]
+#   vrend-replay.sh <corpus.bin> --renderer rs|c [replayer options]
+#
+# Which renderer to run is mandatory: pass --renderer rs (the Rust tree) or --renderer c (the
+# reference C), or set VIRGL_PREFIX to a prefix yourself. There is deliberately no default. A
+# wrapper that picks one silently scores whichever renderer the caller forgot to name, and the
+# result is a full, plausible score file for the wrong implementation -- which reads exactly like
+# a regression in the one you meant.
 #
 # The environment is the point of this wrapper. vrend runs on zink over KosmicKrisp through an
 # epoxy built WITH EGL, and none of that is on the default loader path: a golden recorded under an
@@ -16,14 +22,26 @@
 # -- plus the run counters, so diff is the whole comparison tool.
 set -euo pipefail
 
-[ $# -ge 1 ] || { echo "usage: vrend-replay.sh <corpus.bin> [options]" >&2; exit 2; }
+usage() {
+  echo "usage: vrend-replay.sh <corpus.bin> --renderer rs|c [options]" >&2
+  echo "       (or set VIRGL_PREFIX to a prefix; there is no default)" >&2
+  exit 2
+}
+[ $# -ge 1 ] || usage
 case "$1" in /*) CORPUS="$1" ;; *) CORPUS="$PWD/$1" ;; esac
 shift
 
 # Resolve --score/--expect against the caller's directory: everything below runs from the script's.
 ARGS=()
+RENDERER=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --renderer)
+      case "${2:-}" in
+        rs|c) RENDERER="$2" ;;
+        *) echo "--renderer wants rs or c" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
     --score|--expect)
       case "${2:-}" in
         /*) ARGS+=("$1" "$2") ;;
@@ -52,7 +70,20 @@ ICD="$MESA_PREFIX/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json"
 [ -f "$EPOXY_PREFIX/lib/libepoxy.0.dylib" ] || {
   echo "no epoxy-with-EGL at $EPOXY_PREFIX (set EPOXY_PREFIX)" >&2; exit 1; }
 
-VIRGL_PREFIX="${VIRGL_PREFIX:-$ROOT/harness/vm/prefix}" "$HERE/build.sh" >/dev/null
+case "$RENDERER" in
+  rs) VIRGL_PREFIX="$ROOT/virglrs/prefix" ;;
+  c)  VIRGL_PREFIX="$ROOT/harness/vm/prefix" ;;
+  "") [ -n "${VIRGL_PREFIX:-}" ] || usage ;;
+esac
+# Build what is about to be scored. This script builds the replayer, never the renderer, so a
+# prefix laid down by an earlier install.sh scores whatever was in the tree then -- silently, and
+# with a full plausible score. vkr-replay.sh already takes this precaution for the same reason.
+if [ "$VIRGL_PREFIX" = "$ROOT/virglrs/prefix" ]; then
+  "$ROOT/virglrs/install.sh" >/dev/null
+fi
+echo "replay: $VIRGL_PREFIX" >&2
+
+VIRGL_PREFIX="$VIRGL_PREFIX" "$HERE/build.sh" >/dev/null
 
 # zink needs the Vulkan loader on the dyld path: it dlopens @rpath/libvulkan.1.dylib, and the
 # replayer is not the app bundle whose rpath would resolve it.

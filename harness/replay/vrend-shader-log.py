@@ -16,7 +16,7 @@ The Rust tests read the fixture and hold the TGSI parser and the translator to i
 Record it with the debug C prefix, which is the only one that compiles the dump in:
 
     VIRGL_PREFIX=.../harness/vm/prefix-debug VREND_DEBUG=shader \\
-        ./vrend-replay.sh ../vm/captures/vrend.bin --score /dev/null 2> shader.log
+        ./vrend-replay.sh ../vm/captures/vrend.bin --renderer c --score /dev/null 2> shader.log
     ./vrend-shader-log.py shader.log > fixtures/vrend-shaders.txt
 
 The Rust prefix prints the same blocks under `VIRGLRS_DEBUG=shader`, with the mark on its own

@@ -35,9 +35,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   captured order. Scores every colour offscreen at its unref — a content hash and an ink count
   per readback, in stream order — and every IOSurface-backed resource at end of stream, with the
   same `--score`/`--expect` contract as the venus side.
-  Run it with `vrend-replay.sh <corpus>`, which supplies the zink-on-KosmicKrisp environment the
-  renderer needs; `build.sh` alone builds it, pointing `VIRGL_PREFIX` at the implementation under
-  test. Two switches bisect a score line that differs: `--until <seq>` stops the stream there
+  Run it with `vrend-replay.sh <corpus> --renderer rs|c`, which supplies the zink-on-KosmicKrisp
+  environment the renderer needs; `build.sh` alone builds it, pointing `VIRGL_PREFIX` at the
+  implementation under test. Two switches bisect a score line that differs: `--until <seq>` stops the stream there
   and scores what the surfaces hold at that point, and `--readback <res>` on a resource still
   alive at the end reads its texture as well, so a scanout's surface and its texture can be
   compared — the pair disagreeing is how a stale surface read was told from a wrong render.
@@ -55,8 +55,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 - `rgba2png.py` — turns raw readbacks into viewable PNGs.
 - `rs/` — `vkr-replay`, the venus replayer. Creates each context, feeds the prologue journals and
   then the whole stream in execution order through the limina replay ABI, and scores the result.
-  Run it with `vkr-replay.sh <corpus>`; it builds the crate and points the Vulkan loader at the
-  ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
+  Run it with `vkr-replay.sh <corpus> --renderer rs|c`; it builds the crate and points the Vulkan
+  loader at the ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
   and exits non-zero, so `diff` is the whole comparison tool.
 - `rs/` also builds `venus-roundtrip`, the venus decoder's differential test. It decodes every
   recorded command with the Rust decoder, encodes it straight back, and compares against the bytes
@@ -103,8 +103,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   only perturbs non-zero payload bytes is caught on 449 of synoik's 1397 replies with the fill and
   331 without it. Still out of reach are chained outputs — the fill leaves `pNext` null, because
   planting one link takes the reachable type set from 42 structs to 235.
-- The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh` with
-  `VIRGL_PREFIX` pointed at `virglrs/prefix`. It drives the real ABI — context create, the replay
+- The Rust renderer has a second, GPU-free gate on the same corpora: `vkr-replay.sh --renderer rs`. It drives the real ABI — context create, the replay
   feed, the decode loop, the object table — and every command is accounted for rather than merely
   parsed, which is what separates it from `venus-roundtrip`. Every corpus reaches `cmds N/N` with
   no `FAIL` line. What it catches is the layer between the bytes and Vulkan, and it caught two things
@@ -186,8 +185,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
   `vrend.caps` is the classic capsets, `virgl_caps_v1` and `virgl_caps_v2`, as the C fills
-  them on this host: `./vrend-replay.sh ../vm/captures/vrend.bin --caps FILE` writes them a field a
-  line, and the same against the Rust prefix diffs against the fixture. The guest's virgl driver
+  them on this host: `./vrend-replay.sh ../vm/captures/vrend.bin --renderer c --caps FILE` writes
+  them a field a line, and `--renderer rs` diffs the Rust side against the fixture. The guest's virgl driver
   configures itself from nothing else -- a format missing from `sampler` is a format the guest
   never creates, a wrong `glsl_level` is a whole feature set switched off -- and none of it is a
   pixel, so a score cannot see it. Four lines are expected to differ, all by design, and every
@@ -314,7 +313,8 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `vrend_convert_shader` emitted. It is the shader translator's differential -- a score compares
   pixels, which cannot say *which* line of a 200-line shader went wrong; the GLSL can. It is
   recorded with `vm/prefix-debug` (a `-Db_ndebug=false` build of the C; the release prefix
-  compiles the dump out) as `VREND_DEBUG=shader ./vrend-replay.sh ../vm/captures/vrend.bin`,
+  compiles the dump out) as
+  `VREND_DEBUG=shader ./vrend-replay.sh ../vm/captures/vrend.bin --renderer c`,
   normalised by `vrend-shader-log.py`. The Rust tests in `virglrs/src/vrend/tgsi/fixture.rs`
   read it and hold the parser to the TGSI half: every dump parses and prints back byte for
   byte; those in `virglrs/src/vrend/shader/glsl/mod.rs` hold the translator to the GLSL half.
@@ -503,6 +503,12 @@ dylib exports, and `layout.txt`, the size, alignment and field offsets of every 
 crosses the ABI. `VIRGL_PREFIX` selects the build under test, so pointing it at a Rust build is
 how the port gets checked — the same variable `vrend-replay.sh`, `vkr-replay.sh` and `build.sh`
 resolve, so one setting drives every layer at once; `--pin` re-records, and is only for a change to the ABI that is meant.
+
+**Which renderer to score is never defaulted.** Both replay wrappers refuse to run until they are
+told, by `--renderer rs|c` or by `VIRGL_PREFIX`, and each echoes the prefix it used. A default is
+worse than an argument here: picking one silently produces a full, plausible score for whichever
+implementation the caller forgot to name, and a score file for the wrong renderer reads exactly
+like a regression in the right one.
 
 **No gate here has a manual install step, and adding one to a ladder buys nothing.** A script that
 scores `virglrs/prefix` builds and installs it first — `abi-fixture.sh` and `vkr-replay.sh` both
