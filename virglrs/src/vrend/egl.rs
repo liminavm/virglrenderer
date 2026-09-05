@@ -602,4 +602,74 @@ mod tests {
         drop(luma);
         assert_eq!(chroma.surface().id(), id);
     }
+
+    /// A plane image samples the plane it asked for, asked by content.
+    ///
+    /// The import succeeding proves only that the driver took the attributes, and the image's
+    /// own width and height cannot settle it either: they are set from the geometry the import
+    /// was handed, so a chroma image reports half-resolution because that is what it was told,
+    /// whether or not the plane index reached Metal underneath. Both are measurements of this
+    /// side's own input.
+    ///
+    /// Content is the oracle that cannot lie. Each plane gets a different byte through the CPU,
+    /// and each image is read back through a framebuffer. If the index is dropped anywhere
+    /// between EGL and Metal, both images are plane 0 and the chroma read returns the luma
+    /// pattern.
+    #[test]
+    #[ignore = "needs the zink-on-KosmicKrisp environment"]
+    fn a_plane_image_samples_the_plane_it_asked_for() {
+        use super::super::gl::Gl;
+        use super::super::gl::gles::{
+            GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RED, GL_RG,
+            GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
+        };
+        use crate::metal::{PlanarFormat, Surface};
+
+        const LUMA_BYTE: u8 = 0x10;
+        const CHROMA_BYTE: u8 = 0x80;
+
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let ctx =
+            winsys.create_context(Version { major: 3, minor: 1 }, None).expect("a 3.1 context");
+        winsys.make_current(&ctx).expect("current");
+        let gl = Gl::new(winsys.gles());
+
+        let surface = Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface");
+        assert!(surface.fill_plane(0, LUMA_BYTE), "the luma plane fills");
+        assert!(surface.fill_plane(1, CHROMA_BYTE), "the chroma plane fills");
+        let surface: Arc<dyn Held> = Arc::new(surface);
+
+        let read = |plane: Plane, format, w, h| -> Vec<u8> {
+            let image = winsys
+                .image_from_iosurface_plane(Arc::clone(&surface), plane)
+                .expect("the driver imports the plane");
+            let texture = gl.gen_texture();
+            gl.bind_texture(GL_TEXTURE_2D, Some(texture));
+            gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+            let fb = gl.gen_framebuffer();
+            gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+            gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(texture), 0);
+            assert_eq!(
+                gl.check_framebuffer_status(),
+                GL_FRAMEBUFFER_COMPLETE,
+                "a plane texture is not renderable, so this test cannot read it"
+            );
+            let mut out = vec![0u8; (w * h) as usize * if format == GL_RG { 2 } else { 1 }];
+            assert!(gl.read_pixels(0, 0, w, h, format, GL_UNSIGNED_BYTE, &mut out), "readback");
+            gl.bind_framebuffer(GL_FRAMEBUFFER, None);
+            out
+        };
+
+        let luma = read(Plane::Luma, GL_RED, 64, 64);
+        let chroma = read(Plane::ChromaPair, GL_RG, 32, 32);
+
+        assert!(luma.iter().all(|&b| b == LUMA_BYTE), "luma read {:?}", &luma[..8]);
+        assert!(
+            chroma.iter().all(|&b| b == CHROMA_BYTE),
+            "the chroma image did not sample the chroma plane; it read {:?}. A read of \
+             {LUMA_BYTE:#04x} means the plane index was dropped between EGL and Metal and both \
+             images are plane 0.",
+            &chroma[..8]
+        );
+    }
 }
