@@ -38,6 +38,7 @@ enum vrend_trace_type {
    VREND_TRACE_RETIRE   = 6,
    VREND_TRACE_PAD      = 7,  /* filler to the end of the ring; carries no meaning */
    VREND_TRACE_XFERDATA = 9,  /* the BYTES a guest->host transfer carried; aux0 = res handle */
+   VREND_TRACE_BLOBDATA = 10, /* the BYTES behind an imported blob; aux0 = res handle */
 };
 
 /* Resource creation does NOT pass through the command stream -- it arrives on the control path
@@ -96,6 +97,18 @@ void vrend_trace_res_event(struct vrend_trace_res *res);
  * blob/iov machinery: it synthesizes one backing iov per resource and memcpys these in. */
 void vrend_trace_transfer_data(uint32_t ctx_id, uint32_t res_handle, uint64_t offset,
                                const void *data, uint32_t len);
+/* The bytes behind an imported blob, captured where vrend reads them to feed a texture it is
+ * about to sample. A blob's contents never travel as a transfer -- a venus client writes them
+ * GPU-side into the memory the blob exports -- so without this a replay has the blob's shape
+ * and none of its pixels, and scores an all-zero texture whose every wrong answer is also zero.
+ *
+ * Deduped against the last bytes recorded for the handle: the refresh that calls this is
+ * unconditional once per sampling batch, and a window redrawn rarely would otherwise be
+ * recorded identically hundreds of times. Deliberately the blob's OWN layout from offset 0,
+ * not the packed staging vrend uploads, so each replayed renderer applies its own stride
+ * machinery to the same source bytes rather than inheriting the recorder's. */
+void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
+                           const void *data, uint32_t len);
 void vrend_trace_retire_fence(uint32_t ctx_id, uint64_t fence_id);
 
 /* Called at a safe point (the top of a submit) -- a relaxed atomic load when idle. The dump runs
