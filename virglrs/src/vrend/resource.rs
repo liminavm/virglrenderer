@@ -8,15 +8,16 @@
 //! mean anything. Here the backing is an enum, so a transfer or a destroy is one match with no
 //! flag to consult, and a buffer cannot be mistaken for a texture.
 
-use super::egl::{Image, Winsys};
+use super::egl::{self, Image, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
 use super::pipe::TextureTarget;
 use super::proto::Format;
+use super::video;
 use crate::guest_mem::Iov;
-use crate::metal::{Held, PixelFormat, Surface};
+use crate::metal::{Held, PixelFormat, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,8 @@ pub struct Args {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {
     UnsupportedFormat,
+    /// A multi-plane format with nothing to back its planes with.
+    NoPlanarStorage,
     UnsupportedMultisampleFormat,
     MultisampleNot2d,
     MultisampleWithMipmaps,
@@ -147,6 +150,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Refusal::UnsupportedFormat => "unsupported texture format",
+            Refusal::NoPlanarStorage => "no planar surface to back a multi-plane target",
             Refusal::UnsupportedMultisampleFormat => "unsupported multisample texture format",
             Refusal::MultisampleNot2d => "multisample textures must be 2D",
             Refusal::MultisampleWithMipmaps => "multisample textures do not support mipmaps",
@@ -338,7 +342,9 @@ impl Untyped {
         };
         // The share is gone into the image, or was never there; a refusal past this point has
         // nothing left to hand back but an empty slot, which is what the handle already was.
-        let storage = match alloc_texture(gl, features, formats, &args, image) {
+        // No planes: this is a resource adopting a surface it was handed, and a composite
+        // target is never one of those -- it mints its own, and its planes are cut from that.
+        let storage = match alloc_texture(gl, features, formats, &args, image, None) {
             Ok(s) => s,
             Err(e) => return Err((Untyped { surface: None }, e)),
         };
@@ -457,6 +463,43 @@ pub enum Storage {
 /// texture's storage alive on its own while an attachment names it -- deleting a texture releases
 /// the name, not the object -- but leaning on that means every user must stay attached for its
 /// whole life to stay correct, which is not a property any of them state. The share says it.
+/// The planes of a composite decode target: one image per plane of one planar IOSurface.
+///
+/// Held beside the texture's own storage rather than as it. A guest that samples the planar
+/// format whole lands on the texture, which the decode path converts into; one that asks for a
+/// plane by index lands here. Replacing the texture's storage would serve the second by breaking
+/// the first.
+///
+/// Both planes or neither. A target holding an image for one of them is one whose chroma view
+/// silently samples luma, which is a green picture and no error anywhere -- so the type does not
+/// admit it.
+pub struct Planes {
+    luma: Image,
+    chroma: Image,
+}
+
+impl Planes {
+    /// The image for plane `index`, or `None` past the planes there are.
+    pub fn image(&self, index: u32) -> Option<&Image> {
+        match index {
+            0 => Some(&self.luma),
+            1 => Some(&self.chroma),
+            _ => None,
+        }
+    }
+
+    /// The surface both planes are cut from. One surface, so either image answers.
+    pub fn surface(&self) -> &Surface {
+        self.luma.surface()
+    }
+
+    /// How many planes there are. A biplanar surface, so always two -- named rather than
+    /// written as a literal at each call site.
+    pub fn count(&self) -> u32 {
+        2
+    }
+}
+
 pub struct Texture {
     pub name: TextureName,
     /// The GL target -- not the pipe target: on GLES a 1D texture is a 2D one, a 1D array a
@@ -468,6 +511,8 @@ pub struct Texture {
     /// The image owns the surface, so the surface's id is good exactly as long as the
     /// texture is.
     pub image: Option<Image>,
+    /// The planes, when this resource is a composite decode target. See [`Planes`].
+    pub planes: Option<Planes>,
     /// The render-target views taken of this texture, one per distinct [`ViewKey`].
     ///
     /// They live here rather than on the surface objects that ask for them because a view
@@ -590,8 +635,29 @@ impl Resource {
         let storage = if args.target == TextureTarget::Buffer {
             alloc_buffer(gl, features, &args)?
         } else {
+            let planes = mint_planes(winsys, features, &args);
+            // A resource in a format that has more than one plane, with nothing backing them,
+            // is one whose plane views would find no image and fall through to a texture view
+            // the format has no view class for -- which puts the guest's context in error for
+            // its lifetime. The guest never sees this refusal: the kernel handed it the handle
+            // before we were asked, so it will use the resource and poison itself either way.
+            // What keeps it from asking is the capset, which offers a planar format only where
+            // `composite_target_backable` says it can be backed. This fires when that contract
+            // is broken -- IOSurfaces off, an allocation refused, the two sides disagreeing on
+            // a format -- and it fails loudly rather than corrupting.
+            if planes.is_none() && video::guest_planes(args.format) > 1 {
+                eprintln!(
+                    "[virglrs] vrend: no planar surface for a {}x{} {} target; refusing the \
+                     create (the guest cannot see this and will poison its context -- the \
+                     capset should not have let it ask)",
+                    args.width,
+                    args.height,
+                    args.format.name()
+                );
+                return Err(Refusal::NoPlanarStorage);
+            }
             let image = mint_surface(winsys, features, &args);
-            alloc_texture(gl, features, formats, &args, image)?
+            alloc_texture(gl, features, formats, &args, image, planes)?
         };
         Ok(Resource { args, storage })
     }
@@ -632,7 +698,14 @@ impl Resource {
 impl Texture {
     /// Texture storage that names no GL object, for tests about identity and nothing else.
     pub fn unbacked(name: TextureName) -> Texture {
-        Texture { name, target: 0, immutable: true, image: None, views: Mutex::default() }
+        Texture {
+            name,
+            target: 0,
+            immutable: true,
+            image: None,
+            planes: None,
+            views: Mutex::default(),
+        }
     }
 }
 
@@ -909,6 +982,66 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
     }
 }
 
+/// The planar IOSurface behind a composite decode target, and an image per plane.
+///
+/// A composite target is one resource in a planar format with its planes chained behind it,
+/// which is the shape a guest takes when the capset says this host can back it. It is neither a
+/// scanout nor shared, so it never reaches the bind gate in [`mint_surface`]: its format is what
+/// identifies it, and nothing else on this host carries a planar one.
+///
+/// `None` for every format this build cannot back, and for a surface the system or the driver
+/// refuses -- the caller turns that into a refused create rather than a resource whose planes
+/// cannot be sampled.
+fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes> {
+    if !video::composite_target_backable(a.format) {
+        return None;
+    }
+    if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
+    {
+        return None;
+    }
+    if !features.adopts_iosurfaces() {
+        // Known at init and reported there.
+        return None;
+    }
+    let surface = match Surface::planar(a.width, a.height, PlanarFormat::BiPlanar420) {
+        Ok(surface) => Arc::new(surface),
+        Err(e) => {
+            eprintln!(
+                "[virglrs] vrend: no planar IOSurface for a {}x{} {} target ({e:?})",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+            return None;
+        }
+    };
+    // Both planes of the one surface, each holding its own share of it: the surface outlives
+    // whichever image is dropped last.
+    let plane = |which| match winsys.image_from_iosurface_plane(Arc::clone(&surface) as _, which) {
+        Ok(image) => Some(image),
+        Err(e) => {
+            eprintln!(
+                "[virglrs] vrend: the driver refused plane {which:?} of a {}x{} {} target ({e})",
+                a.width,
+                a.height,
+                a.format.name()
+            );
+            None
+        }
+    };
+    let (luma, chroma) = (plane(egl::Plane::Luma)?, plane(egl::Plane::ChromaPair)?);
+    eprintln!(
+        "[virglrs] vrend: composite target: {}x{} {} on a two-plane IOSurface (id {}); plane \
+         views sample the surface directly",
+        a.width,
+        a.height,
+        a.format.name(),
+        surface.id().0
+    );
+    Some(Planes { luma, chroma })
+}
+
 /// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
 ///
 /// A scanout is the compositor's framebuffer; a shared buffer is every buffer gbm hands out,
@@ -1016,6 +1149,7 @@ fn alloc_texture(
     formats: &Table,
     a: &Args,
     image: Option<Image>,
+    planes: Option<Planes>,
 ) -> Result<Storage, Refusal> {
     let entry = formats.get(a.format).ok_or(Refusal::UnsupportedFormat)?;
     let mut immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
@@ -1059,6 +1193,7 @@ fn alloc_texture(
             target,
             immutable,
             image: Some(image),
+            planes,
             views: Mutex::default(),
         })));
     }
@@ -1154,6 +1289,7 @@ fn alloc_texture(
         target,
         immutable,
         image: None,
+        planes,
         views: Mutex::default(),
     })))
 }
