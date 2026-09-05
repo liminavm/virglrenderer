@@ -678,7 +678,14 @@ the command stream reads it through its iov like any other resource. That holds 
 binds a *sampler view* to an imported buffer, which the Vulkan-client corpus does six times. The
 stand-in carries `VREND_STORAGE_GL_BUFFER`, so vrend takes its texture-buffer path; live the same
 blob is guest memory and never goes near it. `vrend-vkclient` cannot be pinned until a blob is
-modelled as what it is. (It is also what exposed the unguarded `glTexBuffer` — `../docs/rust-rewrite.md`.)
+modelled as what it is.
+
+The defect earns its keep even so: standing a blob up as a buffer is what drove a sampler view
+onto one, which is how the unguarded `glTexBuffer` was found — a guest-reachable `abort()` of the
+whole process in the C, fixed in `vrend_set_single_sampler_view`. The C leg now replays this
+corpus to completion instead of exiting 134, which is the check to re-run when touching that
+guard; it is not pinnable as a score until the blob is modelled, because the path it exercises is
+one the replay invents.
 
 **Stable within a run, different between runs, means the fix is upstream of the comparison.**
 Never in the settle time. A value the corpus determines converges as you wait; a value it does not
