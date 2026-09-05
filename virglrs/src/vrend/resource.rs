@@ -1548,8 +1548,47 @@ fn alloc_texture(
 
 #[cfg(test)]
 mod tests {
+    use super::Conversion;
     use super::Format;
     use super::{PlaneRequest, plane_request};
+
+    /// The conversion state, walked as the two trigger sites walk it.
+    ///
+    /// Small enough to read and still get wrong: the whole point of the state is that the pass
+    /// runs at whichever event comes second, so every path has to be entered from both ends.
+    #[test]
+    fn a_conversion_is_owed_at_whichever_of_the_two_events_comes_second() {
+        // Delivery first, then the view. This is the order the C's pair of booleans exists for:
+        // a frame that landed before anything looked must still be converted when something does.
+        let landed = Conversion::default().delivered();
+        assert!(!landed.needs_fill(), "nothing samples it yet, so nothing is owed");
+        assert!(landed.sampled().needs_fill(), "the first composite view converts what is there");
+
+        // The view first, then delivery.
+        let watched = Conversion::default().sampled();
+        assert!(!watched.needs_fill(), "nothing has been delivered, so there is nothing to show");
+        assert!(watched.delivered().needs_fill());
+
+        // A successful pass clears it, and the next picture owes another.
+        let filled = watched.delivered().filled();
+        assert!(!filled.needs_fill());
+        assert!(filled.delivered().needs_fill());
+
+        // A failed pass does not call `filled`, so the debt is still there for the next event to
+        // find. Stated as a test because the retry is the only thing keeping a target from
+        // sitting a frame behind for the rest of its life.
+        let owed = watched.delivered();
+        assert!(owed.sampled().needs_fill(), "a failed pass leaves it owed");
+
+        // Sampling is sticky: a view made once may be sampled again at any time, and a target
+        // that forgot would deliver into planes nothing converts.
+        assert_eq!(watched.filled().delivered(), Conversion::Pending);
+
+        // ... and filling an unwatched target does not make it watched. Reaching `filled` from
+        // there means a pass ran for nobody, which is a bug elsewhere; it must not be recorded
+        // as a composite consumer regardless.
+        assert_eq!(landed.filled(), Conversion::UnwatchedPending);
+    }
 
     /// One decision, read from both ends: which view is a plane and which is the whole thing.
     ///
