@@ -1423,7 +1423,7 @@ impl FrameDesc {
     /// The only part of the frame header coded *relative* to a reference, which is why
     /// [`ObuState`] keeps saved warp parameters at all. Note the emission order: the two-by-two
     /// block (indices 2..5) precedes the translation pair (0, 1).
-    fn write_global_motion_params(&self, w: &mut Writer, c: &FrameCtx, state: &ObuState) {
+    fn write_global_motion_params<C>(&self, w: &mut Writer, c: &FrameCtx, state: &ObuState<C>) {
         if c.frame_is_intra {
             return;
         }
@@ -1557,7 +1557,7 @@ impl FrameDesc {
     ///
     /// Only the *presence* of the bit is at stake, but getting that wrong shifts every bit after
     /// it, so the reference search is reproduced exactly.
-    fn skip_mode_allowed(&self, c: &FrameCtx, state: &ObuState) -> bool {
+    fn skip_mode_allowed<C>(&self, c: &FrameCtx, state: &ObuState<C>) -> bool {
         let bits = u32::from(self.seq.order_hint_bits.get());
         let order_hint = i32::from(self.order_hint);
 
@@ -1590,7 +1590,7 @@ impl FrameDesc {
     }
 
     /// 5.9.2 `uncompressed_header`.
-    fn write_uncompressed_header(&self, w: &mut Writer, c: &mut FrameCtx, state: &ObuState) {
+    fn write_uncompressed_header<C>(&self, w: &mut Writer, c: &mut FrameCtx, state: &ObuState<C>) {
         let s = &self.seq;
         let size_override =
             c.upscaled_width != u32::from(s.max_width) || c.frame_height != u32::from(s.max_height);
@@ -1780,6 +1780,12 @@ impl FrameDesc {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Unit {
     pub bytes: Vec<u8>,
+    /// Whether the picture this unit decodes to is one nothing collects.
+    ///
+    /// A caller does not have to read it: what a discarded picture would have been decoded into
+    /// is released by [`Carried::picture_delivered`] before the unit is ever emitted. It is the
+    /// model stating its own decision, and the differential against the C compares it, which is
+    /// what pins that decision to the reference.
     pub discard: bool,
 }
 
@@ -1795,13 +1801,32 @@ enum Owed {
     SlotOnly,
 }
 
+/// Whatever the caller keeps alongside a held frame.
+///
+/// The model decides when a frame is held and when its picture goes out, so it is the model that
+/// carries the caller's side of the hold. The alternative -- the caller keeping a record beside
+/// the model's -- is two containers holding one fact, and every reset path becomes a purge site to
+/// remember. Here there is nothing to remember: what the hold owns dies with the hold.
+pub trait Carried {
+    /// The held frame's picture went out when the frame was first built. What is still held is a
+    /// re-emission that exists only to claim a reference slot, and its picture is discarded, so
+    /// anything the carrier kept in order to receive one is no longer owed.
+    fn picture_delivered(&mut self);
+}
+
+/// The model on its own carries nothing.
+impl Carried for () {
+    fn picture_delivered(&mut self) {}
+}
+
 /// A frame kept across one submission, because which slot the guest stored it in is only visible
 /// in the *next* frame's `ref[]`, and guessing evicts pictures later frames still reference.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Held {
+struct Held<C> {
     desc: FrameDesc,
     tiles: Vec<u8>,
     owes: Owed,
+    carry: C,
 }
 
 /// A frame was built while one was still held.
@@ -1824,7 +1849,7 @@ pub struct StillHolding;
 /// carry it -- mesa writes a constant 1 -- because a VA driver never needs it: the application
 /// hands it the whole reference list per frame and manages the DPB itself. A bitstream writer does
 /// need it, so slots are assigned here and the guest's `ref_frame_idx` remapped onto them.
-pub struct ObuState {
+pub struct ObuState<C = ()> {
     saved_gm: [[[i32; WARP_PARAMS]; REFS_PER_FRAME]; NUM_REF_FRAMES],
     /// Not needed to *write* a value, but to decide whether a bit is present at all:
     /// `skip_mode_params` searches the references for a forward and a backward one, and only
@@ -1833,7 +1858,7 @@ pub struct ObuState {
     saved_order_hint: [u8; NUM_REF_FRAMES],
     /// The surface we placed in each of our slots.
     slot_surface: [u32; NUM_REF_FRAMES],
-    held: Option<Held>,
+    held: Option<Held<C>>,
     /// The model has been advanced onto the current descriptor. A frame's tile data may arrive
     /// over several `decode_bitstream` calls, each carrying the same descriptor, so the advance
     /// has to be idempotent within a frame.
@@ -1846,17 +1871,17 @@ pub struct ObuState {
     pending_slot: Option<u8>,
 }
 
-impl Default for ObuState {
-    fn default() -> ObuState {
+impl<C> Default for ObuState<C> {
+    fn default() -> ObuState<C> {
         ObuState::new()
     }
 }
 
-impl ObuState {
+impl<C> ObuState<C> {
     /// The state implied by "no frames decoded yet": every slot empty, every saved model the
     /// identity, every saved order hint zero -- which is what a decoder starting from a key frame
     /// also assumes.
-    pub fn new() -> ObuState {
+    pub fn new() -> ObuState<C> {
         ObuState {
             saved_gm: [[DEFAULT_WARP; REFS_PER_FRAME]; NUM_REF_FRAMES],
             saved_order_hint: [0; NUM_REF_FRAMES],
@@ -1983,10 +2008,10 @@ impl ObuState {
     /// guest stored it and so must we; if it is absent, the guest kept nothing, and a frame it
     /// never stored can never be referenced. `None` at the end of a stream, where nothing follows
     /// to reveal anything and nothing that follows can reference it either.
-    fn emit_held(&mut self, live: Option<&[u32; NUM_REF_FRAMES]>) -> Option<Unit> {
+    fn emit_held(&mut self, live: Option<&[u32; NUM_REF_FRAMES]>) -> Option<(Unit, C)> {
         let held = self.held.take()?;
 
-        let surface = live.map_or(0, |l| ObuState::new_surface(&self.prev_ref, l));
+        let surface = live.map_or(0, |l| Self::new_surface(&self.prev_ref, l));
         let mut refresh = 0;
         let mut slot = None;
         if surface != 0 {
@@ -1996,7 +2021,7 @@ impl ObuState {
             }
         }
 
-        let mut desc = held.desc;
+        let mut desc = held.desc.clone();
         let mut discard = false;
 
         // A frame whose picture already went out owes only the DPB. If the guest stored nothing
@@ -2017,7 +2042,7 @@ impl ObuState {
         if let Some(i) = slot {
             self.slot_surface[i] = surface;
         }
-        Some(Unit { bytes, discard })
+        Some((Unit { bytes, discard }, held.carry))
     }
 
     /// Advance the model onto this descriptor: emit the held frame, learn where the previous
@@ -2032,7 +2057,7 @@ impl ObuState {
     /// Call it as soon as the descriptor is known, so the held picture reaches its target as early
     /// as possible: a stream may display a hidden frame just one decode later, leaving no margin.
     /// Idempotent within a frame.
-    pub fn flush_held(&mut self, d: &FrameDesc) -> Option<Unit> {
+    pub fn flush_held(&mut self, d: &FrameDesc) -> Option<(Unit, C)> {
         if self.advanced {
             return None;
         }
@@ -2046,7 +2071,7 @@ impl ObuState {
         // anything asks for a free slot, or a just-stored slot still reading as empty is handed
         // out again and the picture in it is lost.
         if let Some(slot) = self.pending_slot.take() {
-            let surface = ObuState::new_surface(&self.prev_ref, &d.ref_map);
+            let surface = Self::new_surface(&self.prev_ref, &d.ref_map);
             if surface != 0 {
                 self.slot_surface[usize::from(slot)] = surface;
             }
@@ -2066,7 +2091,11 @@ impl ObuState {
         &mut self,
         d: &FrameDesc,
         tiles: &[u8],
-    ) -> Result<Option<Vec<u8>>, StillHolding> {
+        mut carry: C,
+    ) -> Result<Option<Vec<u8>>, StillHolding>
+    where
+        C: Carried,
+    {
         // Refuse before advancing: this unit would be the second in one buffer.
         if self.held.is_some() {
             return Err(StillHolding);
@@ -2102,6 +2131,7 @@ impl ObuState {
                     desc: d.clone(),
                     tiles: tiles.to_vec(),
                     owes: Owed::PictureAndSlot,
+                    carry,
                 });
                 return Ok(None);
             }
@@ -2113,7 +2143,11 @@ impl ObuState {
             // and settles no eviction, and the copy that claims the slot follows on the next
             // submission, ahead of the frame that might reference it.
             let bytes = self.emit_frame(d, tiles, 0);
-            self.held = Some(Held { desc: d.clone(), tiles: tiles.to_vec(), owes: Owed::SlotOnly });
+            // The picture goes out with these bytes, so whatever the carrier was keeping to
+            // receive it is released here rather than surviving into the re-emission.
+            carry.picture_delivered();
+            self.held =
+                Some(Held { desc: d.clone(), tiles: tiles.to_vec(), owes: Owed::SlotOnly, carry });
             return Ok(Some(bytes));
         };
 
@@ -2130,7 +2164,7 @@ impl ObuState {
     ///
     /// Nothing follows to reveal where the guest stored it, and nothing that follows can reference
     /// it either, so it is written storing nothing.
-    pub fn flush_temporal_unit(&mut self) -> Option<Unit> {
+    pub fn flush_temporal_unit(&mut self) -> Option<(Unit, C)> {
         self.emit_held(None)
     }
 }
@@ -2674,7 +2708,7 @@ mod oracle {
     fn play(seed: u64, frames: usize, cover: &mut Coverage) {
         let guest = CGuest::new(seed);
         let theirs = CState::new();
-        let mut ours = ObuState::new();
+        let mut ours: ObuState<Target> = ObuState::new();
 
         for frame in 0..frames {
             let (desc, tiles) = guest.next();
@@ -2686,7 +2720,14 @@ mod oracle {
             // A frame's tile data may arrive over several calls, each carrying the same
             // descriptor, so the advance is asked for more than once on purpose.
             for call in 0..2 {
-                let mine = ours.flush_held(&parsed);
+                let held = ours.flush_held(&parsed);
+                // A picture the unit says nothing collects is one the model has already released
+                // the target for. The renderer never has to reconcile the two, and this is where
+                // that is pinned.
+                if let Some((unit, target)) = &held {
+                    assert_eq!(target.0, !unit.discard, "seed {seed}, frame {frame}");
+                }
+                let mine = held.map(|(unit, _)| unit);
                 let c = theirs.flush_held(&desc);
                 assert_eq!(mine, c, "seed {seed}, frame {frame}, flush {call}");
                 if call == 0 && mine.is_some() {
@@ -2697,7 +2738,7 @@ mod oracle {
                 }
             }
 
-            let mine = ours.build_temporal_unit(&parsed, &tiles);
+            let mine = ours.build_temporal_unit(&parsed, &tiles, Target(true));
             let c = theirs.build(&desc, &tiles);
             assert_eq!(mine, c, "seed {seed}, frame {frame}, build");
             match &mine {
@@ -2709,7 +2750,7 @@ mod oracle {
             // A caller that builds twice without flushing is refused on both sides -- two units in
             // one sample lose a picture, which is the failure the hold exists to prevent.
             if frame % 7 == 3 {
-                let mine = ours.build_temporal_unit(&parsed, &tiles);
+                let mine = ours.build_temporal_unit(&parsed, &tiles, Target(true));
                 let c = theirs.build(&desc, &tiles);
                 assert_eq!(mine, c, "seed {seed}, frame {frame}, second build");
                 if mine.is_err() {
@@ -2718,7 +2759,20 @@ mod oracle {
             }
         }
 
-        assert_eq!(ours.flush_temporal_unit(), theirs.flush_unit(), "seed {seed}, final flush");
+        let last = ours.flush_temporal_unit().map(|(unit, _)| unit);
+        assert_eq!(last, theirs.flush_unit(), "seed {seed}, final flush");
+    }
+
+    /// Stands in for the renderer's held target: set when a frame is built, and cleared by the
+    /// model the moment that frame's picture goes out. The C has no equivalent -- it reports the
+    /// same decision as `discard` on the unit -- so the two are asserted against each other.
+    #[derive(PartialEq, Eq, Debug)]
+    struct Target(bool);
+
+    impl Carried for Target {
+        fn picture_delivered(&mut self) {
+            self.0 = false;
+        }
     }
 
     #[test]
@@ -2788,11 +2842,12 @@ mod oracle {
         for _ in 0..40 {
             let (desc, tiles) = guest.next();
             let parsed = FrameDesc::read(desc.bytes()).unwrap();
-            assert_eq!(ours.flush_held(&parsed), theirs.flush_held(&desc));
-            assert_eq!(ours.build_temporal_unit(&parsed, &tiles), theirs.build(&desc, &tiles));
+            let mine = ours.flush_held(&parsed).map(|(unit, ())| unit);
+            assert_eq!(mine, theirs.flush_held(&desc));
+            assert_eq!(ours.build_temporal_unit(&parsed, &tiles, ()), theirs.build(&desc, &tiles));
             ours.drop_held();
             theirs.drop_held();
         }
-        assert_eq!(ours.flush_temporal_unit(), theirs.flush_unit());
+        assert_eq!(ours.flush_temporal_unit().map(|(unit, ())| unit), theirs.flush_unit());
     }
 }
