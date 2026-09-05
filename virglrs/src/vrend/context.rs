@@ -3353,13 +3353,16 @@ impl Context {
             let format = resource.args.format;
             let entry = resource.entry(host.formats).ok_or(Fault::IllegalFormat { cmd, format })?;
             let description = format.describe().ok_or(Fault::IllegalFormat { cmd, format })?;
-            resolved.push(video::Plane::new(
-                texture,
-                entry.gl,
-                description.block_bytes(),
-                resource.args.width,
-                resource.args.height,
-            ));
+            resolved.push(
+                video::Plane::new(
+                    texture,
+                    entry.gl,
+                    description.block_bytes(),
+                    resource.args.width,
+                    resource.args.height,
+                )
+                .ok_or(Fault::IllegalFormat { cmd, format })?,
+            );
         }
         video_result(cmd, self.video.create_buffer(handle, format, width, height, resolved))
     }
