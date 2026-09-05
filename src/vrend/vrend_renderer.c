@@ -3951,7 +3951,18 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
             internalformat = vrend_get_arb_format(view->format);
          }
 
-         if (has_feature(feat_texture_buffer_range)) {
+         /* Guarded like the shader-image path below and resource creation above: without
+          * the extension there is no glTexBuffer for epoxy to dispatch to, and it aborts
+          * the process rather than returning -- which a guest binding a sampler view to a
+          * buffer reaches, so the abort is guest-reachable. Nothing here is salvageable on
+          * such a host anyway: the resource was created GL_PIXEL_PACK_BUFFER_ARB and never
+          * became a texture buffer, and max_texture_buffer_size is left 0, which would
+          * underflow the clamp below. The guest gets an unbound sampler and a wrong
+          * picture; it does not get to end the process. */
+         if (!has_feature(feat_arb_or_gles_ext_texture_buffer)) {
+            virgl_error("%s: sampler view on a buffer needs texture_buffer, which this host "
+                        "lacks; leaving the view unbound\n", __func__);
+         } else if (has_feature(feat_texture_buffer_range)) {
             unsigned offset = view->u.buf.first_element;
             unsigned size = view->u.buf.last_element - view->u.buf.first_element + 1;
             int blsize = util_format_get_blocksize(view->format);
