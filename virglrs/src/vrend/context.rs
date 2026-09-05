@@ -135,6 +135,9 @@ pub struct Host<'a> {
     pub limits: &'a Limits,
     pub shader_cfg: &'a shader::Config,
     pub resources: &'a mut BTreeMap<ResourceHandle, resource::Slot>,
+    /// Which of those copy guest pages this batch, worked out once and read by every sampler
+    /// bind. See [`resource::Refresh`].
+    pub pixels: &'a mut resource::Refresh,
     pub guest: &'a dyn Guest,
     pub ctx: ContextId,
     pub current: &'a mut Current,
@@ -171,6 +174,14 @@ impl Host<'_> {
     fn refresh_guest_pixels(&mut self, handle: ResourceHandle) {
         let (batch, gl, formats, ctx, guest) =
             (self.batch, self.gl, self.formats, self.ctx, self.guest);
+        // Two questions, cheapest first. The set answers "is this one of the blobs that copy" for
+        // the whole batch off one walk of the table, so the common texture -- every classic
+        // resource, every blob that adopted a surface -- costs a scan of a list that is usually
+        // empty rather than a lookup in the resource table. Only a member goes on to ask the
+        // resource whether this batch's copy was already taken.
+        if !self.pixels.wants(batch, handle, self.resources) {
+            return;
+        }
         if !self
             .resources
             .get(&handle)
