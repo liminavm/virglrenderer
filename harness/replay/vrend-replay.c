@@ -483,6 +483,13 @@ static void zero_resource(uint32_t handle, uint32_t width, uint32_t height, int 
 
 static void score_resource(const struct res_ev *ev)
 {
+   /* A planar resource is scored through its IOSurface, plane by plane, and asking for it as one
+    * RGBA texture is asking for the thing that has no answer: the renderer refuses, and the C
+    * refuses by poisoning the context, which drops every later submit in the corpus -- 893 of
+    * them on the composite leg. The sweep must not manufacture the guest-hostile request it
+    * exists to observe the absence of. */
+   if (format_is_planar_yuv(ev->format))
+      return;
    uint32_t w = ev->width ? ev->width : 1, h = ev->height ? ev->height : 1;
    size_t need = (size_t)w * h * 4;
    uint8_t *px = calloc(1, need);
@@ -496,6 +503,12 @@ static void score_resource(const struct res_ev *ev)
    int rr = virgl_renderer_transfer_read_iov(ev->handle, (uint32_t)want_ctx, 0, w * 4, 0,
                                              &box, 0, &riov, 1);
    if (rr) {
+      /* A refusal is a result, not an absence of one. Dropping it here meant a renderer that
+       * started refusing what the reference serves scored byte-identical -- the one class of
+       * divergence the sweep could not see, and one that a hardening change makes real rather
+       * than hypothetical. The errno is the whole content: what it refused, and with which
+       * answer, is what a guest would have been told. */
+      score_addf("readback res=%u %ux%u failed=%d\n", ev->handle, w, h, rr);
       fprintf(stderr, "readback of res %u failed: %d\n", ev->handle, rr);
       free(px);
       return;
@@ -729,6 +742,22 @@ int main(int argc, char **argv)
    for (int i = 0; i < n_ctx; i++) {
       ret = virgl_renderer_context_create((uint32_t)ctx_list[i], (uint32_t)strlen(name), name);
       if (ret) { fprintf(stderr, "context_create %d failed: %d\n", ctx_list[i], ret); return 2; }
+   }
+
+   /* One probe, because a refusal's ANSWER is part of the ABI and no corpus contains a request
+    * that is refused with an errno rather than with -1. This is not the manufactured request the
+    * sweep must not make: it names a handle nothing created, so it touches no resource, poisons
+    * no context and drops no submit -- it asks the one question a recorded guest never asks, and
+    * both implementations have to give the same answer. virglrenderer answers a transfer with a
+    * POSITIVE errno, which is the opposite of most of its ABI, and a port that returns -22 here
+    * reads to a VMM as a different failure entirely. */
+   {
+      uint8_t probe[4] = { 0 };
+      struct iovec piov = { .iov_base = probe, .iov_len = sizeof probe };
+      struct virgl_box pbox = { .x = 0, .y = 0, .z = 0, .w = 1, .h = 1, .d = 1 };
+      int pr = virgl_renderer_transfer_read_iov(0xfffffff0u, (uint32_t)want_ctx, 0, 4, 0,
+                                                &pbox, 0, &piov, 1);
+      score_addf("probe transfer-of-unknown-resource answered=%d\n", pr);
    }
 
    /* Score every colour offscreen at its unref unless told to narrow. The old default picked ONE
