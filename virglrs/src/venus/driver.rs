@@ -2814,16 +2814,19 @@ impl Driver {
         // An import and a scanout are mutually exclusive by construction: an import names
         // storage that exists, and a scanout is storage being made.
         //
-        // An import that resolves to nothing falls through to an ordinary allocation, which is
-        // what this did before anything resolved at all: the guest gets memory, and the storage
-        // it meant to reach stays where it is. That is wrong for the guest -- it renders into a
-        // buffer nobody presents -- but it is the driver's own behaviour for a `pNext` link it
-        // does not recognise, and inventing a refusal here would fail allocations the C serves.
         // Held, not merely resolved: the driver is handed an address, and an address is good
         // only as long as what it points into. The importer's record keeps what it resolved --
         // a share, or the host's own mapping -- so the bytes outlive the exporter's record and
         // the resource both, for exactly as long as the driver may still reach them.
-        let alias = import.and_then(resource_bytes);
+        let alias = import.flatten().and_then(resource_bytes);
+        // An import that resolves to nothing is refused, never quietly turned into an allocation
+        // of our own. The guest asked to alias storage it named; memory that aliases nothing is
+        // a buffer nobody presents, and the bind that follows would reach a handle the host
+        // never backed. Refusing puts the failure where the guest can see it, and ghosts the id
+        // so the commands already in flight behind it are lost rather than fatal.
+        if import.is_some() && alias.is_none() {
+            return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
+        }
         let alias_span = alias.as_ref().and_then(|b| self.span(b));
         let surface = if import.is_some() {
             Err(NoSurface::NotExported)
@@ -3999,11 +4002,13 @@ fn pixel_format(format: VkFormat) -> Option<PixelFormat> {
 /// The resource an allocation's `pNext` chain names, when it is aliasing storage rather than
 /// asking for some.
 ///
-/// Walked rather than asked of the guest, because the chain is where the guest put it. Resource
-/// zero is no resource, the same way a null handle is no image.
-fn imported_resource(node: *const core::ffi::c_void) -> Option<ResourceHandle> {
-    chain_find::<VkImportMemoryResourceInfoMESA>(node)
-        .and_then(|i| ResourceHandle::new(i.resourceId))
+/// Walked rather than asked of the guest, because the chain is where the guest put it. The two
+/// layers are one answer: the outer says the guest asked to import, the inner which resource it
+/// named -- and `Some(None)` is an import naming resource zero, which is no resource the way a
+/// null handle is no image. Both are answered here so that no caller can hold a presence and a
+/// resolution that disagree.
+fn imported_resource(node: *const core::ffi::c_void) -> Option<Option<ResourceHandle>> {
+    chain_find::<VkImportMemoryResourceInfoMESA>(node).map(|i| ResourceHandle::new(i.resourceId))
 }
 
 /// Read a Vulkan `const char *const *` array into owned strings.
@@ -4328,6 +4333,75 @@ mod tests {
         d.abandon_planted();
     }
 
+    /// An import that resolves to nothing is refused, and costs the host neither memory nor a
+    /// call to the driver.
+    ///
+    /// The resource is gone, or was never this context's, or the chain named resource zero. The
+    /// tempting answer is to allocate ordinary memory and report success, and it is the wrong
+    /// one twice over: the guest renders into a buffer nobody presents, and the bind that
+    /// follows reaches a handle the host never backed -- which is fatal on the ring, not
+    /// recoverable. The reference refuses these with the same code, so a guest that sees one is
+    /// seeing what it would see on the C.
+    #[test]
+    fn an_import_that_resolves_to_nothing_is_refused() {
+        use super::super::proto::types::VkImportMemoryResourceInfoMESA;
+        use std::cell::Cell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+
+        thread_local! {
+            static ASKED: Cell<u32> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn allocate(
+            _d: VkDevice,
+            _info: *const VkMemoryAllocateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkDeviceMemory,
+        ) -> VkResult {
+            ASKED.with(|a| a.set(a.get() + 1));
+            // SAFETY: the caller's local.
+            unsafe { *out = VkDeviceMemory(0x9000) };
+            VkResult::VK_SUCCESS
+        }
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkAllocateMemory(allocate);
+        d.plant_device(DEVICE, fns);
+        d.plant_memory_types(DEVICE, &[VkMemoryPropertyFlags(HOST_VISIBLE_BIT as _)]);
+
+        // Two ways for a chain to name nothing, and one answer to both: a resource the resolver
+        // cannot find, and the wire's spelling of no resource at all.
+        for resource_id in [17, 0] {
+            let import = VkImportMemoryResourceInfoMESA {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+                pNext: core::ptr::null(),
+                resourceId: resource_id,
+            };
+            let info = VkMemoryAllocateInfo {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                pNext: (&raw const import).cast(),
+                allocationSize: VkDeviceSize(16384),
+                memoryTypeIndex: 0,
+            };
+            let refused = d.allocate_memory(DEVICE, ObjectId(80), &info, None, &|_| None);
+            assert!(
+                matches!(
+                    refused,
+                    Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE))
+                ),
+                "res {resource_id} names no storage, so there is nothing to alias"
+            );
+        }
+
+        assert_eq!(ASKED.with(Cell::get), 0, "and the driver was never asked to allocate");
+        assert_eq!(d.account.live(), 0, "nor was a byte charged for memory nobody got");
+        assert!(!d.memory.contains_key(&ObjectId(80)), "and no record was filed under the id");
+
+        d.abandon_planted();
+    }
+
     /// A `pNext` chain naming another allocation's resource is what makes an allocation an
     /// import, and the guest may hang it anywhere in the chain. Reading only the head would find
     /// it exactly when the guest happened to put it first, which is not a contract.
@@ -4352,7 +4426,7 @@ mod tests {
         };
         assert_eq!(
             imported_resource((&raw const head).cast()),
-            ResourceHandle::new(7),
+            Some(ResourceHandle::new(7)),
             "found past the head, with its resource"
         );
 
@@ -4360,10 +4434,12 @@ mod tests {
         assert_eq!(imported_resource((&raw const head).cast()), None, "and none when absent");
 
         // Resource zero is how the wire spells "no resource" -- it must not resolve to a handle,
-        // because a handle is what the renderer would then go looking for.
+        // because a handle is what the renderer would then go looking for. The chain still asked
+        // to import, though, which is why the outer answer stays `Some`: it names nothing, and
+        // an import naming nothing is refused rather than allocated.
         tail.resourceId = 0;
         head.pNext = (&raw const tail).cast();
-        assert_eq!(imported_resource((&raw const head).cast()), None);
+        assert_eq!(imported_resource((&raw const head).cast()), Some(None));
     }
 
     /// The budget's three answers, at the one call that asks it.
