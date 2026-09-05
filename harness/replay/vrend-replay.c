@@ -65,7 +65,7 @@
 #define TRACE_MAGIC 0x4c4d5654u
 
 enum { T_SUBMIT = 1, T_CMD = 2, T_DRAW_FB = 3, T_TRANSFER = 4, T_FENCE = 5, T_RETIRE = 6,
-       T_PAD = 7, T_XFERDATA = 9 };
+       T_PAD = 7, T_XFERDATA = 9, T_BLOBDATA = 10 };
 enum { RES_CREATE = 0, RES_BLOB = 1, RES_UNREF = 2 };
 
 #define VIRGL_CCMD_CREATE_OBJECT        1
@@ -111,7 +111,10 @@ struct backing {
     * to read back and is counted rather than scored. */
    bool     is_blob;
    bool     typed;
-   uint32_t t_format, t_width, t_height;
+   uint32_t t_format, t_width, t_height, t_stride;
+   /* Content landed since the last write into the texture. A blob's pixels are not the
+    * texture's: the bytes go into the backing store, and something has to carry them across. */
+   bool     dirty;
 };
 
 /* An array of POINTERS, never of structs. vrend stores the `struct iovec *` it is handed and
@@ -520,6 +523,45 @@ static void zero_resource(uint32_t handle, uint32_t format, uint32_t width, uint
    free(zeros);
 }
 
+/* Carry a blob's recorded bytes from its backing store into its texture.
+ *
+ * Both legs need this and for opposite reasons, which is why it is one unconditional path and
+ * never a per-renderer branch. The C re-reads the backing at every sampling batch on its own
+ * (vrend_resource_refresh_guest_pixels), so a write here is idempotent -- it asserts the same
+ * bytes the refresh is about to assert. virglrs has no such refresh, so this write is the only
+ * way its texture ever holds anything but the zeros the upgrade left. Feeding the backing alone
+ * would score content on one leg and zeros on the other.
+ *
+ * The guest's own stride is used, not a packed row: this corpus declares 4096 for a 500-wide
+ * 8-byte format whose packed row is 4000, and the difference is exactly the class of bug the
+ * content fixture exists to catch. */
+static uint32_t blob_feed(int ctx)
+{
+   uint32_t fed = 0;
+   for (uint32_t i = 0; i < backing_n; i++) {
+      struct backing *b = backings[i];
+      if (!b->is_blob || !b->typed || !b->dirty || !b->live)
+         continue;
+      uint32_t w = b->t_width ? b->t_width : 1, h = b->t_height ? b->t_height : 1;
+      uint32_t packed;
+      size_t need;
+      if (!format_geometry(b->t_format, w, h, &packed, &need))
+         continue;
+      const uint32_t stride = b->t_stride ? b->t_stride : packed;
+      /* The guest's layout must fit in the pages it declared, or the write walks off the end of
+       * the backing. A capture that says otherwise is a capture to fix, not to clamp. */
+      if ((size_t)stride * h > b->size)
+         continue;
+      struct iovec biov = { .iov_base = b->mem, .iov_len = b->size };
+      struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
+      if (!virgl_renderer_transfer_write_iov(b->handle, (uint32_t)ctx, 0, stride, 0, &box,
+                                             0, &biov, 1))
+         fed++;
+      b->dirty = false;
+   }
+   return fed;
+}
+
 static void score_resource(const struct res_ev *ev)
 {
    /* A planar resource is scored through its IOSurface, plane by plane, and asking for it as one
@@ -833,6 +875,7 @@ int main(int argc, char **argv)
        * replayed context is not always the first one named. */
       int batch_ctx = want_ctx;
       uint32_t submits = 0, cmds = 0, xfers = 0, dropped = 0, copy_fed = 0, copy_bad = 0;
+      uint32_t blobdata = 0, blobs_fed = 0;
       uint32_t made = 0, failed = 0, unrefs = 0;
       bool batch_watch = false;
 
@@ -903,10 +946,40 @@ int main(int argc, char **argv)
                   tb->t_format = f[2];
                   tb->t_width = f[4];
                   tb->t_height = f[5];
+                  /* Plane 0's stride, at dword 9. The guest's rows are not necessarily packed
+                   * -- this corpus declares 4096 for a 500-wide 8-byte format whose packed row
+                   * is 4000 -- and a write that assumed packed would shear every frame. */
+                  tb->t_stride = dw > 9 ? f[9] : 0;
                }
             }
             batch_dw += dw;
             cmds++;
+            break;
+         }
+         case T_BLOBDATA: {
+            /* A blob's pixels are written GPU-side by a Vulkan client and never travel as a
+             * transfer, so the recorder reads them where vrend does and they arrive here. Land
+             * them in the backing store at the blob's own offset 0, exactly as the guest laid
+             * them out; blob_feed below is what carries them into the texture. */
+            uint32_t handle = h.aux_count > 0 ? aux[0] : 0;
+            struct backing *b = backing_find(handle);
+            if (b && h.payload_len <= b->size) {
+               memcpy(b->mem, pay, h.payload_len);
+               b->dirty = true;
+               blobdata++;
+               /* The recorder reads a blob at the sampler bind INSIDE a batch, so this record
+                * sits among the commands of the batch that samples it. Hand that batch to vrend
+                * first: the pending commands may carry the SET_TYPE that makes the texture
+                * exist, and the write must land before the draw that reads it -- on the leg
+                * with no refresh of its own, that ordering is the whole content. */
+               if (batch_dw) {
+                  if (virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
+                     dropped++;
+                  submits++;
+                  batch_dw = 0;
+               }
+               blobs_fed += blob_feed(batch_ctx ? batch_ctx : want_ctx);
+            }
             break;
          }
          case T_XFERDATA: {
@@ -1094,6 +1167,12 @@ int main(int argc, char **argv)
                  "copy-fed %u copy-unmatched %u submit-errors %u iosurface-backed %u\n",
                  loop, made, failed, unrefs, submits, cmds, xfers, copy_fed, copy_bad, dropped,
                  iosurf_backed);
+      /* Its own line, and only for a corpus that carries blob content: appending two fields to
+       * the counter line above would move every pinned score in the tree. `records` is what the
+       * capture holds, `fed` what reached a texture, and the two differing is the signal --
+       * bytes recorded for a blob nothing typed land nowhere and say so. */
+      if (blobdata)
+         count_addf("loop %d blob-content records %u fed %u\n", loop, blobdata, blobs_fed);
       made_total += made;
       failed_total += failed;
    }

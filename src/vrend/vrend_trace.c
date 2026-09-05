@@ -351,6 +351,52 @@ void vrend_trace_transfer_data(uint32_t ctx_id, uint32_t res_handle, uint64_t of
    trace_put(VREND_TRACE_XFERDATA, 0, ctx_id, aux, 3, data, len);
 }
 
+/* The last blob bytes recorded per handle, as a 64-bit FNV-1a. A handle table rather than a
+ * per-resource field because the tracer is deliberately reachable from vrend without owning
+ * anything of vrend's: it records, and holds no resource state. */
+#define TR_BLOB_SEEN 64
+static struct { uint32_t handle; uint64_t hash; bool used; } tr_blob_seen[TR_BLOB_SEEN];
+
+void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
+                           const void *data, uint32_t len)
+{
+   uint32_t aux[1];
+   uint64_t hash = 1469598103934665603ull;
+   const uint8_t *p = data;
+   uint32_t slot;
+
+   if (!tr_on || !data || !len)
+      return;
+
+   for (uint32_t i = 0; i < len; i++) {
+      hash ^= p[i];
+      hash *= 1099511628211ull;
+   }
+
+   /* Open addressing with a linear probe, and no eviction: a full table stops deduping rather
+    * than recording a handle under another's hash, which would drop a frame that really did
+    * change. */
+   slot = res_handle % TR_BLOB_SEEN;
+   for (uint32_t i = 0; i < TR_BLOB_SEEN; i++) {
+      uint32_t k = (slot + i) % TR_BLOB_SEEN;
+      if (tr_blob_seen[k].used && tr_blob_seen[k].handle == res_handle) {
+         if (tr_blob_seen[k].hash == hash)
+            return;
+         tr_blob_seen[k].hash = hash;
+         break;
+      }
+      if (!tr_blob_seen[k].used) {
+         tr_blob_seen[k].used = true;
+         tr_blob_seen[k].handle = res_handle;
+         tr_blob_seen[k].hash = hash;
+         break;
+      }
+   }
+
+   aux[0] = res_handle;
+   trace_put(VREND_TRACE_BLOBDATA, 0, ctx_id, aux, 1, data, len);
+}
+
 void vrend_trace_fence(uint32_t ctx_id, uint32_t flags, uint64_t fence_id)
 {
    uint32_t aux[1];

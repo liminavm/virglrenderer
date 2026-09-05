@@ -165,6 +165,12 @@ struct vrend_resource {
    uint32_t guest_pixels_stride[VIRGL_GBM_MAX_PLANES];
    uint32_t guest_pixels_offset[VIRGL_GBM_MAX_PLANES];
    uint64_t guest_pixels_serial;
+   /* limina: the resource handle these pixels belong to, for the tracer alone. The id lives on
+    * the owning virgl_resource, which the refresh path -- reached from a sampler view -- has no
+    * way back to; a capture keyed on anything else cannot be routed to a resource on replay.
+    * Set at the single site that turns ->guest_pixels on and dies with the resource, so it
+    * cannot name a handle that has been reused. */
+   uint32_t guest_pixels_res_id;
 };
 
 #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)

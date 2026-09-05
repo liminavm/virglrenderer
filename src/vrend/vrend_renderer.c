@@ -15474,6 +15474,17 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
       return false;
    }
 
+   /* limina: record the blob's bytes for the replay harness. Emitted here because this is the
+    * one place that has both the pixels and the proof they are readable -- the loop above just
+    * walked the guest's declared layout end to end. The SOURCE region goes out, not `staging`:
+    * the replayed renderers apply their own stride and format handling to it, which is the
+    * thing the fixture exists to compare, and handing them pre-packed rows would compare the
+    * recorder with itself. Only the mapped case is captured; an iov-backed blob's pages are the
+    * guest's own and are already replayed through the backing store. */
+   if (gr->guest_pixels_map && vrend_trace_enabled())
+      vrend_trace_blob_data(0, gr->guest_pixels_res_id, gr->guest_pixels_map,
+                            (uint32_t)gr->guest_pixels_map_size);
+
    if (yuv)
       vrend_resource_write_iosurface_planes(gr, planes, plane_count);
 
@@ -15759,6 +15770,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                gr->guest_pixels_stride[i] = args->plane_strides[i];
                gr->guest_pixels_offset[i] = args->plane_offsets[i];
             }
+            gr->guest_pixels_res_id = res_id;
             gr->guest_pixels =
                vrend_resource_upload_guest_pixels(gr, "set_type");
             if (!gr->guest_pixels) {
