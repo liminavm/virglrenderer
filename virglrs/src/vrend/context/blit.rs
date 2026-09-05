@@ -509,6 +509,38 @@ impl Context {
         }
     }
 
+    /// `vrend_resource_fill_composite`, for every composite target that owes one.
+    ///
+    /// Two things arm this and it runs at whichever comes second: a picture delivered into a
+    /// target something already samples whole, and the first composite view of a target with a
+    /// picture already in it. Both are recorded on the resource, so this asks rather than being
+    /// told -- one owner for the fact, and no queue that could name a target whose state has
+    /// since moved on.
+    ///
+    /// Called after every command in a batch. A target only per-plane consumers ever read never
+    /// owes a fill and so costs nothing but the walk.
+    pub(super) fn fill_composites(&mut self, host: &mut Host<'_>) {
+        for texture in self.video.owed_fills() {
+            let planes = texture.planes.as_ref().expect("a target that owes a fill has planes");
+            // The extent is the luma plane's, which is the surface's, which is what the base
+            // texture was allocated alongside. Not the video buffer's -- that is a second number
+            // the guest states separately.
+            let Some(geometry) = planes.geometry(0) else {
+                continue;
+            };
+            let outcome = self.in_blit_context(host, |blitter, gl, _| {
+                let names = planes.textures(gl);
+                blitter.convert_planes(gl, texture.name, geometry.width, geometry.height, names)
+            });
+            // Only a pass that ran and succeeded clears the debt. A failure has already said so,
+            // and leaving it owed is what makes the next command retry -- where claiming success
+            // would leave the base texture a frame behind for the rest of the target's life.
+            if let Some(Ok(())) = outcome {
+                planes.filled();
+            }
+        }
+    }
+
     /// `vrend_renderer_blit_fbo`.
     fn blit_fbo(
         &mut self,

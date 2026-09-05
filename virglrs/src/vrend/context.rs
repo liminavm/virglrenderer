@@ -991,6 +991,7 @@ impl Context {
             if let Err(f) = self.run(host, cmd) {
                 return self.poison(f);
             }
+            self.fill_composites(host);
             // `vrend_check_no_error`: any GL error a command left is the context's error.
             let err = host.gl.drain_errors();
             if err != GL_NO_ERROR {
@@ -1831,18 +1832,20 @@ impl Context {
             } else {
                 if matches!(request, resource::PlaneRequest::Composite) {
                     // The guest is sampling the planar format itself, which lands on the base
-                    // texture -- and on a plane-backed target nothing fills that but the
-                    // conversion of the planes into it, which this build does not do yet. No
-                    // guest can reach this: the capset offers no planar format, so nothing is
-                    // ever created in one. It arrives with the delivery path, together with the
-                    // advertisement that would let a guest ask.
-                    eprintln!(
-                        "[virglrs] vrend: a composite view of a {}x{} {} target, which this \
-                         build cannot convert; it will sample an unfilled texture",
-                        res.args.width,
-                        res.args.height,
-                        res_format.name()
-                    );
+                    // texture -- and on a plane-backed target nothing on the decode path fills
+                    // that, because delivery puts pixels in the surface planes. So from here on
+                    // this target's planes are converted into it. The pass itself runs at the
+                    // end of this command, with the rest of what the batch has left owing.
+                    let planes = res.planes().expect("a plane request comes from the planes");
+                    if planes.sampled() {
+                        eprintln!(
+                            "[virglrs] vrend: a {}x{} {} target is sampled whole; its planes \
+                             will be converted into the base texture",
+                            res.args.width,
+                            res.args.height,
+                            res_format.name()
+                        );
+                    }
                 }
                 // An index with no plane behind it is spent rather than refused: the C does the
                 // same, and a refused view costs the guest its context for the rest of its life,

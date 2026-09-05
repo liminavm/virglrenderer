@@ -28,7 +28,7 @@ use super::formats::GlFormat;
 use super::gl::gles::GL_TEXTURE_2D;
 use super::gl::{Gl, pixel_bytes};
 use super::proto::{Format, VideoBufferHandle, VideoCodecHandle};
-use super::resource::Texture;
+use super::resource::{self, Texture};
 use crate::videotoolbox::{self, Configuration, PixelFormat, Session, SessionKey};
 
 /// `enum pipe_video_profile`, as virglrenderer numbers it.
@@ -407,11 +407,27 @@ impl Buffer {
                 // lock -- a runtime failure, and one that shows as a target holding the
                 // previous frame.
                 eprintln!(
-                    "[virglrs] video: plane {index} of a composite target would not take a                      picture; the frame keeps whatever was there"
+                    "[virglrs] video: plane {index} of a composite target would not take a \
+                     picture; the frame keeps whatever was there"
                 );
             }
         }
+        // The base texture a composite view samples is now behind these planes. Whether that
+        // matters -- whether anything samples it at all -- is the resource's own to answer, and
+        // it is recorded there. Whether the conversion runs now is the caller's, because the
+        // pass needs a blitter this layer has no business holding.
+        if written > 0 {
+            planes.delivered();
+        }
         written
+    }
+
+    /// The one texture this target is, when it is a composite one.
+    fn composite(&self) -> Option<&Arc<Texture>> {
+        match &self.destination {
+            Destination::Composite(texture) => Some(texture),
+            Destination::PerPlane(_) => None,
+        }
     }
 
     /// Copy a decoded picture into one GL texture per plane.
@@ -1187,6 +1203,23 @@ impl Video {
         self.buffers
             .insert(handle, Arc::new(Buffer { format: layout, width, height, destination }));
         Ok(())
+    }
+
+    /// The composite targets whose base texture is behind their planes.
+    ///
+    /// Asked rather than pushed. The state is on the resource, where delivery recorded it and
+    /// where the sampler-view path reads the same field -- so this walks and answers, and does
+    /// not keep a second list that could disagree with it. A target nothing samples whole never
+    /// appears here, and neither does one already in step.
+    ///
+    /// The caller runs the pass: it needs the blitter, which is a layer up.
+    pub fn owed_fills(&self) -> Vec<Arc<Texture>> {
+        self.buffers
+            .values()
+            .filter_map(|buffer| buffer.composite())
+            .filter(|texture| texture.planes.as_ref().is_some_and(resource::Planes::needs_fill))
+            .cloned()
+            .collect()
     }
 
     /// DESTROY_VIDEO_BUFFER.
