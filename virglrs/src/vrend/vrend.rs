@@ -87,6 +87,8 @@ pub struct Vrend {
     /// current GL context and the driver, and a drop has neither. So it is parked here and swept
     /// from the next place that has both.
     doomed: Vec<Arc<resource::Texture>>,
+    /// Which resources copy guest pages, as of the batch it was last asked in.
+    pixels: resource::Refresh,
     /// Batches run, ever. The unit a copy of a guest's pages is kept fresh in: within one batch
     /// the guest has had no opportunity to run, so one read serves every draw in it.
     batch: u64,
@@ -169,6 +171,7 @@ impl Vrend {
             blitter: None,
             doomed: Vec::new(),
             batch: 0,
+            pixels: resource::Refresh::default(),
         })
     }
 
@@ -222,6 +225,7 @@ impl Vrend {
             blitter,
             doomed: _,
             batch,
+            pixels,
         } = self;
         let host = Host {
             batch: *batch,
@@ -234,6 +238,7 @@ impl Vrend {
             limits,
             shader_cfg,
             resources,
+            pixels,
             guest,
             ctx,
             current,

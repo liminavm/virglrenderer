@@ -17,6 +17,7 @@ use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
 use crate::guest_mem::{Iov, PixelSource};
+use crate::ids::ResourceHandle;
 use crate::metal::{Held, PixelFormat, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -491,14 +492,17 @@ impl Untyped {
         // this fact that the retry above is exactly the thing to make disagree.
         // An adopted surface is the exporter's bytes and needs neither a fill nor a re-read.
         let mut guest_pixels = None;
+        let mut staging = Vec::new();
         if !matches!(&storage, Storage::Texture(t) if t.image.is_some()) {
-            if pixels
-                .is_some_and(|src| fill_texture(gl, formats, &args, &storage, src, plane, true))
-            {
+            if pixels.is_some_and(|src| {
+                fill_texture(gl, formats, &args, &storage, src, plane, &mut staging, true)
+            }) {
                 // A copy, so it is owed a re-read before anything samples it in a later batch.
                 // Stamped with this batch: the guest has had no chance to run since the command
                 // that filled it, so a draw in the same batch reads what is already there.
-                guest_pixels = Some(GuestPixels { plane, read_in: batch, said: false });
+                // The buffer the fill just sized comes along: every later re-read of this blob
+                // wants exactly that many bytes again.
+                guest_pixels = Some(GuestPixels { plane, read_in: batch, said: false, staging });
             } else {
                 // `glTexStorage` leaves contents undefined, which is another context's memory
                 // read as pixels -- wrong, and a leak. Blank is still wrong; not also a leak.
@@ -952,6 +956,13 @@ pub struct GuestPixels {
     /// not change between them, so a source that cannot satisfy the layout would otherwise say so
     /// at frame rate forever. Said once per resource, as [`venus::driver::Pages`] says its own.
     said: bool,
+    /// The packed copy handed to GL, kept between batches rather than allocated in each.
+    ///
+    /// It is scratch and holds nothing between fills -- the texture is what the copy is for. It
+    /// lives here because this is what the fills share: same resource, same size, every batch,
+    /// for as long as the blob is bound. Allocating and freeing a frame buffer's worth per batch
+    /// is the churn this removes; the copy itself is what the C pays too.
+    staging: Vec<u8>,
 }
 
 /// A resource the host holds. Its GL objects are deleted by [`Resource::destroy`], never by drop:
@@ -962,6 +973,48 @@ pub struct Resource {
     /// Set only for a blob filled from pages this renderer may read; `None` for everything else,
     /// which is every classic resource and every blob that adopted a surface.
     pub guest_pixels: Option<GuestPixels>,
+}
+
+/// Which resources copy guest pages, as of one batch.
+///
+/// The draw path asks this of every texture it binds, and the answer is the same for all of them
+/// within a batch, so it is worked out once from the resource table and then read. It is derived
+/// and thrown away rather than maintained: a set kept in step with the table by hand is a second
+/// record of one fact, and the day it disagrees is a handle naming a resource that no longer
+/// exists. Resolved lazily, so a batch that binds no texture never walks the table at all.
+///
+/// A resource typed part-way through a batch is missing from a set resolved before it -- and
+/// wants nothing, because [`Untyped::upgrade`] read its pages as it typed them and stamped this
+/// batch. A resource destroyed part-way through leaves its handle here, naming nothing; the
+/// lookup that follows finds no resource and the refresh declines, which is the whole reason
+/// this holds handles and not resources.
+#[derive(Default)]
+pub struct Refresh {
+    /// The batch `of` was worked out for. Batches start at one, so the default is "never".
+    resolved_in: u64,
+    of: Vec<ResourceHandle>,
+}
+
+impl Refresh {
+    /// Work the set out for `batch` if it has not been, then say whether `handle` is in it.
+    pub fn wants(
+        &mut self,
+        batch: u64,
+        handle: ResourceHandle,
+        resources: &BTreeMap<ResourceHandle, Slot>,
+    ) -> bool {
+        if self.resolved_in != batch {
+            self.resolved_in = batch;
+            self.of.clear();
+            self.of.extend(
+                resources
+                    .iter()
+                    .filter(|(_, slot)| slot.resource().is_some_and(|r| r.guest_pixels.is_some()))
+                    .map(|(handle, _)| *handle),
+            );
+        }
+        self.of.contains(&handle)
+    }
 }
 
 impl Resource {
@@ -988,13 +1041,14 @@ impl Resource {
         batch: u64,
         src: &PixelSource<'_>,
     ) {
-        let Some(gp) = &mut self.guest_pixels else {
+        let Resource { args, storage, guest_pixels } = self;
+        let Some(gp) = guest_pixels else {
             return;
         };
         let plane = gp.plane;
         gp.read_in = batch;
         let say = !gp.said;
-        if !fill_texture(gl, formats, &self.args, &self.storage, src, plane, say) {
+        if !fill_texture(gl, formats, args, storage, src, plane, &mut gp.staging, say) {
             gp.said = true;
         }
     }
@@ -1658,6 +1712,7 @@ fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image>
 /// The rows are copied one at a time because the guest's stride is its own business: it is free
 /// to pad each row to whatever the allocation wanted, and a fill that assumed packed rows would
 /// shear the image by the difference. The staging buffer is packed, which is what GL is then told.
+#[allow(clippy::too_many_arguments)]
 fn fill_texture(
     gl: &Gl,
     formats: &Table,
@@ -1665,6 +1720,7 @@ fn fill_texture(
     storage: &Storage,
     src: &PixelSource<'_>,
     plane: Plane,
+    staging: &mut Vec<u8>,
     say: bool,
 ) -> bool {
     let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
@@ -1732,7 +1788,8 @@ fn fill_texture(
         );
         return false;
     }
-    let mut staging = vec![0u8; total];
+    staging.clear();
+    staging.resize(total, 0);
     for y in 0..a.height as u64 {
         let at = u64::from(plane.offset) + y * stride;
         let dst = y as usize * row;
@@ -1761,7 +1818,7 @@ fn fill_texture(
         a.height as GLsizei,
         entry.gl.glformat,
         entry.gl.gltype,
-        &staging,
+        staging,
     );
     gl.bind_texture_name(t.target, prev as GLuint);
     true
