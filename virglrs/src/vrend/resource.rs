@@ -50,22 +50,57 @@ impl Bind {
         self.0 & other.0 != 0
     }
 
-    /// The buffer binds, which the C matches by *equality*: a resource is a buffer when its bind
-    /// is exactly one of these, and a texture otherwise.
+    /// What this bind names, decided once.
+    ///
+    /// Read it here and nowhere else. `Bind` looks like a bitmask and is one, but the buffer
+    /// binds are told apart by **equality on the whole word** -- `VERTEX_BUFFER|SAMPLER_VIEW` is
+    /// not a vertex buffer, it is the sampler case. The C states that twice, in
+    /// `check_resource_valid` and again in `vrend_resource_alloc_buffer`, and a reader who takes
+    /// either for a mask gets a different answer from the other.
+    fn kind(self) -> BindKind {
+        match self {
+            Bind::CUSTOM => BindKind::HostShadow,
+            Bind::STAGING => BindKind::GuestPages,
+            Bind::INDEX_BUFFER => BindKind::Index,
+            Bind::STREAM_OUTPUT => BindKind::StreamOutput,
+            Bind::VERTEX_BUFFER => BindKind::Vertex,
+            Bind::CONSTANT_BUFFER => BindKind::Constant,
+            Bind::QUERY_BUFFER => BindKind::Query,
+            Bind::COMMAND_ARGS => BindKind::CommandArgs,
+            Bind(0) | Bind::SHADER_BUFFER => BindKind::Plain,
+            b if b.has(Bind::SAMPLER_VIEW) => BindKind::Sampled,
+            _ => BindKind::Other,
+        }
+    }
+}
+
+/// What a bind names. See [`Bind::kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BindKind {
+    /// `VIRGL_BIND_CUSTOM`: host memory, and no GL object at all.
+    HostShadow,
+    /// `VIRGL_BIND_STAGING`: the guest's own pages are the storage.
+    GuestPages,
+    Index,
+    StreamOutput,
+    Vertex,
+    Constant,
+    Query,
+    CommandArgs,
+    /// No bind at all, or a shader buffer: a plain array buffer either way.
+    Plain,
+    /// Not equal to any of the above, but carrying `SAMPLER_VIEW` -- a texture buffer on a
+    /// buffer target, an ordinary texture on any other.
+    Sampled,
+    /// Neither, which on a buffer target is nothing this can make.
+    Other,
+}
+
+impl BindKind {
+    /// Whether this is one of the binds the C tells buffers by, which is what selects the
+    /// buffer-shaped rules rather than the texture-shaped ones.
     fn is_buffer_bind(self) -> bool {
-        matches!(
-            self,
-            Bind(0)
-                | Bind::CUSTOM
-                | Bind::STAGING
-                | Bind::INDEX_BUFFER
-                | Bind::STREAM_OUTPUT
-                | Bind::VERTEX_BUFFER
-                | Bind::CONSTANT_BUFFER
-                | Bind::QUERY_BUFFER
-                | Bind::COMMAND_ARGS
-                | Bind::SHADER_BUFFER
-        )
+        !matches!(self, BindKind::Sampled | BindKind::Other)
     }
 }
 
@@ -122,6 +157,9 @@ pub enum Refusal {
     ArraysUnsupported,
     ZeroWidth,
     BufferBindOnTexture,
+    /// A blob given a type that is not texture storage. Blobs are adopted as textures and there
+    /// is nothing else here to make one into.
+    NotTextureStorage,
     BufferNotFlat,
     QueryBuffersUnsupported,
     IndirectUnsupported,
@@ -163,6 +201,7 @@ impl fmt::Display for Refusal {
             Refusal::ArraysUnsupported => "texture arrays are not supported",
             Refusal::ZeroWidth => "texture width must be > 0",
             Refusal::BufferBindOnTexture => "buffer bind flags require the buffer target",
+            Refusal::NotTextureStorage => "a blob typed as something other than a texture",
             Refusal::BufferNotFlat => "buffer target with height or depth other than 1",
             Refusal::QueryBuffersUnsupported => "query buffers are not supported",
             Refusal::IndirectUnsupported => "indirect draw buffers are not supported",
@@ -309,9 +348,14 @@ impl Untyped {
         limits: &Limits,
         args: Args,
     ) -> Result<Resource, (Untyped, Refusal)> {
-        if let Err(e) = check(features, formats, limits, &args) {
-            return Err((self, e));
-        }
+        // A blob being given a type is always given a texture's. The guest states the target,
+        // so this asks rather than assumes: `gl_target` has no answer for a buffer and would
+        // abort on one, and a guest must never be able to do that.
+        let gl_target = match plan(features, formats, limits, &args) {
+            Ok(Plan::Texture { gl_target }) => gl_target,
+            Ok(_) => return Err((self, Refusal::NotTextureStorage)),
+            Err(e) => return Err((self, e)),
+        };
         let image = match self.surface {
             Some(held) if features.adopts_iosurfaces() => match winsys.image_from_iosurface(held) {
                 Ok(image) => Some(image),
@@ -340,7 +384,7 @@ impl Untyped {
         // nothing left to hand back but an empty slot, which is what the handle already was.
         // No planes: this is a resource adopting a surface it was handed, and a composite
         // target is never one of those -- it mints its own, and its planes are cut from that.
-        let storage = match alloc_texture(gl, features, formats, &args, image, None) {
+        let storage = match alloc_texture(gl, features, formats, &args, gl_target, image, None) {
             Ok(s) => s,
             Err(e) => return Err((Untyped { surface: None }, e)),
         };
@@ -871,33 +915,37 @@ impl Resource {
         limits: &Limits,
         args: Args,
     ) -> Result<Resource, Refusal> {
-        check(features, formats, limits, &args)?;
-        let storage = if args.target == TextureTarget::Buffer {
-            alloc_buffer(gl, features, &args)?
-        } else {
-            let planes = mint_planes(winsys, features, &args);
-            // A resource in a format that has more than one plane, with nothing backing them,
-            // is one whose plane views would find no image and fall through to a texture view
-            // the format has no view class for -- which puts the guest's context in error for
-            // its lifetime. The guest never sees this refusal: the kernel handed it the handle
-            // before we were asked, so it will use the resource and poison itself either way.
-            // What keeps it from asking is the capset, which offers a planar format only where
-            // `composite_target_backable` says it can be backed. This fires when that contract
-            // is broken -- IOSurfaces off, an allocation refused, the two sides disagreeing on
-            // a format -- and it fails loudly rather than corrupting.
-            if planes.is_none() && video::guest_planes(args.format) > 1 {
-                eprintln!(
-                    "[virglrs] vrend: no planar surface for a {}x{} {} target; refusing the \
-                     create (the guest cannot see this and will poison its context -- the \
-                     capset should not have let it ask)",
-                    args.width,
-                    args.height,
-                    args.format.name()
-                );
-                return Err(Refusal::NoPlanarStorage);
+        let storage = match plan(features, formats, limits, &args)? {
+            Plan::HostShadow => Storage::Host(Shadow::fresh(args.width as usize)),
+            Plan::GuestPages => Storage::Guest,
+            Plan::Buffer { gl_target, storage_flags } => {
+                alloc_buffer(gl, &args, gl_target, storage_flags)?
             }
-            let image = mint_surface(winsys, features, &args);
-            alloc_texture(gl, features, formats, &args, image, planes)?
+            Plan::Texture { gl_target } => {
+                let planes = mint_planes(winsys, features, &args);
+                // A resource in a format that has more than one plane, with nothing backing them,
+                // is one whose plane views would find no image and fall through to a texture view
+                // the format has no view class for -- which puts the guest's context in error for
+                // its lifetime. The guest never sees this refusal: the kernel handed it the handle
+                // before we were asked, so it will use the resource and poison itself either way.
+                // What keeps it from asking is the capset, which offers a planar format only where
+                // `composite_target_backable` says it can be backed. This fires when that contract
+                // is broken -- IOSurfaces off, an allocation refused, the two sides disagreeing on
+                // a format -- and it fails loudly rather than corrupting.
+                if planes.is_none() && video::guest_planes(args.format) > 1 {
+                    eprintln!(
+                        "[virglrs] vrend: no planar surface for a {}x{} {} target; refusing the \
+                         create (the guest cannot see this and will poison its context -- the \
+                         capset should not have let it ask)",
+                        args.width,
+                        args.height,
+                        args.format.name()
+                    );
+                    return Err(Refusal::NoPlanarStorage);
+                }
+                let image = mint_surface(winsys, features, &args);
+                alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
+            }
         };
         Ok(Resource { args, storage })
     }
@@ -1013,8 +1061,35 @@ pub fn minify(v: u32, level: u32) -> u32 {
     (v >> level.min(31)).max(1)
 }
 
-/// `check_resource_valid`, every rejection in the C's order.
-fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Result<(), Refusal> {
+/// What a set of creation arguments describes, once it has been understood.
+///
+/// **The point of this type is that it is the only description.** The bug it exists to prevent
+/// is a rule in the checking that says a shape cannot be made, while the allocating has an arm
+/// that makes it -- two accounts of what this build can create, in two functions, disagreeing
+/// silently. A create refusal reaches no guest: the kernel handed out the handle before we were
+/// asked and mesa does not read the control queue's error, so the guest transfers into a
+/// resource that does not exist and dies on a later command naming a handle we never made. The
+/// disagreement is therefore not a wrong error message, it is a hung desktop attributed to
+/// something else entirely.
+///
+/// So the understanding and the refusing happen in one place and produce this, and allocating is
+/// a total match on it. A rule refusing a shape now has to be written as an arm of the same match
+/// that would otherwise say how to build it -- adjacent lines, not two files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plan {
+    /// Host memory and no GL object: `VIRGL_BIND_CUSTOM`.
+    HostShadow,
+    /// The guest's own pages, with nothing allocated here: `VIRGL_BIND_STAGING`.
+    GuestPages,
+    /// A GL buffer at this target. `GL_TEXTURE_BUFFER` is one of them -- a buffer sampled
+    /// through a texture is still a buffer, and the C allocates it as one.
+    Buffer { gl_target: GLenum, storage_flags: GLbitfield },
+    /// A GL texture at this target.
+    Texture { gl_target: GLenum },
+}
+
+/// `check_resource_valid` and the head of the C's create path, every rejection in the C's order.
+fn plan(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Result<Plan, Refusal> {
     use TextureTarget as T;
     let entry = formats.get(a.format);
     let can_texture_storage =
@@ -1071,7 +1146,7 @@ fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Res
     if a.target != T::Buffer && a.width == 0 {
         return Err(Refusal::ZeroWidth);
     }
-    if a.bind.is_buffer_bind() {
+    if a.bind.kind().is_buffer_bind() {
         if a.target != T::Buffer {
             return Err(Refusal::BufferBindOnTexture);
         }
@@ -1084,7 +1159,7 @@ fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Res
         if a.bind == Bind::COMMAND_ARGS && !features.has(Feature::indirect_draw) {
             return Err(Refusal::IndirectUnsupported);
         }
-        return Ok(());
+        return plan_storage(features, a);
     }
     let texture_binds = Bind(
         Bind::SAMPLER_VIEW.0
@@ -1155,30 +1230,48 @@ fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Res
             return Err(Refusal::TooLarge);
         }
     }
-    Ok(())
+    plan_storage(features, a)
 }
 
-/// `vrend_resource_alloc_buffer`: the bind decides the target, and the target the store.
-fn alloc_buffer(gl: &Gl, features: &Features, a: &Args) -> Result<Storage, Refusal> {
-    let size = a.width as usize;
-    let target = match a.bind {
-        Bind::CUSTOM => return Ok(Storage::Host(Shadow::fresh(size))),
-        Bind::STAGING => return Ok(Storage::Guest),
-        Bind::INDEX_BUFFER => GL_ELEMENT_ARRAY_BUFFER,
-        Bind::STREAM_OUTPUT => GL_TRANSFORM_FEEDBACK_BUFFER,
-        Bind::VERTEX_BUFFER => GL_ARRAY_BUFFER,
-        Bind::CONSTANT_BUFFER => GL_UNIFORM_BUFFER,
-        Bind::QUERY_BUFFER => GL_QUERY_BUFFER_AMD,
-        Bind::COMMAND_ARGS => GL_DRAW_INDIRECT_BUFFER,
-        Bind(0) | Bind::SHADER_BUFFER => GL_ARRAY_BUFFER,
-        b if b.has(Bind::SAMPLER_VIEW) => {
+/// Which storage the arguments name, once they are known to be coherent.
+///
+/// The target alone decides buffer from texture, exactly as the C's create path does. The bind
+/// says which *kind* of buffer, and that is the only place it is asked.
+fn plan_storage(features: &Features, a: &Args) -> Result<Plan, Refusal> {
+    if a.target != TextureTarget::Buffer {
+        let gl_target = gl_target(a.target, a.nr_samples);
+        // A multisample array needs the entry point that makes one. Decided here rather than
+        // half-way through allocating, where the refusal arrives after a texture has been
+        // generated and has to be unwound.
+        if a.nr_samples > 1
+            && gl_target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+            && !features.has(Feature::storage_multisample_2d_array)
+        {
+            return Err(Refusal::UnsupportedMultisampleFormat);
+        }
+        return Ok(Plan::Texture { gl_target });
+    }
+    let gl_target = match a.bind.kind() {
+        BindKind::HostShadow => return Ok(Plan::HostShadow),
+        BindKind::GuestPages => return Ok(Plan::GuestPages),
+        BindKind::Index => GL_ELEMENT_ARRAY_BUFFER,
+        BindKind::StreamOutput => GL_TRANSFORM_FEEDBACK_BUFFER,
+        BindKind::Vertex => GL_ARRAY_BUFFER,
+        BindKind::Constant => GL_UNIFORM_BUFFER,
+        BindKind::Query => GL_QUERY_BUFFER_AMD,
+        BindKind::CommandArgs => GL_DRAW_INDIRECT_BUFFER,
+        BindKind::Plain => GL_ARRAY_BUFFER,
+        // A texture buffer. This arm is why no rule above may refuse a buffer target for
+        // carrying a texture bind: the two would be contradicting each other from four lines
+        // apart, which is the whole reason the decision is one function.
+        BindKind::Sampled => {
             if features.has(Feature::arb_or_gles_ext_texture_buffer) {
                 GL_TEXTURE_BUFFER
             } else {
                 GL_PIXEL_PACK_BUFFER
             }
         }
-        _ => return Err(Refusal::IllegalBufferBind),
+        BindKind::Other => return Err(Refusal::IllegalBufferBind),
     };
     let mut storage_flags: GLbitfield = 0;
     if a.flags.has(ResourceFlags::MAP_PERSISTENT) {
@@ -1187,17 +1280,30 @@ fn alloc_buffer(gl: &Gl, features: &Features, a: &Args) -> Result<Storage, Refus
     if a.flags.has(ResourceFlags::MAP_COHERENT) {
         storage_flags |= GL_MAP_COHERENT_BIT_EXT;
     }
+    if storage_flags != 0 && !features.has(Feature::arb_buffer_storage) {
+        // The C logs and leaves the buffer with no data store, reporting success. A buffer the
+        // guest cannot map is a refusal, not a resource.
+        return Err(Refusal::NoBufferStorage);
+    }
+    Ok(Plan::Buffer { gl_target, storage_flags })
+}
+
+/// `vrend_resource_alloc_buffer`, past the deciding: make the buffer [`plan`] asked for.
+///
+/// It takes the target and the storage flags rather than the bind, so there is nothing here to
+/// disagree with the plan about. Every refusal that is a *decision* has already happened; what
+/// is left is the driver's answer.
+fn alloc_buffer(
+    gl: &Gl,
+    a: &Args,
+    target: GLenum,
+    storage_flags: GLbitfield,
+) -> Result<Storage, Refusal> {
+    let size = a.width as usize;
     let name = gl.gen_buffer();
     gl.bind_buffer(target, Some(name));
     gl.drain_errors();
     let ok = if storage_flags != 0 {
-        if !features.has(Feature::arb_buffer_storage) {
-            // The C logs and leaves the buffer with no data store, reporting success. A buffer
-            // the guest cannot map is a refusal, not a resource.
-            gl.bind_buffer(target, None);
-            gl.delete_buffer(name);
-            return Err(Refusal::NoBufferStorage);
-        }
         gl.buffer_storage_null(target, size, storage_flags)
     } else {
         gl.buffer_data_null(target, size, GL_STREAM_DRAW)
@@ -1393,12 +1499,12 @@ fn alloc_texture(
     features: &Features,
     formats: &Table,
     a: &Args,
+    target: GLenum,
     image: Option<Image>,
     planes: Option<Planes>,
 ) -> Result<Storage, Refusal> {
     let entry = formats.get(a.format).ok_or(Refusal::UnsupportedFormat)?;
     let mut immutable = features.has(Feature::texture_storage) && entry.can_texture_storage;
-    let target = gl_target(a.target, a.nr_samples);
     let (ifmt, glformat, gltype) = (entry.gl.internalformat, entry.gl.glformat, entry.gl.gltype);
     let levels = (a.last_level + 1) as GLsizei;
     let (w, h) = (a.width as GLsizei, a.height as GLsizei);
@@ -1448,12 +1554,9 @@ fn alloc_texture(
             if target == GL_TEXTURE_2D_MULTISAMPLE {
                 gl.tex_storage_2d_multisample(target, samples, ifmt, w, h);
             } else {
+                // The entry point was required by `plan`, so reaching here without it is a
+                // host invariant broken, not a guest asking for something.
                 let d = a.array_size as GLsizei;
-                if !features.has(Feature::storage_multisample_2d_array) {
-                    gl.bind_texture(target, None);
-                    gl.delete_texture(name);
-                    return Err(Refusal::UnsupportedMultisampleFormat);
-                }
                 gl.tex_storage_3d_multisample(target, samples, ifmt, w, h, d);
             }
         }
@@ -1717,6 +1820,25 @@ mod tests {
             can_readback: true,
             can_multisample: false,
         });
+        // A second format that multisamples, because the whole multisample branch is otherwise
+        // unreachable: every rule under `nr_samples > 1` is guarded by the entry saying the
+        // format can, and one format that cannot leaves all of them unswept.
+        let bgrx = Format::from_wire(2).unwrap();
+        assert_eq!(bgrx.name(), "B8G8R8X8_UNORM");
+        t.insert(Entry {
+            gl: GlFormat {
+                format: bgrx,
+                internalformat: GL_RGBA8,
+                glformat: GL_RGBA,
+                gltype: GL_UNSIGNED_BYTE,
+                swizzle: None,
+                view_class: ViewClass::Bits32,
+            },
+            bindings: Bindings { sampler_view: true, render_target: true, depth_stencil: false },
+            can_texture_storage: true,
+            can_readback: true,
+            can_multisample: true,
+        });
         t
     }
 
@@ -1900,6 +2022,13 @@ mod tests {
                 return false;
             }
         }
+        // `vrend_resource_alloc_buffer` is the other half of the C's create path and refuses
+        // too, so a reference for "does the C end up with a resource" has to include it. It
+        // runs after the whole of check_resource_valid, and only on a buffer target -- every
+        // other one allocates a texture.
+        if a.target == T::Buffer && !buffer_bind && !a.bind.has(Bind::SAMPLER_VIEW) {
+            return false;
+        }
         true
     }
 
@@ -1960,34 +2089,81 @@ mod tests {
             (99999, 64, 1, 1, 0, 0),
             (64, 64, 999, 1, 0, 0),
         ];
-        let flags = [ResourceFlags(0), ResourceFlags::Y_0_TOP, ResourceFlags(1 << 30)];
+        // MAP_PERSISTENT is in here for the deviation it exposes, below.
+        let flags = [
+            ResourceFlags(0),
+            ResourceFlags::Y_0_TOP,
+            ResourceFlags::MAP_PERSISTENT,
+            ResourceFlags(1 << 30),
+        ];
+        // Both table formats: one that multisamples and one that does not, because the entry
+        // gates a whole branch of the rules.
+        let formats = [Format::from_wire(67).unwrap(), Format::from_wire(2).unwrap()];
         let mut checked = 0usize;
         for &target in &targets {
             for &bind in &binds {
                 for &(width, height, depth, array_size, last_level, nr_samples) in shapes {
                     for &flag in &flags {
-                        let a = Args {
-                            target,
-                            format: Format::from_wire(67).unwrap(),
-                            bind,
-                            width,
-                            height,
-                            depth,
-                            array_size,
-                            last_level,
-                            nr_samples,
-                            flags: flag,
-                        };
-                        let ours = check(&f, &t, &l, &a).is_ok();
-                        let theirs = c_check(&f, &t, &l, &a);
-                        assert_eq!(
-                            ours,
-                            theirs,
-                            "we {} what the C {}: {a:?}",
-                            if ours { "accept" } else { "refuse" },
-                            if theirs { "creates" } else { "refuses" }
-                        );
-                        checked += 1;
+                        for &format in &formats {
+                            let a = Args {
+                                target,
+                                format,
+                                bind,
+                                width,
+                                height,
+                                depth,
+                                array_size,
+                                last_level,
+                                nr_samples,
+                                flags: flag,
+                            };
+                            let ours = plan(&f, &t, &l, &a).is_ok();
+                            let mut theirs = c_check(&f, &t, &l, &a);
+                            // The one deviation, stated here because this is what would otherwise
+                            // quietly re-litigate it: asked for a persistent or coherent mapping
+                            // without `ARB_buffer_storage`, the C logs, leaves the buffer with no
+                            // data store, and reports success. A buffer the guest cannot map is a
+                            // refusal here. See `plan_storage`.
+                            let wants_storage = a.flags.has(ResourceFlags::MAP_PERSISTENT)
+                                || a.flags.has(ResourceFlags::MAP_COHERENT);
+                            if theirs
+                                && a.target == TextureTarget::Buffer
+                                && wants_storage
+                                && !f.has(Feature::arb_buffer_storage)
+                                && !matches!(
+                                    a.bind.kind(),
+                                    BindKind::HostShadow | BindKind::GuestPages
+                                )
+                            {
+                                theirs = false;
+                            }
+                            // An OPEN deviation, not a settled one. A multisample 2D *array* needs
+                            // `glTexStorage3DMultisample`, which GLES has only at 3.2 or behind
+                            // OES_texture_storage_multisample_2d_array; the C reaches for
+                            // `glTexImage3DMultisample` instead, which GLES does not have at all, so
+                            // there is no fallback to port. We refuse. The problem is that the capset
+                            // has no per-target multisample bit, so the guest is told the format
+                            // multisamples and then refused -- invisibly, the failure this whole test
+                            // exists for. It is reachable on this host, which is GLES 3.1. Resolving
+                            // it means advertising no multisample at all without the array form,
+                            // which costs 2D MSAA, and that is a call to make deliberately.
+                            if theirs
+                                && a.nr_samples > 1
+                                && gl_target(a.target, a.nr_samples)
+                                    == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
+                                && !f.has(Feature::storage_multisample_2d_array)
+                            {
+                                theirs = false;
+                            }
+                            assert_eq!(
+                                ours,
+                                theirs,
+                                "we {} what the C {}: {a:?}",
+                                if ours { "accept" } else { "refuse" },
+                                if theirs { "creates" } else { "refuses" }
+                            );
+                            checked += 1;
+                        }
                     }
                 }
             }
@@ -1998,7 +2174,7 @@ mod tests {
     #[test]
     fn the_checks_refuse_what_the_c_refuses() {
         let (f, t, l) = (features(), table(), limits());
-        assert_eq!(check(&f, &t, &l, &texture()), Ok(()));
+        assert!(plan(&f, &t, &l, &texture()).is_ok());
         type Tweak = fn(&mut Args);
         let cases: &[(Tweak, Refusal)] = &[
             (|a| a.format = Format::from_wire(1).unwrap(), Refusal::UnsupportedFormat),
@@ -2038,12 +2214,12 @@ mod tests {
         for (tweak, want) in cases {
             let mut a = texture();
             tweak(&mut a);
-            assert_eq!(check(&f, &t, &l, &a), Err(*want), "{a:?}");
+            assert_eq!(plan(&f, &t, &l, &a).map(|_| ()), Err(*want), "{a:?}");
         }
         // One level more than the extent has is accepted, as in the C.
         let mut a = texture();
         a.last_level = 7;
-        assert_eq!(check(&f, &t, &l, &a), Ok(()));
+        assert!(plan(&f, &t, &l, &a).is_ok());
     }
 
     #[test]
@@ -2061,16 +2237,16 @@ mod tests {
             nr_samples: 0,
             flags: ResourceFlags(0),
         };
-        assert_eq!(check(&f, &t, &l, &buffer), Ok(()));
+        assert!(plan(&f, &t, &l, &buffer).is_ok());
         let mut tall = buffer;
         tall.height = 2;
-        assert_eq!(check(&f, &t, &l, &tall), Err(Refusal::BufferNotFlat));
+        assert_eq!(plan(&f, &t, &l, &tall).map(|_| ()), Err(Refusal::BufferNotFlat));
         let mut query = buffer;
         query.bind = Bind::QUERY_BUFFER;
-        assert_eq!(check(&f, &t, &l, &query), Err(Refusal::QueryBuffersUnsupported));
+        assert_eq!(plan(&f, &t, &l, &query).map(|_| ()), Err(Refusal::QueryBuffersUnsupported));
         let mut mip = buffer;
         mip.last_level = 1;
-        assert_eq!(check(&f, &t, &l, &mip), Err(Refusal::BufferWithMipmaps));
+        assert_eq!(plan(&f, &t, &l, &mip).map(|_| ()), Err(Refusal::BufferWithMipmaps));
     }
 
     #[test]
