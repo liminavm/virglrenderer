@@ -18,9 +18,12 @@
 // hash plus an ink count; REPLAY_DUMP_DIR additionally writes the raw pixels and a manifest.
 // The hash line is the golden: record it from the C build, diff it against virglrs.
 //
-//   vrend-replay <dump> [--ctx N] [--loops N] [--nodraw] [--readback RES] [--sweep]
+//   vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--nodraw] [--readback RES] [--sweep]
 //
-//   --ctx N       which virgl context to replay (default: the one with the most records)
+//   --ctx N[,N]   which virgl contexts to replay (default: the one with the most records).
+//                 A list, because one workload can span contexts that only make sense
+//                 together -- a video player draws in one and decodes in another, and
+//                 either alone replays half the operation.
 //   --loops N     replay the captured stream N times (default 1)
 //   --nodraw      positive control: drop every DRAW_VBO. Score it and diff against the ordinary
 //                 score -- the resources that lose their ink are the ones drawing reaches, and an
@@ -205,6 +208,20 @@ static void iosurf_remember(uint32_t handle, uint32_t w, uint32_t h)
    iosurf_n++;
 }
 static int want_ctx = -1;
+/* The contexts to replay. One is the common case; more than one exists because a workload can
+ * split across contexts that only make sense together -- a video player draws in one and decodes
+ * in another, and either alone replays half an operation. `want_ctx` is the first of them, and is
+ * what the single-context library calls use. */
+enum { MAX_CTX = 8 };
+static int ctx_list[MAX_CTX];
+static int n_ctx;
+
+static bool ctx_wanted(uint16_t id)
+{
+   for (int i = 0; i < n_ctx; i++)
+      if ((uint16_t)ctx_list[i] == id) return true;
+   return false;
+}
 static const char *score_path, *expect_path, *caps_path;
 static bool zero_new = true;
 
@@ -617,7 +634,16 @@ int main(int argc, char **argv)
    uint32_t watch = getenv("REPLAY_WATCH") ? (uint32_t)atoi(getenv("REPLAY_WATCH")) : 0;
 
    for (int i = 1; i < argc; i++) {
-      if (!strcmp(argv[i], "--ctx") && i + 1 < argc) want_ctx = atoi(argv[++i]);
+      if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
+         for (const char *c = argv[++i]; *c; ) {
+            if (n_ctx == MAX_CTX) { fprintf(stderr, "--ctx takes at most %d\n", MAX_CTX); return 2; }
+            ctx_list[n_ctx++] = atoi(c);
+            while (*c && *c != ',') c++;
+            if (*c == ',') c++;
+         }
+         if (!n_ctx) { fprintf(stderr, "--ctx wants at least one context\n"); return 2; }
+         want_ctx = ctx_list[0];
+      }
       else if (!strcmp(argv[i], "--sweep")) sweep = true;
       else if (!strcmp(argv[i], "--sweep-w") && i + 1 < argc)
          sweep_w = (uint32_t)atoi(argv[++i]);
@@ -635,7 +661,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--caps") && i + 1 < argc) caps_path = argv[++i];
       else if (argv[i][0] != '-') path = argv[i];
    }
-   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N] [--loops N] [--nodraw] [--draws-from SEQ] [--until SEQ]\n"); return 2; }
+   if (!path) { fprintf(stderr, "usage: vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--nodraw] [--draws-from SEQ] [--until SEQ]\n"); return 2; }
 
    FILE *f = fopen(path, "rb");
    if (!f) { perror(path); return 2; }
@@ -676,6 +702,8 @@ int main(int argc, char **argv)
       uint32_t best = 0;
       for (uint32_t i = 0; i < 65536; i++) if (count[i] > count[best]) best = i;
       want_ctx = (int)best;
+      ctx_list[0] = want_ctx;
+      n_ctx = 1;
       printf("replay: no --ctx given, picking ctx %d (%u commands)\n", want_ctx, count[best]);
    }
 
@@ -698,8 +726,10 @@ int main(int argc, char **argv)
       return dump_caps(caps_path);
 
    const char *name = "limina-replay";
-   ret = virgl_renderer_context_create((uint32_t)want_ctx, (uint32_t)strlen(name), name);
-   if (ret) { fprintf(stderr, "context_create failed: %d\n", ret); return 2; }
+   for (int i = 0; i < n_ctx; i++) {
+      ret = virgl_renderer_context_create((uint32_t)ctx_list[i], (uint32_t)strlen(name), name);
+      if (ret) { fprintf(stderr, "context_create %d failed: %d\n", ctx_list[i], ret); return 2; }
+   }
 
    /* Score every colour offscreen at its unref unless told to narrow. The old default picked ONE
     * resource with a glyph-pipeline heuristic inherited from the debugging spike this grew out of,
@@ -714,6 +744,9 @@ int main(int argc, char **argv)
       /* Batch assembly: CMD records between two SUBMITs form one submit_cmd call. */
       uint32_t *batch = NULL;
       size_t batch_dw = 0, batch_cap = 0;
+      /* A batch belongs to the context whose records built it, which with more than one
+       * replayed context is not always the first one named. */
+      int batch_ctx = want_ctx;
       uint32_t submits = 0, cmds = 0, xfers = 0, dropped = 0, copy_fed = 0, copy_bad = 0;
       uint32_t made = 0, failed = 0, unrefs = 0;
       bool batch_watch = false;
@@ -725,7 +758,7 @@ int main(int argc, char **argv)
          const uint32_t *aux = (const uint32_t *)(blob + p + sizeof h);
          const uint8_t *pay = blob + p + sizeof h + (size_t)h.aux_count * 4;
 
-         if (h.ctx_id != (uint16_t)want_ctx) { p += h.total_len; continue; }
+         if (!ctx_wanted(h.ctx_id)) { p += h.total_len; continue; }
          if (until && h.seq > until) break;
 
          switch (h.type) {
@@ -736,11 +769,12 @@ int main(int argc, char **argv)
                        watch, (unsigned long long)h.seq);
             batch_watch = false;
             if (batch_dw) {
-               if (virgl_renderer_submit_cmd(batch, want_ctx, (int)batch_dw))
+               if (virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
                   dropped++;
                submits++;
                batch_dw = 0;
             }
+            batch_ctx = h.ctx_id;
             break;
          case T_CMD: {
             if (smoke) break;
@@ -752,6 +786,16 @@ int main(int argc, char **argv)
              * earlier cards' rasterisation is removed. If that card then renders its header, the
              * damage is carried by work done before it rather than by its own stream. */
             if (draws_from && h.cmd == VIRGL_CCMD_DRAW_VBO && h.seq < draws_from) break;
+            /* Two contexts' commands never share a submit. The capture interleaves them, and a
+             * batch handed to the wrong context is rejected wholesale as "Illegal resource" --
+             * which reads exactly like the resource bug this replay exists to find. */
+            if (batch_dw && h.ctx_id != (uint16_t)batch_ctx) {
+               if (virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
+                  dropped++;
+               submits++;
+               batch_dw = 0;
+            }
+            batch_ctx = h.ctx_id;
             if (batch_dw + dw > batch_cap) {
                batch_cap = (batch_dw + dw) * 2;
                batch = realloc(batch, batch_cap * 4);
@@ -772,7 +816,7 @@ int main(int argc, char **argv)
             uint32_t handle = h.aux_count > 0 ? aux[0] : 0;
             uint64_t xoff = h.aux_count > 2 ? ((uint64_t)aux[2] << 32 | aux[1]) : 0;
             uint32_t src = 0;
-            if (copy_src_of_next_cmd(blob, (size_t)flen, p + h.total_len, want_ctx,
+            if (copy_src_of_next_cmd(blob, (size_t)flen, p + h.total_len, h.ctx_id,
                                      handle, xoff, &src, &copy_bad)) {
                handle = src;                 /* see copy_src_of_next_cmd */
                copy_fed++;
@@ -891,7 +935,8 @@ int main(int argc, char **argv)
              * TRANSFER3D touching it fails check_transfer_iovec -- reported as the very same
              * "Illegal resource" as a handle the context has never heard of. */
             virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
-            virgl_renderer_ctx_attach_resource(want_ctx, (int)r->handle);
+            for (int i = 0; i < n_ctx; i++)
+               virgl_renderer_ctx_attach_resource(ctx_list[i], (int)r->handle);
             /* After the attach, which is what gives vrend the resource a transfer can reach. */
             /* Not a planar YUV one. Zeroing writes at four bytes per texel, which is what
              * every format this scores actually is -- but a planar resource cannot take a
@@ -910,7 +955,7 @@ int main(int argc, char **argv)
          p += h.total_len;
       }
 
-      if (!smoke && batch_dw && virgl_renderer_submit_cmd(batch, want_ctx, (int)batch_dw))
+      if (!smoke && batch_dw && virgl_renderer_submit_cmd(batch, batch_ctx, (int)batch_dw))
          dropped++;
       free(batch);
       count_addf("loop %d created %u failed %u unrefs %u submits %u cmds %u xfers %u "
