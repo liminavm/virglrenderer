@@ -52,6 +52,9 @@ pub enum Error {
     /// The format cannot be read back through GL, and the destination is not the resource's own
     /// pages -- so there is nothing to say the guest does not already hold.
     NotReadable,
+    /// The format lays the picture out in more than one plane, and a texture transfer moves it
+    /// through a single GL triple. There is no reading of the request that is not garbage.
+    PlanarTexture,
     /// The driver refused.
     GlError(GLenum),
 }
@@ -64,6 +67,9 @@ impl fmt::Display for Error {
             Error::NoPages => f.write_str("the resource has no pages attached"),
             Error::Unsupported => f.write_str("the host cannot serve that transfer"),
             Error::NotReadable => f.write_str("the format cannot be read back"),
+            Error::PlanarTexture => {
+                f.write_str("the format has more than one plane and cannot be transferred as one")
+            }
             Error::GlError(e) => write!(f, "GL error {e:#x}"),
         }
     }
@@ -358,6 +364,9 @@ pub fn write(
             Ok(())
         }
         Storage::Texture(t) => {
+            if super::video::guest_planes(res.args.format) > 1 {
+                return Err(Error::PlanarTexture);
+            }
             let (name, target) = (t.name, t.target);
             if matches!(target, GL_TEXTURE_2D_MULTISAMPLE | GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
                 return Err(Error::Unsupported);
@@ -639,6 +648,9 @@ pub fn read(
             }
         }
         Storage::Texture { .. } => {
+            if super::video::guest_planes(res.args.format) > 1 {
+                return Err(Error::PlanarTexture);
+            }
             let entry = res.entry(formats).ok_or(Error::Unsupported)?;
             let can_readpixels = entry.can_render() || entry.is_ds();
             let readonly = || -> Result<(), Error> {
@@ -755,6 +767,11 @@ mod tests {
     /// reconciliation and the gather are private to this module, so the only thing a fifth route
     /// could call is the pair that already gets this right.
     ///
+    /// The transfer is refused outright now, by name, before any of that is reached -- a planar
+    /// format has no single GL triple, so there is no reading of the request that is not garbage
+    /// in one direction or the other. What follows is why the refusal is a second line of defence
+    /// and not the only one: with it removed, the shape still cannot overrun.
+    ///
     /// Here there is one description at the moment of use: the staging buffer is sized from
     /// `as_gl`, the same layout the driver reads, and `gather` fills it out of the guest's pages a
     /// row at a time through `copy_out`, which answers false when the pages do not hold the row.
@@ -770,6 +787,10 @@ mod tests {
         let nv12 = Format::from_wire(wire as u32).unwrap();
         let desc = nv12.describe().unwrap();
         assert_eq!(desc.block_bytes(), 1, "gallium describes NV12 as one byte per block");
+        assert!(
+            super::super::video::guest_planes(nv12) > 1,
+            "and the predicate the refusal reads says the picture is in more than one plane"
+        );
 
         let entry = Entry {
             gl: super::super::formats::GlFormat {

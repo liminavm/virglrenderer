@@ -211,6 +211,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   resources created with none refused, 334 IOSurface-backed, and the decode commands served to
   the end with no submit errors.
 
+  **A refused readback is not scored, and that is a hole.** The sweep writes a line for every
+  readback that succeeds and nothing at all for one that fails, so a renderer that starts refusing
+  what the reference serves passes the gate unchanged. It is not hypothetical here: virglrs
+  refuses a transfer of a planar-format texture by name, which fires 323 times on this corpus and
+  moves the answer the guest gets from -1 to EINVAL, and every fixture still matches. Closing it
+  means scoring the failures too -- and then this corpus shows 323 lines of deliberate deviation
+  from a reference that predates the same fix on the C side, so it wants deciding rather than
+  doing.
+
   **The conversion runs but its pixels are not hashed.** `convert_planes` fills a composite
   target's base RGBA texture from its two planes, and with both contexts in one pass it now
   executes -- six passes on the H.264 leg -- so a GL error or a crash in it fails the gate. Its
