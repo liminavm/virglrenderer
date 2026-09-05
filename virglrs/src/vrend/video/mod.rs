@@ -569,16 +569,30 @@ impl Frame {
 /// Only AV1 has one: the other codecs hand the guest's own bitstream over and keep nothing but a
 /// session.
 struct Av1 {
-    obu: av1::ObuState,
-    /// The shape of the last frame ended, which is the shape any unit the model is still holding
-    /// was built from -- the model holds at most one frame, and it is always the most recent.
-    last: Option<Shape>,
-    /// Where a held *hidden* frame's picture goes.
+    obu: av1::ObuState<Owed>,
+}
+
+/// What a held AV1 frame still owes the guest, kept by the model alongside the frame itself.
+///
+/// The model decides what is held and when its picture goes out, so it is the model that carries
+/// this: a record kept beside it here would be a second container for one fact, and every path
+/// that drops a hold would become a place to remember to clear it.
+struct Owed {
+    /// The shape the held frame was built from. Needed whenever the unit is emitted, whether or
+    /// not its picture is collected, because it names the session the bytes are decoded by.
+    shape: Shape,
+    /// Where the picture goes.
     ///
     /// A share, because by the time the frame goes out the guest is several frames on and may
-    /// have destroyed the buffer. `None` for a shown frame held only for its reference slot: its
-    /// picture went out when it was built, and the re-emission is decoded for the slot alone.
-    held_target: Option<Arc<Buffer>>,
+    /// have destroyed the buffer. `None` once the picture has gone out: a shown frame held only
+    /// for its reference slot decodes to a picture nothing collects.
+    target: Option<Arc<Buffer>>,
+}
+
+impl av1::Carried for Owed {
+    fn picture_delivered(&mut self) {
+        self.target = None;
+    }
 }
 
 /// One decoder the guest created.
@@ -723,13 +737,8 @@ impl Codec {
         // The held frame first, under its own shape: decode order is preserved, and it is this
         // descriptor's reference map that makes its refresh exact.
         let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
-        if let Some(unit) = av1.obu.flush_held(&desc) {
-            let shape = av1.last.clone().expect("a held frame was ended, so its shape was kept");
-            // `discard` says the picture was delivered when the frame first went out; the copy
-            // exists only to reach the reference slots, and its target may since have been
-            // recycled for a different frame.
-            let into = if unit.discard { None } else { av1.held_target.take() };
-            self.submit(gl, handle, &shape, &unit.bytes, into.as_ref())?;
+        if let Some((unit, owed)) = av1.obu.flush_held(&desc) {
+            self.submit(gl, handle, &owed.shape, &unit.bytes, owed.target.as_ref())?;
         }
 
         let (accumulated, shape) = self.frame.open_on(target)?;
@@ -760,14 +769,11 @@ impl Codec {
             unreachable!("an AV1 codec's frames carry an AV1 shape");
         };
         let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
-        av1.last = Some(shape.clone());
-        match av1.obu.build_temporal_unit(desc, tiles) {
+        let owed = Owed { shape: shape.clone(), target: Some(Arc::clone(&buffer)) };
+        match av1.obu.build_temporal_unit(desc, tiles, owed) {
             // Nothing emitted: the serializer is holding this frame until the next descriptor
             // says which slot the guest stored it in. Its target is held with it.
-            Ok(None) => {
-                av1.held_target = Some(buffer);
-                Ok(())
-            }
+            Ok(None) => Ok(()),
             Ok(Some(bytes)) => self.submit(gl, handle, shape, &bytes, Some(&buffer)),
             // A frame was built while one was still held: two temporal units would reach the
             // decoder as one sample and lose a picture, which is what the hold exists to
@@ -988,11 +994,7 @@ impl Video {
             gate: Gate::AwaitingKey { dropped: 0, freeze: None },
             frame: Frame::Idle,
             session: None,
-            av1: (profile == Profile::Av1Main).then(|| Av1 {
-                obu: av1::ObuState::new(),
-                last: None,
-                held_target: None,
-            }),
+            av1: (profile == Profile::Av1Main).then(|| Av1 { obu: av1::ObuState::new() }),
         });
         Ok(())
     }
