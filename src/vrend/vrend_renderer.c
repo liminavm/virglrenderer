@@ -12641,7 +12641,8 @@ static bool vrend_limina_force_fbo_blit(void)
 /* limina: LIMINA_VREND_BLIT_LOG=1 reports each distinct blit shape once, with the route
  * taken and why. VREND_DEBUG's dbg_blit is compiled out of the shipped release build, so
  * there is otherwise no way to see which path a blit took on a real run. */
-static void vrend_limina_blit_log(const char *route, struct vrend_resource *src_res,
+static void vrend_limina_blit_log(struct vrend_context *ctx, const char *route,
+                                  struct vrend_resource *src_res,
                                   struct vrend_resource *dst_res,
                                   const struct vrend_blit_info *info)
 {
@@ -12651,7 +12652,11 @@ static void vrend_limina_blit_log(const char *route, struct vrend_resource *src_
    if (!on)
       return;
 
-   uint64_t key = ((uint64_t)src_res->base.format << 40) ^
+   /* Keyed on the context too: a client that restarts gets a fresh context, and
+    * a run comparing two clients needs each one's first blit timestamped rather
+    * than swallowed by the other's. */
+   uint64_t key = ((uint64_t)ctx->ctx_id << 48) ^
+                  ((uint64_t)src_res->base.format << 40) ^
                   ((uint64_t)dst_res->base.format << 24) ^
                   ((uint64_t)src_res->base.nr_samples << 16) ^
                   ((uint64_t)dst_res->base.nr_samples << 8) ^
@@ -12664,9 +12669,9 @@ static void vrend_limina_blit_log(const char *route, struct vrend_resource *src_
    if (seen_n < 64)
       seen[seen_n++] = key;
 
-   virgl_error("[LIMINA-BLIT] %s src=fmt%d/s%d %dx%d -> dst=fmt%d/s%d %dx%d "
+   virgl_error("[LIMINA-BLIT] ctx%d %s src=fmt%d/s%d %dx%d -> dst=fmt%d/s%d %dx%d "
                "(swizzle=%d redblue_or_fmt=%d srgb_dec=%d srgb_enc=%d)\n",
-               route, src_res->base.format, src_res->base.nr_samples,
+               ctx->ctx_id, route, src_res->base.format, src_res->base.nr_samples,
                src_res->base.width0, src_res->base.height0,
                dst_res->base.format, dst_res->base.nr_samples,
                dst_res->base.width0, dst_res->base.height0,
@@ -13022,14 +13027,14 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
 
    if (vrend_renderer_prepare_blit(ctx, src_res, dst_res, &blit_info)) {
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use FBO blit\n");
-      vrend_limina_blit_log("FBO", src_res, dst_res, &blit_info);
+      vrend_limina_blit_log(ctx, "FBO", src_res, dst_res, &blit_info);
       vrend_renderer_blit_fbo(ctx, src_res, dst_res, &blit_info);
    } else {
       blit_info.has_srgb_write_control = has_feature(feat_texture_srgb_decode);
       blit_info.has_texture_srgb_decode = has_feature(feat_srgb_write_control);
 
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use GL fallback\n");
-      vrend_limina_blit_log("GLFB", src_res, dst_res, &blit_info);
+      vrend_limina_blit_log(ctx, "GLFB", src_res, dst_res, &blit_info);
       vrend_renderer_blit_gl(ctx, src_res, dst_res, &blit_info);
       vrend_sync_make_current(ctx->sub->gl_context);
    }
