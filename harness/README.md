@@ -206,16 +206,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   those. A leg that serves one instead censuses 26 allocations to the fixture's 23.
   `vrend-vkclient.score` is a Vulkan client under a virgl compositor, and it is the blob fixture:
   17 blobs, of which the stream types six as 500x500 `R16G16B16X16_FLOAT` render-target/sampler-
-  views and leaves eleven untyped. **It scores those six as structure with no content.** The
-  windows were written GPU-side by the venus client, so no classic transfer carries their bytes
-  and both legs read back all-zero — which is deterministic, and is what the corpus can honestly
-  measure with no VM. What it does measure is the import: that a blob is registered untyped, that
-  `PIPE_RESOURCE_SET_TYPE` upgrades it at the right point in the stream, that both legs agree on
-  the format, extent and storage plan, and that everything downstream sampling those handles
-  agrees too. What it cannot measure is any bug that only shows in pixel values — stride, channel
-  order, swizzle, sRGB — because **a zero texture is a weak oracle: every wrong answer is also
-  zero.** Closing that half needs the blob's bytes captured at trace time, not a closer reading of
-  this score. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
+  views and leaves eleven untyped. It measures the import — a blob registered untyped, upgraded by
+  `PIPE_RESOURCE_SET_TYPE` at its own point in the stream, and sampled downstream — and it
+  measures the **pixels**, which is what makes the six lines worth reading. Their bytes are
+  written GPU-side by the venus client and travel in no transfer, so the recorder reads them where
+  vrend does and they replay from the capture: six fully-inked windows with six distinct hashes,
+  one per recorded frame. Both legs must agree on all of it. **A blob replaying at
+  `ink=0/250000` means the content records did not land**, and the fixture is then measuring only
+  its own structure again — the failure to watch for, because a zero texture is a weak oracle
+  where every wrong answer is also zero. The guest declares a stride of 4096 for a packed row of
+  4000, so a leg that assumes packed rows shears every frame and says so in the hash. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
   with H.264 and VP9 played one after the other in Showtime.

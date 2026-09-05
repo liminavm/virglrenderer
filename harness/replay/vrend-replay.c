@@ -886,7 +886,11 @@ int main(int argc, char **argv)
          const uint32_t *aux = (const uint32_t *)(blob + p + sizeof h);
          const uint8_t *pay = blob + p + sizeof h + (size_t)h.aux_count * 4;
 
-         if (!ctx_wanted(h.ctx_id)) { p += h.total_len; continue; }
+         /* Blob content is keyed by RESOURCE, not by context: the bytes belong to the memory
+          * a blob exports, and the recorder reads them at a sampler bind with no context in
+          * hand. Filtering them by ctx dropped every one of them -- they carry ctx 0, which no
+          * corpus selects -- and the blobs replayed as the zeros this record exists to replace. */
+         if (h.type != T_BLOBDATA && !ctx_wanted(h.ctx_id)) { p += h.total_len; continue; }
          if (until && h.seq > until) break;
 
          switch (h.type) {
@@ -963,8 +967,14 @@ int main(int argc, char **argv)
              * them out; blob_feed below is what carries them into the texture. */
             uint32_t handle = h.aux_count > 0 ? aux[0] : 0;
             struct backing *b = backing_find(handle);
-            if (b && h.payload_len <= b->size) {
-               memcpy(b->mem, pay, h.payload_len);
+            if (b) {
+               /* The record carries the whole SHM CARRIER, which is page-rounded and so is
+                * routinely larger than the blob it backs -- 2 MiB behind a 2,048,000-byte
+                * window here. Both start at offset 0, so the blob's own size is the honest
+                * amount to take, and a record shorter than the blob is a short read that fills
+                * what it can. Requiring the record to fit dropped all 24 of them in silence. */
+               size_t n = h.payload_len < b->size ? h.payload_len : b->size;
+               memcpy(b->mem, pay, n);
                b->dirty = true;
                blobdata++;
                /* The recorder reads a blob at the sampler bind INSIDE a batch, so this record
@@ -1294,6 +1304,15 @@ int main(int argc, char **argv)
             } else {
                fprintf(stderr, "SCORE DIFFERS from %s:\n", expect_path);
                diff_lines(want, text);
+               /* A hash says two implementations disagree and nothing about how. The pixels
+                * behind it are gone by now -- they are read, hashed and freed one resource at a
+                * time, and keeping every readback against the chance of a mismatch would hold a
+                * corpus's worth of images to print one line. So name the way to get them, once,
+                * at the only moment anyone wants them. */
+               if (!getenv("REPLAY_DUMP_DIR"))
+                  fprintf(stderr,
+                          "  (a hash names no pixels: re-run with REPLAY_DUMP_DIR=<dir> to write "
+                          "the readbacks, then rgba2png.py <dir>/*.rgba and look at them)\n");
                ok = 0;
             }
          }
