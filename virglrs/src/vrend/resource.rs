@@ -1242,15 +1242,11 @@ pub fn gl_target(target: TextureTarget, nr_samples: u32) -> GLenum {
 /// refuses -- the caller turns that into a refused create rather than a resource whose planes
 /// cannot be sampled.
 fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes> {
-    if !video::composite_target_backable(a.format) {
+    if !video::composite_target_backable(features, a.format) {
         return None;
     }
     if a.target != TextureTarget::Texture2d || a.last_level != 0 || a.nr_samples > 1 || a.depth != 1
     {
-        return None;
-    }
-    if !features.adopts_iosurfaces() {
-        // Known at init and reported there.
         return None;
     }
     // Named once: the surface is cut to this layout and the planes are read back by it, and a
