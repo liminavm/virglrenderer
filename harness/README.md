@@ -189,14 +189,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
   with H.264 and VP9 played one after the other in Showtime.
 
-  **Showtime splits each playback across two virgl contexts, and only one of them decodes.**
+  **Showtime splits each playback across two virgl contexts, and neither half is the workload.**
   The player's GL context draws the video (`--ctx 8` for H.264, `--ctx 10` for VP9); its decoder
   runs in a context of its own (`--ctx 9` and `--ctx 11`), and that is where every
-  `DECODE_BITSTREAM` and every bitstream upload lands. The two fixtures pin the decoder contexts,
-  because a player context replays with its bitstream nowhere and every plane reads back zero.
-  The way to find the pair in a new capture is to count `XFERDATA` records per context: the
-  decoder's is the one holding them. Naming a context is not optional either way -- the busiest is
-  the shell's, and scoring it measures the desktop and none of the decode.
+  `DECODE_BITSTREAM` and every bitstream upload lands. A player context replayed alone has its
+  bitstream nowhere and every plane reads back zero; a decoder context alone fills planes that
+  nothing samples. So both fixtures name both: `--ctx 8,9` and `--ctx 10,11`. `--ctx` takes a list
+  for this reason, and the replayer keeps each context's commands in their own submit -- a batch
+  handed to the wrong context is rejected wholesale as "Illegal resource", which reads exactly
+  like the resource bug this replay exists to find. The way to find the pair in a new capture is
+  to count `XFERDATA` records per context: the decoder's is the one holding them. Naming contexts
+  is not optional -- the busiest is the shell's, and scoring it measures the desktop and none of
+  the decode.
 
   **The plane lines are the decoded picture.** A composite target is an IOSurface-backed planar
   surface, which is neither a GL texture nor a BGRA IOSurface, so the sweep resolves it with
@@ -207,10 +211,14 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   resources created with none refused, 334 IOSurface-backed, and the decode commands served to
   the end with no submit errors.
 
-  **What is still unmeasured is the conversion output.** `convert_planes` fills a composite
-  target's base RGBA texture from its two planes, and no single-context replay sees both halves:
-  the decoder context fills planes nothing samples, the player context samples planes nothing
-  filled. Scoring it needs the replayer to run more than one context in a pass.
+  **The conversion runs but its pixels are not hashed.** `convert_planes` fills a composite
+  target's base RGBA texture from its two planes, and with both contexts in one pass it now
+  executes -- six passes on the H.264 leg -- so a GL error or a crash in it fails the gate. Its
+  output is still not scored, and the reason has moved: a composite target is read through its
+  IOSurface planes, and its base texture has no readback route at all, because the resource's
+  format says planar and every transfer read of a planar format is refused. Scoring it means the
+  renderer answering "hand me this resource as it is sampled", which is an ABI question, not a
+  harness one.
 
   `vrend-overview.score` is the GNOME shell with someone **typing in the overview's search
   entry**, and it exists because that one act allocates a resource no other corpus contains: a
