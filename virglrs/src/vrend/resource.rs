@@ -1734,6 +1734,26 @@ fn fill_texture(
     if t.target != GL_TEXTURE_2D {
         return false;
     }
+    // A picture in more than one plane. Its table entry is the RGBA8 triple -- four bytes per
+    // pixel at luma resolution -- against guest pages holding one byte of luma and a
+    // quarter-sized chroma plane the single-plane layout below has no way to name. The
+    // arithmetic refuses it as it stands, but for the wrong reason and saying the wrong thing:
+    // a byte count, when what is missing is a YUV-to-RGBA pass over the planes. Refused by
+    // name, as `transfer::write` refuses the same formats, so the gap reads as a gap.
+    if video::guest_planes(a.format) > 1 {
+        if !say {
+            return false;
+        }
+        eprintln!(
+            "[virglrs] vrend: blob {}x{} is {}, whose picture is in {} planes; converting one \
+             from guest pages is not served",
+            a.width,
+            a.height,
+            a.format.name(),
+            video::guest_planes(a.format),
+        );
+        return false;
+    }
     let (Some(row), Some(total)) = (
         crate::vrend::gl::image_bytes(entry.gl.glformat, entry.gl.gltype, a.width as GLsizei, 1, 1),
         crate::vrend::gl::image_bytes(
