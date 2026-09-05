@@ -25,7 +25,7 @@ use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::transfer::{self, Info};
 use crate::config::Config;
-use crate::guest_mem::Iov;
+use crate::guest_mem::{Iov, PixelSource};
 use crate::ids::{ContextId, ResourceHandle};
 use crate::metal;
 use crate::videotoolbox;
@@ -87,6 +87,9 @@ pub struct Vrend {
     /// current GL context and the driver, and a drop has neither. So it is parked here and swept
     /// from the next place that has both.
     doomed: Vec<Arc<resource::Texture>>,
+    /// Batches run, ever. The unit a copy of a guest's pages is kept fresh in: within one batch
+    /// the guest has had no opportunity to run, so one read serves every draw in it.
+    batch: u64,
 }
 
 /// The versions tried, newest first -- the GLES rows of the C's `gl_versions` ladder.
@@ -165,6 +168,7 @@ impl Vrend {
             todo: Todo::default(),
             blitter: None,
             doomed: Vec::new(),
+            batch: 0,
         })
     }
 
@@ -217,8 +221,10 @@ impl Vrend {
             todo,
             blitter,
             doomed: _,
+            batch,
         } = self;
         let host = Host {
+            batch: *batch,
             gl,
             winsys,
             version: *version,
@@ -269,6 +275,10 @@ impl Vrend {
         words: &[u32],
         guest: &dyn Guest,
     ) -> Option<Result<(), Fault>> {
+        // One tick per batch, before anything in it runs. It is what says a guest has had no
+        // opportunity to rewrite its pages since a copy of them was taken -- see
+        // [`resource::GuestPixels`] -- so it must move exactly when that stops being true.
+        self.batch += 1;
         let (mut host, contexts) = self.split(id, guest);
         contexts.get_mut(&id).map(|c| c.submit(&mut host, words))
     }
@@ -463,6 +473,10 @@ impl Guest for NoGuest {
     }
 
     fn pages(&self, _: ContextId, _: ResourceHandle) -> Option<Iov<'_>> {
+        None
+    }
+
+    fn blob_pixels(&self, _: ContextId, _: ResourceHandle) -> Option<PixelSource<'_>> {
         None
     }
 }

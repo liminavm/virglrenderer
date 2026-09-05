@@ -490,6 +490,48 @@ impl std::fmt::Debug for GuestMap {
     }
 }
 
+/// Where a blob's pixels are, for the one caller that has to read them without caring which.
+///
+/// A blob's bytes reach the host by one of two routes -- the guest's own scatter list, or a
+/// mapping this process holds -- and the texture fill needs the bytes, not the route. Both are
+/// read-only and read by copy, for the reason [`Iov`] gives: the guest writes them whenever it
+/// likes, so a reference into them cannot be sound.
+///
+/// Borrowed from the resource table and never held: the pages belong to the VMM and the mapping
+/// to whoever minted it, so a source outliving the resource it came from is exactly the stale
+/// reference this tree refuses to make representable. Ask again at the next read instead.
+pub enum PixelSource<'a> {
+    /// The guest pages a VMM attached, as `Backing::Blob` with `BlobStorage::Guest` has them.
+    Scattered(Iov<'a>),
+    /// A mapping this process holds: minted shm, or the linear pages a venus allocation was
+    /// published from.
+    Mapped(&'a GuestMap),
+}
+
+impl PixelSource<'_> {
+    /// The bytes on offer. Not what any consumer asked for -- a caller wanting fewer must check.
+    pub fn len(&self) -> u64 {
+        match self {
+            PixelSource::Scattered(iov) => iov.len(),
+            PixelSource::Mapped(map) => map.len() as u64,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Fill `dst` from `at`. `false`, with `dst` untouched, if the range is not wholly inside
+    /// the source -- the bounds check belongs here because this is the only place that knows
+    /// how far the source runs.
+    pub fn copy_out(&self, at: u64, dst: &mut [u8]) -> bool {
+        match self {
+            PixelSource::Scattered(iov) => iov.copy_out(at, dst),
+            PixelSource::Mapped(map) => usize::try_from(at).is_ok_and(|at| map.copy_out(at, dst)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

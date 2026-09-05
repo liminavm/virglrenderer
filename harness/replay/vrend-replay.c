@@ -18,13 +18,18 @@
 // hash plus an ink count; REPLAY_DUMP_DIR additionally writes the raw pixels and a manifest.
 // The hash line is the golden: record it from the C build, diff it against virglrs.
 //
-//   vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--nodraw] [--readback RES] [--sweep]
+//   vrend-replay <dump> [--ctx N[,N...]] [--loops N] [--nodraw] [--nofeed] [--readback RES] [--sweep]
 //
 //   --ctx N[,N]   which virgl contexts to replay (default: the one with the most records).
 //                 A list, because one workload can span contexts that only make sense
 //                 together -- a video player draws in one and decodes in another, and
 //                 either alone replays half the operation.
 //   --loops N     replay the captured stream N times (default 1)
+//   --nofeed      positive control for blob content: land the recorded bytes in the backing
+//                 store as usual, but never carry them into the texture. What inks a blob's
+//                 window then is the renderer reading the guest's pages for itself, which is
+//                 the whole of the import path -- and with the feed on, a renderer that reads
+//                 nothing scores exactly like one that reads correctly.
 //   --nodraw      positive control: drop every DRAW_VBO. Score it and diff against the ordinary
 //                 score -- the resources that lose their ink are the ones drawing reaches, and an
 //                 empty diff means the oracle is measuring nothing.
@@ -745,6 +750,7 @@ int main(int argc, char **argv)
    const char *path = NULL;
    int loops = 1;
    bool nodraw = false;
+   bool nofeed = false;
    /* Exercise only what a skeleton owes: init, context create, resource create. No submits, no
     * transfers, no scoring. This is P1's gate -- a renderer that gets through it has a working
     * ABI, resource table and context table, which is all a skeleton claims. */
@@ -781,6 +787,7 @@ int main(int argc, char **argv)
          until = strtoull(argv[++i], NULL, 10);
       else if (!strcmp(argv[i], "--loops") && i + 1 < argc) loops = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--nodraw")) nodraw = true;
+      else if (!strcmp(argv[i], "--nofeed")) nofeed = true;
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
@@ -1015,7 +1022,8 @@ int main(int argc, char **argv)
                   submits++;
                   batch_dw = 0;
                }
-               blobs_fed += blob_feed(batch_ctx ? batch_ctx : want_ctx);
+               if (!nofeed)
+                  blobs_fed += blob_feed(batch_ctx ? batch_ctx : want_ctx);
             }
             break;
          }

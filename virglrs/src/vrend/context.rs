@@ -37,7 +37,7 @@ use super::proto::{self, *};
 use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi, video};
-use crate::guest_mem::{HostSpan, Iov};
+use crate::guest_mem::{HostSpan, Iov, PixelSource};
 use crate::ids::{ContextId, ResourceHandle};
 use crate::videotoolbox;
 use std::cell::Cell;
@@ -66,6 +66,14 @@ pub trait Guest {
     fn attached(&self, ctx: ContextId, handle: ResourceHandle) -> bool;
     /// The resource's attached pages, when the context may reach it and it has any.
     fn pages(&self, ctx: ContextId, handle: ResourceHandle) -> Option<Iov<'_>>;
+    /// The pixels behind a blob, wherever they live, when the context may reach it.
+    ///
+    /// Asked by handle at the moment of the read and never kept. The bytes belong to the VMM or
+    /// to whoever minted the mapping, so a source vrend held across commands would name storage
+    /// a detach or an unref had already taken back -- which is the C's `gr->iov`, still pointing
+    /// at a scatter list the VMM has reclaimed. Here a resource that is gone simply answers
+    /// `None` and the read that needed it fails on its own.
+    fn blob_pixels(&self, ctx: ContextId, handle: ResourceHandle) -> Option<PixelSource<'_>>;
 }
 
 /// Whether a bind may use what a handle names: attached to the asking context, and typed.
@@ -115,6 +123,9 @@ impl Todo {
 /// resources, the guest's pages, and the winsys for sub-context switches.
 pub struct Host<'a> {
     pub gl: &'a Gl,
+    /// Which batch is running, for the one thing that has to know: whether a copy of a guest's
+    /// pages was already taken since the guest last had a chance to write them.
+    pub batch: u64,
     pub winsys: &'a Winsys,
     /// The version and share context a new sub-context's GL context is made with.
     pub version: Version,
@@ -149,6 +160,31 @@ impl Host<'_> {
     fn resource(&self, cmd: Cmd, handle: ResourceHandle) -> Result<&Resource, Fault> {
         let slot = self.slot(cmd, handle)?;
         slot.resource().ok_or(Fault::UntypedResource { cmd, handle })
+    }
+
+    /// Re-read the pages behind a blob before something samples it, if it is a texture that
+    /// copies them and the copy was not already taken in this batch.
+    ///
+    /// The source is looked up only once the resource says it wants one, and is borrowed from
+    /// the table for the length of the fill: vrend keeps no pages of its own, so a resource the
+    /// guest detached answers `None` here and the last good copy stands.
+    fn refresh_guest_pixels(&mut self, handle: ResourceHandle) {
+        let (batch, gl, formats, ctx, guest) =
+            (self.batch, self.gl, self.formats, self.ctx, self.guest);
+        if !self
+            .resources
+            .get(&handle)
+            .and_then(|s| s.resource())
+            .is_some_and(|r| r.wants_guest_pixels(batch))
+        {
+            return;
+        }
+        let Some(src) = guest.blob_pixels(ctx, handle) else {
+            return;
+        };
+        if let Some(res) = self.resources.get_mut(&handle).and_then(|s| s.resource_mut()) {
+            res.take_guest_pixels(gl, formats, batch, &src);
+        }
     }
 
     /// A resource a bind may use, or `None` for one it must skip.
@@ -1208,8 +1244,19 @@ impl Context {
             Command::ClearTexture { resource, level, region, data } => {
                 self.clear_texture(host, resource, level, region, data)
             }
-            Command::PipeResourceSetType { resource, format, bind, width, height, .. } => {
-                self.set_resource_type(host, resource, format, bind, width, height)
+            Command::PipeResourceSetType {
+                resource,
+                format,
+                bind,
+                width,
+                height,
+                ref planes,
+                ..
+            } => {
+                // Plane zero is the image: this command only ever describes a plain 2D texture
+                // here, and the strides of any others describe planes nothing reads.
+                let plane = planes.first().copied().unwrap_or(Plane { stride: 0, offset: 0 });
+                self.set_resource_type(host, resource, format, bind, width, height, plane)
             }
             Command::PipeResourceCreate { .. }
             | Command::GetMemoryInfo(_)
@@ -3113,6 +3160,7 @@ impl Context {
     ///
     /// Describing a resource that is already typed succeeds and does nothing, as the C does: the
     /// guest may name a buffer twice, and the second telling asks for nothing new.
+    #[allow(clippy::too_many_arguments)]
     fn set_resource_type(
         &mut self,
         host: &mut Host<'_>,
@@ -3121,6 +3169,7 @@ impl Context {
         bind: u32,
         width: u32,
         height: u32,
+        plane: Plane,
     ) -> Result<(), Fault> {
         let cmd = Cmd::PipeResourceSetType;
         if host.slot(cmd, resource)?.resource().is_some() {
@@ -3141,8 +3190,20 @@ impl Context {
         let Some(resource::Slot::Untyped(untyped)) = host.resources.remove(&resource) else {
             unreachable!("the slot was read as untyped a statement ago, under one borrow");
         };
-        match untyped.upgrade(host.gl, host.winsys, host.features, host.formats, host.limits, args)
-        {
+        // Asked here and not held: the bytes are the VMM's or the exporter's, and the source
+        // borrows the table for this call only.
+        let pixels = host.guest.blob_pixels(host.ctx, resource);
+        match untyped.upgrade(
+            host.gl,
+            host.winsys,
+            host.features,
+            host.formats,
+            host.limits,
+            args,
+            pixels.as_ref(),
+            plane,
+            host.batch,
+        ) {
             Ok(res) => {
                 host.resources.insert(resource, resource::Slot::Resource(res));
                 Ok(())

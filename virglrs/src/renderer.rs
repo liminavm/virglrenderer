@@ -10,7 +10,7 @@
 use crate::abi::{GuestIov, VmmPtr};
 use crate::config::{CapsetId, Config};
 use crate::fence::{FenceSink, Retirement};
-use crate::guest_mem::{GuestMap, Iov};
+use crate::guest_mem::{GuestMap, Iov, PixelSource};
 use crate::ids::{
     BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx, SurfaceId,
 };
@@ -406,6 +406,44 @@ impl Guest for BTreeMap<ResourceHandle, Resource> {
             return None;
         }
         Some(Iov::new(&r.iov))
+    }
+
+    fn blob_pixels(&self, ctx: ContextId, handle: ResourceHandle) -> Option<PixelSource<'_>> {
+        let r = self.get(&handle)?;
+        if !r.attached.contains(&ctx) {
+            return None;
+        }
+        let Backing::Blob { storage, .. } = &r.backing else {
+            // Only a blob is typed after the fact; a classic resource was made from a description
+            // and has never been in the state this answers for.
+            return None;
+        };
+        match storage {
+            // The guest's own pages. `iov` is the VMM's list, borrowed for this call only.
+            BlobStorage::Guest => {
+                (!r.iov.is_empty()).then(|| PixelSource::Scattered(Iov::new(&r.iov)))
+            }
+            BlobStorage::Minted(h) => Some(PixelSource::Mapped(&h.map)),
+            // `pages()` is `None` for a surface, which is not a gap: a surface is adopted whole
+            // and the texture's storage becomes it, so reading its bytes here would mint exactly
+            // the copy the adopt exists to avoid.
+            BlobStorage::Shared { storage, .. } => storage.mapping().map(PixelSource::Mapped),
+            // Ordinary device memory published as a borrowed `vkMapMemory` pointer. Good only in
+            // the context that mapped it and only while that allocation stands, so it is not
+            // this renderer's to hand anyone else -- the same refusal `bytes()` gives, and for
+            // the same lifetime reason.
+            BlobStorage::Borrowed { ctx: owner, .. } => {
+                if *owner != ctx {
+                    eprintln!(
+                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, published as a \
+                         borrowed mapping this renderer cannot share across contexts",
+                        ctx.get(),
+                        owner.get(),
+                    );
+                }
+                None
+            }
+        }
     }
 }
 
