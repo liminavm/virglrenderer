@@ -895,6 +895,10 @@ static size_t virgl_oracle_av1_guest_next(void *guest, uint8_t *desc_out)
  * Each of these is a place the C reads past the end of what the wire carries; the values are kept
  * moderate so the overread stays inside the descriptor and the test observes the bytes rather than
  * the fault. The Rust refuses them by name instead, and the test pins that divergence.
+ *
+ * The last is not a count but a bit width, which the C widens the frame header with rather than
+ * refusing. It is kept at 31 so the C's own writer stays inside a word: the values the Rust
+ * refuses reach far past that, and there is no C behaviour left to compare against.
  */
 size_t virgl_oracle_av1_guest_break(void *guest, uint8_t *desc_out, int guard)
 {
@@ -909,6 +913,7 @@ size_t virgl_oracle_av1_guest_break(void *guest, uint8_t *desc_out, int guard)
    case 5: d->picture_parameter.film_grain_info.num_cr_points = 16; break;  /* out of 10 */
    case 6: d->picture_parameter.max_width = 0;
            d->picture_parameter.frame_width = 0; break;
+   case 7: d->picture_parameter.order_hint_bits_minus_1 = 31; break; /* a width, out of 3 bits */
    default: break;
    }
    return tiles_size;

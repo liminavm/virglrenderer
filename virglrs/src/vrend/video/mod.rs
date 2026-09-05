@@ -712,7 +712,7 @@ impl Codec {
             );
             return Err(Refusal::HostRefusedFrame);
         }
-        let config = match av1::SeqParams::read(descriptor).av1c() {
+        let config = match av1::SeqParams::read(descriptor).and_then(|seq| seq.av1c()) {
             Ok(config) => config,
             Err(why) => {
                 eprintln!("[virglrs] video codec {handle}: no AV1 configuration record ({why})");
@@ -1374,7 +1374,9 @@ mod tests {
         let av1 = Shape::Av1 {
             key: desc.starts_dpb(),
             desc: Box::new(desc),
-            config: av1::SeqParams::read(&blob).av1c().expect("a Main sequence header"),
+            config: av1::SeqParams::read(&blob)
+                .and_then(|seq| seq.av1c())
+                .expect("a Main sequence header"),
             width: 640,
             height: 360,
         };

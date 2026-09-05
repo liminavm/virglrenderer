@@ -18,6 +18,36 @@ pub enum Escape {
     Raw,
 }
 
+/// A bit width that came from data rather than from a literal.
+///
+/// `Writer::u` asserts the width it is handed is one it can emit, which is a host invariant for
+/// the literal widths the serializers write: `w.u(3, ..)` is right or the code is wrong. A width
+/// read out of a guest descriptor is not that -- it is untrusted input, and an impossible one has
+/// to be refused where it is read, not asserted on several frames later when it is finally
+/// written. `BitWidth` is how a read hands one onward: it cannot be constructed out of range, so
+/// [`Writer::u_var`] cannot be reached with a width that would fire the assert.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub struct BitWidth(u8);
+
+impl BitWidth {
+    /// No bits: the field is absent, and writing it writes nothing.
+    pub const ZERO: BitWidth = BitWidth(0);
+
+    /// `None` for a width no `u(n)` can emit. The only constructor, so a width taken from data is
+    /// checked once, at the boundary that read it, and is beyond doubt everywhere after.
+    pub fn new(bits: u8) -> Option<BitWidth> {
+        (u32::from(bits) <= Writer::MAX_BITS).then_some(BitWidth(bits))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// A bit writer over a growing buffer.
 ///
 /// The buffer grows, so there is no overflow to report and no capacity for a caller to have got
@@ -33,6 +63,9 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// The widest `u(n)` there is: the value written is a `u32`.
+    pub const MAX_BITS: u32 = 32;
+
     pub fn new(escape: Escape) -> Self {
         Self { out: Vec::new(), acc: 0, nbits: 0, zeros: 0, escape }
     }
@@ -66,8 +99,12 @@ impl Writer {
     }
 
     /// `u(n)` / `f(n)`: `n` bits of `v`, most significant first.
+    ///
+    /// `n` is a literal at every call site, so the assert is a host invariant. A width that came
+    /// out of a descriptor goes through [`Writer::u_var`] instead, which cannot be handed one
+    /// that would fire it.
     pub fn u(&mut self, n: u32, v: u32) {
-        assert!(n <= 32, "u({n}) is wider than the value it writes");
+        assert!(n <= Self::MAX_BITS, "u({n}) is wider than the value it writes");
         for i in 0..n {
             self.acc = (self.acc << 1) | ((v >> (n - 1 - i)) & 1);
             self.nbits += 1;
@@ -78,6 +115,11 @@ impl Writer {
                 self.nbits = 0;
             }
         }
+    }
+
+    /// `u(n)` where `n` was read rather than written: see [`BitWidth`].
+    pub fn u_var(&mut self, n: BitWidth, v: u32) {
+        self.u(u32::from(n.get()), v);
     }
 
     pub fn flag(&mut self, v: bool) {

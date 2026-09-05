@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use super::bitstream::{Escape, Writer};
+use super::bitstream::{BitWidth, Escape, Writer};
 
 /// OBU types (5.3.1).
 const OBU_SEQUENCE_HEADER: u32 = 1;
@@ -301,6 +301,10 @@ pub enum Unsupported {
     /// More film grain scaling points than the wire has room for: fourteen for luma, ten each for
     /// the chroma planes.
     FilmGrainPoints(usize),
+    /// `order_hint_bits_minus_1` past the three bits the syntax gives it. The descriptor carries a
+    /// whole byte, and the value is a *bit width*: every order hint in the frame header, and the
+    /// eight saved hints of a reference-frame update, are written that many bits wide.
+    OrderHintBits(u8),
 }
 
 impl fmt::Display for Unsupported {
@@ -314,6 +318,9 @@ impl fmt::Display for Unsupported {
             }
             Unsupported::FilmGrainPoints(n) => {
                 write!(f, "{n} film grain scaling points is more than the wire carries")
+            }
+            Unsupported::OrderHintBits(n) => {
+                write!(f, "order_hint_bits_minus_1 {n} is out of range")
             }
         }
     }
@@ -329,8 +336,8 @@ impl fmt::Display for Unsupported {
 pub struct SeqParams {
     pub profile: u8,
     pub level_idx: u8,
-    /// 0 when order hints are off.
-    pub order_hint_bits: u8,
+    /// The width every order hint is written at. [`BitWidth::ZERO`] when order hints are off.
+    pub order_hint_bits: BitWidth,
     /// 8, 10 or 12.
     pub bit_depth: u8,
     pub mono_chrome: bool,
@@ -382,7 +389,7 @@ fn pick_level(w: u32, h: u32) -> u8 {
 
 impl SeqParams {
     /// Derive the sequence parameters from a descriptor the guest wrote.
-    pub fn read(blob: &[u8]) -> SeqParams {
+    pub fn read(blob: &[u8]) -> Result<SeqParams, Unsupported> {
         let d = Fields(blob);
         let max_width = match d.short(at::MAX_WIDTH) {
             0 => d.short(at::FRAME_WIDTH),
@@ -393,15 +400,22 @@ impl SeqParams {
             h => h,
         };
         let enable_order_hint = d.flag(at::SEQ_ENABLE_ORDER_HINT);
+        // A width, not a count: refused here rather than carried inward, because every later use
+        // of it is a `u(n)` and no `n` past what a word holds can be written at all.
+        let order_hint_bits = if enable_order_hint {
+            let minus_1 = d.byte(at::ORDER_HINT_BITS_MINUS_1);
+            if minus_1 > MAX_ORDER_HINT_BITS_MINUS_1 {
+                return Err(Unsupported::OrderHintBits(minus_1));
+            }
+            BitWidth::new(minus_1 + 1).expect("eight bits is a width the writer can emit")
+        } else {
+            BitWidth::ZERO
+        };
 
-        SeqParams {
+        Ok(SeqParams {
             profile: d.byte(at::PROFILE),
             level_idx: pick_level(u32::from(max_width), u32::from(max_height)),
-            order_hint_bits: if enable_order_hint {
-                d.byte(at::ORDER_HINT_BITS_MINUS_1) + 1
-            } else {
-                0
-            },
+            order_hint_bits,
             bit_depth: match d.byte(at::BIT_DEPTH_IDX) {
                 1 => 10,
                 2 => 12,
@@ -426,7 +440,7 @@ impl SeqParams {
             height_bits: floor_log2(if max_height != 0 { u32::from(max_height) - 1 } else { 1 })
                 as u8
                 + 1,
-        }
+        })
     }
 
     /// 5.5.2 `color_config`.
@@ -492,7 +506,9 @@ impl SeqParams {
         w.flag(true); // seq_choose_screen_content_tools
         w.flag(true); // seq_choose_integer_mv
         if self.enable_order_hint {
-            w.u(3, u32::from(self.order_hint_bits) - 1);
+            // The read refuses anything wider, so this cannot underflow: with order hints on the
+            // width is one to eight.
+            w.u(3, u32::from(self.order_hint_bits.get()) - 1);
         }
 
         // enable_superres and enable_restoration are likewise absent from the descriptor and only
@@ -588,6 +604,9 @@ const MAX_UV_POINTS: usize = 10;
 const MAX_SLICES: usize = 256;
 /// `cdef_bits` is two bits wide, so at most eight strengths, which is the array's length.
 const MAX_CDEF_BITS: u8 = 3;
+
+/// 5.5.1 -- `order_hint_bits_minus_1` is `f(3)`, so eight is the widest an order hint gets.
+const MAX_ORDER_HINT_BITS_MINUS_1: u8 = 7;
 
 /// One reference's global motion model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -768,7 +787,7 @@ impl FrameDesc {
             (0..count).map(|i| (byte(value + i), byte(scaling + i))).collect()
         };
 
-        let seq = SeqParams::read(blob);
+        let seq = SeqParams::read(blob)?;
         if seq.max_width == 0 || seq.max_height == 0 {
             return Err(Unsupported::NoGeometry);
         }
@@ -1539,7 +1558,7 @@ impl FrameDesc {
     /// Only the *presence* of the bit is at stake, but getting that wrong shifts every bit after
     /// it, so the reference search is reproduced exactly.
     fn skip_mode_allowed(&self, c: &FrameCtx, state: &ObuState) -> bool {
-        let bits = u32::from(self.seq.order_hint_bits);
+        let bits = u32::from(self.seq.order_hint_bits.get());
         let order_hint = i32::from(self.order_hint);
 
         if c.frame_is_intra || !self.reference_select || !self.seq.enable_order_hint {
@@ -1609,8 +1628,8 @@ impl FrameDesc {
             w.flag(size_override);
         }
 
-        if s.order_hint_bits != 0 {
-            w.u(u32::from(s.order_hint_bits), u32::from(self.order_hint));
+        if !s.order_hint_bits.is_zero() {
+            w.u_var(s.order_hint_bits, u32::from(self.order_hint));
         }
 
         if !(c.frame_is_intra || c.error_resilient) {
@@ -1624,7 +1643,7 @@ impl FrameDesc {
         if (!c.frame_is_intra || !all_frames_refreshed) && s.enable_order_hint && c.error_resilient
         {
             for hint in state.saved_order_hint {
-                w.u(u32::from(s.order_hint_bits), u32::from(hint));
+                w.u_var(s.order_hint_bits, u32::from(hint));
             }
         }
 
@@ -2167,8 +2186,37 @@ mod tests {
     }
 
     #[test]
+    fn a_bit_width_out_of_range_is_refused_where_it_is_read() {
+        // `order_hint_bits_minus_1` is three bits of syntax carried in a whole byte of descriptor,
+        // and what it sizes is every order hint the frame header writes. Unrefused it reaches the
+        // writer as a `u(n)`, where a width past a word is an assert -- and this crate aborts on
+        // panic, so a guest that sent one would take the worker down with it. The byte that wraps
+        // is the same bug from the other side: 0xff plus one is zero, and a zero width with order
+        // hints enabled underflows the sequence header's `order_hint_bits - 1`.
+        let mut blob = test_descriptor(640, 360);
+        let seq = SeqParams::read(&blob).expect("the fixture is in range");
+        assert!(seq.order_hint_bits.is_zero(), "the fixture leaves order hints off");
+
+        let on = at::SEQ_ENABLE_ORDER_HINT;
+        blob[on.at + on.shift as usize / 8] |= 1 << (on.shift % 8);
+        for minus_1 in [8u8, 31, 40, 0xff] {
+            blob[at::ORDER_HINT_BITS_MINUS_1] = minus_1;
+            assert_eq!(SeqParams::read(&blob), Err(Unsupported::OrderHintBits(minus_1)));
+            assert_eq!(FrameDesc::read(&blob), Err(Unsupported::OrderHintBits(minus_1)));
+        }
+
+        // And the widths that are legal still are, at both ends of the range.
+        for minus_1 in [0u8, MAX_ORDER_HINT_BITS_MINUS_1] {
+            blob[at::ORDER_HINT_BITS_MINUS_1] = minus_1;
+            let seq = SeqParams::read(&blob).expect("a width the syntax allows");
+            assert_eq!(seq.order_hint_bits.get(), minus_1 + 1);
+            assert!(seq.sequence_header().is_ok());
+        }
+    }
+
+    #[test]
     fn a_profile_other_than_main_is_refused_rather_than_written_as_main() {
-        let mut seq = SeqParams::read(&[]);
+        let mut seq = SeqParams::read(&[]).unwrap();
         seq.profile = 1;
         assert_eq!(seq.sequence_header(), Err(Unsupported::Profile(1)));
         assert_eq!(seq.av1c(), Err(Unsupported::Profile(1)));
@@ -2176,7 +2224,7 @@ mod tests {
 
     #[test]
     fn an_av1c_record_carries_the_sequence_header_after_its_four_bytes() {
-        let seq = SeqParams::read(&[]);
+        let seq = SeqParams::read(&[]).unwrap();
         let record = seq.av1c().unwrap();
         let header = seq.sequence_header().unwrap();
 
@@ -2285,7 +2333,7 @@ mod oracle {
     fn the_av1c_record_is_the_bytes_the_c_writes() {
         for seed in 0..512u64 {
             let desc = Descriptor::new(seed);
-            let ours = SeqParams::read(desc.bytes()).av1c().unwrap();
+            let ours = SeqParams::read(desc.bytes()).unwrap().av1c().unwrap();
             assert_eq!(Some(ours), desc.c_av1c(), "seed {seed}");
         }
     }
@@ -2299,7 +2347,7 @@ mod oracle {
         // leaving this note to go quietly stale.
         for seed in 0..8u64 {
             let desc = Descriptor::new(seed);
-            let mut seq = SeqParams::read(desc.bytes());
+            let mut seq = SeqParams::read(desc.bytes()).unwrap();
             assert_eq!(seq.profile, 0);
             seq.profile = 1;
             assert_eq!(seq.av1c(), Err(Unsupported::Profile(1)));
@@ -2690,12 +2738,17 @@ mod oracle {
     }
 
     #[test]
-    fn a_count_past_its_array_is_refused_rather_than_read_past() {
-        // Each of these is a place the C indexes past the end of what the wire carries:
+    fn a_field_past_its_bound_is_refused_rather_than_used() {
+        // Most of these are places the C indexes past the end of what the wire carries:
         // `1 << cdef_bits` strengths out of eight, `slice_count` tiles out of two hundred and
         // fifty-six -- which for a large count runs past the descriptor entirely -- and the film
         // grain point counts out of fourteen and ten. It emits the bytes it read; the Rust
         // reconciles each count with its array where the descriptor is read, and refuses.
+        //
+        // The last is a bit width rather than a count, and nothing it sizes is an array: the C
+        // simply widens the frame header with it. Widths past what a word holds are refused in
+        // `a_bit_width_out_of_range_is_refused_where_it_is_read`, where there is no C behaviour
+        // left to compare against.
         //
         // The assertions that the C still emits are the point: they fail if it is ever fixed,
         // rather than leaving these notes to go quietly stale.
@@ -2706,6 +2759,7 @@ mod oracle {
             Unsupported::FilmGrainPoints(16),
             Unsupported::FilmGrainPoints(16),
             Unsupported::NoGeometry,
+            Unsupported::OrderHintBits(31),
         ];
 
         for (i, want) in expected.iter().enumerate() {
