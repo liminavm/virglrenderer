@@ -56,8 +56,15 @@ unsafe extern "C" {
     static kCFBooleanTrue: CfTypeRef;
     static kCFTypeDictionaryKeyCallBacks: CfType;
     static kCFTypeDictionaryValueCallBacks: CfType;
+    static kCFTypeArrayCallBacks: CfType;
 
     fn CFRelease(cf: CfTypeRef);
+    fn CFArrayCreate(
+        allocator: CfTypeRef,
+        values: *const CfTypeRef,
+        count: CfIndex,
+        callbacks: *const CfType,
+    ) -> CfTypeRef;
     fn CFNumberCreate(allocator: CfTypeRef, ty: CfIndex, value: *const c_void) -> CfTypeRef;
     fn CFDictionaryCreate(
         allocator: CfTypeRef,
@@ -77,12 +84,20 @@ unsafe extern "C" {
     static kIOSurfaceBytesPerRow: CfTypeRef;
     static kIOSurfacePixelFormat: CfTypeRef;
     static kIOSurfaceIsGlobal: CfTypeRef;
+    static kIOSurfacePlaneInfo: CfTypeRef;
+    static kIOSurfacePlaneWidth: CfTypeRef;
+    static kIOSurfacePlaneHeight: CfTypeRef;
+    static kIOSurfacePlaneBytesPerElement: CfTypeRef;
 
     fn IOSurfaceCreate(properties: CfTypeRef) -> CfTypeRef;
     fn IOSurfaceGetID(surface: CfTypeRef) -> u32;
     fn IOSurfaceGetBaseAddress(surface: CfTypeRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: CfTypeRef) -> usize;
     fn IOSurfaceGetBytesPerRow(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetPlaneCount(surface: CfTypeRef) -> usize;
+    fn IOSurfaceGetWidthOfPlane(surface: CfTypeRef, plane: usize) -> usize;
+    fn IOSurfaceGetHeightOfPlane(surface: CfTypeRef, plane: usize) -> usize;
+    fn IOSurfaceGetBytesPerRowOfPlane(surface: CfTypeRef, plane: usize) -> usize;
     fn IOSurfaceLock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceUnlock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
 }
@@ -193,6 +208,54 @@ impl PixelFormat {
         let align = linear_alignment(self.mtl_format())?;
         let row = u64::from(width) * u64::from(self.bytes_per_element());
         u32::try_from(row.div_ceil(align) * align).ok()
+    }
+}
+
+/// One plane of a planar surface: its extent, and what one of its elements takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneShape {
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_element: u32,
+}
+
+/// The layout of a planar surface.
+///
+/// A separate type from [`PixelFormat`], not another variant of it, because a planar surface has
+/// no single pixel size: each plane has its own, and a format that answered `bytes_per_element`
+/// with one number would be answering for a plane it was not asked about. The kernel lays a
+/// planar surface out from the plane list alone, so that list is the whole description.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlanarFormat {
+    /// `'420f'` -- `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`. A full-resolution 8-bit luma
+    /// plane, then a half-resolution plane of interleaved two-byte chroma. What VideoToolbox
+    /// decodes 8-bit 4:2:0 into, and what NV12 names on the wire.
+    BiPlanar420,
+}
+
+impl PlanarFormat {
+    /// The FourCC IOSurface names it by.
+    fn fourcc(self) -> u32 {
+        match self {
+            PlanarFormat::BiPlanar420 => u32::from_be_bytes(*b"420f"),
+        }
+    }
+
+    /// What each plane of a `width` x `height` surface is.
+    ///
+    /// Chroma rounds *up*: an odd-sized picture still has a chroma sample for its last column,
+    /// and a plane a row short of the luma it subsamples is one the decoder writes past.
+    pub fn planes(self, width: u32, height: u32) -> [PlaneShape; 2] {
+        match self {
+            PlanarFormat::BiPlanar420 => [
+                PlaneShape { width, height, bytes_per_element: 1 },
+                PlaneShape {
+                    width: width.div_ceil(2),
+                    height: height.div_ceil(2),
+                    bytes_per_element: 2,
+                },
+            ],
+        }
     }
 }
 
@@ -344,6 +407,141 @@ impl Surface {
     /// its import, which is what makes the pointer good for that long.
     pub(crate) fn client_buffer(&self) -> *mut c_void {
         self.surface.as_ptr().cast()
+    }
+    /// Mint a planar surface: one allocation, every plane inside it.
+    ///
+    /// This is the storage a composite decode target needs -- the shape where the guest creates
+    /// *one* resource in a planar format and chains its planes behind it, rather than one
+    /// resource per plane. The kernel decides the layout from the plane list, and it is the only
+    /// one that can: the planes share an allocation, so their strides and offsets are a single
+    /// decision no caller is in a position to make. What it chose is read back per plane from
+    /// [`Self::plane_bytes_per_row`].
+    ///
+    /// No top-level pitch or element size is asked for, unlike [`Self::scanout`]: for a planar
+    /// surface those describe no plane, and supplying them is how a surface gets laid out to a
+    /// stride nothing reads by.
+    pub fn planar(width: u32, height: u32, format: PlanarFormat) -> Result<Surface, SurfaceError> {
+        if width == 0 || height == 0 {
+            return Err(SurfaceError::ZeroExtent);
+        }
+        let shapes = format.planes(width, height);
+
+        // SAFETY: every object below is one this call creates and owns; each guard releases its
+        // own reference on the way out, and the containers retain what they hold, so the guards
+        // are free to release the moment the container exists. The statics are the framework's
+        // exported property keys.
+        let surface = unsafe {
+            let mut planes = Vec::with_capacity(shapes.len());
+            for shape in shapes {
+                let numbers = [
+                    Number::new(shape.width),
+                    Number::new(shape.height),
+                    Number::new(shape.bytes_per_element),
+                ];
+                if numbers.iter().any(|n| n.0.is_null()) {
+                    return Err(SurfaceError::Refused);
+                }
+                let keys =
+                    [kIOSurfacePlaneWidth, kIOSurfacePlaneHeight, kIOSurfacePlaneBytesPerElement];
+                let values = [numbers[0].0, numbers[1].0, numbers[2].0];
+                let dict = Cf(CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    keys.len() as CfIndex,
+                    &raw const kCFTypeDictionaryKeyCallBacks,
+                    &raw const kCFTypeDictionaryValueCallBacks,
+                ));
+                if dict.0.is_null() {
+                    return Err(SurfaceError::Refused);
+                }
+                planes.push(dict);
+            }
+
+            let refs: Vec<CfTypeRef> = planes.iter().map(|p| p.0).collect();
+            let list = Cf(CFArrayCreate(
+                std::ptr::null(),
+                refs.as_ptr(),
+                refs.len() as CfIndex,
+                &raw const kCFTypeArrayCallBacks,
+            ));
+            if list.0.is_null() {
+                return Err(SurfaceError::Refused);
+            }
+
+            let numbers = [Number::new(width), Number::new(height), Number::new(format.fourcc())];
+            if numbers.iter().any(|n| n.0.is_null()) {
+                return Err(SurfaceError::Refused);
+            }
+            let keys = [
+                kIOSurfaceWidth,
+                kIOSurfaceHeight,
+                kIOSurfacePixelFormat,
+                kIOSurfacePlaneInfo,
+                kIOSurfaceIsGlobal,
+            ];
+            let values = [numbers[0].0, numbers[1].0, numbers[2].0, list.0, kCFBooleanTrue];
+            let properties = Cf(CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                keys.len() as CfIndex,
+                &raw const kCFTypeDictionaryKeyCallBacks,
+                &raw const kCFTypeDictionaryValueCallBacks,
+            ));
+            if properties.0.is_null() {
+                return Err(SurfaceError::Refused);
+            }
+            IOSurfaceCreate(properties.0)
+        };
+
+        // SAFETY: `IOSurfaceCreate` returns a +1 reference or null, and `Surface` takes that one
+        // reference -- there is no second owner and no second release.
+        let surface = NonNull::new(surface.cast_mut())
+            .map(|surface| Surface { surface })
+            .ok_or(SurfaceError::Refused)?;
+
+        // A surface that came back with a different plane count is not the surface that was
+        // asked for, and every later index into it would be a guess. The kernel has never been
+        // seen to do this; if it does, it is not something to paper over.
+        if surface.plane_count() != shapes.len() as u32 {
+            return Err(SurfaceError::Refused);
+        }
+        Ok(surface)
+    }
+
+    /// How many planes the surface has. Zero for a surface that is not planar.
+    pub fn plane_count(&self) -> u32 {
+        // SAFETY: a read-only query of the live surface this type owns.
+        let count = unsafe { IOSurfaceGetPlaneCount(self.as_ref()) };
+        u32::try_from(count).expect("an IOSurface plane count does not exceed a u32")
+    }
+
+    /// One plane's extent and row pitch, as the kernel laid it out.
+    ///
+    /// `None` for a plane the surface does not have, which is every plane of a surface that is
+    /// not planar.
+    pub fn plane(&self, plane: u32) -> Option<(PlaneShape, u32)> {
+        if plane >= self.plane_count() {
+            return None;
+        }
+        let index = plane as usize;
+        // SAFETY: read-only queries of the live surface this type owns, at an index just
+        // checked against its own plane count.
+        let (width, height, pitch) = unsafe {
+            (
+                IOSurfaceGetWidthOfPlane(self.as_ref(), index),
+                IOSurfaceGetHeightOfPlane(self.as_ref(), index),
+                IOSurfaceGetBytesPerRowOfPlane(self.as_ref(), index),
+            )
+        };
+        let as_u32 = |v: usize| u32::try_from(v).expect("an IOSurface plane extent fits a u32");
+        // The element size is the caller's own -- the kernel does not report one per plane --
+        // so it is left out of the shape rather than invented here.
+        Some((
+            PlaneShape { width: as_u32(width), height: as_u32(height), bytes_per_element: 0 },
+            as_u32(pitch),
+        ))
     }
 
     /// The global id another process looks this surface up by.
@@ -497,6 +695,22 @@ pub enum SurfaceError {
     Refused,
 }
 
+/// Any CoreFoundation object this module creates, released on drop.
+///
+/// The planar path builds a dictionary per plane, an array of them, and a dictionary around
+/// that, with a fallible step between each -- so every one of them needs an owner that survives
+/// an early return. [`Number`] is the same idea for the one type that predates it.
+struct Cf(CfTypeRef);
+
+impl Drop for Cf {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the +1 from the create call this wraps, released once.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
 /// A `CFNumber` that releases itself, so the properties dictionary can be built without a leak on
 /// every early return between the first number and the last.
 struct Number(CfTypeRef);
@@ -526,6 +740,61 @@ impl Drop for Number {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A planar surface is one allocation with the planes the format describes inside it, and
+    /// the kernel's own layout for each -- which is the whole reason to ask for one rather than
+    /// mint a surface per plane.
+    #[test]
+    fn a_planar_surface_carries_every_plane_at_the_kernels_own_pitch() {
+        let surface =
+            Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("the system minted");
+        assert_eq!(surface.plane_count(), 2);
+
+        let (luma, luma_pitch) = surface.plane(0).expect("a luma plane");
+        assert_eq!((luma.width, luma.height), (64, 64));
+        assert!(luma_pitch >= 64, "luma rows hold at least their pixels, got {luma_pitch}");
+
+        // Half resolution, and two bytes a sample: the chroma plane is a quarter of the pixels
+        // and half the bytes of the luma one.
+        let (chroma, chroma_pitch) = surface.plane(1).expect("a chroma plane");
+        assert_eq!((chroma.width, chroma.height), (32, 32));
+        assert!(chroma_pitch >= 64, "interleaved chroma is two bytes a sample, got {chroma_pitch}");
+
+        assert_eq!(surface.plane(2), None, "there is no third plane to index");
+        // The whole allocation holds both planes, whatever padding the kernel chose between them.
+        let least = u64::from(luma_pitch) * 64 + u64::from(chroma_pitch) * 32;
+        assert!(surface.alloc_size() >= least, "{} < {least}", surface.alloc_size());
+    }
+
+    /// Chroma rounds up, so an odd picture keeps a sample for its last row and column. A plane
+    /// short of the luma it subsamples is one the decoder writes past.
+    #[test]
+    fn an_odd_extent_rounds_its_chroma_plane_up() {
+        assert_eq!(
+            PlanarFormat::BiPlanar420.planes(65, 33),
+            [
+                PlaneShape { width: 65, height: 33, bytes_per_element: 1 },
+                PlaneShape { width: 33, height: 17, bytes_per_element: 2 },
+            ]
+        );
+        let surface =
+            Surface::planar(65, 33, PlanarFormat::BiPlanar420).expect("the system minted");
+        let (chroma, _) = surface.plane(1).expect("a chroma plane");
+        assert_eq!((chroma.width, chroma.height), (33, 17));
+    }
+
+    /// A surface with no pixels is named here rather than left to arrive as a bare null.
+    #[test]
+    fn a_planar_surface_with_no_pixels_is_refused_by_name() {
+        assert_eq!(
+            Surface::planar(0, 64, PlanarFormat::BiPlanar420).expect_err("refused"),
+            SurfaceError::ZeroExtent
+        );
+        assert_eq!(
+            Surface::planar(64, 0, PlanarFormat::BiPlanar420).expect_err("refused"),
+            SurfaceError::ZeroExtent
+        );
+    }
 
     // Resolving an id to a surface is the *importer's* half of this path and arrives with it.
     // It is declared here because the test below is about what another process can reach, and
