@@ -26,6 +26,7 @@ pub mod encode;
 pub mod features;
 pub mod formats;
 pub mod gl;
+pub mod journal;
 pub mod pipe;
 pub mod proto;
 pub mod resource;

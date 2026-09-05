@@ -60,8 +60,19 @@ impl<'a> Batch<'a> {
     }
 }
 
+/// A framed command: what it says, and the dwords it said it in.
+///
+/// The two travel together because the journal retains the dwords of commands it accepted, and a
+/// retained slice that came from anywhere but the frame just decoded could describe a different
+/// command than the one that ran.
+#[derive(Debug)]
+pub struct Framed<'a> {
+    pub cmd: Command<'a>,
+    pub wire: &'a [u32],
+}
+
 impl<'a> Iterator for Batch<'a> {
-    type Item = Result<Command<'a>, Refused>;
+    type Item = Result<Framed<'a>, Refused>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.at >= self.words.len() {
@@ -82,7 +93,7 @@ impl<'a> Iterator for Batch<'a> {
         let words = &self.words[at..end];
         let decoded = decode(cmd, header.obj, words);
         self.at = if decoded.is_ok() { end } else { self.words.len() };
-        Some(decoded)
+        Some(decoded.map(|cmd| Framed { cmd, wire: words }))
     }
 }
 
@@ -1716,7 +1727,7 @@ mod tests {
             encode(c, &mut wire);
         }
         let decoded: Vec<Command> =
-            Batch::new(&wire).map(|c| c.expect("a command we wrote")).collect();
+            Batch::new(&wire).map(|c| c.expect("a command we wrote").cmd).collect();
         assert_eq!(decoded, cmds);
 
         let mut again = Vec::new();
@@ -2063,8 +2074,8 @@ mod tests {
         encode(&Command::SetSampleMask(3), &mut wire);
 
         let mut batch = Batch::new(&wire);
-        assert_eq!(batch.next().unwrap().unwrap(), Command::SetSampleMask(1));
-        assert_eq!(batch.next().unwrap().unwrap(), Command::SetMinSamples(2));
+        assert_eq!(batch.next().unwrap().unwrap().cmd, Command::SetSampleMask(1));
+        assert_eq!(batch.next().unwrap().unwrap().cmd, Command::SetMinSamples(2));
         assert_eq!(batch.position(), bad_at);
         assert_eq!(
             batch.next().unwrap().unwrap_err(),
