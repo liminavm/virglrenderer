@@ -133,9 +133,6 @@ pub enum Refusal {
     ZeroDepth,
     ZeroArraySize,
     CubeNotSquare,
-    /// A buffer target carrying texture binds, which the C lets through to an allocation with
-    /// GL target zero.
-    TextureBindOnBuffer,
     IllegalBufferBind,
     /// Persistent mapping was asked for and the driver has no `GL_EXT_buffer_storage`.
     NoBufferStorage,
@@ -177,7 +174,6 @@ impl fmt::Display for Refusal {
             Refusal::ZeroDepth => "3D texture storage requires non-zero height and depth",
             Refusal::ZeroArraySize => "array texture storage requires non-zero array size",
             Refusal::CubeNotSquare => "cube map not square",
-            Refusal::TextureBindOnBuffer => "texture bind flags on the buffer target",
             Refusal::IllegalBufferBind => "illegal buffer binding flags",
             Refusal::NoBufferStorage => "persistent mapping needs GL_EXT_buffer_storage",
             Refusal::GlError(_) => "the driver refused the allocation",
@@ -1101,10 +1097,11 @@ fn check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> Res
     if !a.bind.has(texture_binds) {
         return Err(Refusal::NoTextureBind);
     }
-    // The C lets a buffer target with texture binds through to an allocation with GL target 0.
-    if a.target == T::Buffer {
-        return Err(Refusal::TextureBindOnBuffer);
-    }
+    // A buffer target reaching here is a texture buffer -- a buffer sampled through a texture --
+    // and it is `alloc_buffer` that makes one, so it is not refused and none of the per-target
+    // shape rules below name it. It arrives with a texture bind rather than a buffer one, which
+    // is why it missed the buffer branch above; what decides its storage is its target, and the
+    // creating path reads the target.
     if entry.is_none() {
         return Err(Refusal::UnsupportedFormat);
     }
@@ -1750,6 +1747,254 @@ mod tests {
         }
     }
 
+    /// `check_resource_valid`, transcribed from `src/vrend/vrend_renderer.c` and used for
+    /// nothing but disagreeing with our own.
+    ///
+    /// Deliberately a second implementation rather than a call into the first: what it is worth
+    /// is that it was written from the C and reads in the C's order, so a rule ours has and the
+    /// C does not cannot appear in it by construction. It answers only accept-or-refuse, because
+    /// the C's reason is a formatted string and ours is a variant, and pinning a mapping between
+    /// them would be pinning our own translation.
+    ///
+    /// The GBM early return is not transcribed: this build has no GBM, so the C never takes it.
+    fn c_check(features: &Features, formats: &Table, limits: &Limits, a: &Args) -> bool {
+        type T = TextureTarget;
+        let entry = formats.get(a.format);
+        let fcts = entry.is_some_and(|e| e.can_texture_storage);
+        let can_multisample = entry.is_some_and(|e| e.can_multisample);
+        if a.nr_samples > 1 {
+            if !can_multisample {
+                return false;
+            }
+            if !matches!(a.target, T::Texture2d | T::Array2d) {
+                return false;
+            }
+            if a.last_level > 0 {
+                return false;
+            }
+        }
+        if a.last_level > 0 {
+            if matches!(a.target, T::Buffer | T::Rect) {
+                return false;
+            }
+            let cap = (f64::from(a.width.max(a.height)).log2().floor() as u32) + 1;
+            if a.last_level > cap {
+                return false;
+            }
+        }
+        if a.flags.0 != 0 {
+            let supported = ResourceFlags::Y_0_TOP.0
+                | ResourceFlags::MAP_PERSISTENT.0
+                | ResourceFlags::MAP_COHERENT.0;
+            if a.flags.0 & !supported != 0 {
+                return false;
+            }
+        }
+        if a.flags.0 & ResourceFlags::Y_0_TOP.0 != 0 && !matches!(a.target, T::Texture2d | T::Rect)
+        {
+            return false;
+        }
+        if a.target == T::Cube {
+            if a.array_size != 6 {
+                return false;
+            }
+        } else if a.target == T::CubeArray {
+            if !features.has(Feature::cube_map_array) {
+                return false;
+            }
+            if !a.array_size.is_multiple_of(6) {
+                return false;
+            }
+        } else if a.array_size > 1 {
+            if !matches!(a.target, T::Array2d | T::Array1d) {
+                return false;
+            }
+            if !features.has(Feature::texture_array) {
+                return false;
+            }
+        }
+        if a.target != T::Buffer && a.width == 0 {
+            return false;
+        }
+        // The C matches the buffer binds by equality, and everything else is a texture.
+        let buffer_bind = matches!(
+            a.bind,
+            Bind(0)
+                | Bind::CUSTOM
+                | Bind::STAGING
+                | Bind::INDEX_BUFFER
+                | Bind::STREAM_OUTPUT
+                | Bind::VERTEX_BUFFER
+                | Bind::CONSTANT_BUFFER
+                | Bind::QUERY_BUFFER
+                | Bind::COMMAND_ARGS
+                | Bind::SHADER_BUFFER
+        );
+        if buffer_bind {
+            if a.target != T::Buffer {
+                return false;
+            }
+            if a.height != 1 || a.depth != 1 {
+                return false;
+            }
+            if a.bind == Bind::QUERY_BUFFER && !features.has(Feature::qbo) {
+                return false;
+            }
+            if a.bind == Bind::COMMAND_ARGS && !features.has(Feature::indirect_draw) {
+                return false;
+            }
+            return true;
+        }
+        let texture_bind = a.bind.has(Bind(
+            Bind::SAMPLER_VIEW.0
+                | Bind::DEPTH_STENCIL.0
+                | Bind::RENDER_TARGET.0
+                | Bind::CURSOR.0
+                | Bind::SHARED.0
+                | Bind::LINEAR.0,
+        ));
+        if !texture_bind {
+            return false;
+        }
+        // Note what is NOT here: nothing in this branch names PIPE_BUFFER. A buffer target with
+        // a texture bind reaches the end and is accepted, and the C then allocates it as a
+        // buffer, because the create path routes on the target alone.
+        if matches!(a.target, T::Texture2d | T::Rect | T::Cube | T::Array2d | T::CubeArray) {
+            if a.depth != 1 {
+                return false;
+            }
+            if fcts && a.height == 0 {
+                return false;
+            }
+        }
+        if matches!(a.target, T::Texture1d | T::Array1d) {
+            if a.height != 1 || a.depth != 1 {
+                return false;
+            }
+            if a.width > limits.max_texture_2d_size {
+                return false;
+            }
+        }
+        if matches!(a.target, T::Texture2d | T::Rect | T::Array2d)
+            && (a.width > limits.max_texture_2d_size || a.height > limits.max_texture_2d_size)
+        {
+            return false;
+        }
+        if a.target == T::Texture3d {
+            if fcts && (a.height == 0 || a.depth == 0) {
+                return false;
+            }
+            let m = limits.max_texture_3d_size;
+            if a.width > m || a.height > m || a.depth > m {
+                return false;
+            }
+        }
+        if matches!(a.target, T::Array2d | T::CubeArray | T::Array1d) && fcts && a.array_size == 0 {
+            return false;
+        }
+        if matches!(a.target, T::Cube | T::CubeArray) {
+            if a.width != a.height {
+                return false;
+            }
+            if a.width > limits.max_texture_cube_size {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The whole input space, ours against the C's, because the guest cannot see a refusal.
+    ///
+    /// A create is answered on ctx0, before any context owns the resource, and mesa does not read
+    /// the control queue's error -- so a resource we refuse is one the guest goes on to attach
+    /// backing to and transfer into, and the context dies on that later command naming a resource
+    /// that "does not exist". The symptom is a desktop that hangs several commands after the
+    /// mistake, attributed to the wrong thing. Nothing downstream can recover from it and no
+    /// amount of care at the refusal site prevents it, because the refusal is invisible.
+    ///
+    /// So the acceptance set is the invariant, not the individual rules: whatever this build
+    /// accepts must be what the C accepts, over every shape the wire can express. Sweeping it is
+    /// what makes a rule refusing something real impossible to add -- it fails here on the first
+    /// run, rather than in a guest, months later, as a hang.
+    ///
+    /// This caught a refusal of a texture buffer -- `PIPE_BUFFER` carrying `SAMPLER_VIEW`, which
+    /// `alloc_buffer` has always known how to make -- that killed GNOME's overview on the first
+    /// glyph it uploaded.
+    #[test]
+    fn nothing_is_refused_that_the_c_creates() {
+        let (f, t, l) = (features(), table(), limits());
+        let targets = [
+            TextureTarget::Buffer,
+            TextureTarget::Texture1d,
+            TextureTarget::Texture2d,
+            TextureTarget::Texture3d,
+            TextureTarget::Cube,
+            TextureTarget::Rect,
+            TextureTarget::Array1d,
+            TextureTarget::Array2d,
+            TextureTarget::CubeArray,
+        ];
+        // Every single bind flag, plus the unions a real guest sends: the C tells buffers from
+        // textures by *equality*, so a union of two buffer binds is a texture to it and the
+        // pairs are where a reimplementation drifts.
+        let singles: Vec<Bind> = (0..23).map(|i| Bind(1 << i)).collect();
+        let mut binds = vec![Bind(0)];
+        binds.extend(singles.iter().copied());
+        for &a in &[Bind::SAMPLER_VIEW, Bind::VERTEX_BUFFER, Bind::CONSTANT_BUFFER, Bind::CUSTOM] {
+            for &b in &singles {
+                binds.push(Bind(a.0 | b.0));
+            }
+        }
+        let shapes: &[(u32, u32, u32, u32, u32, u32)] = &[
+            // width, height, depth, array_size, last_level, nr_samples
+            (64, 64, 1, 1, 0, 0),
+            (64, 64, 1, 6, 0, 0),
+            (64, 32, 1, 1, 0, 0),
+            (64, 1, 1, 1, 0, 0),
+            (64, 64, 4, 1, 0, 0),
+            (0, 64, 1, 1, 0, 0),
+            (64, 0, 1, 1, 0, 0),
+            (64, 64, 1, 0, 0, 0),
+            (64, 64, 1, 1, 3, 0),
+            (64, 64, 1, 1, 0, 4),
+            (99999, 64, 1, 1, 0, 0),
+            (64, 64, 999, 1, 0, 0),
+        ];
+        let flags = [ResourceFlags(0), ResourceFlags::Y_0_TOP, ResourceFlags(1 << 30)];
+        let mut checked = 0usize;
+        for &target in &targets {
+            for &bind in &binds {
+                for &(width, height, depth, array_size, last_level, nr_samples) in shapes {
+                    for &flag in &flags {
+                        let a = Args {
+                            target,
+                            format: Format::from_wire(67).unwrap(),
+                            bind,
+                            width,
+                            height,
+                            depth,
+                            array_size,
+                            last_level,
+                            nr_samples,
+                            flags: flag,
+                        };
+                        let ours = check(&f, &t, &l, &a).is_ok();
+                        let theirs = c_check(&f, &t, &l, &a);
+                        assert_eq!(
+                            ours,
+                            theirs,
+                            "we {} what the C {}: {a:?}",
+                            if ours { "accept" } else { "refuse" },
+                            if theirs { "creates" } else { "refuses" }
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 20_000, "the sweep covered only {checked} shapes");
+    }
+
     #[test]
     fn the_checks_refuse_what_the_c_refuses() {
         let (f, t, l) = (features(), table(), limits());
@@ -1778,7 +2023,6 @@ mod tests {
             (|a| a.width = 0, Refusal::ZeroWidth),
             (|a| a.bind = Bind::VERTEX_BUFFER, Refusal::BufferBindOnTexture),
             (|a| a.bind = Bind::SCANOUT, Refusal::NoTextureBind),
-            (|a| a.target = TextureTarget::Buffer, Refusal::TextureBindOnBuffer),
             (|a| a.depth = 2, Refusal::DepthOn2d),
             (|a| a.height = 0, Refusal::ZeroHeight),
             (|a| a.width = 8192, Refusal::TooLarge),
