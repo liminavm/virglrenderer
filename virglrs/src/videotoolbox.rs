@@ -233,9 +233,11 @@ impl Owned {
 // SAFETY: a CoreFoundation reference may be held by whichever thread owns it. Retain and release
 // are atomic, so moving one between threads cannot lose or double a reference, and the objects
 // this module holds -- a decompression session, a format description, a pixel buffer -- are all
-// documented as usable from any thread when access to them is serialized. It is: the renderer's
-// root is behind a mutex, so exactly one thread reaches a Session at a time. Send and not Sync,
-// because that is the whole of the claim -- ownership may move, and two threads may not share.
+// documented as usable from any thread when access to them is serialized. Serialized is what
+// `Send` and not `Sync` means: an `Owned` is reached only through ownership or a borrow of it,
+// neither of which two threads can hold at once, so the access this claim needs to be serial is
+// serial by the type and not by anything a caller arranges. Ownership may move; two threads may
+// not share.
 unsafe impl Send for Owned {}
 
 impl Drop for Owned {
