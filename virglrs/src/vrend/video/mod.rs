@@ -323,12 +323,30 @@ pub enum Layout {
     Unserved(u32),
 }
 
+/// Where a decoded picture's planes go.
+///
+/// The two shapes a guest can ask for, and they are alternatives rather than a pair: a target is
+/// one or the other, so neither delivery has to ask whether the other's fields mean anything.
+///
+/// Which one arrives is the guest's decision, made from the capset before it allocates -- see
+/// [`composite_target_backable`].
+pub enum Destination {
+    /// One resource per plane. Each decoded plane is uploaded into its own GL texture, which is
+    /// what a plane's consumer samples.
+    PerPlane(Vec<Plane>),
+    /// One resource for the whole picture, its planes inside a single IOSurface. The guest
+    /// sends that one resource once per plane, and each plane's pixels go into the surface
+    /// plane a view of the guest's own samples -- so there is nothing to upload and no GL work
+    /// on this path at all.
+    Composite(Arc<Texture>),
+}
+
 /// A decode target: the picture the guest handed us to decode into.
 pub struct Buffer {
     pub format: Layout,
     pub width: u32,
     pub height: u32,
-    planes: Vec<Plane>,
+    destination: Destination,
 }
 
 impl Buffer {
@@ -338,9 +356,74 @@ impl Buffer {
     /// what the target has -- a target with fewer planes than the picture is the guest's own
     /// choice of layout, not an error.
     fn deliver(&self, gl: &Gl, layout: TargetFormat, picture: &videotoolbox::Locked<'_>) -> usize {
+        match &self.destination {
+            Destination::PerPlane(planes) => Self::deliver_per_plane(gl, planes, layout, picture),
+            Destination::Composite(texture) => Self::deliver_composite(texture, layout, picture),
+        }
+    }
+
+    /// Copy a decoded picture into the planes of a composite target's surface.
+    ///
+    /// Nothing is uploaded and no GL context is touched: the guest samples these planes through
+    /// views of its own, so the surface is where the pixels belong and the only place they go.
+    ///
+    /// Each plane's row length is the surface plane's own tight extent -- read back from the
+    /// surface, which is what was actually allocated, and not from the target's separately
+    /// stated width and height. Widening it to either pitch in sight, the decoder's or the
+    /// kernel's, writes padding into the picture and shears it.
+    fn deliver_composite(
+        texture: &Texture,
+        layout: TargetFormat,
+        picture: &videotoolbox::Locked<'_>,
+    ) -> usize {
+        // A composite target without planes cannot be built -- `create_buffer` refuses it -- so
+        // reaching this with none is a host bug and not a guest one.
+        let planes = texture.planes.as_ref().expect("a composite decode target has planes");
+        let count = picture.plane_count().min(planes.count() as usize);
+        let mut written = 0;
+        for index in 0..count {
+            let Some(source) = picture.plane(layout.source_plane(index, count)) else {
+                continue;
+            };
+            let Some(geometry) = planes.geometry(index as u32) else {
+                continue;
+            };
+            // Clamp to what the SOURCE holds, as the per-plane path does and for the same
+            // reason: the plane is the aligned allocation while the decoded picture holds
+            // exactly its own rows, so copying the plane's extent reads past the mapping.
+            let rows = geometry.height.min(source.height);
+            let row_bytes = geometry.row_bytes().min(source.pitch);
+            if planes.surface().write_plane(
+                index as u32,
+                source.bytes,
+                source.pitch,
+                rows,
+                row_bytes,
+            ) {
+                written += 1;
+            } else {
+                // Not an assert, unlike the upload below: the arithmetic here is clamped to
+                // both sides and cannot be the cause, so a refusal is the surface declining to
+                // lock -- a runtime failure, and one that shows as a target holding the
+                // previous frame.
+                eprintln!(
+                    "[virglrs] video: plane {index} of a composite target would not take a                      picture; the frame keeps whatever was there"
+                );
+            }
+        }
+        written
+    }
+
+    /// Copy a decoded picture into one GL texture per plane.
+    fn deliver_per_plane(
+        gl: &Gl,
+        planes: &[Plane],
+        layout: TargetFormat,
+        picture: &videotoolbox::Locked<'_>,
+    ) -> usize {
         let count = picture.plane_count();
         let mut written = 0;
-        for (index, target) in self.planes.iter().enumerate().take(count) {
+        for (index, target) in planes.iter().enumerate().take(count) {
             let Some(source) = picture.plane(layout.source_plane(index, count)) else {
                 continue;
             };
@@ -1074,7 +1157,7 @@ impl Video {
         format: u32,
         width: u32,
         height: u32,
-        planes: Vec<Plane>,
+        destination: Destination,
     ) -> Result<(), Refusal> {
         // Not refused: the C takes any format here and only asks for a CoreVideo layout when a
         // frame is decoded into the target, and a guest that allocates a target it never decodes
@@ -1092,10 +1175,17 @@ impl Video {
         if width == 0 || height == 0 {
             return Err(Refusal::Malformed("a decode target with no extent"));
         }
-        if planes.is_empty() {
-            return Err(Refusal::Malformed("a decode target with no planes"));
+        match &destination {
+            Destination::PerPlane(planes) if planes.is_empty() => {
+                return Err(Refusal::Malformed("a decode target with no planes"));
+            }
+            Destination::Composite(texture) if texture.planes.is_none() => {
+                return Err(Refusal::Malformed("a composite decode target with no planes"));
+            }
+            _ => {}
         }
-        self.buffers.insert(handle, Arc::new(Buffer { format: layout, width, height, planes }));
+        self.buffers
+            .insert(handle, Arc::new(Buffer { format: layout, width, height, destination }));
         Ok(())
     }
 
