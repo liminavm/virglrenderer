@@ -809,6 +809,34 @@ to have it, each because reproducing the C would mean reproducing a defect.
   established; the fixture pins the invariant, so a driver or a cache change that lets the write
   through moves the score.
 
+## Open, and owed a decision
+
+Each of these is a question about the renderers rather than about the harness, and each is
+waiting on a call rather than on work.
+
+- **The C aborts the process on a sampler view over a buffer, and virglrs does not.**
+  `vrend_set_single_sampler_view` calls `glTexBuffer` with no feature guard
+  (`vrend_renderer.c:3965`), while the shader-image path at `:6067` wraps the identical work in
+  `if (has_feature(feat_arb_or_gles_ext_texture_buffer))` and resource creation at `:9174`
+  branches on the same feature when choosing a target. On a host without it — this one, which
+  reports `gl_version 31 - es profile enabled` on a real boot and under VM-free replay alike —
+  epoxy has nothing to dispatch to and calls `abort()`. A guest reaches that, which puts it in
+  the class no guest is allowed to reach. virglrs completes the same corpus and refuses the work.
+  The decision is whether our C reference gets the guard: it is plainly right, and it changes the
+  behaviour every fixture is recorded against, so it is not a change to make while debugging
+  something else.
+
+- **virglrs keeps three imported client buffers the C frees.** On `synoik-glclient` the census
+  reports 26 live allocations against the C's 23, the difference being exactly three
+  1,920,000-byte buffers — 800x600x4, the GL client's window. Stable across runs on both legs.
+  Either virglrs retains an imported buffer past its use or the C drops one early, and which is
+  correct depends on whether the guest still holds a reference. Not chased, and not readable until
+  the census stops hashing uninitialised memory (`../harness/README.md`).
+
+- **`MultisampleArrayUnsupported` is latent.** `vrend/resource.rs` refuses a multisampled array
+  texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
+  a known refusal waiting for either a workload that needs it or a decision that it never will be.
+
 ## Consequences to accept
 
 - **Upstream gets the fixes made up to the switch, and nothing after.** The delta

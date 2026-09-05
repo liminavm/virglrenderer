@@ -661,3 +661,29 @@ speed.
 `tests/fuzzer/` corpora move to `cargo-fuzz` once the Rust decode paths exist — corpora are data
 and survive the language change. Performance is a trend ledger, never a gate — a rewrite regresses
 performance invisibly, and gating on it stops work for the wrong reason.
+
+## What the harness owes
+
+Each of these blocks a corpus or makes one unreadable. They are harness defects, not renderer
+findings — none of them says anything about virglrs or the C until it is fixed.
+
+**A blob is modelled as a vertex buffer, and a sampled one then lies.** The replay stands a
+virtio-gpu blob up as a plain `PIPE_BUFFER` with `VIRGL_BIND_VERTEX_BUFFER`, on the reasoning that
+the command stream reads it through its iov like any other resource. That holds until the guest
+binds a *sampler view* to an imported buffer, which the Vulkan-client corpus does six times. The
+stand-in carries `VREND_STORAGE_GL_BUFFER`, so vrend takes its texture-buffer path; live the same
+blob is guest memory and never goes near it. `vrend-vkclient` cannot be pinned until a blob is
+modelled as what it is. (It is also what exposed the unguarded `glTexBuffer` — `../docs/rust-rewrite.md`.)
+
+**The venus census hashes memory the guest never wrote.** It reads 1 MiB of each live allocation,
+including allocations far larger that the workload only partly filled, so the tail is whatever the
+host allocator last left there. On `synoik-glclient` two allocations hash differently on every run
+on *both* legs. That makes the corpus unpinnable, and worse, it would make any real divergence in
+it unreadable. Hash what the guest wrote, or hash nothing.
+
+**`synoik-glclient` is captured but unpinned**, waiting on the census. Unlike the Vulkan client
+corpora, the C *can* replay it — the GL client's contexts are classic and are skipped — so it can
+carry a real C-recorded fixture rather than gating virglrs against its own previous build.
+
+**`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
+be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
