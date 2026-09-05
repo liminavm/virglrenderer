@@ -115,6 +115,10 @@ struct backing {
    /* Content landed since the last write into the texture. A blob's pixels are not the
     * texture's: the bytes go into the backing store, and something has to carry them across. */
    bool     dirty;
+   /* Set when this blob's geometry has been refused once. The geometry is fixed the moment the
+    * blob is typed, so the refusal is permanent: without this the retry fires again at every
+    * subsequent content record and says the same thing once per frame. */
+   bool     declined;
 };
 
 /* An array of POINTERS, never of structs. vrend stores the `struct iovec *` it is handed and
@@ -540,18 +544,31 @@ static uint32_t blob_feed(int ctx)
    uint32_t fed = 0;
    for (uint32_t i = 0; i < backing_n; i++) {
       struct backing *b = backings[i];
-      if (!b->is_blob || !b->typed || !b->dirty || !b->live)
+      if (!b->is_blob || !b->typed || !b->dirty || !b->live || b->declined)
          continue;
       uint32_t w = b->t_width ? b->t_width : 1, h = b->t_height ? b->t_height : 1;
       uint32_t packed;
       size_t need;
-      if (!format_geometry(b->t_format, w, h, &packed, &need))
+      /* A refusal is a result, not an absence of one. Both declines below are permanent for the
+       * blob and leave it reading ink=0, so the score has to say which blob and why -- a `fed`
+       * count short of `records` says only that something went unfed. */
+      if (!format_geometry(b->t_format, w, h, &packed, &need)) {
+         score_addf("blob res=%u %ux%u fmt=%u declined=block-size-unknown\n",
+                    b->handle, w, h, b->t_format);
+         b->declined = true;
          continue;
+      }
       const uint32_t stride = b->t_stride ? b->t_stride : packed;
       /* The guest's layout must fit in the pages it declared, or the write walks off the end of
        * the backing. A capture that says otherwise is a capture to fix, not to clamp. */
-      if ((size_t)stride * h > b->size)
+      if ((size_t)stride * h > b->size) {
+         score_addf("blob res=%u %ux%u stride=%u declined=layout-exceeds-backing size=%zu\n",
+                    b->handle, w, h, stride, b->size);
+         fprintf(stderr, "blob %u: stride %u x %u rows exceeds its %zu-byte backing\n",
+                 b->handle, stride, h, b->size);
+         b->declined = true;
          continue;
+      }
       struct iovec biov = { .iov_base = b->mem, .iov_len = b->size };
       struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
       if (!virgl_renderer_transfer_write_iov(b->handle, (uint32_t)ctx, 0, stride, 0, &box,
@@ -971,10 +988,20 @@ int main(int argc, char **argv)
                /* The record carries the whole SHM CARRIER, which is page-rounded and so is
                 * routinely larger than the blob it backs -- 2 MiB behind a 2,048,000-byte
                 * window here. Both start at offset 0, so the blob's own size is the honest
-                * amount to take, and a record shorter than the blob is a short read that fills
-                * what it can. Requiring the record to fit dropped all 24 of them in silence. */
-               size_t n = h.payload_len < b->size ? h.payload_len : b->size;
-               memcpy(b->mem, pay, n);
+                * amount to take. Requiring the record to FIT dropped all 24 of them in silence,
+                * which is why only the surplus is discarded. */
+               if (h.payload_len < b->size) {
+                  /* The other direction is not a short read to fill in: the recorder writes a
+                   * record whole or refuses it whole, so a payload smaller than the blob is a
+                   * corrupt capture. Taking the prefix and counting it landed would report
+                   * content the replay does not have, and score it green on both legs. */
+                  score_addf("blob res=%u content=%u/%zu declined=short-record\n",
+                             b->handle, h.payload_len, b->size);
+                  fprintf(stderr, "blob %u: content record is %u bytes, blob is %zu\n",
+                          b->handle, h.payload_len, b->size);
+                  break;
+               }
+               memcpy(b->mem, pay, b->size);
                b->dirty = true;
                blobdata++;
                /* The recorder reads a blob at the sampler bind INSIDE a batch, so this record

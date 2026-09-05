@@ -391,7 +391,9 @@ void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
 
    /* Open addressing with a linear probe, and no eviction: a full table stops deduping rather
     * than recording a handle under another's hash, which would drop a frame that really did
-    * change. */
+    * change. It stops CAPPING too -- past the 64th blob every changed frame is recorded, and
+    * the dropped tally below stays silent about it because nothing was dropped. The ring's
+    * `evicted` count is the tell in that regime. */
    slot = res_handle % TR_BLOB_SEEN;
    for (uint32_t i = 0; i < TR_BLOB_SEEN; i++) {
       uint32_t k = (slot + i) % TR_BLOB_SEEN;
@@ -491,6 +493,22 @@ static void trace_dump_locked(void)
 
    fprintf(stderr, "[LIMINA-TRACE] dumped %zu bytes, %llu records, %llu evicted -> %s\n",
            tr.used, (unsigned long long)tr.seq, (unsigned long long)tr.evicted, tr.out_path);
+
+   /* A corpus short of content looks exactly like a client that drew fewer frames, so the cap
+    * has to say when it bit. Counting it and never printing it left the two indistinguishable. */
+   {
+      uint32_t dropped = 0, capped = 0;
+      for (uint32_t i = 0; i < TR_BLOB_SEEN; i++) {
+         if (tr_blob_seen[i].used && tr_blob_seen[i].dropped) {
+            dropped += tr_blob_seen[i].dropped;
+            capped++;
+         }
+      }
+      if (dropped)
+         fprintf(stderr, "[LIMINA-TRACE] blob content: %u changed frame(s) dropped past the "
+                         "cap of %u across %u blob(s); raise LIMINA_VREND_TRACE_BLOB_MAX to "
+                         "keep more\n", dropped, tr_blob_max, capped);
+   }
    fflush(stderr);
 
    pthread_mutex_unlock(&tr_lock);
