@@ -25,8 +25,8 @@ use std::collections::btree_map::Entry as MapEntry;
 use std::sync::Arc;
 
 use super::formats::GlFormat;
-use super::gl::Gl;
 use super::gl::gles::GL_TEXTURE_2D;
+use super::gl::{Gl, pixel_bytes};
 use super::proto::{Format, VideoBufferHandle, VideoCodecHandle};
 use super::resource::Texture;
 use crate::videotoolbox::{self, Configuration, PixelFormat, Session, SessionKey};
@@ -275,22 +275,36 @@ pub struct Plane {
     /// format, never from the plane's size: an R8 luma plane and an RG8 chroma plane are the
     /// same bytes at different widths, and a guessed format uploads them silently wrong.
     gl: GlFormat,
-    /// `util_format_get_blocksize` for that format: bytes per pixel, for turning the decoder's
-    /// row pitch into a row length in pixels.
+    /// Bytes per pixel, for turning the decoder's row pitch into a row length in pixels.
+    ///
+    /// The resource's format and its GL triple each state one, and `Plane::new` refused this
+    /// plane unless they agreed, so this is the single number both of them mean.
     block_bytes: u32,
     width: u32,
     height: u32,
 }
 
 impl Plane {
+    /// `None` for a plane the delivery arithmetic cannot be written for.
+    ///
+    /// The pixel size is stated twice about every resource -- once by the format's own
+    /// description, and once by the GL triple the upload actually reads by -- and for a great
+    /// many formats the two are different numbers: a compressed format is described in blocks,
+    /// and a planar one like NV12 is described in bytes while its triple names a four-byte
+    /// pixel. A guest may hand any resource it likes over as a decode plane, so the pair is
+    /// reconciled here, at the boundary that can see both. Where they agree there is one number
+    /// and the delivery below is exact; where they disagree there is no arithmetic that is
+    /// right, and the plane is refused rather than uploaded from a row length derived from the
+    /// wrong one.
     pub fn new(
         texture: Arc<Texture>,
         gl: GlFormat,
         block_bytes: u32,
         width: u32,
         height: u32,
-    ) -> Plane {
-        Plane { texture, gl, block_bytes, width, height }
+    ) -> Option<Plane> {
+        (pixel_bytes(gl.glformat, gl.gltype)? == usize::try_from(block_bytes).ok()?)
+            .then_some(Plane { texture, gl, block_bytes, width, height })
     }
 }
 
@@ -336,7 +350,7 @@ impl Buffer {
             // reads past the mapping -- which is a fault here rather than wrong pixels, because
             // the source is a slice. The width bound is the padded row, not the picture's
             // width: the decoder's pitch is what the upload strides by.
-            let row_pixels = source.pitch as u32 / target.block_bytes.max(1);
+            let row_pixels = source.pitch as u32 / target.block_bytes;
             let w = target.width.min(row_pixels);
             let h = target.height.min(source.height);
             if w == 0 || h == 0 {
@@ -356,9 +370,11 @@ impl Buffer {
                 source.bytes,
                 row_pixels as i32,
             );
-            // The source is a slice sized by CoreVideo and the rectangle is clamped to it just
-            // above, so a refusal here is this function's own arithmetic being wrong -- a host
-            // bug, and one that would otherwise show as a target holding the previous frame.
+            // The source is a slice sized by CoreVideo, the rectangle is clamped to it just
+            // above, and the plane's bytes per pixel is the same number the upload reads by --
+            // `Plane::new` refused the formats where the two disagree. So a refusal here is this
+            // function's own arithmetic being wrong: a host bug, and one that would otherwise
+            // show as a target holding the previous frame.
             assert!(ok, "a decoded plane clamped to its own extent does not fit it");
             written += 1;
         }
@@ -1272,6 +1288,52 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every format a guest could hand over as a decode plane, against whether the delivery
+    /// arithmetic can be written for it.
+    ///
+    /// A plane is any texture the guest names, and for most formats the two statements of a
+    /// pixel's size -- gallium's description and the GL triple the upload reads by -- are
+    /// different numbers. `Plane::new` refuses those, and that refusal is what makes the fit
+    /// assertion in `deliver` a statement about this function's own arithmetic rather than about
+    /// the guest's choice of resource. Both sides of the rule are walked here, so a table row
+    /// added on either side of it fails in this test rather than in a decode.
+    #[test]
+    fn a_decode_plane_is_refused_unless_its_two_pixel_sizes_agree() {
+        let (mut agreed, mut refused) = (0, 0);
+        for group in super::super::formats::GL_GROUPS {
+            for row in group.formats {
+                let Some(described) = row.format.describe() else {
+                    continue;
+                };
+                let texture =
+                    Arc::new(Texture::unbacked(super::super::gl::TextureName::unbacked(1)));
+                let plane = Plane::new(texture, *row, described.block_bytes(), 64, 64);
+                let same = pixel_bytes(row.glformat, row.gltype)
+                    == usize::try_from(described.block_bytes()).ok();
+                assert_eq!(plane.is_some(), same, "{}", described.name);
+                match plane {
+                    Some(plane) => {
+                        assert_eq!(
+                            plane.block_bytes,
+                            described.block_bytes(),
+                            "{}",
+                            described.name
+                        );
+                        agreed += 1;
+                    }
+                    None => {
+                        // Nothing compressed survives: it is described in blocks and uploaded in
+                        // pixels, and no row length reconciles the two.
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        // Both sides are reached: this is not a walk over an empty table, and the refusal is not
+        // unreachable.
+        assert!(agreed > 50 && refused > 50, "{agreed} agreed, {refused} refused");
+    }
 
     /// The descriptor offsets are the load-bearing numbers in this file: read one wrong and the
     /// session is built for a frame nobody sent. They were measured with `offsetof` against
