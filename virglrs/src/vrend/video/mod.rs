@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
 use std::sync::Arc;
 
+use super::features::Features;
 use super::formats::GlFormat;
 use super::gl::gles::GL_TEXTURE_2D;
 use super::gl::{Gl, pixel_bytes};
@@ -1042,10 +1043,19 @@ pub fn guest_planes(format: Format) -> u32 {
 }
 
 /// Whether this build can back a composite planar decode target -- one resource holding every
-/// plane -- in `format`.
+/// plane -- in `format` on this host.
 ///
-/// Nothing, yet. Backing one needs a two-plane IOSurface and the plane views laid over it, and
-/// this build has neither; the stock per-plane shape, one resource per plane, is what it serves.
+/// NV12 and nothing else. The surface behind a composite target is a two-plane 4:2:0 IOSurface,
+/// which is the layout NV12 already is: NV21 is the same two planes with the chroma pair
+/// exchanged *within* the plane, which no CoreVideo output produces and no plane ordering
+/// repairs, and I420 and YV12 are three planes, which this surface is not. Each of those stays
+/// on the per-plane shape, where the guest allocates a resource per plane and the delivery path
+/// reorders and converts as it must.
+///
+/// The host's own answer is the other half: without an IOSurface-to-image entry point nothing
+/// can be minted, and a build that says yes here would refuse at create. So the two conditions
+/// are asked as one question, and [`resource::mint_planes`] and the capset ask it here rather
+/// than each keeping half.
 ///
 /// The capset has to say so rather than leave it to a refusal at create, because **the sampler
 /// bitmask is the guest's permission to take the shape**. By the time the host is asked, the
@@ -1053,8 +1063,9 @@ pub fn guest_planes(format: Format) -> u32 {
 /// backing and builds plane views on a resource that does not exist, and its context is poisoned
 /// for the rest of its life. A format advertised here that create then refuses is not a
 /// degraded guest, it is a dead one.
-pub fn composite_target_backable(_format: Format) -> bool {
-    false
+pub fn composite_target_backable(features: &Features, format: Format) -> bool {
+    features.adopts_iosurfaces()
+        && matches!(TargetFormat::from_wire(format.wire()), Some(TargetFormat::Nv12))
 }
 
 /// The profiles this host advertises decode for, in the order the capset lists them.
@@ -1508,13 +1519,25 @@ mod tests {
     /// making one backable without the path behind it is what this test is here to catch.
     #[test]
     fn no_planar_layout_is_offered_before_it_can_be_backed() {
-        let planar = [163, 165, 166, 167];
-        for raw in planar {
+        let host = Features::probe(300, ["GL_OES_EGL_image".to_string()]);
+        assert!(host.adopts_iosurfaces(), "the surface entry point is what backing needs");
+        // A host without it backs nothing, whatever the format -- the capset asks one question
+        // and this is the half that is not about the layout.
+        let bare = Features::probe(300, []);
+        for raw in [163, 165, 166, 167] {
             let format = Format::from_wire(raw).expect("a planar format is on the wire");
             assert!(guest_planes(format) > 1, "format {raw} is planar");
-            assert!(
-                !composite_target_backable(format),
-                "format {raw} is offered as a composite target, so this build must back one"
+            assert!(!composite_target_backable(&bare, format), "no surface, no composite target");
+            // Backable exactly where the surface's own layout is the format's. The surface is
+            // two 4:2:0 planes; the other three layouts are not that, and offering one would
+            // hand the guest a shape create then refuses.
+            let backable = composite_target_backable(&host, format);
+            assert_eq!(backable, raw == 166, "format {raw}");
+            assert_eq!(
+                backable,
+                TargetFormat::from_wire(raw).is_some_and(|t| t.pixels().is_some())
+                    && guest_planes(format) == 2,
+                "format {raw} is offered as a composite target without a picture to fill it"
             );
         }
         // Everything else is one plane, and so is offered on its own merits.
