@@ -1,0 +1,92 @@
+<!doctype html><meta charset=utf-8>
+<!--
+SPDX-License-Identifier: MIT
+Copyright © 2026 the limina authors
+
+The WebGL workload `vrend-webgl.bin` is recorded from: three lit, textured, indexed cubes over a
+procedural 256x256 mipmapped texture, drawn into a fixed 640x400 backing store that CSS scales to
+fill the window.
+
+Two of those choices are load-bearing and must not be "improved":
+
+  * The backing store is small and the loop is capped near 15 fps. The tracer ring is a byte
+    budget, so an uncapped full-window canvas fills 1 GB in about four seconds -- a window that
+    no longer reaches the page's own shader compiles and texture upload. Replayed, every draw
+    then references objects that were never created, and the corpus scores no ink at all.
+  * The context is requested with `antialias:false`. With MSAA the host loses the Vulkan device
+    (`VK_ERROR_DEVICE_LOST`) about twenty seconds in, on BOTH renderer legs; the allocator pool
+    then grows without bound because nothing ever completes, and the VM aborts. See
+    README.md -- that crash is a finding of its own, not something to record around.
+-->
+<style>html,body{margin:0;background:#101018;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh}</style>
+<canvas id=c></canvas>
+<script>
+const c=document.getElementById('c');
+c.width=640;c.height=400;   // backing store, not the CSS size
+const gl=c.getContext('webgl',{antialias:false,depth:true});
+document.title='webgl corpus '+(gl?gl.getParameter(gl.RENDERER):'NO-GL');
+const vs=`attribute vec3 p;attribute vec2 uv;attribute vec3 n;
+uniform mat4 mvp;varying vec2 v;varying vec3 vn;
+void main(){v=uv;vn=n;gl_Position=mvp*vec4(p,1.0);}`;
+const fs=`precision mediump float;varying vec2 v;varying vec3 vn;
+uniform sampler2D tex;uniform float t;
+void main(){vec4 c=texture2D(tex,v);
+float l=max(dot(normalize(vn),normalize(vec3(0.4,0.7,0.6))),0.15);
+gl_FragColor=vec4(c.rgb*l+0.12*vec3(sin(t),cos(t*1.3),sin(t*0.7))*c.a,1.0);}`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o}
+const pr=gl.createProgram();
+gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));
+gl.linkProgram(pr);gl.useProgram(pr);
+// unit cube: 24 verts, 36 indices
+const P=[],U=[],N=[],I=[];
+const faces=[[[1,0,0],[0,0,1],[0,1,0]],[[-1,0,0],[0,0,-1],[0,1,0]],
+[[0,1,0],[1,0,0],[0,0,1]],[[0,-1,0],[1,0,0],[0,0,-1]],
+[[0,0,1],[-1,0,0],[0,1,0]],[[0,0,-1],[1,0,0],[0,1,0]]];
+faces.forEach((f,fi)=>{const[n,a,b]=f;
+for(const[s,tt]of[[-1,-1],[1,-1],[1,1],[-1,1]]){
+P.push(n[0]+a[0]*s+b[0]*tt,n[1]+a[1]*s+b[1]*tt,n[2]+a[2]*s+b[2]*tt);
+U.push((s+1)/2,(tt+1)/2);N.push(...n)}
+const o=fi*4;I.push(o,o+1,o+2,o,o+2,o+3)});
+function buf(d,loc,sz){const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(d),gl.STATIC_DRAW);
+const l=gl.getAttribLocation(pr,loc);gl.enableVertexAttribArray(l);
+gl.vertexAttribPointer(l,sz,gl.FLOAT,false,0,0)}
+buf(P,'p',3);buf(U,'uv',2);buf(N,'n',3);
+const ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(I),gl.STATIC_DRAW);
+// procedural 256x256 RGBA texture, uploaded once
+const S=256,px=new Uint8Array(S*S*4);
+for(let y=0;y<S;y++)for(let x=0;x<S;x++){const i=(y*S+x)*4,k=((x>>5)+(y>>5))&1;
+px[i]=k?230:30+x%200;px[i+1]=k?60+((x*y)%180):200;px[i+2]=k?90:40+y%200;px[i+3]=255}
+const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,S,S,0,gl.RGBA,gl.UNSIGNED_BYTE,px);
+gl.generateMipmap(gl.TEXTURE_2D);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+gl.uniform1i(gl.getUniformLocation(pr,'tex'),0);
+gl.enable(gl.DEPTH_TEST);gl.enable(gl.CULL_FACE);
+const uM=gl.getUniformLocation(pr,'mvp'),uT=gl.getUniformLocation(pr,'t');
+function mul(a,b){const o=new Float32Array(16);
+for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;
+for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s}return o}
+function persp(f,ar,n,fa){const t=1/Math.tan(f/2);return new Float32Array(
+[t/ar,0,0,0, 0,t,0,0, 0,0,(fa+n)/(n-fa),-1, 0,0,2*fa*n/(n-fa),0])}
+function rot(x,y){const cx=Math.cos(x),sx=Math.sin(x),cy=Math.cos(y),sy=Math.sin(y);
+return mul(new Float32Array([cy,0,-sy,0, 0,1,0,0, sy,0,cy,0, 0,0,0,1]),
+new Float32Array([1,0,0,0, 0,cx,sx,0, 0,-sx,cx,0, 0,0,0,1]))}
+let f0=0;
+function frame(ms){const t=ms/1000;
+gl.viewport(0,0,c.width,c.height);
+gl.clearColor(0.06,0.06,0.10,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+const V=new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-5.5,1]);
+for(let i=0;i<3;i++){
+const M=rot(t*0.7+i,t*0.9+i*2.1);
+M[12]=(i-1)*2.4;M[13]=Math.sin(t+i)*0.5;
+gl.uniform1f(uT,t+i);
+gl.uniformMatrix4fv(uM,false,mul(persp(1.0,c.width/c.height,0.1,100),mul(V,M)));
+gl.drawElements(gl.TRIANGLES,I.length,gl.UNSIGNED_SHORT,0)}
+f0++;setTimeout(()=>requestAnimationFrame(frame),66)}   // ~15 fps
+requestAnimationFrame(frame);
+setInterval(()=>{document.title='webgl corpus frames='+f0+' '+(gl?gl.getParameter(gl.RENDERER):'')},1000);
+</script>
