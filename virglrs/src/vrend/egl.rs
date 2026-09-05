@@ -169,6 +169,47 @@ impl Drop for Context {
 /// as the client buffer of. The value is the one `egl_dri2.c` defines, and must stay so.
 const EGL_IOSURFACE_LIMINA: EGLenum = 0x3B9A;
 
+/// `EGL_IOSURFACE_PLANE_LIMINA` and `EGL_IOSURFACE_FOURCC_LIMINA`: which plane of a planar
+/// surface an image is over, and how that plane's bytes are laid out. Same source as the target
+/// above, and the same requirement that the values match.
+const EGL_IOSURFACE_PLANE_LIMINA: EGLint = 0x3B9B;
+const EGL_IOSURFACE_FOURCC_LIMINA: EGLint = 0x3B9C;
+
+/// How one plane of a planar surface is read: the DRM FourCC limina's Mesa names it by.
+///
+/// A plane of a 4:2:0 biplanar surface is not YUV to the sampler -- it is one or two 8-bit
+/// channels, and which one decides the texture format the driver lays over those bytes. The
+/// index and the layout travel as one value because neither means anything alone: an index
+/// without a layout names bytes with no interpretation, and a layout without an index names no
+/// bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Plane {
+    /// Plane 0 of a 4:2:0 surface: one 8-bit channel, full resolution. `R8`.
+    Luma,
+    /// Plane 1 of a 4:2:0 biplanar surface: two interleaved 8-bit channels at half resolution.
+    /// `GR88`.
+    ChromaPair,
+}
+
+impl Plane {
+    /// The plane's index within the surface.
+    fn index(self) -> EGLint {
+        match self {
+            Plane::Luma => 0,
+            Plane::ChromaPair => 1,
+        }
+    }
+
+    /// The DRM FourCC for the plane's own layout.
+    fn fourcc(self) -> EGLint {
+        let code = match self {
+            Plane::Luma => u32::from_le_bytes(*b"R8  "),
+            Plane::ChromaPair => u32::from_le_bytes(*b"GR88"),
+        };
+        code as EGLint
+    }
+}
+
 /// An EGL image over an IOSurface, which is the surface's bytes seen as a GL texture's storage.
 ///
 /// Holds a share of the surface it was made from, so the image cannot outlive what it images:
@@ -413,18 +454,50 @@ impl Winsys {
     /// bind it. Fails, naming the call, when the driver will not import the surface -- the
     /// resource then keeps ordinary GL storage, and the caller says so.
     pub fn image_from_iosurface(&self, held: Arc<dyn Held>) -> Result<Image, EglError> {
+        self.image_of_iosurface(held, None)
+    }
+
+    /// An EGL image over *one plane* of a planar surface, in that plane's own layout.
+    ///
+    /// The planes of a composite decode target share one allocation, so each is imaged
+    /// separately and the images are what the plane resources take as storage. Each holds its
+    /// own share of the surface: the surface outlives whichever plane image is dropped last,
+    /// and no plane's image is a view into something already freed.
+    pub fn image_from_iosurface_plane(
+        &self,
+        held: Arc<dyn Held>,
+        plane: Plane,
+    ) -> Result<Image, EglError> {
+        self.image_of_iosurface(held, Some(plane))
+    }
+
+    fn image_of_iosurface(
+        &self,
+        held: Arc<dyn Held>,
+        plane: Option<Plane>,
+    ) -> Result<Image, EglError> {
         let egl = &self.shared.egl;
+        let attribs = plane.map(|plane| {
+            [
+                EGL_IOSURFACE_PLANE_LIMINA,
+                plane.index(),
+                EGL_IOSURFACE_FOURCC_LIMINA,
+                plane.fourcc(),
+                proc::EGL_NONE as EGLint,
+            ]
+        });
         // SAFETY: the display is initialised; the target is the one limina's Mesa defines for an
         // `IOSurfaceRef` client buffer, and `surface` is held by the `Image` for as long as the
         // image exists, so the reference passed here outlives every use the driver makes of it.
-        // No attributes, as `NULL` is the documented empty list.
+        // The attribute list, when there is one, is a live local this call outlives and is
+        // `EGL_NONE`-terminated; `NULL` is the documented empty list when there is not.
         let image = unsafe {
             egl.eglCreateImageKHR()(
                 self.shared.display,
                 proc::EGL_NO_CONTEXT,
                 EGL_IOSURFACE_LIMINA,
                 held.surface().client_buffer(),
-                core::ptr::null(),
+                attribs.as_ref().map_or(core::ptr::null(), |a| a.as_ptr()),
             )
         };
         if image.is_null() {
@@ -492,5 +565,41 @@ mod tests {
             .expect("a shared context");
         winsys.make_current(&second).expect("current");
         winsys.release_current().expect("released");
+    }
+
+    /// The two planes of one planar surface import as two images, each in its own layout.
+    ///
+    /// This is the whole storage model behind a composite decode target: the planes share an
+    /// allocation and are reached separately, so if the driver will not take the plane
+    /// attributes there is nothing above this that can work. It asks the driver rather than
+    /// asserting the attribute values, because the values are only right if Mesa agrees.
+    ///
+    /// Run it on its own (`--lib each_plane_of -- --ignored`): two displays opened in one
+    /// process leave this driver unable to make a shared context, so the ignored tests in this
+    /// module fail each other when run together.
+    #[test]
+    #[ignore = "needs the zink-on-KosmicKrisp environment"]
+    fn each_plane_of_a_planar_surface_imports_as_its_own_image() {
+        use crate::metal::{PlanarFormat, Surface};
+
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let surface: Arc<dyn Held> =
+            Arc::new(Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("a planar surface"));
+        let id = surface.surface().id();
+
+        let luma = winsys
+            .image_from_iosurface_plane(Arc::clone(&surface), Plane::Luma)
+            .expect("the driver imports the luma plane");
+        let chroma = winsys
+            .image_from_iosurface_plane(Arc::clone(&surface), Plane::ChromaPair)
+            .expect("the driver imports the chroma plane");
+
+        assert_ne!(luma.raw(), chroma.raw(), "a plane image per plane, not one image twice");
+        assert_eq!(luma.surface().id(), id, "both image the surface they were made from");
+        assert_eq!(chroma.surface().id(), id);
+
+        // Each holds its own share, so dropping one leaves the other imaging a live surface.
+        drop(luma);
+        assert_eq!(chroma.surface().id(), id);
     }
 }
