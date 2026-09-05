@@ -430,7 +430,7 @@ def main():
     for k, v in by_type.most_common():
         print("  %-10s %d" % (k, v))
     print("\ncommands:")
-    for k, v in by_cmd.most_common(20):
+    for k, v in by_cmd.most_common():
         print("  %-28s %d" % (k, v))
     print("\ndraw targets (size: count):")
     for k, v in fbs.most_common(15):
