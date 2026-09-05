@@ -749,6 +749,12 @@ mod tests {
     /// the end of a correctly sized iov. Two descriptions of one format, and the bound taken from
     /// the wrong one.
     ///
+    /// Every route a guest has into a transfer converges on `write` and `read`: TRANSFER3D,
+    /// COPY_TRANSFER3D, RESOURCE_INLINE_WRITE and the C ABI's own `transfer_*_iov`. None of them
+    /// bounds-checks first and then moves bytes itself, and none of them can -- the layout
+    /// reconciliation and the gather are private to this module, so the only thing a fifth route
+    /// could call is the pair that already gets this right.
+    ///
     /// Here there is one description at the moment of use: the staging buffer is sized from
     /// `as_gl`, the same layout the driver reads, and `gather` fills it out of the guest's pages a
     /// row at a time through `copy_out`, which answers false when the pages do not hold the row.
