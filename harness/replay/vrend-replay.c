@@ -104,6 +104,14 @@ struct backing {
    size_t   size;
    struct iovec iov;
    bool     live;
+   /* A blob is registered UNTYPED and carries no format or extent of its own: the stream's
+    * PIPE_RESOURCE_SET_TYPE is what says which. These three are that command's answer, kept so
+    * the readback can ask for the resource at the geometry the guest gave it. `typed` is the
+    * one place that says whether the answer arrived -- a blob nothing ever typed has no texture
+    * to read back and is counted rather than scored. */
+   bool     is_blob;
+   bool     typed;
+   uint32_t t_format, t_width, t_height;
 };
 
 /* An array of POINTERS, never of structs. vrend stores the `struct iovec *` it is handed and
@@ -882,6 +890,21 @@ int main(int argc, char **argv)
             /* CCMD 43 is TRANSFER3D; its payload dword 1 is the resource handle. */
             if (watch && h.cmd == 43 && dw > 1 && ((const uint32_t *)pay)[1] == watch)
                batch_watch = true;
+            /* CCMD 49 is PIPE_RESOURCE_SET_TYPE, the only command that says what a blob is.
+             * Read it here rather than reconstructing a type at the create: the stream carries
+             * the guest's own description, and the create record carries none. Recorded even
+             * though vrend is about to be handed the same command -- this is the copy the
+             * readback reads, and the renderer's is the copy that types the texture. */
+            if (h.cmd == 49 && dw > 5) {
+               const uint32_t *f = (const uint32_t *)pay;
+               struct backing *tb = backing_find(f[1]);
+               if (tb && tb->is_blob && !tb->typed) {
+                  tb->typed = true;
+                  tb->t_format = f[2];
+                  tb->t_width = f[4];
+                  tb->t_height = f[5];
+               }
+            }
             batch_dw += dw;
             cmds++;
             break;
@@ -945,6 +968,20 @@ int main(int argc, char **argv)
                         born = &res[k];
                   if (born) score_resource(born);
                }
+               {
+                  /* A typed blob is scored at its unref, like every other resource, and from
+                   * the geometry SET_TYPE gave it rather than the create record's -- the record
+                   * carries blob_mem and a size, which describe pages and not an image. An
+                   * untyped one has no texture to read and is counted at the end instead. */
+                  struct backing *tb = backing_find(r->handle);
+                  if (tb && tb->is_blob && tb->typed) {
+                     const struct res_ev bev = {
+                        .handle = r->handle, .target = 2, .format = tb->t_format,
+                        .width = tb->t_width, .height = tb->t_height,
+                     };
+                     score_resource(&bev);
+                  }
+               }
                if (no_unref) continue;
                struct backing *b = backing_find(r->handle);
                if (b) { virgl_renderer_resource_unref(r->handle); b->live = false; free(b->mem); b->mem = NULL; unrefs++; }
@@ -952,15 +989,32 @@ int main(int argc, char **argv)
             }
             struct backing *b = backing_add(r->handle, res_bytes(r));
             if (r->kind == RES_BLOB) {
-               /* A guest-memory blob is just shared pages; the command stream reads it through
-                * its iov exactly like any other resource, so a plain resource with a backing
-                * store is a faithful stand-in and needs no get_blob plumbing. */
-               struct virgl_renderer_resource_create_args a = {
-                  .handle = r->handle, .target = 0, .format = 64 /* R8_UNORM */,
-                  .bind = 0x10 /* VIRGL_BIND_VERTEX_BUFFER */, .width = (uint32_t)b->size,
-                  .height = 1, .depth = 1, .array_size = 1, .nr_samples = 0, .last_level = 0, .flags = 0,
+               /* A blob is created as a blob, and deliberately WITHOUT a type. The stream says
+                * what it is -- PIPE_RESOURCE_SET_TYPE, later, from the context that samples it --
+                * and typing it here instead threw that description away: set_type returns early
+                * on an already-typed resource, so pre-creating one as a buffer made the command
+                * a no-op on both legs and left a sampled 500x500 R16G16B16X16_FLOAT texture
+                * standing in as a linear R8 vertex buffer.
+                *
+                * blob_mem is GUEST, not the recorded HOST3D. HOST3D routes through ctx->get_blob,
+                * which pops a resource parked by PIPE_RESOURCE_CREATE -- an opcode that appears
+                * in no capture, so live these blobs came from venus and no classic context can
+                * serve one. GUEST asks for the one thing the replayer can honestly supply: pages.
+                * The C reads blob_flags only on the HOST3D path, so the recorded flags pass
+                * through unexamined and need no masking.
+                *
+                * The iov goes in HERE rather than through attach_iov below, which is the reverse
+                * of every other resource: the GUEST path requires iov_size >= size at create and
+                * virgl_resource_create_from_iov takes the pages directly, while attach_iov would
+                * then refuse with EINVAL for an iov already set. */
+               b->is_blob = true;
+               struct virgl_renderer_resource_create_blob_args a = {
+                  .res_handle = r->handle, .ctx_id = r->flags,
+                  .blob_mem = VIRGL_RENDERER_BLOB_MEM_GUEST, .blob_flags = r->bind,
+                  .blob_id = ((uint64_t)r->array_size << 32) | r->depth,
+                  .size = b->size, .iovecs = &b->iov, .num_iovs = 1,
                };
-               int cr = virgl_renderer_resource_create(&a, NULL, 0);
+               int cr = virgl_renderer_resource_create_blob(&a);
                if (cr) {
                   if (failed < 5)
                      fprintf(stderr, "create BLOB res=%u size=%zu failed: %d\n", r->handle, b->size, cr);
@@ -1011,7 +1065,8 @@ int main(int argc, char **argv)
              * reaches vrend. The resource then creates, registers and attaches cleanly, and every
              * TRANSFER3D touching it fails check_transfer_iovec -- reported as the very same
              * "Illegal resource" as a handle the context has never heard of. */
-            virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
+            if (r->kind != RES_BLOB)
+               virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
             for (int i = 0; i < n_ctx; i++)
                virgl_renderer_ctx_attach_resource(ctx_list[i], (int)r->handle);
             /* After the attach, which is what gives vrend the resource a transfer can reach. */
@@ -1056,6 +1111,22 @@ int main(int argc, char **argv)
    for (uint32_t i = 0; i < iosurf_n; i++)
       score_iosurface(iosurf_res[i].handle, iosurf_res[i].w, iosurf_res[i].h);
 
+   /* A typed blob the stream never unrefs is scored HERE, at the end, from its texture -- the
+    * same second chance the --readback resource gets below. Scoring only at the unref read three
+    * of this corpus's six sampled windows and passed over the other three in silence, because a
+    * capture stops where it stops and a resource still alive at that point has no unref to hang
+    * a readback on. Creation order, so the sequence is the corpus's and not the allocator's. */
+   for (uint32_t i = 0; i < backing_n; i++) {
+      const struct backing *b = backings[i];
+      if (!b->is_blob || !b->typed || !b->live)
+         continue;
+      const struct res_ev bev = {
+         .handle = b->handle, .target = 2, .format = b->t_format,
+         .width = b->t_width, .height = b->t_height,
+      };
+      score_resource(&bev);
+   }
+
    /* A --readback resource that is still alive at the end of the stream is read back THEN, from
     * its texture. For a scanout this is the second leg of the IOSurface question: the surface
     * line above reads the display storage, this reads the texture rendered into it, and the two
@@ -1072,6 +1143,18 @@ int main(int argc, char **argv)
       }
       if (born && alive)
          score_resource(born);
+   }
+
+   /* A blob nothing typed is a real result -- it says the stream never described storage the
+    * guest went on to use -- so it is counted rather than passed over in silence. Emitted only
+    * for a corpus that HAS blobs: an unconditional line would rewrite every pinned score in the
+    * tree to say zero about a thing it does not contain. */
+   {
+      uint32_t blobs = 0, untyped = 0;
+      for (uint32_t i = 0; i < backing_n; i++)
+         if (backings[i]->is_blob) { blobs++; if (!backings[i]->typed) untyped++; }
+      if (blobs)
+         score_addf("blobs %u untyped %u\n", blobs, untyped);
    }
 
    if (!scored)

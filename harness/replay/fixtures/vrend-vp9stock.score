@@ -2963,3 +2963,4 @@ iosurface res=356 1280x800 sync=0 hash=162358d3c50b0383 ink=0/1024000
 iosurface res=426 1280x800 sync=0 hash=162358d3c50b0383 ink=0/1024000
 iosurface res=429 1x1 sync=0 hash=315446a086a23133 ink=0/1
 iosurface res=430 48x48 sync=0 hash=0f8f2914f3c2b383 ink=0/2304
+blobs 2 untyped 2

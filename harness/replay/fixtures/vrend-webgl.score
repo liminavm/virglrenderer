@@ -1391,3 +1391,4 @@ iosurface res=1620 640x400 sync=0 hash=d1d99411e5c2760a ink=256000/256000
 iosurface res=1684 1280x800 sync=-22 read-failed=-22
 iosurface res=1685 1280x800 sync=0 hash=cce10c40aec01ae0 ink=1024000/1024000
 iosurface res=1686 1280x800 sync=0 hash=836bca6abfde0a71 ink=1024000/1024000
+blobs 2 untyped 2

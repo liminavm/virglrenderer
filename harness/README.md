@@ -204,7 +204,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   them is also what makes four of its allocations imports that resolve to nothing — they name
   resources belonging to a context the venus replay never stands up — and both legs must refuse
   those. A leg that serves one instead censuses 26 allocations to the fixture's 23.
-  `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
+  `vrend-vkclient.score` is a Vulkan client under a virgl compositor, and it is the blob fixture:
+  17 blobs, of which the stream types six as 500x500 `R16G16B16X16_FLOAT` render-target/sampler-
+  views and leaves eleven untyped. **It scores those six as structure with no content.** The
+  windows were written GPU-side by the venus client, so no classic transfer carries their bytes
+  and both legs read back all-zero — which is deterministic, and is what the corpus can honestly
+  measure with no VM. What it does measure is the import: that a blob is registered untyped, that
+  `PIPE_RESOURCE_SET_TYPE` upgrades it at the right point in the stream, that both legs agree on
+  the format, extent and storage plan, and that everything downstream sampling those handles
+  agrees too. What it cannot measure is any bug that only shows in pixel values — stride, channel
+  order, swizzle, sRGB — because **a zero texture is a weak oracle: every wrong answer is also
+  zero.** Closing that half needs the blob's bytes captured at trace time, not a closer reading of
+  this score. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
   with H.264 and VP9 played one after the other in Showtime.
@@ -671,21 +682,6 @@ performance invisibly, and gating on it stops work for the wrong reason.
 
 Each of these blocks a corpus or makes one unreadable. They are harness defects, not renderer
 findings — none of them says anything about virglrs or the C until it is fixed.
-
-**A blob is modelled as a vertex buffer, and a sampled one then lies.** The replay stands a
-virtio-gpu blob up as a plain `PIPE_BUFFER` with `VIRGL_BIND_VERTEX_BUFFER`, on the reasoning that
-the command stream reads it through its iov like any other resource. That holds until the guest
-binds a *sampler view* to an imported buffer, which the Vulkan-client corpus does six times. The
-stand-in carries `VREND_STORAGE_GL_BUFFER`, so vrend takes its texture-buffer path; live the same
-blob is guest memory and never goes near it. `vrend-vkclient` cannot be pinned until a blob is
-modelled as what it is.
-
-The defect earns its keep even so: standing a blob up as a buffer is what drove a sampler view
-onto one, which is how the unguarded `glTexBuffer` was found — a guest-reachable `abort()` of the
-whole process in the C, fixed in `vrend_set_single_sampler_view`. The C leg now replays this
-corpus to completion instead of exiting 134, which is the check to re-run when touching that
-guard; it is not pinnable as a score until the blob is modelled, because the path it exercises is
-one the replay invents.
 
 **Stable within a run, different between runs, means the fix is upstream of the comparison.**
 Never in the settle time. A value the corpus determines converges as you wait; a value it does not
