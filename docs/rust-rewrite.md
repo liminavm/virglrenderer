@@ -834,22 +834,30 @@ waiting on a call rather than on work.
   reach it either: composite decode targets arrive through `resource_create`, and the C sets
   `guest_pixels` at one site only, in `SET_TYPE`.
 
-  **No video route on the rig types a blob at all**, which is stronger than the fixture census and
-  was measured rather than reasoned. Measured 2026-09-05, stock guest, one 267 s window over
-  819,698 records covering five arms: software H.264 into `waylandsink`; into
-  `glupload ! glimagesink`; Showtime with the VA decoders deranked; then hardware decode through
-  `vah264dec`, and Showtime's default. The window holds 3,506 `TRANSFER3D`, 1,372
-  `COPY_TRANSFER3D` and 165 `DECODE_BITSTREAM` — and zero `PIPE_RESOURCE_SET_TYPE`. Decoded
-  frames reach the renderer as transfers into ordinary resources, or as video buffers. Never as a
-  typed blob. The instrument is `harness/replay/vrend-trace-decode.py`, which names the command
-  and counts six of it in `vrend-vkclient.bin`.
+  **No video route on either GNOME tier types a blob at all**, which is stronger than the fixture
+  census and was measured rather than reasoned. Measured 2026-09-05, both guests seated, the
+  discriminator `PIPE_RESOURCE_SET_TYPE` in the dumped command histogram:
 
-  So the C's own comment above this code — that the guest-pages fill is how "every GStreamer
-  glupload whose buffers qualify" reaches the GPU — names a route that does not run here: the
-  glupload arm decoded, drew, and typed nothing. Reaching the planar arm needs a guest that
-  allocates the frame as a planar dmabuf and imports it, which no route tried does. Until such a
-  workload is found the conversion is unreachable and unscoreable, and refusing it by name is the
-  resting state; the decision is whether to keep hunting for one.
+  - stock, one 267 s window over 819,698 records: software H.264 into `waylandsink`, into
+    `glupload ! glimagesink`, and Showtime with the VA decoders deranked; then `vah264dec`, and
+    Showtime's default. 3,506 `TRANSFER3D`, 165 `DECODE_BITSTREAM`, zero `SET_TYPE`.
+  - enhanced, one 123 s window over 772,843 records: `vah264dec ! waylandsink` — the VA decoder
+    exporting a dmabuf for the compositor to import, which is the shape a planar `SET_TYPE` would
+    come from — then Showtime hardware and Showtime deranked. 833 `DECODE_BITSTREAM`, 3,183
+    video buffers, zero `SET_TYPE`.
+
+  Decoded frames reach the renderer as transfers into ordinary resources, or as video buffers.
+  Never as a typed blob. The instrument was checked before the negative was believed: the decoder
+  names the command and counts six of it in `vrend-vkclient.bin`.
+
+  Two gaps, so the negative is not read wider than it is. The C's comment above this code says the
+  guest-pages fill is how "every GStreamer glupload whose buffers qualify" reaches the GPU;
+  qualifying means dmabuf-backed, and the one arm pairing a dmabuf source with `glupload`
+  (`vah264dec ! glupload ! glimagesink`) died guest-side on a bus error before it drew. That arm
+  is unobserved, not disproved. And synoik was not booted — it has no GNOME and no video stack, so
+  it is the least likely of the three, but it was not tried. Until a workload is found the
+  conversion is unreachable and unscoreable, and refusing it by name is the resting state; the
+  decision is whether to keep hunting for one.
 
 ## Consequences to accept
 
