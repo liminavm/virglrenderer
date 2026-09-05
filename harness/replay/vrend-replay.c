@@ -53,6 +53,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <IOSurface/IOSurface.h>
 #include <string.h>
 #include <sys/uio.h>
 
@@ -322,10 +323,75 @@ static int copy_src_of_next_cmd(const uint8_t *blob, size_t flen, size_t p,
  * sync first, and only here: the blit-and-wait is a CLASSIC vrend operation (the VMM calls it on
  * RESOURCE_FLUSH for ctx 0 only). A venus blob renders into its surface directly and must never
  * be synced. */
+/* A planar surface, read plane by plane, because nothing else can read it at all.
+ *
+ * `read_iosurface` copies a surface out as BGRA, which is what a scanout is. A composite decode
+ * target is not: it is two 4:2:0 planes, and asking for BGRA gets -22 on both renderers -- which
+ * agrees, and measures nothing. Every corpus that decodes into the composite shape therefore
+ * scored its decode targets as `read-failed` and gated only what surrounds them.
+ *
+ * The id is used to find the surface and is still not scored: ids are host-private and recycled,
+ * so pinning one pins a number no implementation owes us. Nor is the plane's PITCH scored -- it
+ * is the allocator's, Metal-aligned and free to differ -- so only the tight rows are hashed, the
+ * picture and none of the padding. The plane's own extent and element size are facts about the
+ * format and the resource, so those are pinned.
+ *
+ * Returns false if this is not a planar surface, and the caller falls back to the BGRA read.
+ */
+static bool score_iosurface_planes(uint32_t handle, int sr)
+{
+   uint32_t id = 0;
+   if (virgl_renderer_resource_get_iosurface_id(handle, &id) != 0 || !id)
+      return false;
+   IOSurfaceRef surf = IOSurfaceLookup((IOSurfaceID)id);
+   if (!surf)
+      return false;
+   size_t planes = IOSurfaceGetPlaneCount(surf);
+   if (planes < 2) {
+      CFRelease(surf);
+      return false;
+   }
+   if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+      CFRelease(surf);
+      score_addf("iosurface res=%u planes=%zu sync=%d lock-failed\n", handle, planes, sr);
+      return true;
+   }
+   for (size_t p = 0; p < planes; p++) {
+      size_t pw = IOSurfaceGetWidthOfPlane(surf, p);
+      size_t ph = IOSurfaceGetHeightOfPlane(surf, p);
+      size_t bpe = IOSurfaceGetBytesPerElementOfPlane(surf, p);
+      size_t pitch = IOSurfaceGetBytesPerRowOfPlane(surf, p);
+      const uint8_t *base = IOSurfaceGetBaseAddressOfPlane(surf, p);
+      size_t row = pw * bpe;
+      if (!base || !row || row > pitch) {
+         score_addf("iosurface res=%u plane=%zu unreadable\n", handle, p);
+         continue;
+      }
+      uint64_t hash = 1469598103934665603ull;
+      size_t ink = 0;
+      for (size_t y = 0; y < ph; y++) {
+         const uint8_t *r = base + y * pitch;
+         for (size_t i = 0; i < row; i++) {
+            hash ^= r[i];
+            hash *= 1099511628211ull;
+            if (r[i]) ink++;
+         }
+      }
+      score_addf("iosurface res=%u plane=%zu %zux%zu bpe=%zu sync=%d hash=%016llx ink=%zu/%zu\n",
+                 handle, p, pw, ph, bpe, sr, (unsigned long long)hash, ink, row * ph);
+      scored_ink |= ink != 0;
+   }
+   IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+   CFRelease(surf);
+   return true;
+}
+
 static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
 {
    size_t need = (size_t)w * h * 4;
    int sr = virgl_renderer_resource_sync_iosurface(handle);
+   if (score_iosurface_planes(handle, sr))
+      return;
    uint8_t *sp = calloc(1, need);
    if (!sp) { fprintf(stderr, "OOM\n"); exit(2); }
 
@@ -340,6 +406,7 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
       for (size_t i = 0; i < need; i++) { hash ^= sp[i]; hash *= 1099511628211ull; }
       score_addf("iosurface res=%u %ux%u sync=%d hash=%016llx ink=%zu/%zu\n",
                  handle, w, h, sr, (unsigned long long)hash, ink, need / 4);
+      scored_ink |= ink != 0;
       /* The surface's pixels, for the same reason the texture readback dumps: a hash says
        * two frames differ, and only the frame says where. */
       const char *dir = getenv("REPLAY_DUMP_DIR");
@@ -451,7 +518,11 @@ static void score_resource(const struct res_ev *ev)
       }
    }
    scored = 1;
-   scored_ink = ink != 0;
+   /* Any ink anywhere clears the floor, so |= and never =. Plain assignment made the
+    * verdict the LAST resource's ink, and the sweep ends on whatever the resource log
+    * ends on -- a corpus that rendered a whole desktop failed the floor because its
+    * final unref happened to be an empty scratch texture. */
+   scored_ink |= ink != 0;
    free(px);
 }
 
@@ -894,7 +965,8 @@ int main(int argc, char **argv)
    text[total] = 0;
    fputs(text, stdout);
 
-   /* Ink somewhere is the floor: a run that reads back nothing but zeros rendered nothing, and
+   /* Ink somewhere is the floor -- from ANY of the three readbacks, texture, IOSurface or
+    * plane: a run that reads back nothing but zeros rendered nothing, and
     * every hash it reports is the hash of an empty buffer. --nodraw is NOT the inverse of that.
     * It used to fail on any ink at all, which was right when one render target was scored and is
     * wrong now that the sweep scores every offscreen: a texture filled by a transfer has ink with

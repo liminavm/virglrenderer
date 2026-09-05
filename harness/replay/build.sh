@@ -32,7 +32,8 @@ done
 
 cc -O2 -Wall -Wextra -o vrend-replay vrend-replay.c \
    -I"$SRC/src" -I"$SRC/build/src" -I"$PREFIX/include/virgl" \
-   -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR"
+   -L"$LIBDIR" -lvirglrenderer -Wl,-rpath,"$LIBDIR" \
+   -framework IOSurface -framework CoreFoundation
 
 echo "built: $PWD/vrend-replay"
 otool -L vrend-replay | grep virgl
