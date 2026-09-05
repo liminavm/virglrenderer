@@ -179,6 +179,106 @@ pub enum Refusal {
     /// An IOSurface was minted for the resource and the driver has no entry point to make it
     /// a texture's storage.
     NoEglImage,
+    /// A multisample 2D *array*, on a host with no `glTexStorage3DMultisample`.
+    ///
+    /// Split out from [`Refusal::UnsupportedMultisampleFormat`] because it cannot claim that
+    /// one's justification: the format IS advertised as multisampling, and the capset has no
+    /// per-target bit to say the array form is missing. See [`Justification::Unjustified`].
+    MultisampleArrayUnsupported,
+}
+
+/// Why a refusal is safe to make, which every refusal has to answer.
+///
+/// **A create refusal reaches no guest.** The kernel handed out the handle before the host was
+/// asked and mesa does not read the control queue's error, so the guest goes on to attach
+/// backing and transfer into a resource that was never made, and its context dies on that later
+/// command naming a handle nothing created. The symptom is a hang several commands away,
+/// attributed to the wrong thing, and no care taken at the refusal site changes that.
+///
+/// So a refusal is only ever safe for one of two reasons, and [`Refusal::justification`] is an
+/// exhaustive match: a new variant does not compile until it says which. That is the whole
+/// mechanism -- the compiler cannot tell whether the answer is *true*, but it can insist the
+/// question is answered, in a place where a false answer is one grep from the capset that would
+/// have to contain it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Justification {
+    /// The arguments contradict themselves and the wire cannot mean anything else. No conforming
+    /// guest sends this, so nothing is owed to one that does.
+    Malformed,
+    /// The capset already excluded it, so a guest reading the capset never asks. Names the field
+    /// that excludes it, because a claim that cannot name one is the bug this type is for.
+    NotAdvertised(&'static str),
+    /// The driver answered no while allocating. Nothing could have advertised it, because
+    /// nothing knew until it was asked; the guest dies, and the alternative is a resource that
+    /// is not there.
+    HostRefused,
+    /// **Nothing in the capset excludes this.** A guest is told yes and then refused, invisibly.
+    /// Every refusal here is a known bug, and naming them makes the list finite and countable
+    /// instead of a property nobody checks; the test below pins the list so a new one cannot be
+    /// added quietly.
+    Unjustified(&'static str),
+}
+
+impl Refusal {
+    /// See [`Justification`]. Exhaustive on purpose: a new refusal must say why it is safe.
+    pub fn justification(self) -> Justification {
+        use Justification as J;
+        match self {
+            // The wire contradicts itself.
+            Refusal::MultisampleNot2d
+            | Refusal::MultisampleWithMipmaps
+            | Refusal::BufferWithMipmaps
+            | Refusal::RectWithMipmaps
+            | Refusal::TooManyLevels
+            | Refusal::UnknownFlags
+            | Refusal::Y0TopNot2d
+            | Refusal::CubeArraySize
+            | Refusal::CubeArrayArraySize
+            | Refusal::ArrayOfNonArrayTarget
+            | Refusal::ZeroWidth
+            | Refusal::BufferBindOnTexture
+            | Refusal::NotTextureStorage
+            | Refusal::BufferNotFlat
+            | Refusal::NoTextureBind
+            | Refusal::DepthOn2d
+            | Refusal::ZeroHeight
+            | Refusal::Not1dShape
+            | Refusal::ZeroDepth
+            | Refusal::ZeroArraySize
+            | Refusal::CubeNotSquare
+            | Refusal::IllegalBufferBind => J::Malformed,
+
+            // The capset said no first. Each names the field a guest would have read.
+            Refusal::UnsupportedFormat => J::NotAdvertised("caps_v1.sampler / .render"),
+            Refusal::UnsupportedMultisampleFormat => {
+                J::NotAdvertised("caps_v2.supported_multisample_formats")
+            }
+            Refusal::CubeArraysUnsupported => J::NotAdvertised("caps_v1.bset::CUBE_MAP_ARRAY"),
+            Refusal::ArraysUnsupported => J::NotAdvertised("caps_v1.max_texture_array_layers"),
+            Refusal::QueryBuffersUnsupported => J::NotAdvertised("caps_v2.cap::QBO"),
+            Refusal::IndirectUnsupported => J::NotAdvertised("caps_v2.cap::BIND_COMMAND_ARGS"),
+            Refusal::TooLarge => J::NotAdvertised("caps_v2.max_texture_{2d,3d,cube}_size"),
+            Refusal::NoBufferStorage => J::NotAdvertised("caps_v2.cap::ARB_BUFFER_STORAGE"),
+            // The sampler bitmask offers a planar format only where one can be backed, which is
+            // the one place in this tree the weld was made by hand.
+            Refusal::NoPlanarStorage => {
+                J::NotAdvertised("caps_v1.sampler, via video::composite_target_backable")
+            }
+
+            // The driver, at the moment of asking.
+            Refusal::GlError(_) => J::HostRefused,
+            // The feature probe answers this before any resource exists, and the capset has no
+            // field for "IOSurfaces can become textures" -- but nor does a guest ever ask for
+            // one: it arrives on a blob the guest exported, and the refusal is reported at init.
+            Refusal::NoEglImage => J::HostRefused,
+
+            Refusal::MultisampleArrayUnsupported => J::Unjustified(
+                "the capset has no per-target multisample bit, so a format advertised as \
+                 multisampling is refused for its array form; closing it means advertising no \
+                 multisample without glTexStorage3DMultisample, at the cost of 2D MSAA",
+            ),
+        }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -202,6 +302,7 @@ impl fmt::Display for Refusal {
             Refusal::ZeroWidth => "texture width must be > 0",
             Refusal::BufferBindOnTexture => "buffer bind flags require the buffer target",
             Refusal::NotTextureStorage => "a blob typed as something other than a texture",
+            Refusal::MultisampleArrayUnsupported => "multisample array textures are not supported",
             Refusal::BufferNotFlat => "buffer target with height or depth other than 1",
             Refusal::QueryBuffersUnsupported => "query buffers are not supported",
             Refusal::IndirectUnsupported => "indirect draw buffers are not supported",
@@ -1247,7 +1348,7 @@ fn plan_storage(features: &Features, a: &Args) -> Result<Plan, Refusal> {
             && gl_target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
             && !features.has(Feature::storage_multisample_2d_array)
         {
-            return Err(Refusal::UnsupportedMultisampleFormat);
+            return Err(Refusal::MultisampleArrayUnsupported);
         }
         return Ok(Plan::Texture { gl_target });
     }
@@ -2032,6 +2133,76 @@ mod tests {
         true
     }
 
+    /// Every refusal this build can make, so the unjustified ones can be counted.
+    ///
+    /// Hand-written, because a payload variant rules out a derive. The compiler already forces
+    /// each variant to *have* a justification -- `Refusal::justification` is an exhaustive match
+    /// -- so what this list adds is that the unjustifiable ones stay a closed, named set.
+    const EVERY_REFUSAL: &[Refusal] = &[
+        Refusal::UnsupportedFormat,
+        Refusal::NoPlanarStorage,
+        Refusal::UnsupportedMultisampleFormat,
+        Refusal::MultisampleNot2d,
+        Refusal::MultisampleWithMipmaps,
+        Refusal::BufferWithMipmaps,
+        Refusal::RectWithMipmaps,
+        Refusal::TooManyLevels,
+        Refusal::UnknownFlags,
+        Refusal::Y0TopNot2d,
+        Refusal::CubeArraySize,
+        Refusal::CubeArraysUnsupported,
+        Refusal::CubeArrayArraySize,
+        Refusal::ArrayOfNonArrayTarget,
+        Refusal::ArraysUnsupported,
+        Refusal::ZeroWidth,
+        Refusal::BufferBindOnTexture,
+        Refusal::NotTextureStorage,
+        Refusal::BufferNotFlat,
+        Refusal::QueryBuffersUnsupported,
+        Refusal::IndirectUnsupported,
+        Refusal::NoTextureBind,
+        Refusal::DepthOn2d,
+        Refusal::ZeroHeight,
+        Refusal::Not1dShape,
+        Refusal::TooLarge,
+        Refusal::ZeroDepth,
+        Refusal::ZeroArraySize,
+        Refusal::CubeNotSquare,
+        Refusal::IllegalBufferBind,
+        Refusal::NoBufferStorage,
+        Refusal::GlError(0),
+        Refusal::NoEglImage,
+        Refusal::MultisampleArrayUnsupported,
+    ];
+
+    /// A refusal a guest can be handed after the capset told it yes is a bug, and there is
+    /// exactly one.
+    ///
+    /// This does not test behaviour; it pins a count. The refusals that cannot name an
+    /// advertisement are the ones that kill a guest silently, and leaving them as a property
+    /// nobody enumerates is how the texture-buffer refusal survived. Adding another fails here,
+    /// and closing this one is a deliberate change to what the capset promises -- which is what
+    /// editing this list should feel like.
+    #[test]
+    fn only_one_refusal_cannot_point_at_the_capset() {
+        let unjustified: Vec<&Refusal> = EVERY_REFUSAL
+            .iter()
+            .filter(|r| matches!(r.justification(), Justification::Unjustified(_)))
+            .collect();
+        assert_eq!(
+            unjustified,
+            [&Refusal::MultisampleArrayUnsupported],
+            "a refusal with nothing in the capset behind it is a guest told yes and then killed"
+        );
+        // And every advertisement claimed names a capset field. The compiler cannot tell whether
+        // the field really excludes the case; it can insist the claim points somewhere.
+        for r in EVERY_REFUSAL {
+            if let Justification::NotAdvertised(field) = r.justification() {
+                assert!(field.starts_with("caps_v"), "{r:?} names {field:?}, not a capset field");
+            }
+        }
+    }
+
     /// The whole input space, ours against the C's, because the guest cannot see a refusal.
     ///
     /// A create is answered on ctx0, before any context owns the resource, and mesa does not read
@@ -2137,22 +2308,21 @@ mod tests {
                             {
                                 theirs = false;
                             }
-                            // An OPEN deviation, not a settled one. A multisample 2D *array* needs
-                            // `glTexStorage3DMultisample`, which GLES has only at 3.2 or behind
-                            // OES_texture_storage_multisample_2d_array; the C reaches for
-                            // `glTexImage3DMultisample` instead, which GLES does not have at all, so
-                            // there is no fallback to port. We refuse. The problem is that the capset
-                            // has no per-target multisample bit, so the guest is told the format
-                            // multisamples and then refused -- invisibly, the failure this whole test
-                            // exists for. It is reachable on this host, which is GLES 3.1. Resolving
-                            // it means advertising no multisample at all without the array form,
-                            // which costs 2D MSAA, and that is a call to make deliberately.
+                            // The one deviation the capset cannot cover, and the only refusal
+                            // in the tree that admits as much: see
+                            // `Refusal::MultisampleArrayUnsupported` and the justification it
+                            // declares. Asserted rather than waved through, so that if it is
+                            // ever closed this stops matching and has to be removed.
                             if theirs
                                 && a.nr_samples > 1
                                 && gl_target(a.target, a.nr_samples)
                                     == GL_TEXTURE_2D_MULTISAMPLE_ARRAY
                                 && !f.has(Feature::storage_multisample_2d_array)
                             {
+                                assert!(matches!(
+                                    plan(&f, &t, &l, &a),
+                                    Err(Refusal::MultisampleArrayUnsupported)
+                                ));
                                 theirs = false;
                             }
                             assert_eq!(
