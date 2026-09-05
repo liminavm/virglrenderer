@@ -225,8 +225,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   no longer does is carry them into the texture. So what inks a window is the renderer reading the
   guest's pages for itself -- and both legs still score six fully-inked windows with the same six
   hashes the fed run gives. With the feed on, a renderer that reads nothing scores exactly like
-  one that reads correctly, which is why the fed fixture alone cannot see this: it was green
-  across the whole period virglrs zeroed every blob it could not adopt as a surface.
+  one that reads correctly, which is why the fed fixture alone cannot see this.
+  **It covers one of the two shapes a blob's bytes arrive in.** The replay creates guest-memory
+  blobs, so what it measures is the scattered iov; a blob whose bytes are a mapping this process
+  holds -- minted shm, or the linear pages a venus allocation was published from, which is the
+  production shape of a venus blob with no surface -- reaches the same fill through a different
+  source and no fixture here runs it.
   `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,

@@ -492,11 +492,13 @@ impl Untyped {
         // An adopted surface is the exporter's bytes and needs neither a fill nor a re-read.
         let mut guest_pixels = None;
         if !matches!(&storage, Storage::Texture(t) if t.image.is_some()) {
-            if pixels.is_some_and(|src| fill_texture(gl, formats, &args, &storage, src, plane)) {
+            if pixels
+                .is_some_and(|src| fill_texture(gl, formats, &args, &storage, src, plane, true))
+            {
                 // A copy, so it is owed a re-read before anything samples it in a later batch.
                 // Stamped with this batch: the guest has had no chance to run since the command
                 // that filled it, so a draw in the same batch reads what is already there.
-                guest_pixels = Some(GuestPixels { plane, read_in: batch });
+                guest_pixels = Some(GuestPixels { plane, read_in: batch, said: false });
             } else {
                 // `glTexStorage` leaves contents undefined, which is another context's memory
                 // read as pixels -- wrong, and a leak. Blank is still wrong; not also a leak.
@@ -927,8 +929,6 @@ pub struct ViewKey {
     pub layers: u32,
 }
 
-/// A resource the host holds. Its GL objects are deleted by [`Resource::destroy`], never by drop:
-/// deleting needs the driver and a current context, which a drop does not have.
 /// A texture that is a *copy* of a blob's pages, and the layout it is copied at.
 ///
 /// An adopted surface is not one of these: its storage IS the exporter's bytes, so there is
@@ -936,16 +936,26 @@ pub struct ViewKey {
 /// wrote its own mapping -- there is no transfer, no flush, no command at all -- so the only
 /// honest moment to look is just before something samples it.
 ///
-/// `read_in` is the batch the copy was last taken in, which is what keeps a frame drawn from one
-/// texture twice from reading its pages twice. It is a *batch* and not a draw for the reason the
-/// C gives its `guest_pixels_serial`: within one batch the guest has had no opportunity to run.
+/// `read_in` is the batch the copy was last *attempted* in -- not the last one that succeeded --
+/// which is what keeps a frame drawn from one texture twice from reading its pages twice, and
+/// keeps a source that cannot satisfy the layout from being retried once per sampler. It is a
+/// batch and not a draw for the reason the C gives its `guest_pixels_serial`: a batch is the unit
+/// this renderer runs without pause, so re-reading inside one buys nothing a guest could have
+/// written. It is a freshness heuristic and not a guarantee -- the guest's vCPUs run throughout,
+/// and a write landing mid-copy tears it under any scheme, the C's included.
 pub struct GuestPixels {
     /// The layout `SET_TYPE` described. The guest's stride is its own business, and a re-read
     /// that assumed packed rows would shear the image exactly as the first read did not.
     pub plane: Plane,
     pub read_in: u64,
+    /// Whether a refusal has been reported. The refresh runs once per batch and its reasons do
+    /// not change between them, so a source that cannot satisfy the layout would otherwise say so
+    /// at frame rate forever. Said once per resource, as [`venus::driver::Pages`] says its own.
+    said: bool,
 }
 
+/// A resource the host holds. Its GL objects are deleted by [`Resource::destroy`], never by drop:
+/// deleting needs the driver and a current context, which a drop does not have.
 pub struct Resource {
     pub args: Args,
     pub storage: Storage,
@@ -955,20 +965,18 @@ pub struct Resource {
 }
 
 impl Resource {
-    /// Re-read the pages behind a blob, if this is a texture that copies them and the copy was
-    /// not already taken in this batch.
-    ///
-    /// The source is asked for by handle and not held: see [`Untyped::upgrade`]. A resource the
-    /// guest has since detached simply has no pages, and the copy standing is the last good one
-    /// -- which is what the C does too, having no way to tell a detach from a slow frame.
     /// Whether a re-read is owed before this batch samples the texture. Asked before the source
     /// is looked up, so a resource that copies nothing costs one compare.
     pub fn wants_guest_pixels(&self, batch: u64) -> bool {
         self.guest_pixels.as_ref().is_some_and(|gp| gp.read_in != batch)
     }
 
-    /// Take the copy. `src` is borrowed from the resource table for this call and not kept: see
-    /// [`Untyped::upgrade`].
+    /// Take the copy: re-read the pages behind a blob into its texture.
+    ///
+    /// `src` is borrowed from the resource table for this call and not kept -- see
+    /// [`Untyped::upgrade`]. A resource the guest has since detached has no pages to offer, so
+    /// the caller never gets here and the copy standing is the last good one, which is what the
+    /// C does too, having no way to tell a detach from a slow frame.
     ///
     /// The batch is stamped whether or not the fill succeeded, so a source that cannot satisfy
     /// the layout is read once per batch and not once per sampler bound in it. `fill_texture`
@@ -985,7 +993,10 @@ impl Resource {
         };
         let plane = gp.plane;
         gp.read_in = batch;
-        fill_texture(gl, formats, &self.args, &self.storage, src, plane);
+        let say = !gp.said;
+        if !fill_texture(gl, formats, &self.args, &self.storage, src, plane, say) {
+            gp.said = true;
+        }
     }
 }
 
@@ -1637,11 +1648,6 @@ fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image>
     }
 }
 
-/// `vrend_resource_alloc_texture`.
-/// Write zeros over a texture's first level.
-///
-/// For storage nothing filled: an adopted surface carries the exporter's pixels, but a texture
-/// that stood in for one carries whatever the driver's allocator last held there.
 /// Fill a blob's texture from the bytes behind it, at the layout the guest described.
 ///
 /// The counterpart to [`zero_texture`], and the reason a blob need not be blank: a resource whose
@@ -1659,10 +1665,19 @@ fn fill_texture(
     storage: &Storage,
     src: &PixelSource<'_>,
     plane: Plane,
+    say: bool,
 ) -> bool {
     let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
         return false;
     };
+    // `glTexSubImage2D` serves this target and no other. Reaching it with an array or a 3D
+    // target would GL-error and still report a fill, which leaves undefined `glTexStorage`
+    // contents standing -- another context's memory read as pixels, which is the leak the blank
+    // exists to prevent. `SET_TYPE` describes a plain 2D image and nothing else builds one of
+    // these today, so this is the guard on a future call site rather than a live case.
+    if t.target != GL_TEXTURE_2D {
+        return false;
+    }
     let (Some(row), Some(total)) = (
         crate::vrend::gl::image_bytes(entry.gl.glformat, entry.gl.gltype, a.width as GLsizei, 1, 1),
         crate::vrend::gl::image_bytes(
@@ -1679,6 +1694,9 @@ fn fill_texture(
     // wire means by it, and what the C's own layout falls back to.
     let stride = if plane.stride == 0 { row as u64 } else { u64::from(plane.stride) };
     if stride < row as u64 {
+        if !say {
+            return false;
+        }
         eprintln!(
             "[virglrs] vrend: blob {}x{} {} says stride {} for a {}-byte row; not filling",
             a.width,
@@ -1689,26 +1707,42 @@ fn fill_texture(
         );
         return false;
     }
+    // The layout and the storage are two accounts of one thing, reconciled here because this is
+    // the boundary that holds both -- once, and before anything is allocated. Per-row checking
+    // reconciles it `height` times and, worse, sizes the staging buffer from a guest's figures
+    // first: a guest declaring 16384x16384 over a handful of pages would have this allocate and
+    // zero gigabytes before the first row refused.
+    let last = a.height.saturating_sub(1) as u64;
+    let wants = last
+        .checked_mul(stride)
+        .and_then(|s| s.checked_add(u64::from(plane.offset)))
+        .and_then(|s| s.checked_add(row as u64));
+    let wants = wants.unwrap_or(u64::MAX);
+    if a.height == 0 || wants > src.len() {
+        if !say {
+            return false;
+        }
+        eprintln!(
+            "[virglrs] vrend: blob {}x{} {} wants {wants} bytes at stride {stride} from {} bytes \
+             of storage; not filling",
+            a.width,
+            a.height,
+            a.format.name(),
+            src.len(),
+        );
+        return false;
+    }
     let mut staging = vec![0u8; total];
     for y in 0..a.height as u64 {
         let at = u64::from(plane.offset) + y * stride;
         let dst = y as usize * row;
-        // Out of range is the guest describing a layout its own storage does not hold. Bailing
-        // on the first row that misses beats filling a prefix: a half-read frame is a plausible
-        // picture, and a plausible wrong picture is the hardest kind of wrong to notice.
-        if !src.copy_out(at, &mut staging[dst..dst + row]) {
-            eprintln!(
-                "[virglrs] vrend: blob {}x{} {} wants {} bytes at stride {} from {} bytes of \
-                 storage; not filling",
-                a.width,
-                a.height,
-                a.format.name(),
-                u64::from(plane.offset) + a.height as u64 * stride,
-                stride,
-                src.len(),
-            );
-            return false;
-        }
+        // Checked whole above, so a row that misses now is this renderer's arithmetic and not the
+        // guest's description.
+        assert!(
+            src.copy_out(at, &mut staging[dst..dst + row]),
+            "the layout was reconciled against {} bytes of storage before any row was read",
+            src.len(),
+        );
     }
     // The binding is put back, not cleared. This runs inside the draw's sampler loop, before the
     // unit for this sampler is made active, so the unit that happens to be current belongs to
@@ -1744,6 +1778,10 @@ fn binding_query(target: GLenum) -> GLenum {
     }
 }
 
+/// Write zeros over a texture's first level.
+///
+/// For storage nothing filled: an adopted surface carries the exporter's pixels, but a texture
+/// that stood in for one carries whatever the driver's allocator last held there.
 fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {
     let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
         return;
@@ -1774,6 +1812,7 @@ fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {
     gl.bind_texture(t.target, None);
 }
 
+/// `vrend_resource_alloc_texture`.
 fn alloc_texture(
     gl: &Gl,
     features: &Features,
