@@ -173,6 +173,42 @@ fn detach_all(gl: &Gl) {
 }
 
 impl Context {
+    /// Run something in the blitter's own GL context, and put the sub-context's back afterwards.
+    ///
+    /// The restore is what this exists for, and why it is a helper rather than a pattern each
+    /// caller repeats. Every command after this one in the batch assumes the sub-context's GL
+    /// context is current, and none of them ask -- so a path that returns without restoring
+    /// leaves the rest of the batch drawing into the blitter's, which shows up nowhere near the
+    /// blit that caused it. Structural beats remembered: a caller cannot forget what it does not
+    /// write.
+    ///
+    /// `None` when there is no blitter and none can be built, which is already reported.
+    fn in_blit_context<T>(
+        &mut self,
+        host: &mut Host<'_>,
+        run: impl FnOnce(&mut blitter::Blitter, &Gl, &Features) -> T,
+    ) -> Option<T> {
+        let (gl, winsys, features) = (host.gl, host.winsys, host.features);
+        if host.blitter.is_none() {
+            match blitter::Blitter::open(winsys, gl, host.version, host.share) {
+                Ok(b) => *host.blitter = Some(b),
+                Err(e) => {
+                    eprintln!("[virglrs] vrend: no GL context for the blitter ({e}); no blit");
+                    host.todo.note("the shader blitter");
+                    return None;
+                }
+            }
+            // `Blitter::open` left its own context current.
+            *host.current = Current::Blitter;
+        }
+        let blitter = host.blitter.as_mut().expect("just built");
+        winsys.make_current(blitter.context()).expect("the blitter's context can be made current");
+        *host.current = Current::Blitter;
+        let outcome = run(blitter, gl, features);
+        self.make_current(host);
+        Some(outcome)
+    }
+
     /// `vrend_renderer_blit`.
     pub(super) fn blit(&mut self, host: &mut Host<'_>, b: &Blit) -> Result<(), Fault> {
         let cmd = Cmd::Blit;
@@ -458,26 +494,11 @@ impl Context {
                 ]
             }),
         };
-        let (gl, winsys, features) = (host.gl, host.winsys, host.features);
-        if host.blitter.is_none() {
-            match blitter::Blitter::open(winsys, gl, host.version, host.share) {
-                Ok(b) => *host.blitter = Some(b),
-                Err(e) => {
-                    eprintln!("[virglrs] vrend: no GL context for the blitter ({e}); no blit");
-                    host.todo.note("the shader blitter");
-                    return Ok(());
-                }
-            }
-            // `Blitter::open` left its own context current.
-            *host.current = Current::Blitter;
-        }
-        let blitter = host.blitter.as_mut().expect("just built");
-        winsys.make_current(blitter.context()).expect("the blitter's context can be made current");
-        *host.current = Current::Blitter;
-        let outcome = blitter.run(gl, features, &job);
-        // Unconditionally, and before anything else can run: the commands after this one in the
-        // batch do not switch contexts, they assume the sub-context's is current.
-        self.make_current(host);
+        let Some(outcome) =
+            self.in_blit_context(host, |blitter, gl, features| blitter.run(gl, features, &job))
+        else {
+            return Ok(());
+        };
         match outcome {
             Ok(()) => Ok(()),
             Err(blitter::Unserved::NoFeature(feature)) => Err(Fault::NoFeature { cmd, feature }),
