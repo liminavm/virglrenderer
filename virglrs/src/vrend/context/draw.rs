@@ -953,6 +953,12 @@ impl Context {
                 Some(Object::SamplerView(v)) => Some(v),
                 _ => None,
             });
+            // Nothing dirties a texture whose guest pages the guest rewrote behind our back --
+            // there is no transfer, no flush, no command at all -- so this is outside the dirty
+            // check, and outside it for a texture bound in an earlier batch and left alone since.
+            if let Some(view) = view {
+                host.refresh_guest_pixels(view.resource);
+            }
             if dirty.contains(i)
                 && let Some(view) = view
             {

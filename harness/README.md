@@ -219,7 +219,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   says two renderers disagree and nothing about how: `REPLAY_DUMP_DIR=<dir>` writes the readbacks,
   and `rgba2png.py` renders the 8-bit BGRA offscreens while `half2png.py` renders a half-float one
   such as a blob window. Reading half floats as bytes shows noise, which looks exactly like the
-  corruption one would be hunting. `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
+  corruption one would be hunting.
+  `vrend-vkclient-nofeed.score` is the same capture under `--nofeed`, and it is the fixture that
+  measures the import itself. The recorded bytes still land in the backing store; what the replay
+  no longer does is carry them into the texture. So what inks a window is the renderer reading the
+  guest's pages for itself -- and both legs still score six fully-inked windows with the same six
+  hashes the fed run gives. With the feed on, a renderer that reads nothing scores exactly like
+  one that reads correctly, which is why the fed fixture alone cannot see this: it was green
+  across the whole period virglrs zeroed every blob it could not adopt as a surface.
+  `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
   with H.264 and VP9 played one after the other in Showtime.

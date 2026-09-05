@@ -3693,6 +3693,19 @@ impl Storage {
         }
     }
 
+    /// The mapping behind storage that is pages, and nothing for storage that is a surface.
+    ///
+    /// The counterpart to [`Storage::surface`]: a surface is *adopted* whole and its bytes are
+    /// never read out, so answering `None` for one is not a gap. Borrowed, never cloned -- the
+    /// pages live as long as the share does and a caller holding them past it would outlive
+    /// what it describes.
+    pub fn mapping(&self) -> Option<&GuestMap> {
+        match self {
+            Storage::Texture(_) => None,
+            Storage::Linear(p) => Some(&p.it.map),
+        }
+    }
+
     /// The surface, for storage that is one -- or why this storage is not. Pages have nothing
     /// to adopt and no presented pixels to read, and the one question -- "is this a surface" --
     /// is answered here once rather than per thing a caller wants from it.

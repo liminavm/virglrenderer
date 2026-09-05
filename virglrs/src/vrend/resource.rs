@@ -14,9 +14,9 @@ use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
 use super::pipe::TextureTarget;
-use super::proto::Format;
+use super::proto::{Format, Plane};
 use super::video;
-use crate::guest_mem::Iov;
+use crate::guest_mem::{Iov, PixelSource};
 use crate::metal::{Held, PixelFormat, PlanarFormat, Surface};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -432,14 +432,16 @@ impl Untyped {
     /// guest that describes none has erred, and gets a refusal that stops its own context and
     /// nobody else's.
     ///
-    /// A host that cannot adopt IOSurfaces at all, or a blob whose share is not a surface,
-    /// is neither party's error: the resource gets a blank texture and the log says the
-    /// contents are wrong. That is a limitation, answered once at init for the first and
-    /// carried by the storage for the second.
+    /// Storage that is not a surface is not storage with no pixels: `pixels` is where they are,
+    /// and `SET_TYPE` is what finally says how to read them, so the texture is filled from them.
+    /// The blank texture survives only as the answer to a fill that could not be done -- a
+    /// layout the storage does not hold, or a blob whose bytes this renderer may not reach --
+    /// and it says so, because a window rendering the wrong thing is otherwise silent.
     ///
     /// A host that said it adopts IOSurfaces and then refuses this one is a host bug, and it
     /// crashes. Degrading there would hide our own defect behind a window that renders the
     /// wrong thing, which is the one outcome worth less than stopping.
+    #[allow(clippy::too_many_arguments)]
     pub fn upgrade(
         self,
         gl: &Gl,
@@ -448,6 +450,9 @@ impl Untyped {
         formats: &Table,
         limits: &Limits,
         args: Args,
+        pixels: Option<&PixelSource<'_>>,
+        plane: Plane,
+        batch: u64,
     ) -> Result<Resource, (Untyped, Refusal)> {
         // A blob being given a type is always given a texture's. The guest states the target,
         // so this asks rather than assumes: `gl_target` has no answer for a buffer and would
@@ -469,17 +474,9 @@ impl Untyped {
                 ),
             },
             // Either this host adopts no surfaces -- said once at init -- or these bytes are
-            // not one, which the storage that minted them already said. Neither is news here.
-            Some(_) | None => {
-                eprintln!(
-                    "[virglrs] vrend: resource {}x{} {} has no surface to adopt; it gets a blank \
-                     texture and its contents will be wrong",
-                    args.width,
-                    args.height,
-                    args.format.name()
-                );
-                None
-            }
+            // not one, which the storage that minted them already said. Neither is news, and
+            // neither means there are no pixels: the fill below reads them where they are.
+            Some(_) | None => None,
         };
         // The share is gone into the image, or was never there; a refusal past this point has
         // nothing left to hand back but an empty slot, which is what the handle already was.
@@ -492,12 +489,28 @@ impl Untyped {
         // Whether an image backs the storage is read off the storage, not carried alongside it:
         // the adopt can fail at either step, and a second boolean tracking it would be a copy of
         // this fact that the retry above is exactly the thing to make disagree.
+        // An adopted surface is the exporter's bytes and needs neither a fill nor a re-read.
+        let mut guest_pixels = None;
         if !matches!(&storage, Storage::Texture(t) if t.image.is_some()) {
-            // `glTexStorage` leaves contents undefined, which is another context's memory read
-            // as pixels -- wrong, and a leak. Blank is still wrong; it is not also a leak.
-            zero_texture(gl, formats, &args, &storage);
+            if pixels.is_some_and(|src| fill_texture(gl, formats, &args, &storage, src, plane)) {
+                // A copy, so it is owed a re-read before anything samples it in a later batch.
+                // Stamped with this batch: the guest has had no chance to run since the command
+                // that filled it, so a draw in the same batch reads what is already there.
+                guest_pixels = Some(GuestPixels { plane, read_in: batch });
+            } else {
+                // `glTexStorage` leaves contents undefined, which is another context's memory
+                // read as pixels -- wrong, and a leak. Blank is still wrong; not also a leak.
+                eprintln!(
+                    "[virglrs] vrend: resource {}x{} {} has no surface to adopt and no pixels \
+                     to read; it gets a blank texture and its contents will be wrong",
+                    args.width,
+                    args.height,
+                    args.format.name()
+                );
+                zero_texture(gl, formats, &args, &storage);
+            }
         }
-        Ok(Resource { args, storage })
+        Ok(Resource { args, storage, guest_pixels })
     }
 
     /// A share of the surface these bytes are, if they are one.
@@ -916,9 +929,64 @@ pub struct ViewKey {
 
 /// A resource the host holds. Its GL objects are deleted by [`Resource::destroy`], never by drop:
 /// deleting needs the driver and a current context, which a drop does not have.
+/// A texture that is a *copy* of a blob's pages, and the layout it is copied at.
+///
+/// An adopted surface is not one of these: its storage IS the exporter's bytes, so there is
+/// nothing to keep in step. A copy has to be re-read, because nothing on the wire says the guest
+/// wrote its own mapping -- there is no transfer, no flush, no command at all -- so the only
+/// honest moment to look is just before something samples it.
+///
+/// `read_in` is the batch the copy was last taken in, which is what keeps a frame drawn from one
+/// texture twice from reading its pages twice. It is a *batch* and not a draw for the reason the
+/// C gives its `guest_pixels_serial`: within one batch the guest has had no opportunity to run.
+pub struct GuestPixels {
+    /// The layout `SET_TYPE` described. The guest's stride is its own business, and a re-read
+    /// that assumed packed rows would shear the image exactly as the first read did not.
+    pub plane: Plane,
+    pub read_in: u64,
+}
+
 pub struct Resource {
     pub args: Args,
     pub storage: Storage,
+    /// Set only for a blob filled from pages this renderer may read; `None` for everything else,
+    /// which is every classic resource and every blob that adopted a surface.
+    pub guest_pixels: Option<GuestPixels>,
+}
+
+impl Resource {
+    /// Re-read the pages behind a blob, if this is a texture that copies them and the copy was
+    /// not already taken in this batch.
+    ///
+    /// The source is asked for by handle and not held: see [`Untyped::upgrade`]. A resource the
+    /// guest has since detached simply has no pages, and the copy standing is the last good one
+    /// -- which is what the C does too, having no way to tell a detach from a slow frame.
+    /// Whether a re-read is owed before this batch samples the texture. Asked before the source
+    /// is looked up, so a resource that copies nothing costs one compare.
+    pub fn wants_guest_pixels(&self, batch: u64) -> bool {
+        self.guest_pixels.as_ref().is_some_and(|gp| gp.read_in != batch)
+    }
+
+    /// Take the copy. `src` is borrowed from the resource table for this call and not kept: see
+    /// [`Untyped::upgrade`].
+    ///
+    /// The batch is stamped whether or not the fill succeeded, so a source that cannot satisfy
+    /// the layout is read once per batch and not once per sampler bound in it. `fill_texture`
+    /// says why on each failure, and the copy standing is the last good one.
+    pub fn take_guest_pixels(
+        &mut self,
+        gl: &Gl,
+        formats: &Table,
+        batch: u64,
+        src: &PixelSource<'_>,
+    ) {
+        let Some(gp) = &mut self.guest_pixels else {
+            return;
+        };
+        let plane = gp.plane;
+        gp.read_in = batch;
+        fill_texture(gl, formats, &self.args, &self.storage, src, plane);
+    }
 }
 
 impl Resource {
@@ -1057,7 +1125,7 @@ impl Resource {
                 alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
             }
         };
-        Ok(Resource { args, storage })
+        Ok(Resource { args, storage, guest_pixels: None })
     }
 
     /// The texture storage, for the operations only a texture has.
@@ -1574,6 +1642,91 @@ fn mint_surface(winsys: &Winsys, features: &Features, a: &Args) -> Option<Image>
 ///
 /// For storage nothing filled: an adopted surface carries the exporter's pixels, but a texture
 /// that stood in for one carries whatever the driver's allocator last held there.
+/// Fill a blob's texture from the bytes behind it, at the layout the guest described.
+///
+/// The counterpart to [`zero_texture`], and the reason a blob need not be blank: a resource whose
+/// storage is not a surface still has pixels somewhere, and `SET_TYPE` is what finally says how to
+/// read them. `false` when it could not be done, which is the caller's cue to blank the texture --
+/// undefined `glTexStorage` contents are another context's memory read as pixels.
+///
+/// The rows are copied one at a time because the guest's stride is its own business: it is free
+/// to pad each row to whatever the allocation wanted, and a fill that assumed packed rows would
+/// shear the image by the difference. The staging buffer is packed, which is what GL is then told.
+fn fill_texture(
+    gl: &Gl,
+    formats: &Table,
+    a: &Args,
+    storage: &Storage,
+    src: &PixelSource<'_>,
+    plane: Plane,
+) -> bool {
+    let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
+        return false;
+    };
+    let (Some(row), Some(total)) = (
+        crate::vrend::gl::image_bytes(entry.gl.glformat, entry.gl.gltype, a.width as GLsizei, 1, 1),
+        crate::vrend::gl::image_bytes(
+            entry.gl.glformat,
+            entry.gl.gltype,
+            a.width as GLsizei,
+            a.height as GLsizei,
+            1,
+        ),
+    ) else {
+        return false;
+    };
+    // A stride of zero is the guest declining to say, not a zero-width row: packed is what the
+    // wire means by it, and what the C's own layout falls back to.
+    let stride = if plane.stride == 0 { row as u64 } else { u64::from(plane.stride) };
+    if stride < row as u64 {
+        eprintln!(
+            "[virglrs] vrend: blob {}x{} {} says stride {} for a {}-byte row; not filling",
+            a.width,
+            a.height,
+            a.format.name(),
+            plane.stride,
+            row,
+        );
+        return false;
+    }
+    let mut staging = vec![0u8; total];
+    for y in 0..a.height as u64 {
+        let at = u64::from(plane.offset) + y * stride;
+        let dst = y as usize * row;
+        // Out of range is the guest describing a layout its own storage does not hold. Bailing
+        // on the first row that misses beats filling a prefix: a half-read frame is a plausible
+        // picture, and a plausible wrong picture is the hardest kind of wrong to notice.
+        if !src.copy_out(at, &mut staging[dst..dst + row]) {
+            eprintln!(
+                "[virglrs] vrend: blob {}x{} {} wants {} bytes at stride {} from {} bytes of \
+                 storage; not filling",
+                a.width,
+                a.height,
+                a.format.name(),
+                u64::from(plane.offset) + a.height as u64 * stride,
+                stride,
+                src.len(),
+            );
+            return false;
+        }
+    }
+    gl.bind_texture(t.target, Some(t.name));
+    gl.unpack_tight();
+    gl.tex_sub_image_2d(
+        t.target,
+        0,
+        0,
+        0,
+        a.width as GLsizei,
+        a.height as GLsizei,
+        entry.gl.glformat,
+        entry.gl.gltype,
+        &staging,
+    );
+    gl.bind_texture(t.target, None);
+    true
+}
+
 fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {
     let (Storage::Texture(t), Some(entry)) = (storage, formats.get(a.format)) else {
         return;
