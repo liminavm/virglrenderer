@@ -28,6 +28,7 @@ use super::gl::{
     ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
     TransformFeedbackName, UniformLocation, VertexArrayName,
 };
+use super::journal::{Retained, Seq};
 use super::pipe::slots::{
     MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
     MAX_VIEWPORTS,
@@ -488,6 +489,56 @@ pub enum Object {
     StreamoutTarget(StreamoutTarget),
 }
 
+/// A sub-context's objects, each holding the commands that created it.
+///
+/// A plain map plus a second map of retained dwords would be two records of one fact, and the
+/// destroy that updates only one of them is the bug this shape cannot have: there is one entry,
+/// [`insert`](Objects::insert) is the only way to make one and takes both halves at once, and
+/// `remove` takes both away. Lookups hand out only the object, so no caller can reach the wire to
+/// let it drift -- the journal reads it through [`retained`](Objects::retained) alone.
+#[derive(Default)]
+pub struct Objects {
+    live: BTreeMap<ObjectHandle, (Retained, Object)>,
+}
+
+impl Objects {
+    /// Create an object and retain the command that asked for it.
+    fn insert(&mut self, handle: ObjectHandle, at: Retained, obj: Object) -> Option<Object> {
+        self.live.insert(handle, (at, obj)).map(|(_, old)| old)
+    }
+
+    fn get(&self, handle: &ObjectHandle) -> Option<&Object> {
+        self.live.get(handle).map(|(_, o)| o)
+    }
+
+    fn get_mut(&mut self, handle: &ObjectHandle) -> Option<&mut Object> {
+        self.live.get_mut(handle).map(|(_, o)| o)
+    }
+
+    fn remove(&mut self, handle: &ObjectHandle) -> Option<Object> {
+        self.live.remove(handle).map(|(_, o)| o)
+    }
+
+    /// Retain another chunk of the create already under way for `handle` -- a shader's text
+    /// arriving in pieces. Nothing happens for a handle that is not there; the caller has already
+    /// refused that command.
+    fn extend(&mut self, handle: &ObjectHandle, wire: &[u32]) {
+        if let Some((at, _)) = self.live.get_mut(handle) {
+            at.extend(wire);
+        }
+    }
+
+    /// Every live object's create, for the export to order against everything else.
+    pub fn retained(&self) -> impl Iterator<Item = &Retained> {
+        self.live.values().map(|(at, _)| at)
+    }
+
+    /// The objects, to release at teardown. Consumes the retained creates with them.
+    fn drain(&mut self) -> impl Iterator<Item = Object> {
+        std::mem::take(&mut self.live).into_values().map(|(_, o)| o)
+    }
+}
+
 impl Object {
     fn kind(&self) -> ObjectType {
         match self {
@@ -619,7 +670,7 @@ pub struct SubContext {
     fb: FramebufferName,
     blit_fbs: [FramebufferName; 2],
     vao: VertexArrayName,
-    objects: BTreeMap<ObjectHandle, Object>,
+    objects: Objects,
     long_shader: [Option<ObjectHandle>; ShaderStage::COUNT],
 
     blend: Option<BlendState>,
@@ -712,7 +763,7 @@ impl SubContext {
             fb,
             blit_fbs,
             vao,
-            objects: BTreeMap::new(),
+            objects: Objects::default(),
             long_shader: [None; ShaderStage::COUNT],
             blend: None,
             hw_blend: HwBlend::default(),
@@ -789,8 +840,8 @@ impl SubContext {
             }
             gl.delete_program(p.id);
         }
-        let objects = std::mem::take(&mut self.objects);
-        for (_, obj) in objects {
+        let objects: Vec<Object> = self.objects.drain().collect();
+        for obj in objects {
             match obj {
                 Object::Shader(s) => draw::release_shader(&mut self, gl, s),
                 other => release(gl, other),
@@ -967,6 +1018,9 @@ pub struct Context {
     /// view is made against the resource, and a guest that tears its decoder down with the last
     /// frame still on screen has no buffer left to be found through.
     owed: Vec<Arc<Texture>>,
+    /// How far this context's journal has got. One counter, because the order a rebuild replays
+    /// in, the create-before-use guarantee and the VMM's fence watermark are one order.
+    seq: Seq,
 }
 
 impl Context {
@@ -978,6 +1032,7 @@ impl Context {
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
+            seq: Seq::default(),
         };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
@@ -1042,12 +1097,12 @@ impl Context {
         self.make_current(host);
         let batch = Batch::new(words);
         for item in batch {
-            let cmd = match item {
+            let framed = match item {
                 Ok(c) => c,
                 Err(r) => return self.poison(Fault::Wire(r)),
             };
-            let kind = cmd.kind();
-            if let Err(f) = self.run(host, cmd) {
+            let kind = framed.cmd.kind();
+            if let Err(f) = self.run(host, framed.cmd, framed.wire) {
                 return self.poison(f);
             }
             self.fill_composites(host);
@@ -1066,11 +1121,13 @@ impl Context {
         Err(f)
     }
 
-    fn run(&mut self, host: &mut Host<'_>, cmd: Command<'_>) -> Result<(), Fault> {
+    fn run(&mut self, host: &mut Host<'_>, cmd: Command<'_>, wire: &[u32]) -> Result<(), Fault> {
         let kind = cmd.kind();
         match cmd {
             Command::Nop => Ok(()),
-            Command::CreateObject { handle, object } => self.create_object(host, handle, object),
+            Command::CreateObject { handle, object } => {
+                self.create_object(host, handle, object, wire)
+            }
             Command::BindObject { kind: ty, handle } => self.bind_object(host, ty, handle),
             Command::DestroyObject { handle, .. } => {
                 self.destroy_object(host, handle);
@@ -1365,13 +1422,14 @@ impl Context {
         host: &mut Host<'_>,
         handle: ObjectHandle,
         object: proto::Object<'_>,
+        wire: &[u32],
     ) -> Result<(), Fault> {
         let cmd = Cmd::CreateObject;
         let obj = match object {
             proto::Object::Blend(s) => Object::Blend(s),
             proto::Object::Rasterizer(s) => Object::Rasterizer(s),
             proto::Object::Dsa(s) => Object::Dsa(s),
-            proto::Object::Shader(s) => return self.create_shader(host, handle, s),
+            proto::Object::Shader(s) => return self.create_shader(host, handle, s, wire),
             proto::Object::VertexElements(elements) => {
                 Object::VertexElements(vertex_elements(&elements)?)
             }
@@ -1386,14 +1444,21 @@ impl Context {
                 Object::StreamoutTarget(t)
             }
         };
-        self.insert_object(host, handle, obj);
+        self.insert_object(host, handle, obj, wire);
         Ok(())
     }
 
     /// Insert, replacing -- and releasing -- whatever the handle named before, as the C's hash
     /// table does.
-    fn insert_object(&mut self, host: &mut Host<'_>, handle: ObjectHandle, obj: Object) {
-        if let Some(old) = self.sub_mut().objects.insert(handle, obj) {
+    fn insert_object(
+        &mut self,
+        host: &mut Host<'_>,
+        handle: ObjectHandle,
+        obj: Object,
+        wire: &[u32],
+    ) {
+        let at = Retained::new(self.seq.advance(), wire);
+        if let Some(old) = self.sub_mut().objects.insert(handle, at, obj) {
             self.on_object_gone(host, handle, old);
         }
     }
@@ -1725,6 +1790,7 @@ impl Context {
         host: &mut Host<'_>,
         handle: ObjectHandle,
         s: ShaderCreate<'_>,
+        wire: &[u32],
     ) -> Result<(), Fault> {
         let cmd = Cmd::CreateObject;
         let missing = match s.stage {
@@ -1758,7 +1824,7 @@ impl Context {
                     ShaderText::Arriving { text: bytes, total }
                 };
                 let shader = Shader { stage: s.stage, kind: s.kind, text };
-                self.insert_object(host, handle, Object::Shader(shader));
+                self.insert_object(host, handle, Object::Shader(shader), wire);
                 if whole {
                     self.select_new(host, handle)?;
                 }
@@ -1768,6 +1834,10 @@ impl Context {
                     self.destroy_object(host, handle);
                     return Err(Fault::Shader { cmd, what: "a continuation of no shader" });
                 }
+                // Retained before the chunk is checked: every way this command can fail from here
+                // destroys the object, which takes the record with it, so there is no path that
+                // leaves a chunk retained for a shader that is gone.
+                self.sub_mut().objects.extend(&handle, wire);
                 let sub = self.sub_mut();
                 let Some(Object::Shader(shader)) = sub.objects.get_mut(&handle) else {
                     return Err(Fault::IllegalHandle { cmd, handle });
