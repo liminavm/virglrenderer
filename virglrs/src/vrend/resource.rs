@@ -507,11 +507,21 @@ impl Untyped {
                 // `glTexStorage` leaves contents undefined, which is another context's memory
                 // read as pixels -- wrong, and a leak. Blank is still wrong; not also a leak.
                 eprintln!(
-                    "[virglrs] vrend: resource {}x{} {} has no surface to adopt and no pixels \
-                     to read; it gets a blank texture and its contents will be wrong",
+                    "[virglrs] vrend: resource {}x{} {} has no surface to adopt and {}; it gets \
+                     a blank texture and its contents will be wrong",
                     args.width,
                     args.height,
-                    args.format.name()
+                    args.format.name(),
+                    // Two different failures reach here and they want different words. A blob
+                    // whose bytes this renderer may not read has none; one whose bytes are right
+                    // there and could not be laid into a texture has some, and `fill_texture`
+                    // has already said why on the line above. Reporting both as "no pixels"
+                    // sends the reader looking for a missing mapping that is not missing.
+                    if pixels.is_some() {
+                        "could not be filled from its pixels"
+                    } else {
+                        "no pixels to read"
+                    },
                 );
                 zero_texture(gl, formats, &args, &storage);
             }
