@@ -168,6 +168,21 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the test binary and drives both sides from one script. These have no other reference — there is
   no conformance vector for an SPS we invented, only the bytes that have played — so agreeing with
   the C is the whole standard, and it is checked byte for byte rather than asserted.
+- **A refusal is scored, not dropped.** The sweep used to write a line for a readback that
+  succeeded and nothing at all for one that failed, so a port that started refusing what the
+  reference serves scored byte-identical -- the one class of divergence the oracle could not see,
+  and the one a hardening change makes real. Every refused readback now carries its resource, its
+  extent and the errno, 2132 lines across eight fixtures. One line more comes from a probe: a
+  transfer naming a handle nothing created, because no recorded guest ever asks for something
+  refused with an errno rather than with the `-1` that means "cannot serve this readback", and the
+  transfer entry points answer with a POSITIVE errno unlike most of the ABI. That probe caught the
+  port answering -22 where the reference answers 22.
+
+  The sweep does not ask for a planar resource as one RGBA texture. It is scored through its
+  IOSurface plane by plane, the request has no answer, and the C refuses it by poisoning the
+  context -- which dropped 893 later submits and replayed half the composite corpus into a dead
+  context. A sweep must not manufacture the guest-hostile request it exists to observe the absence
+  of.
 - `fixtures/` — pinned scores, recorded from the C build. `vrend.score` scores 310 offscreens and
   5 IOSurfaces from the classic corpus: the stock guest's GNOME session with its wallpaper, which
   arrives as one 64 MiB transfer and is why the recorder's default capacity is 512 MB. That one
@@ -210,15 +225,6 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   every plane inked and every hash distinct. Around the picture the fixtures gate 5018
   resources created with none refused, 334 IOSurface-backed, and the decode commands served to
   the end with no submit errors.
-
-  **A refused readback is not scored, and that is a hole.** The sweep writes a line for every
-  readback that succeeds and nothing at all for one that fails, so a renderer that starts refusing
-  what the reference serves passes the gate unchanged. It is not hypothetical here: virglrs
-  refuses a transfer of a planar-format texture by name, which fires 323 times on this corpus and
-  moves the answer the guest gets from -1 to EINVAL, and every fixture still matches. Closing it
-  means scoring the failures too -- and then this corpus shows 323 lines of deliberate deviation
-  from a reference that predates the same fix on the C side, so it wants deciding rather than
-  doing.
 
   **The conversion runs but its pixels are not hashed.** `convert_planes` fills a composite
   target's base RGBA texture from its two planes, and with both contexts in one pass it now
@@ -330,7 +336,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
 
   `vrend-av1.score` is 400 pictures across six clips, and it is **not scored on this host**: AV1
   decode needs M3-or-later silicon, so a machine without it advertises no AV1 and the corpus
-  measures nothing on either leg. It is recorded and scored on the AV1 machine, against a rig
+  measures nothing on either leg. A change to what the sweep records therefore reaches it only
+  when someone re-records it on that machine: a bulk re-record here cannot include it, and it lags
+  the others until then. It is recorded and scored on the AV1 machine, against a rig
   copied there rather than rebuilt: the bundles are self-contained after `make-rig.sh`, the two
   renderer prefixes and the KosmicKrisp/epoxy prefixes are a few tens of MB, and only the guest
   disk is large. What the copy does need is the prefixes' own dependencies present at the paths
@@ -415,7 +423,9 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   answer, so the C is the wrong golden here; reproducing its bug to keep a fixture green is not a
   trade worth making, and a permanently red line is a gate nobody reads. The deviation is in
   `docs/rust-rewrite.md`; every other line of this fixture, and every other fixture in the tree,
-  is still pinned from the C.
+  is still pinned from the C. **A bulk re-record overwrites that line with the C's answer**, and
+  it is one line in a fixture nobody rereads, so restore it deliberately afterwards -- the value
+  to restore is the one `res=52` carries, because the whole point is that the two reads agree.
   The last two lines are the depth-writing blit, which takes the blitter's other fragment
   shader — `gl_FragDepth` instead of a colour, and the depth attachment instead of colour
   attachment 0. Two disagreeing depth formats force it off `glBlitFramebuffer`, and the Z mask

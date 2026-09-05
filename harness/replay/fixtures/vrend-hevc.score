@@ -1,4 +1,5 @@
 loop 0 created 2732 failed 0 unrefs 2604 submits 2239 cmds 10924 xfers 600 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 5
+probe transfer-of-unknown-resource answered=22
 res=8 64x64 hash=be7fb0911be00383 ink=0/4096
 res=9 32x32 hash=b43a063055adc383 ink=0/1024
 res=10 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -8,7 +9,9 @@ res=13 64x64 hash=be7fb0911be00383 ink=0/4096
 res=14 32x32 hash=b43a063055adc383 ink=0/1024
 res=15 32x32 hash=b43a063055adc383 ink=0/1024
 res=16 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=17 32x32 failed=-1
 res=18 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=19 32x32 failed=-1
 res=20 64x64 hash=be7fb0911be00383 ink=0/4096
 res=21 64x64 hash=be7fb0911be00383 ink=0/4096
 res=22 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -28,7 +31,9 @@ res=35 64x64 hash=be7fb0911be00383 ink=0/4096
 res=36 32x32 hash=b43a063055adc383 ink=0/1024
 res=37 32x32 hash=b43a063055adc383 ink=0/1024
 res=38 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=39 32x32 failed=-1
 res=40 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=41 32x32 failed=-1
 res=42 64x64 hash=be7fb0911be00383 ink=0/4096
 res=43 64x64 hash=be7fb0911be00383 ink=0/4096
 res=44 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -48,7 +53,9 @@ res=57 64x64 hash=be7fb0911be00383 ink=0/4096
 res=58 32x32 hash=b43a063055adc383 ink=0/1024
 res=59 32x32 hash=b43a063055adc383 ink=0/1024
 res=60 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=61 32x32 failed=-1
 res=62 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=63 32x32 failed=-1
 res=64 64x64 hash=be7fb0911be00383 ink=0/4096
 res=65 64x64 hash=be7fb0911be00383 ink=0/4096
 res=66 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -68,7 +75,9 @@ res=79 64x64 hash=be7fb0911be00383 ink=0/4096
 res=80 32x32 hash=b43a063055adc383 ink=0/1024
 res=81 32x32 hash=b43a063055adc383 ink=0/1024
 res=82 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=83 32x32 failed=-1
 res=84 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=85 32x32 failed=-1
 res=86 64x64 hash=be7fb0911be00383 ink=0/4096
 res=87 64x64 hash=be7fb0911be00383 ink=0/4096
 res=88 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -88,7 +97,9 @@ res=101 64x64 hash=be7fb0911be00383 ink=0/4096
 res=102 32x32 hash=b43a063055adc383 ink=0/1024
 res=103 32x32 hash=b43a063055adc383 ink=0/1024
 res=104 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=105 32x32 failed=-1
 res=106 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=107 32x32 failed=-1
 res=108 64x64 hash=be7fb0911be00383 ink=0/4096
 res=109 64x64 hash=be7fb0911be00383 ink=0/4096
 res=110 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -108,7 +119,9 @@ res=123 64x64 hash=be7fb0911be00383 ink=0/4096
 res=124 32x32 hash=b43a063055adc383 ink=0/1024
 res=125 32x32 hash=b43a063055adc383 ink=0/1024
 res=126 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=127 32x32 failed=-1
 res=128 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=129 32x32 failed=-1
 res=130 64x64 hash=be7fb0911be00383 ink=0/4096
 res=131 64x64 hash=be7fb0911be00383 ink=0/4096
 res=132 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -128,7 +141,9 @@ res=145 64x64 hash=be7fb0911be00383 ink=0/4096
 res=146 32x32 hash=b43a063055adc383 ink=0/1024
 res=147 32x32 hash=b43a063055adc383 ink=0/1024
 res=148 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=149 32x32 failed=-1
 res=150 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=151 32x32 failed=-1
 res=152 64x64 hash=be7fb0911be00383 ink=0/4096
 res=153 64x64 hash=be7fb0911be00383 ink=0/4096
 res=154 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -148,7 +163,9 @@ res=167 64x64 hash=be7fb0911be00383 ink=0/4096
 res=168 32x32 hash=b43a063055adc383 ink=0/1024
 res=169 32x32 hash=b43a063055adc383 ink=0/1024
 res=170 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=171 32x32 failed=-1
 res=172 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=173 32x32 failed=-1
 res=174 64x64 hash=be7fb0911be00383 ink=0/4096
 res=175 64x64 hash=be7fb0911be00383 ink=0/4096
 res=176 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -168,7 +185,9 @@ res=189 64x64 hash=be7fb0911be00383 ink=0/4096
 res=190 32x32 hash=b43a063055adc383 ink=0/1024
 res=191 32x32 hash=b43a063055adc383 ink=0/1024
 res=192 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=193 32x32 failed=-1
 res=194 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=195 32x32 failed=-1
 res=196 64x64 hash=be7fb0911be00383 ink=0/4096
 res=197 64x64 hash=be7fb0911be00383 ink=0/4096
 res=198 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -188,7 +207,9 @@ res=211 64x64 hash=be7fb0911be00383 ink=0/4096
 res=212 32x32 hash=b43a063055adc383 ink=0/1024
 res=213 32x32 hash=b43a063055adc383 ink=0/1024
 res=214 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=215 32x32 failed=-1
 res=216 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=217 32x32 failed=-1
 res=218 64x64 hash=be7fb0911be00383 ink=0/4096
 res=219 64x64 hash=be7fb0911be00383 ink=0/4096
 res=220 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -208,7 +229,9 @@ res=233 64x64 hash=be7fb0911be00383 ink=0/4096
 res=234 32x32 hash=b43a063055adc383 ink=0/1024
 res=235 32x32 hash=b43a063055adc383 ink=0/1024
 res=236 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=237 32x32 failed=-1
 res=238 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=239 32x32 failed=-1
 res=240 64x64 hash=be7fb0911be00383 ink=0/4096
 res=241 64x64 hash=be7fb0911be00383 ink=0/4096
 res=242 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -228,7 +251,9 @@ res=255 64x64 hash=be7fb0911be00383 ink=0/4096
 res=256 32x32 hash=b43a063055adc383 ink=0/1024
 res=257 32x32 hash=b43a063055adc383 ink=0/1024
 res=258 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=259 32x32 failed=-1
 res=260 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=261 32x32 failed=-1
 res=262 64x64 hash=be7fb0911be00383 ink=0/4096
 res=263 64x64 hash=be7fb0911be00383 ink=0/4096
 res=264 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -248,7 +273,9 @@ res=277 64x64 hash=be7fb0911be00383 ink=0/4096
 res=278 32x32 hash=b43a063055adc383 ink=0/1024
 res=279 32x32 hash=b43a063055adc383 ink=0/1024
 res=280 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=281 32x32 failed=-1
 res=282 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=283 32x32 failed=-1
 res=284 64x64 hash=be7fb0911be00383 ink=0/4096
 res=285 64x64 hash=be7fb0911be00383 ink=0/4096
 res=286 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -268,7 +295,9 @@ res=299 64x64 hash=be7fb0911be00383 ink=0/4096
 res=300 32x32 hash=b43a063055adc383 ink=0/1024
 res=301 32x32 hash=b43a063055adc383 ink=0/1024
 res=302 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=303 32x32 failed=-1
 res=304 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=305 32x32 failed=-1
 res=306 64x64 hash=be7fb0911be00383 ink=0/4096
 res=307 64x64 hash=be7fb0911be00383 ink=0/4096
 res=308 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -288,7 +317,9 @@ res=321 64x64 hash=be7fb0911be00383 ink=0/4096
 res=322 32x32 hash=b43a063055adc383 ink=0/1024
 res=323 32x32 hash=b43a063055adc383 ink=0/1024
 res=324 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=325 32x32 failed=-1
 res=326 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=327 32x32 failed=-1
 res=328 64x64 hash=be7fb0911be00383 ink=0/4096
 res=329 64x64 hash=be7fb0911be00383 ink=0/4096
 res=330 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -308,7 +339,9 @@ res=343 64x64 hash=be7fb0911be00383 ink=0/4096
 res=344 32x32 hash=b43a063055adc383 ink=0/1024
 res=345 32x32 hash=b43a063055adc383 ink=0/1024
 res=346 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=347 32x32 failed=-1
 res=348 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=349 32x32 failed=-1
 res=350 64x64 hash=be7fb0911be00383 ink=0/4096
 res=351 64x64 hash=be7fb0911be00383 ink=0/4096
 res=352 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -328,7 +361,9 @@ res=365 64x64 hash=be7fb0911be00383 ink=0/4096
 res=366 32x32 hash=b43a063055adc383 ink=0/1024
 res=367 32x32 hash=b43a063055adc383 ink=0/1024
 res=368 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=369 32x32 failed=-1
 res=370 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=371 32x32 failed=-1
 res=372 64x64 hash=be7fb0911be00383 ink=0/4096
 res=373 64x64 hash=be7fb0911be00383 ink=0/4096
 res=374 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -348,7 +383,9 @@ res=387 64x64 hash=be7fb0911be00383 ink=0/4096
 res=388 32x32 hash=b43a063055adc383 ink=0/1024
 res=389 32x32 hash=b43a063055adc383 ink=0/1024
 res=390 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=391 32x32 failed=-1
 res=392 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=393 32x32 failed=-1
 res=394 64x64 hash=be7fb0911be00383 ink=0/4096
 res=395 64x64 hash=be7fb0911be00383 ink=0/4096
 res=396 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -368,7 +405,9 @@ res=409 64x64 hash=be7fb0911be00383 ink=0/4096
 res=410 32x32 hash=b43a063055adc383 ink=0/1024
 res=411 32x32 hash=b43a063055adc383 ink=0/1024
 res=412 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=413 32x32 failed=-1
 res=414 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=415 32x32 failed=-1
 res=416 64x64 hash=be7fb0911be00383 ink=0/4096
 res=417 64x64 hash=be7fb0911be00383 ink=0/4096
 res=418 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -388,7 +427,9 @@ res=431 64x64 hash=be7fb0911be00383 ink=0/4096
 res=432 32x32 hash=b43a063055adc383 ink=0/1024
 res=433 32x32 hash=b43a063055adc383 ink=0/1024
 res=434 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=435 32x32 failed=-1
 res=436 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=437 32x32 failed=-1
 res=438 64x64 hash=be7fb0911be00383 ink=0/4096
 res=439 64x64 hash=be7fb0911be00383 ink=0/4096
 res=440 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -408,7 +449,9 @@ res=453 64x64 hash=be7fb0911be00383 ink=0/4096
 res=454 32x32 hash=b43a063055adc383 ink=0/1024
 res=455 32x32 hash=b43a063055adc383 ink=0/1024
 res=456 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=457 32x32 failed=-1
 res=458 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=459 32x32 failed=-1
 res=460 64x64 hash=be7fb0911be00383 ink=0/4096
 res=461 64x64 hash=be7fb0911be00383 ink=0/4096
 res=462 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -428,7 +471,9 @@ res=475 64x64 hash=be7fb0911be00383 ink=0/4096
 res=476 32x32 hash=b43a063055adc383 ink=0/1024
 res=477 32x32 hash=b43a063055adc383 ink=0/1024
 res=478 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=479 32x32 failed=-1
 res=480 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=481 32x32 failed=-1
 res=482 64x64 hash=be7fb0911be00383 ink=0/4096
 res=483 64x64 hash=be7fb0911be00383 ink=0/4096
 res=484 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -448,7 +493,9 @@ res=497 64x64 hash=be7fb0911be00383 ink=0/4096
 res=498 32x32 hash=b43a063055adc383 ink=0/1024
 res=499 32x32 hash=b43a063055adc383 ink=0/1024
 res=500 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=501 32x32 failed=-1
 res=502 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=503 32x32 failed=-1
 res=504 64x64 hash=be7fb0911be00383 ink=0/4096
 res=505 64x64 hash=be7fb0911be00383 ink=0/4096
 res=506 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -468,7 +515,9 @@ res=519 64x64 hash=be7fb0911be00383 ink=0/4096
 res=520 32x32 hash=b43a063055adc383 ink=0/1024
 res=521 32x32 hash=b43a063055adc383 ink=0/1024
 res=522 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=523 32x32 failed=-1
 res=524 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=525 32x32 failed=-1
 res=526 64x64 hash=be7fb0911be00383 ink=0/4096
 res=527 64x64 hash=be7fb0911be00383 ink=0/4096
 res=528 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -488,7 +537,9 @@ res=541 64x64 hash=be7fb0911be00383 ink=0/4096
 res=542 32x32 hash=b43a063055adc383 ink=0/1024
 res=543 32x32 hash=b43a063055adc383 ink=0/1024
 res=544 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=545 32x32 failed=-1
 res=546 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=547 32x32 failed=-1
 res=548 64x64 hash=be7fb0911be00383 ink=0/4096
 res=549 64x64 hash=be7fb0911be00383 ink=0/4096
 res=550 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -508,7 +559,9 @@ res=563 64x64 hash=be7fb0911be00383 ink=0/4096
 res=564 32x32 hash=b43a063055adc383 ink=0/1024
 res=565 32x32 hash=b43a063055adc383 ink=0/1024
 res=566 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=567 32x32 failed=-1
 res=568 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=569 32x32 failed=-1
 res=570 64x64 hash=be7fb0911be00383 ink=0/4096
 res=571 64x64 hash=be7fb0911be00383 ink=0/4096
 res=572 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -528,7 +581,9 @@ res=585 64x64 hash=be7fb0911be00383 ink=0/4096
 res=586 32x32 hash=b43a063055adc383 ink=0/1024
 res=587 32x32 hash=b43a063055adc383 ink=0/1024
 res=588 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=589 32x32 failed=-1
 res=590 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=591 32x32 failed=-1
 res=592 64x64 hash=be7fb0911be00383 ink=0/4096
 res=593 64x64 hash=be7fb0911be00383 ink=0/4096
 res=594 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -548,7 +603,9 @@ res=607 64x64 hash=be7fb0911be00383 ink=0/4096
 res=608 32x32 hash=b43a063055adc383 ink=0/1024
 res=609 32x32 hash=b43a063055adc383 ink=0/1024
 res=610 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=611 32x32 failed=-1
 res=612 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=613 32x32 failed=-1
 res=614 64x64 hash=be7fb0911be00383 ink=0/4096
 res=615 64x64 hash=be7fb0911be00383 ink=0/4096
 res=616 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -568,7 +625,9 @@ res=629 64x64 hash=be7fb0911be00383 ink=0/4096
 res=630 32x32 hash=b43a063055adc383 ink=0/1024
 res=631 32x32 hash=b43a063055adc383 ink=0/1024
 res=632 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=633 32x32 failed=-1
 res=634 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=635 32x32 failed=-1
 res=636 64x64 hash=be7fb0911be00383 ink=0/4096
 res=637 64x64 hash=be7fb0911be00383 ink=0/4096
 res=638 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -588,7 +647,9 @@ res=651 64x64 hash=be7fb0911be00383 ink=0/4096
 res=652 32x32 hash=b43a063055adc383 ink=0/1024
 res=653 32x32 hash=b43a063055adc383 ink=0/1024
 res=654 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=655 32x32 failed=-1
 res=656 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=657 32x32 failed=-1
 res=658 64x64 hash=be7fb0911be00383 ink=0/4096
 res=659 64x64 hash=be7fb0911be00383 ink=0/4096
 res=660 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -608,7 +669,9 @@ res=673 64x64 hash=be7fb0911be00383 ink=0/4096
 res=674 32x32 hash=b43a063055adc383 ink=0/1024
 res=675 32x32 hash=b43a063055adc383 ink=0/1024
 res=676 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=677 32x32 failed=-1
 res=678 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=679 32x32 failed=-1
 res=680 64x64 hash=be7fb0911be00383 ink=0/4096
 res=681 64x64 hash=be7fb0911be00383 ink=0/4096
 res=682 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -628,7 +691,9 @@ res=695 64x64 hash=be7fb0911be00383 ink=0/4096
 res=696 32x32 hash=b43a063055adc383 ink=0/1024
 res=697 32x32 hash=b43a063055adc383 ink=0/1024
 res=698 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=699 32x32 failed=-1
 res=700 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=701 32x32 failed=-1
 res=703 64x64 hash=be7fb0911be00383 ink=0/4096
 res=704 64x64 hash=be7fb0911be00383 ink=0/4096
 res=705 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -648,7 +713,9 @@ res=718 64x64 hash=be7fb0911be00383 ink=0/4096
 res=719 32x32 hash=b43a063055adc383 ink=0/1024
 res=720 32x32 hash=b43a063055adc383 ink=0/1024
 res=721 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=722 32x32 failed=-1
 res=723 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=724 32x32 failed=-1
 res=725 64x64 hash=be7fb0911be00383 ink=0/4096
 res=726 64x64 hash=be7fb0911be00383 ink=0/4096
 res=727 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -668,7 +735,9 @@ res=740 64x64 hash=be7fb0911be00383 ink=0/4096
 res=741 32x32 hash=b43a063055adc383 ink=0/1024
 res=742 32x32 hash=b43a063055adc383 ink=0/1024
 res=743 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=744 32x32 failed=-1
 res=745 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=746 32x32 failed=-1
 res=747 64x64 hash=be7fb0911be00383 ink=0/4096
 res=748 64x64 hash=be7fb0911be00383 ink=0/4096
 res=749 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -688,7 +757,9 @@ res=762 64x64 hash=be7fb0911be00383 ink=0/4096
 res=763 32x32 hash=b43a063055adc383 ink=0/1024
 res=764 32x32 hash=b43a063055adc383 ink=0/1024
 res=765 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=766 32x32 failed=-1
 res=767 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=768 32x32 failed=-1
 res=769 64x64 hash=be7fb0911be00383 ink=0/4096
 res=770 64x64 hash=be7fb0911be00383 ink=0/4096
 res=771 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -708,7 +779,9 @@ res=784 64x64 hash=be7fb0911be00383 ink=0/4096
 res=785 32x32 hash=b43a063055adc383 ink=0/1024
 res=786 32x32 hash=b43a063055adc383 ink=0/1024
 res=787 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=788 32x32 failed=-1
 res=789 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=790 32x32 failed=-1
 res=791 64x64 hash=be7fb0911be00383 ink=0/4096
 res=792 64x64 hash=be7fb0911be00383 ink=0/4096
 res=793 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -728,7 +801,9 @@ res=806 64x64 hash=be7fb0911be00383 ink=0/4096
 res=807 32x32 hash=b43a063055adc383 ink=0/1024
 res=808 32x32 hash=b43a063055adc383 ink=0/1024
 res=809 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=810 32x32 failed=-1
 res=811 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=812 32x32 failed=-1
 res=813 64x64 hash=be7fb0911be00383 ink=0/4096
 res=814 64x64 hash=be7fb0911be00383 ink=0/4096
 res=815 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -748,7 +823,9 @@ res=828 64x64 hash=be7fb0911be00383 ink=0/4096
 res=829 32x32 hash=b43a063055adc383 ink=0/1024
 res=830 32x32 hash=b43a063055adc383 ink=0/1024
 res=831 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=832 32x32 failed=-1
 res=833 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=834 32x32 failed=-1
 res=835 64x64 hash=be7fb0911be00383 ink=0/4096
 res=836 64x64 hash=be7fb0911be00383 ink=0/4096
 res=837 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -768,7 +845,9 @@ res=850 64x64 hash=be7fb0911be00383 ink=0/4096
 res=851 32x32 hash=b43a063055adc383 ink=0/1024
 res=852 32x32 hash=b43a063055adc383 ink=0/1024
 res=853 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=854 32x32 failed=-1
 res=855 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=856 32x32 failed=-1
 res=857 64x64 hash=be7fb0911be00383 ink=0/4096
 res=858 64x64 hash=be7fb0911be00383 ink=0/4096
 res=859 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -788,7 +867,9 @@ res=872 64x64 hash=be7fb0911be00383 ink=0/4096
 res=873 32x32 hash=b43a063055adc383 ink=0/1024
 res=874 32x32 hash=b43a063055adc383 ink=0/1024
 res=875 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=876 32x32 failed=-1
 res=877 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=878 32x32 failed=-1
 res=879 64x64 hash=be7fb0911be00383 ink=0/4096
 res=880 64x64 hash=be7fb0911be00383 ink=0/4096
 res=881 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -808,7 +889,9 @@ res=894 64x64 hash=be7fb0911be00383 ink=0/4096
 res=895 32x32 hash=b43a063055adc383 ink=0/1024
 res=896 32x32 hash=b43a063055adc383 ink=0/1024
 res=897 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=898 32x32 failed=-1
 res=899 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=900 32x32 failed=-1
 res=901 64x64 hash=be7fb0911be00383 ink=0/4096
 res=902 64x64 hash=be7fb0911be00383 ink=0/4096
 res=903 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -828,7 +911,9 @@ res=916 64x64 hash=be7fb0911be00383 ink=0/4096
 res=917 32x32 hash=b43a063055adc383 ink=0/1024
 res=918 32x32 hash=b43a063055adc383 ink=0/1024
 res=919 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=920 32x32 failed=-1
 res=921 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=922 32x32 failed=-1
 res=923 64x64 hash=be7fb0911be00383 ink=0/4096
 res=924 64x64 hash=be7fb0911be00383 ink=0/4096
 res=925 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -848,7 +933,9 @@ res=938 64x64 hash=be7fb0911be00383 ink=0/4096
 res=939 32x32 hash=b43a063055adc383 ink=0/1024
 res=940 32x32 hash=b43a063055adc383 ink=0/1024
 res=941 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=942 32x32 failed=-1
 res=943 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=944 32x32 failed=-1
 res=945 64x64 hash=be7fb0911be00383 ink=0/4096
 res=946 64x64 hash=be7fb0911be00383 ink=0/4096
 res=947 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -868,7 +955,9 @@ res=960 64x64 hash=be7fb0911be00383 ink=0/4096
 res=961 32x32 hash=b43a063055adc383 ink=0/1024
 res=962 32x32 hash=b43a063055adc383 ink=0/1024
 res=963 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=964 32x32 failed=-1
 res=965 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=966 32x32 failed=-1
 res=967 64x64 hash=be7fb0911be00383 ink=0/4096
 res=968 64x64 hash=be7fb0911be00383 ink=0/4096
 res=969 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -888,7 +977,9 @@ res=982 64x64 hash=be7fb0911be00383 ink=0/4096
 res=983 32x32 hash=b43a063055adc383 ink=0/1024
 res=984 32x32 hash=b43a063055adc383 ink=0/1024
 res=985 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=986 32x32 failed=-1
 res=987 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=988 32x32 failed=-1
 res=989 64x64 hash=be7fb0911be00383 ink=0/4096
 res=990 64x64 hash=be7fb0911be00383 ink=0/4096
 res=991 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -908,7 +999,9 @@ res=1004 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1005 32x32 hash=b43a063055adc383 ink=0/1024
 res=1006 32x32 hash=b43a063055adc383 ink=0/1024
 res=1007 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1008 32x32 failed=-1
 res=1009 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1010 32x32 failed=-1
 res=1011 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1012 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1013 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -928,7 +1021,9 @@ res=1026 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1027 32x32 hash=b43a063055adc383 ink=0/1024
 res=1028 32x32 hash=b43a063055adc383 ink=0/1024
 res=1029 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1030 32x32 failed=-1
 res=1031 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1032 32x32 failed=-1
 res=1033 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1034 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1035 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -948,7 +1043,9 @@ res=1048 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1049 32x32 hash=b43a063055adc383 ink=0/1024
 res=1050 32x32 hash=b43a063055adc383 ink=0/1024
 res=1051 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1052 32x32 failed=-1
 res=1053 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1054 32x32 failed=-1
 res=1055 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1056 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1057 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -968,7 +1065,9 @@ res=1070 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1071 32x32 hash=b43a063055adc383 ink=0/1024
 res=1072 32x32 hash=b43a063055adc383 ink=0/1024
 res=1073 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1074 32x32 failed=-1
 res=1075 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1076 32x32 failed=-1
 res=1077 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1078 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1079 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -988,7 +1087,9 @@ res=1092 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1093 32x32 hash=b43a063055adc383 ink=0/1024
 res=1094 32x32 hash=b43a063055adc383 ink=0/1024
 res=1095 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1096 32x32 failed=-1
 res=1097 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1098 32x32 failed=-1
 res=1099 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1100 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1101 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1008,7 +1109,9 @@ res=1114 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1115 32x32 hash=b43a063055adc383 ink=0/1024
 res=1116 32x32 hash=b43a063055adc383 ink=0/1024
 res=1117 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1118 32x32 failed=-1
 res=1119 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1120 32x32 failed=-1
 res=1121 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1122 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1123 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1028,7 +1131,9 @@ res=1136 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1137 32x32 hash=b43a063055adc383 ink=0/1024
 res=1138 32x32 hash=b43a063055adc383 ink=0/1024
 res=1139 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1140 32x32 failed=-1
 res=1141 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1142 32x32 failed=-1
 res=1143 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1144 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1145 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1048,7 +1153,9 @@ res=1158 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1159 32x32 hash=b43a063055adc383 ink=0/1024
 res=1160 32x32 hash=b43a063055adc383 ink=0/1024
 res=1161 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1162 32x32 failed=-1
 res=1163 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1164 32x32 failed=-1
 res=1165 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1166 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1167 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1068,7 +1175,9 @@ res=1180 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1181 32x32 hash=b43a063055adc383 ink=0/1024
 res=1182 32x32 hash=b43a063055adc383 ink=0/1024
 res=1183 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1184 32x32 failed=-1
 res=1185 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1186 32x32 failed=-1
 res=1187 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1188 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1189 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1088,7 +1197,9 @@ res=1202 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1203 32x32 hash=b43a063055adc383 ink=0/1024
 res=1204 32x32 hash=b43a063055adc383 ink=0/1024
 res=1205 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1206 32x32 failed=-1
 res=1207 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1208 32x32 failed=-1
 res=1209 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1210 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1211 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1108,7 +1219,9 @@ res=1225 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1226 32x32 hash=b43a063055adc383 ink=0/1024
 res=1227 32x32 hash=b43a063055adc383 ink=0/1024
 res=1228 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1229 32x32 failed=-1
 res=1230 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1231 32x32 failed=-1
 res=1232 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1233 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1234 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1128,7 +1241,9 @@ res=1248 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1249 32x32 hash=b43a063055adc383 ink=0/1024
 res=1250 32x32 hash=b43a063055adc383 ink=0/1024
 res=1251 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1252 32x32 failed=-1
 res=1253 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1254 32x32 failed=-1
 res=1255 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1256 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1257 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1148,7 +1263,9 @@ res=1271 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1272 32x32 hash=b43a063055adc383 ink=0/1024
 res=1273 32x32 hash=b43a063055adc383 ink=0/1024
 res=1274 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1275 32x32 failed=-1
 res=1276 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1277 32x32 failed=-1
 res=1278 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1279 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1280 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1188,7 +1305,9 @@ res=1457 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1458 32x32 hash=b43a063055adc383 ink=0/1024
 res=1459 32x32 hash=b43a063055adc383 ink=0/1024
 res=1460 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1461 32x32 failed=-1
 res=1462 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1463 32x32 failed=-1
 res=1464 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1465 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1466 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1208,7 +1327,9 @@ res=1479 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1480 32x32 hash=b43a063055adc383 ink=0/1024
 res=1481 32x32 hash=b43a063055adc383 ink=0/1024
 res=1482 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1483 32x32 failed=-1
 res=1484 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1485 32x32 failed=-1
 res=1486 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1487 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1488 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1228,7 +1349,9 @@ res=1501 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1502 32x32 hash=b43a063055adc383 ink=0/1024
 res=1503 32x32 hash=b43a063055adc383 ink=0/1024
 res=1504 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1505 32x32 failed=-1
 res=1506 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1507 32x32 failed=-1
 res=1508 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1509 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1510 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1248,7 +1371,9 @@ res=1523 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1524 32x32 hash=b43a063055adc383 ink=0/1024
 res=1525 32x32 hash=b43a063055adc383 ink=0/1024
 res=1526 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1527 32x32 failed=-1
 res=1528 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1529 32x32 failed=-1
 res=1530 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1531 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1532 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1268,7 +1393,9 @@ res=1545 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1546 32x32 hash=b43a063055adc383 ink=0/1024
 res=1547 32x32 hash=b43a063055adc383 ink=0/1024
 res=1548 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1549 32x32 failed=-1
 res=1550 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1551 32x32 failed=-1
 res=1552 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1553 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1554 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1288,7 +1415,9 @@ res=1567 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1568 32x32 hash=b43a063055adc383 ink=0/1024
 res=1569 32x32 hash=b43a063055adc383 ink=0/1024
 res=1570 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1571 32x32 failed=-1
 res=1572 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1573 32x32 failed=-1
 res=1574 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1575 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1576 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1308,7 +1437,9 @@ res=1589 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1590 32x32 hash=b43a063055adc383 ink=0/1024
 res=1591 32x32 hash=b43a063055adc383 ink=0/1024
 res=1592 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1593 32x32 failed=-1
 res=1594 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1595 32x32 failed=-1
 res=1596 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1597 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1598 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1328,7 +1459,9 @@ res=1611 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1612 32x32 hash=b43a063055adc383 ink=0/1024
 res=1613 32x32 hash=b43a063055adc383 ink=0/1024
 res=1614 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1615 32x32 failed=-1
 res=1616 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1617 32x32 failed=-1
 res=1618 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1619 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1620 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1348,7 +1481,9 @@ res=1633 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1634 32x32 hash=b43a063055adc383 ink=0/1024
 res=1635 32x32 hash=b43a063055adc383 ink=0/1024
 res=1636 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1637 32x32 failed=-1
 res=1638 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1639 32x32 failed=-1
 res=1640 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1641 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1642 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1368,7 +1503,9 @@ res=1655 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1656 32x32 hash=b43a063055adc383 ink=0/1024
 res=1657 32x32 hash=b43a063055adc383 ink=0/1024
 res=1658 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1659 32x32 failed=-1
 res=1660 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1661 32x32 failed=-1
 res=1662 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1663 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1664 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1388,7 +1525,9 @@ res=1677 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1678 32x32 hash=b43a063055adc383 ink=0/1024
 res=1679 32x32 hash=b43a063055adc383 ink=0/1024
 res=1680 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1681 32x32 failed=-1
 res=1682 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1683 32x32 failed=-1
 res=1684 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1685 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1686 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1408,7 +1547,9 @@ res=1699 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1700 32x32 hash=b43a063055adc383 ink=0/1024
 res=1701 32x32 hash=b43a063055adc383 ink=0/1024
 res=1702 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1703 32x32 failed=-1
 res=1704 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1705 32x32 failed=-1
 res=1706 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1707 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1708 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1428,7 +1569,9 @@ res=1721 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1722 32x32 hash=b43a063055adc383 ink=0/1024
 res=1723 32x32 hash=b43a063055adc383 ink=0/1024
 res=1724 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1725 32x32 failed=-1
 res=1726 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1727 32x32 failed=-1
 res=1728 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1729 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1730 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1448,7 +1591,9 @@ res=1743 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1744 32x32 hash=b43a063055adc383 ink=0/1024
 res=1745 32x32 hash=b43a063055adc383 ink=0/1024
 res=1746 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1747 32x32 failed=-1
 res=1748 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1749 32x32 failed=-1
 res=1750 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1751 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1752 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1468,7 +1613,9 @@ res=1765 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1766 32x32 hash=b43a063055adc383 ink=0/1024
 res=1767 32x32 hash=b43a063055adc383 ink=0/1024
 res=1768 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1769 32x32 failed=-1
 res=1770 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1771 32x32 failed=-1
 res=1772 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1773 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1774 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1488,7 +1635,9 @@ res=1787 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1788 32x32 hash=b43a063055adc383 ink=0/1024
 res=1789 32x32 hash=b43a063055adc383 ink=0/1024
 res=1790 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1791 32x32 failed=-1
 res=1792 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1793 32x32 failed=-1
 res=1794 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1795 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1796 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1508,7 +1657,9 @@ res=1809 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1810 32x32 hash=b43a063055adc383 ink=0/1024
 res=1811 32x32 hash=b43a063055adc383 ink=0/1024
 res=1812 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1813 32x32 failed=-1
 res=1814 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1815 32x32 failed=-1
 res=1816 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1817 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1818 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1528,7 +1679,9 @@ res=1831 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1832 32x32 hash=b43a063055adc383 ink=0/1024
 res=1833 32x32 hash=b43a063055adc383 ink=0/1024
 res=1834 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1835 32x32 failed=-1
 res=1836 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1837 32x32 failed=-1
 res=1838 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1839 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1840 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1548,7 +1701,9 @@ res=1853 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1854 32x32 hash=b43a063055adc383 ink=0/1024
 res=1855 32x32 hash=b43a063055adc383 ink=0/1024
 res=1856 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1857 32x32 failed=-1
 res=1858 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1859 32x32 failed=-1
 res=1860 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1861 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1862 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1568,7 +1723,9 @@ res=1875 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1876 32x32 hash=b43a063055adc383 ink=0/1024
 res=1877 32x32 hash=b43a063055adc383 ink=0/1024
 res=1878 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1879 32x32 failed=-1
 res=1880 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1881 32x32 failed=-1
 res=1882 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1883 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1884 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1588,7 +1745,9 @@ res=1897 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1898 32x32 hash=b43a063055adc383 ink=0/1024
 res=1899 32x32 hash=b43a063055adc383 ink=0/1024
 res=1900 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1901 32x32 failed=-1
 res=1902 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1903 32x32 failed=-1
 res=1904 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1905 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1906 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1608,7 +1767,9 @@ res=1919 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1920 32x32 hash=b43a063055adc383 ink=0/1024
 res=1921 32x32 hash=b43a063055adc383 ink=0/1024
 res=1922 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1923 32x32 failed=-1
 res=1924 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1925 32x32 failed=-1
 res=1926 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1927 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1928 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1628,7 +1789,9 @@ res=1941 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1942 32x32 hash=b43a063055adc383 ink=0/1024
 res=1943 32x32 hash=b43a063055adc383 ink=0/1024
 res=1944 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1945 32x32 failed=-1
 res=1946 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1947 32x32 failed=-1
 res=1948 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1949 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1950 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1648,7 +1811,9 @@ res=1963 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1964 32x32 hash=b43a063055adc383 ink=0/1024
 res=1965 32x32 hash=b43a063055adc383 ink=0/1024
 res=1966 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1967 32x32 failed=-1
 res=1968 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1969 32x32 failed=-1
 res=1970 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1971 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1972 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1668,7 +1833,9 @@ res=1985 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1986 32x32 hash=b43a063055adc383 ink=0/1024
 res=1987 32x32 hash=b43a063055adc383 ink=0/1024
 res=1988 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1989 32x32 failed=-1
 res=1990 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=1991 32x32 failed=-1
 res=1992 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1993 64x64 hash=be7fb0911be00383 ink=0/4096
 res=1994 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1688,7 +1855,9 @@ res=2007 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2008 32x32 hash=b43a063055adc383 ink=0/1024
 res=2009 32x32 hash=b43a063055adc383 ink=0/1024
 res=2010 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2011 32x32 failed=-1
 res=2012 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2013 32x32 failed=-1
 res=2014 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2015 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2016 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1708,7 +1877,9 @@ res=2029 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2030 32x32 hash=b43a063055adc383 ink=0/1024
 res=2031 32x32 hash=b43a063055adc383 ink=0/1024
 res=2032 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2033 32x32 failed=-1
 res=2034 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2035 32x32 failed=-1
 res=2036 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2037 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2038 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1728,7 +1899,9 @@ res=2051 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2052 32x32 hash=b43a063055adc383 ink=0/1024
 res=2053 32x32 hash=b43a063055adc383 ink=0/1024
 res=2054 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2055 32x32 failed=-1
 res=2056 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2057 32x32 failed=-1
 res=2058 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2059 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2060 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1748,7 +1921,9 @@ res=2073 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2074 32x32 hash=b43a063055adc383 ink=0/1024
 res=2075 32x32 hash=b43a063055adc383 ink=0/1024
 res=2076 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2077 32x32 failed=-1
 res=2078 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2079 32x32 failed=-1
 res=2080 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2081 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2082 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1768,7 +1943,9 @@ res=2095 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2096 32x32 hash=b43a063055adc383 ink=0/1024
 res=2097 32x32 hash=b43a063055adc383 ink=0/1024
 res=2098 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2099 32x32 failed=-1
 res=2100 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2101 32x32 failed=-1
 res=2102 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2103 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2104 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1788,7 +1965,9 @@ res=2117 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2118 32x32 hash=b43a063055adc383 ink=0/1024
 res=2119 32x32 hash=b43a063055adc383 ink=0/1024
 res=2120 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2121 32x32 failed=-1
 res=2122 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2123 32x32 failed=-1
 res=2124 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2125 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2126 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1808,7 +1987,9 @@ res=2139 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2140 32x32 hash=b43a063055adc383 ink=0/1024
 res=2141 32x32 hash=b43a063055adc383 ink=0/1024
 res=2142 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2143 32x32 failed=-1
 res=2144 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2145 32x32 failed=-1
 res=2146 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2147 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2148 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1828,7 +2009,9 @@ res=2161 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2162 32x32 hash=b43a063055adc383 ink=0/1024
 res=2163 32x32 hash=b43a063055adc383 ink=0/1024
 res=2164 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2165 32x32 failed=-1
 res=2166 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2167 32x32 failed=-1
 res=2168 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2169 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2170 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1848,7 +2031,9 @@ res=2183 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2184 32x32 hash=b43a063055adc383 ink=0/1024
 res=2185 32x32 hash=b43a063055adc383 ink=0/1024
 res=2186 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2187 32x32 failed=-1
 res=2188 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2189 32x32 failed=-1
 res=2190 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2191 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2192 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1868,7 +2053,9 @@ res=2205 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2206 32x32 hash=b43a063055adc383 ink=0/1024
 res=2207 32x32 hash=b43a063055adc383 ink=0/1024
 res=2208 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2209 32x32 failed=-1
 res=2210 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2211 32x32 failed=-1
 res=2212 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2213 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2214 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1888,7 +2075,9 @@ res=2227 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2228 32x32 hash=b43a063055adc383 ink=0/1024
 res=2229 32x32 hash=b43a063055adc383 ink=0/1024
 res=2230 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2231 32x32 failed=-1
 res=2232 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2233 32x32 failed=-1
 res=2234 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2235 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2236 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1908,7 +2097,9 @@ res=2249 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2250 32x32 hash=b43a063055adc383 ink=0/1024
 res=2251 32x32 hash=b43a063055adc383 ink=0/1024
 res=2252 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2253 32x32 failed=-1
 res=2254 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2255 32x32 failed=-1
 res=2256 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2257 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2258 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1928,7 +2119,9 @@ res=2271 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2272 32x32 hash=b43a063055adc383 ink=0/1024
 res=2273 32x32 hash=b43a063055adc383 ink=0/1024
 res=2274 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2275 32x32 failed=-1
 res=2276 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2277 32x32 failed=-1
 res=2278 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2279 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2280 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1948,7 +2141,9 @@ res=2293 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2294 32x32 hash=b43a063055adc383 ink=0/1024
 res=2295 32x32 hash=b43a063055adc383 ink=0/1024
 res=2296 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2297 32x32 failed=-1
 res=2298 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2299 32x32 failed=-1
 res=2300 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2301 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2302 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1968,7 +2163,9 @@ res=2315 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2316 32x32 hash=b43a063055adc383 ink=0/1024
 res=2317 32x32 hash=b43a063055adc383 ink=0/1024
 res=2318 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2319 32x32 failed=-1
 res=2320 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2321 32x32 failed=-1
 res=2322 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2323 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2324 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -1988,7 +2185,9 @@ res=2337 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2338 32x32 hash=b43a063055adc383 ink=0/1024
 res=2339 32x32 hash=b43a063055adc383 ink=0/1024
 res=2340 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2341 32x32 failed=-1
 res=2342 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2343 32x32 failed=-1
 res=2344 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2345 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2346 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2008,7 +2207,9 @@ res=2359 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2360 32x32 hash=b43a063055adc383 ink=0/1024
 res=2361 32x32 hash=b43a063055adc383 ink=0/1024
 res=2362 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2363 32x32 failed=-1
 res=2364 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2365 32x32 failed=-1
 res=2366 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2367 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2368 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2028,7 +2229,9 @@ res=2381 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2382 32x32 hash=b43a063055adc383 ink=0/1024
 res=2383 32x32 hash=b43a063055adc383 ink=0/1024
 res=2384 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2385 32x32 failed=-1
 res=2386 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2387 32x32 failed=-1
 res=2388 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2389 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2390 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2048,7 +2251,9 @@ res=2403 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2404 32x32 hash=b43a063055adc383 ink=0/1024
 res=2405 32x32 hash=b43a063055adc383 ink=0/1024
 res=2406 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2407 32x32 failed=-1
 res=2408 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2409 32x32 failed=-1
 res=2410 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2411 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2412 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2068,7 +2273,9 @@ res=2425 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2426 32x32 hash=b43a063055adc383 ink=0/1024
 res=2427 32x32 hash=b43a063055adc383 ink=0/1024
 res=2428 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2429 32x32 failed=-1
 res=2430 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2431 32x32 failed=-1
 res=2432 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2433 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2434 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2088,7 +2295,9 @@ res=2447 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2448 32x32 hash=b43a063055adc383 ink=0/1024
 res=2449 32x32 hash=b43a063055adc383 ink=0/1024
 res=2450 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2451 32x32 failed=-1
 res=2452 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2453 32x32 failed=-1
 res=2454 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2455 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2456 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2108,7 +2317,9 @@ res=2469 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2470 32x32 hash=b43a063055adc383 ink=0/1024
 res=2471 32x32 hash=b43a063055adc383 ink=0/1024
 res=2472 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2473 32x32 failed=-1
 res=2474 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2475 32x32 failed=-1
 res=2476 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2477 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2478 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2128,7 +2339,9 @@ res=2491 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2492 32x32 hash=b43a063055adc383 ink=0/1024
 res=2493 32x32 hash=b43a063055adc383 ink=0/1024
 res=2494 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2495 32x32 failed=-1
 res=2496 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2497 32x32 failed=-1
 res=2498 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2499 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2500 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2148,7 +2361,9 @@ res=2513 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2514 32x32 hash=b43a063055adc383 ink=0/1024
 res=2515 32x32 hash=b43a063055adc383 ink=0/1024
 res=2516 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2517 32x32 failed=-1
 res=2518 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2519 32x32 failed=-1
 res=2520 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2521 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2522 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2168,7 +2383,9 @@ res=2535 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2536 32x32 hash=b43a063055adc383 ink=0/1024
 res=2537 32x32 hash=b43a063055adc383 ink=0/1024
 res=2538 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2539 32x32 failed=-1
 res=2540 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2541 32x32 failed=-1
 res=2542 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2543 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2544 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2188,7 +2405,9 @@ res=2557 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2558 32x32 hash=b43a063055adc383 ink=0/1024
 res=2559 32x32 hash=b43a063055adc383 ink=0/1024
 res=2560 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2561 32x32 failed=-1
 res=2562 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2563 32x32 failed=-1
 res=2564 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2565 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2566 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2208,7 +2427,9 @@ res=2579 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2580 32x32 hash=b43a063055adc383 ink=0/1024
 res=2581 32x32 hash=b43a063055adc383 ink=0/1024
 res=2582 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2583 32x32 failed=-1
 res=2584 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2585 32x32 failed=-1
 res=2586 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2587 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2588 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2228,7 +2449,9 @@ res=2601 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2602 32x32 hash=b43a063055adc383 ink=0/1024
 res=2603 32x32 hash=b43a063055adc383 ink=0/1024
 res=2604 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2605 32x32 failed=-1
 res=2606 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2607 32x32 failed=-1
 res=2608 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2609 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2610 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2248,7 +2471,9 @@ res=2623 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2624 32x32 hash=b43a063055adc383 ink=0/1024
 res=2625 32x32 hash=b43a063055adc383 ink=0/1024
 res=2626 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2627 32x32 failed=-1
 res=2628 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2629 32x32 failed=-1
 res=2630 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2631 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2632 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2268,7 +2493,9 @@ res=2645 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2646 32x32 hash=b43a063055adc383 ink=0/1024
 res=2647 32x32 hash=b43a063055adc383 ink=0/1024
 res=2648 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2649 32x32 failed=-1
 res=2650 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2651 32x32 failed=-1
 res=2652 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2653 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2654 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2288,7 +2515,9 @@ res=2668 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2669 32x32 hash=b43a063055adc383 ink=0/1024
 res=2670 32x32 hash=b43a063055adc383 ink=0/1024
 res=2671 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2672 32x32 failed=-1
 res=2673 64x64 hash=be7fb0911be00383 ink=0/4096
+readback res=2674 32x32 failed=-1
 res=2675 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2676 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2677 64x64 hash=be7fb0911be00383 ink=0/4096
