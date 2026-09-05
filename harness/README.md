@@ -184,21 +184,33 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
-  `vrend-composite.score` is hardware decode into the **composite planar** target -- one NV12
-  resource with its planes chained behind it, against the per-plane shape `vrend-vp9stock` holds.
-  Recorded from the enhanced guest with H.264 and VP9 played one after the other, so the decodes
-  land in two contexts: **`--ctx 8` is the H.264 leg and is what the fixture pins**, and `--ctx 10`
-  is the VP9 one, scoreable the same way. `--ctx` is not optional here for the usual reason -- the
-  busiest context is the shell's, and scoring it measures the desktop and none of the decode.
+  `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
+  **composite planar** target -- one NV12 resource with its two planes chained behind it, against
+  the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
+  with H.264 and VP9 played one after the other in Showtime.
 
-  **What it does not measure is the decoded picture.** A composite target is an IOSurface-backed
-  planar surface: the sweep can read a resource as a GL texture or as a BGRA IOSurface, and a
-  planar surface is neither, so every decode target scores `sync=-22 read-failed=-22` on both
-  legs. What the fixture gates is everything around the picture -- 5018 resources created with
-  none refused, 334 IOSurface-backed, the decode commands served to the end with no submit
-  errors, the base textures staying untouched, and the 325 inked resources the session draws.
-  A content oracle for this shape needs the sweep to read a planar surface plane by plane, which
-  it cannot yet; until then `vrend-vp9stock` remains the corpus that scores decoded pixels.
+  **Showtime splits each playback across two virgl contexts, and only one of them decodes.**
+  The player's GL context draws the video (`--ctx 8` for H.264, `--ctx 10` for VP9); its decoder
+  runs in a context of its own (`--ctx 9` and `--ctx 11`), and that is where every
+  `DECODE_BITSTREAM` and every bitstream upload lands. The two fixtures pin the decoder contexts,
+  because a player context replays with its bitstream nowhere and every plane reads back zero.
+  The way to find the pair in a new capture is to count `XFERDATA` records per context: the
+  decoder's is the one holding them. Naming a context is not optional either way -- the busiest is
+  the shell's, and scoring it measures the desktop and none of the decode.
+
+  **The plane lines are the decoded picture.** A composite target is an IOSurface-backed planar
+  surface, which is neither a GL texture nor a BGRA IOSurface, so the sweep resolves it with
+  `IOSurfaceLookup` and hashes it plane by plane -- and only the tight rows: the pitch is the
+  allocator's choice and the surface id is the run's, so neither is scored. H.264 pins six DPB
+  slots as 2560x1440 luma and 1280x720 two-byte chroma, VP9 thirty-five at 352x240 and 176x120,
+  every plane inked and every hash distinct. Around the picture the fixtures gate 5018
+  resources created with none refused, 334 IOSurface-backed, and the decode commands served to
+  the end with no submit errors.
+
+  **What is still unmeasured is the conversion output.** `convert_planes` fills a composite
+  target's base RGBA texture from its two planes, and no single-context replay sees both halves:
+  the decoder context fills planes nothing samples, the player context samples planes nothing
+  filled. Scoring it needs the replayer to run more than one context in a pass.
 
   `vrend-overview.score` is the GNOME shell with someone **typing in the overview's search
   entry**, and it exists because that one act allocates a resource no other corpus contains: a

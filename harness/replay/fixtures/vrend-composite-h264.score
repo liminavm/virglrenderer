@@ -1,4 +1,4 @@
-loop 0 created 5018 failed 0 unrefs 4838 submits 1497 cmds 10701 xfers 2 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 334
+loop 0 created 5018 failed 0 unrefs 4838 submits 354 cmds 1837 xfers 294 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 334
 res=9 64x64 hash=be7fb0911be00383 ink=0/4096
 res=11 64x64 hash=be7fb0911be00383 ink=0/4096
 res=13 64x64 hash=be7fb0911be00383 ink=0/4096
@@ -2122,7 +2122,7 @@ res=2799 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2800 64x64 hash=be7fb0911be00383 ink=0/4096
 res=2830 2560x1440 hash=90535851ff290383 ink=0/3686400
 res=2843 2560x1440 hash=90535851ff290383 ink=0/3686400
-res=2779 320x240 hash=7f6faf3cf3054383 ink=76800/76800
+res=2779 320x240 hash=bbbb18dffe854383 ink=0/76800
 res=2845 2560x1440 hash=90535851ff290383 ink=0/3686400
 res=1041 144x64 hash=4b3133762633c383 ink=0/9216
 res=2854 2560x1440 hash=90535851ff290383 ink=0/3686400
@@ -3952,12 +3952,18 @@ iosurface res=2749 64x64 sync=-22 read-failed=-22
 iosurface res=2764 64x64 sync=-22 read-failed=-22
 iosurface res=2786 64x64 sync=-22 read-failed=-22
 iosurface res=2801 2560x1440 sync=-22 read-failed=-22
-iosurface res=2802 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
-iosurface res=2803 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
-iosurface res=2804 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
-iosurface res=2805 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
-iosurface res=2806 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
-iosurface res=2842 2560x1440 sync=0 hash=90535851ff290383 ink=0/3686400
+iosurface res=2802 plane=0 2560x1440 bpe=1 sync=0 hash=da08e98102543363 ink=3686400/3686400
+iosurface res=2802 plane=1 1280x720 bpe=2 sync=0 hash=5698eec2ec67f197 ink=1843200/1843200
+iosurface res=2803 plane=0 2560x1440 bpe=1 sync=0 hash=591fcf5f043f5fa4 ink=3686400/3686400
+iosurface res=2803 plane=1 1280x720 bpe=2 sync=0 hash=b1f8592b5c8c378c ink=1843200/1843200
+iosurface res=2804 plane=0 2560x1440 bpe=1 sync=0 hash=dc1c058b39194bcb ink=3686400/3686400
+iosurface res=2804 plane=1 1280x720 bpe=2 sync=0 hash=6189dba976c0ffbd ink=1843200/1843200
+iosurface res=2805 plane=0 2560x1440 bpe=1 sync=0 hash=c30c6f1dff884e2a ink=3686400/3686400
+iosurface res=2805 plane=1 1280x720 bpe=2 sync=0 hash=e4aeee31aac2d41f ink=1843200/1843200
+iosurface res=2806 plane=0 2560x1440 bpe=1 sync=0 hash=d6df4fca604c7898 ink=3686400/3686400
+iosurface res=2806 plane=1 1280x720 bpe=2 sync=0 hash=9ebac0d1ddd3004a ink=1843200/1843200
+iosurface res=2842 plane=0 2560x1440 bpe=1 sync=0 hash=4a1ac817b7aae7e0 ink=3686400/3686400
+iosurface res=2842 plane=1 1280x720 bpe=2 sync=0 hash=5c032f16febc48af ink=1843200/1843200
 iosurface res=2920 64x64 sync=-22 read-failed=-22
 iosurface res=2935 64x64 sync=-22 read-failed=-22
 iosurface res=2950 64x64 sync=-22 read-failed=-22
