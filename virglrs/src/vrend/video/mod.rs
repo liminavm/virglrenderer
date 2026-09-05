@@ -20,8 +20,8 @@ pub mod bitstream;
 pub mod h264;
 pub mod h265;
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry as MapEntry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::features::Features;
@@ -1106,6 +1106,13 @@ pub struct Video {
     /// Shared because a codec mid-frame holds the target it is decoding into, and a frozen
     /// target outlives the guest's own reference to it.
     buffers: BTreeMap<VideoBufferHandle, Arc<Buffer>>,
+    /// Formats already named in an unserved-layout message.
+    ///
+    /// The message is about the format, not the buffer, so it is worth saying once however many
+    /// targets the guest allocates. A seated desktop allocates hundreds it never decodes into --
+    /// a GNOME session playing one hardware-decoded VP9 stream said it 2880 times across 580
+    /// handles and 10 formats, none of which had anything to do with the stream that played.
+    said: BTreeSet<u32>,
 }
 
 impl Video {
@@ -1192,10 +1199,12 @@ impl Video {
         let layout = match TargetFormat::from_wire(format) {
             Some(served) => Layout::Served(served),
             None => {
-                eprintln!(
-                    "[virglrs] video buffer {handle}: format {format} names no layout this build \
-                     decodes into; a frame targeting it will be refused"
-                );
+                if self.said.insert(format) {
+                    eprintln!(
+                        "[virglrs] video: format {format} names no layout this build decodes \
+                         into; decoding into a buffer of this format will be refused"
+                    );
+                }
                 Layout::Unserved(format)
             }
         };
