@@ -437,4 +437,5 @@ def main():
         print("  %-14s %d" % (k, v))
 
 
-main()
+if __name__ == "__main__":
+    main()
