@@ -758,6 +758,16 @@ impl Renderer {
     /// `ctx` names the context the transfer runs on, or the VMM's own (ctx 0) when `None`. A
     /// named context must exist and must have the resource attached, as in the C's per-context
     /// lookup.
+    ///
+    /// **A refusal here is answered to the caller and never poisons `ctx`.** Poisoning is the
+    /// answer to a guest that asked for something impossible, and on this path the guest did not
+    /// ask -- the VMM did, naming a context only to reach its resources. The C conflates the two:
+    /// its planar refusal calls `vrend_report_context_error`, so a VMM readback of a planar
+    /// resource marks that guest's context in error and every later submit on it is dropped. It
+    /// survives that only because vrend exempts ctx 0 from the gate and its one host-side reader
+    /// happens to pass 0. Here the separation is structural instead: the command handlers turn a
+    /// transfer failure into a `Fault`, which poisons, and this function returns a
+    /// `transfer::Error`, which cannot. A host-initiated transfer has no way to kill a guest.
     pub fn transfer(
         &mut self,
         handle: ResourceHandle,
