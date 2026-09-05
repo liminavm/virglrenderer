@@ -88,6 +88,9 @@ unsafe extern "C" {
     static kIOSurfacePlaneWidth: CfTypeRef;
     static kIOSurfacePlaneHeight: CfTypeRef;
     static kIOSurfacePlaneBytesPerElement: CfTypeRef;
+    static kIOSurfacePlaneBytesPerRow: CfTypeRef;
+    static kIOSurfacePlaneOffset: CfTypeRef;
+    static kIOSurfaceAllocSize: CfTypeRef;
 
     fn IOSurfaceCreate(properties: CfTypeRef) -> CfTypeRef;
     fn IOSurfaceGetID(surface: CfTypeRef) -> u32;
@@ -211,12 +214,22 @@ impl PixelFormat {
     }
 }
 
-/// One plane of a planar surface: its extent, and what one of its elements takes.
+/// One plane of a planar surface, as this side lays it out.
+///
+/// The pitch and offset are dictated, never discovered. The guest is told this layout and
+/// addresses the planes by it, so a surface laid out any other way shears every plane after the
+/// first -- which is why [`Surface::planar`] sends all five numbers and refuses a surface that
+/// came back with different ones.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PlaneShape {
     pub width: u32,
     pub height: u32,
     pub bytes_per_element: u32,
+    /// The tight row, aligned up to what a linear Metal texture of this plane's *sampled*
+    /// format demands.
+    pub bytes_per_row: u32,
+    /// Where the plane starts in the surface's one allocation: the planes before it, tightly.
+    pub offset: u32,
 }
 
 /// The layout of a planar surface.
@@ -241,21 +254,44 @@ impl PlanarFormat {
         }
     }
 
-    /// What each plane of a `width` x `height` surface is.
+    /// The `MTLPixelFormat` a plane is *sampled* as, which is what its pitch must suit.
+    ///
+    /// Asked per plane rather than of the surface, because the surface has no Metal format at
+    /// all: `420f` names the pair, and a plane is imported as its own single- or two-component
+    /// texture. Aligning a plane as if for the composite is a measured way to slide every row
+    /// sideways.
+    fn plane_mtl_format(self, plane: usize) -> u64 {
+        match (self, plane) {
+            (PlanarFormat::BiPlanar420, 0) => 10, // MTLPixelFormatR8Unorm
+            (PlanarFormat::BiPlanar420, _) => 30, // MTLPixelFormatRG8Unorm
+        }
+    }
+
+    /// What each plane of a `width` x `height` surface is, laid out.
     ///
     /// Chroma rounds *up*: an odd-sized picture still has a chroma sample for its last column,
     /// and a plane a row short of the luma it subsamples is one the decoder writes past.
-    pub fn planes(self, width: u32, height: u32) -> [PlaneShape; 2] {
-        match self {
-            PlanarFormat::BiPlanar420 => [
-                PlaneShape { width, height, bytes_per_element: 1 },
-                PlaneShape {
-                    width: width.div_ceil(2),
-                    height: height.div_ceil(2),
-                    bytes_per_element: 2,
-                },
-            ],
+    ///
+    /// `None` when there is no Metal device to ask for an alignment -- the pitch is not
+    /// something to guess at, since a guess that is too small is a sheared plane and a guess
+    /// that is too large is silently wasted memory.
+    pub fn planes(self, width: u32, height: u32) -> Option<[PlaneShape; 2]> {
+        let extents = match self {
+            PlanarFormat::BiPlanar420 => {
+                [(width, height, 1u32), (width.div_ceil(2), height.div_ceil(2), 2u32)]
+            }
+        };
+        let mut offset = 0u32;
+        let mut planes =
+            [PlaneShape { width: 0, height: 0, bytes_per_element: 0, bytes_per_row: 0, offset: 0 };
+                2];
+        for (i, (width, height, bytes_per_element)) in extents.into_iter().enumerate() {
+            let align = u32::try_from(linear_alignment(self.plane_mtl_format(i))?).ok()?;
+            let bytes_per_row = (width * bytes_per_element).div_ceil(align) * align;
+            planes[i] = PlaneShape { width, height, bytes_per_element, bytes_per_row, offset };
+            offset = offset.checked_add(bytes_per_row.checked_mul(height)?)?;
         }
+        Some(planes)
     }
 }
 
@@ -408,23 +444,30 @@ impl Surface {
     pub(crate) fn client_buffer(&self) -> *mut c_void {
         self.surface.as_ptr().cast()
     }
-    /// Mint a planar surface: one allocation, every plane inside it.
+    /// Mint a planar surface: one allocation, every plane inside it, laid out as this side says.
     ///
     /// This is the storage a composite decode target needs -- the shape where the guest creates
     /// *one* resource in a planar format and chains its planes behind it, rather than one
-    /// resource per plane. The kernel decides the layout from the plane list, and it is the only
-    /// one that can: the planes share an allocation, so their strides and offsets are a single
-    /// decision no caller is in a position to make. What it chose is read back per plane from
-    /// [`Self::plane_bytes_per_row`].
+    /// resource per plane.
     ///
-    /// No top-level pitch or element size is asked for, unlike [`Self::scanout`]: for a planar
-    /// surface those describe no plane, and supplying them is how a surface gets laid out to a
-    /// stride nothing reads by.
+    /// **Offsets and pitches are dictated, never discovered.** The guest is told this layout and
+    /// addresses the planes by it, so a surface IOSurface laid out its own way shears every
+    /// plane after the first. Left to itself the kernel does exactly that -- a 64-byte luma row
+    /// comes back with a 128-byte pitch -- so all five numbers are sent per plane and the result
+    /// is read back and checked. A surface that came back different is refused rather than
+    /// accepted, because accepting hands the guest offsets that do not describe the surface.
+    ///
+    /// `None` from [`PlanarFormat::planes`] when there is no Metal device to ask for the
+    /// alignment; a pitch is not something to guess at.
     pub fn planar(width: u32, height: u32, format: PlanarFormat) -> Result<Surface, SurfaceError> {
         if width == 0 || height == 0 {
             return Err(SurfaceError::ZeroExtent);
         }
-        let shapes = format.planes(width, height);
+        let shapes = format.planes(width, height).ok_or(SurfaceError::NoPitch)?;
+        let total = shapes
+            .last()
+            .and_then(|last| last.offset.checked_add(last.bytes_per_row.checked_mul(last.height)?))
+            .ok_or(SurfaceError::NoPitch)?;
 
         // SAFETY: every object below is one this call creates and owns; each guard releases its
         // own reference on the way out, and the containers retain what they hold, so the guards
@@ -437,13 +480,20 @@ impl Surface {
                     Number::new(shape.width),
                     Number::new(shape.height),
                     Number::new(shape.bytes_per_element),
+                    Number::new(shape.bytes_per_row),
+                    Number::new(shape.offset),
                 ];
                 if numbers.iter().any(|n| n.0.is_null()) {
                     return Err(SurfaceError::Refused);
                 }
-                let keys =
-                    [kIOSurfacePlaneWidth, kIOSurfacePlaneHeight, kIOSurfacePlaneBytesPerElement];
-                let values = [numbers[0].0, numbers[1].0, numbers[2].0];
+                let keys = [
+                    kIOSurfacePlaneWidth,
+                    kIOSurfacePlaneHeight,
+                    kIOSurfacePlaneBytesPerElement,
+                    kIOSurfacePlaneBytesPerRow,
+                    kIOSurfacePlaneOffset,
+                ];
+                let values = [numbers[0].0, numbers[1].0, numbers[2].0, numbers[3].0, numbers[4].0];
                 let dict = Cf(CFDictionaryCreate(
                     std::ptr::null(),
                     keys.as_ptr(),
@@ -469,7 +519,12 @@ impl Surface {
                 return Err(SurfaceError::Refused);
             }
 
-            let numbers = [Number::new(width), Number::new(height), Number::new(format.fourcc())];
+            let numbers = [
+                Number::new(width),
+                Number::new(height),
+                Number::new(format.fourcc()),
+                Number::new(total),
+            ];
             if numbers.iter().any(|n| n.0.is_null()) {
                 return Err(SurfaceError::Refused);
             }
@@ -477,10 +532,12 @@ impl Surface {
                 kIOSurfaceWidth,
                 kIOSurfaceHeight,
                 kIOSurfacePixelFormat,
+                kIOSurfaceAllocSize,
                 kIOSurfacePlaneInfo,
                 kIOSurfaceIsGlobal,
             ];
-            let values = [numbers[0].0, numbers[1].0, numbers[2].0, list.0, kCFBooleanTrue];
+            let values =
+                [numbers[0].0, numbers[1].0, numbers[2].0, numbers[3].0, list.0, kCFBooleanTrue];
             let properties = Cf(CFDictionaryCreate(
                 std::ptr::null(),
                 keys.as_ptr(),
@@ -501,11 +558,25 @@ impl Surface {
             .map(|surface| Surface { surface })
             .ok_or(SurfaceError::Refused)?;
 
-        // A surface that came back with a different plane count is not the surface that was
-        // asked for, and every later index into it would be a guess. The kernel has never been
-        // seen to do this; if it does, it is not something to paper over.
+        // What came back has to be what was asked for, plane by plane. A surface the kernel laid
+        // out its own way is not a worse surface, it is a different one, and every offset the
+        // guest was told describes the one that was asked for.
         if surface.plane_count() != shapes.len() as u32 {
-            return Err(SurfaceError::Refused);
+            return Err(SurfaceError::Overridden);
+        }
+        for (i, shape) in shapes.iter().enumerate() {
+            let (got, pitch) = surface.plane(i as u32).ok_or(SurfaceError::Overridden)?;
+            if pitch != shape.bytes_per_row
+                || got.width != shape.width
+                || got.height != shape.height
+            {
+                eprintln!(
+                    "[virglrs] metal: IOSurface overrode the layout of plane {i} of a {width}x\
+                     {height} surface (asked {}x{} pitch {}, got {}x{} pitch {pitch})",
+                    shape.width, shape.height, shape.bytes_per_row, got.width, got.height,
+                );
+                return Err(SurfaceError::Overridden);
+            }
         }
         Ok(surface)
     }
@@ -564,10 +635,11 @@ impl Surface {
         u32::try_from(count).expect("an IOSurface plane count does not exceed a u32")
     }
 
-    /// One plane's extent and row pitch, as the kernel laid it out.
+    /// One plane's extent and row pitch, read back from the surface.
     ///
     /// `None` for a plane the surface does not have, which is every plane of a surface that is
-    /// not planar.
+    /// not planar. The returned shape carries only what the kernel reports -- extent and pitch;
+    /// the element size and offset are the caller's own and are not invented here.
     pub fn plane(&self, plane: u32) -> Option<(PlaneShape, u32)> {
         if plane >= self.plane_count() {
             return None;
@@ -586,7 +658,13 @@ impl Surface {
         // The element size is the caller's own -- the kernel does not report one per plane --
         // so it is left out of the shape rather than invented here.
         Some((
-            PlaneShape { width: as_u32(width), height: as_u32(height), bytes_per_element: 0 },
+            PlaneShape {
+                width: as_u32(width),
+                height: as_u32(height),
+                bytes_per_element: 0,
+                bytes_per_row: as_u32(pitch),
+                offset: 0,
+            },
             as_u32(pitch),
         ))
     }
@@ -740,6 +818,10 @@ pub enum SurfaceError {
     /// IOSurface would not create it. It gives no reason; the usual one is an extent or a pitch
     /// the kernel will not back.
     Refused,
+    /// The surface came back laid out differently from the layout that was asked for. The guest
+    /// is told the layout this side computed, so a surface that does not match it would shear
+    /// every plane after the first.
+    Overridden,
 }
 
 /// Any CoreFoundation object this module creates, released on drop.
@@ -788,71 +870,67 @@ impl Drop for Number {
 mod tests {
     use super::*;
 
-    /// A planar surface is one allocation with the planes the format describes inside it, and
-    /// the kernel's own layout for each -- which is the whole reason to ask for one rather than
-    /// mint a surface per plane.
+    /// A planar surface is one allocation with every plane inside it, laid out as this side
+    /// dictated -- which is the whole reason to ask for one rather than mint a surface per plane.
     #[test]
-    fn a_planar_surface_carries_every_plane_at_the_kernels_own_pitch() {
+    fn a_planar_surface_carries_every_plane_where_it_was_told_to() {
         let surface =
             Surface::planar(64, 64, PlanarFormat::BiPlanar420).expect("the system minted");
         assert_eq!(surface.plane_count(), 2);
 
         let (luma, luma_pitch) = surface.plane(0).expect("a luma plane");
         assert_eq!((luma.width, luma.height), (64, 64));
-        assert!(luma_pitch >= 64, "luma rows hold at least their pixels, got {luma_pitch}");
 
         // Half resolution, and two bytes a sample: the chroma plane is a quarter of the pixels
         // and half the bytes of the luma one.
         let (chroma, chroma_pitch) = surface.plane(1).expect("a chroma plane");
         assert_eq!((chroma.width, chroma.height), (32, 32));
-        assert!(chroma_pitch >= 64, "interleaved chroma is two bytes a sample, got {chroma_pitch}");
 
         assert_eq!(surface.plane(2), None, "there is no third plane to index");
-        // The whole allocation holds both planes, whatever padding the kernel chose between them.
         let least = u64::from(luma_pitch) * 64 + u64::from(chroma_pitch) * 32;
         assert!(surface.alloc_size() >= least, "{} < {least}", surface.alloc_size());
     }
 
-    /// A plane's row pitch is the kernel's, and it is not the tight one.
+    /// The surface is laid out as this side dictated, and that layout is not the tight one.
     ///
-    /// The guest computes a canonical layout for the same surface -- tight, stride is plane
-    /// width times plane block size, no row alignment -- and both ends are supposed to arrive at
-    /// the same arithmetic. They do not: the kernel pads. Measured here, a plane 352 bytes wide
-    /// gets a 384-byte pitch and a 64-byte one gets 128, while 1280 and 1920 come back tight
-    /// because they are already whatever the kernel rounds to.
-    ///
-    /// So the pitch is read off the surface and never computed. The two widths that pad are not
-    /// exotic: 352x240 is a real clip size, and 64x64 is the extent gst-va probes every fourcc it
-    /// knows at.
+    /// Two facts, each interesting only beside the other. The pitch is Metal's alignment for the
+    /// format the plane is *sampled* as, not the tight row -- so a layout computed tight and this
+    /// one disagree at every width the alignment does not already divide. And the kernel took it:
+    /// left to itself it lays a 64-byte luma row out at a 128-byte pitch, so a surface that comes
+    /// back matching is one that was told, not one that was asked.
     #[test]
-    fn a_planes_pitch_is_the_kernels_and_can_exceed_the_tight_one() {
-        let mut padded = 0;
+    fn a_planar_surface_is_laid_out_as_this_side_dictated() {
+        let mut wider_than_tight = 0;
         for (w, h) in [(64u32, 64u32), (65, 33), (352, 240), (1280, 720), (1920, 1080)] {
             let surface = Surface::planar(w, h, PlanarFormat::BiPlanar420).expect("minted");
-            for (i, shape) in PlanarFormat::BiPlanar420.planes(w, h).iter().enumerate() {
+            let shapes = PlanarFormat::BiPlanar420.planes(w, h).expect("a device to align to");
+            let mut offset = 0;
+            for (i, shape) in shapes.iter().enumerate() {
                 let (got, pitch) = surface.plane(i as u32).expect("a plane");
+                // What was asked for is what came back -- `planar` refuses otherwise, so this
+                // asserts that the refusal never had to fire.
                 assert_eq!((got.width, got.height), (shape.width, shape.height), "{w}x{h}/{i}");
-                let tight = shape.width * shape.bytes_per_element;
-                assert!(pitch >= tight, "{w}x{h}/{i}: pitch {pitch} < tight {tight}");
-                padded += u32::from(pitch > tight);
+                assert_eq!(pitch, shape.bytes_per_row, "{w}x{h}/{i}");
+                // The planes are packed against each other, in order.
+                assert_eq!(shape.offset, offset, "{w}x{h}/{i}");
+                offset += shape.bytes_per_row * shape.height;
+                wider_than_tight +=
+                    u32::from(shape.bytes_per_row > shape.width * shape.bytes_per_element);
             }
+            assert!(surface.alloc_size() >= u64::from(offset), "{w}x{h}");
         }
-        // A kernel that stopped padding would make every caller that reads the pitch back look
-        // like dead caution. It pads; this says so.
-        assert!(padded > 0, "no plane was padded, so nothing here is measuring what it claims");
+        // Were the alignment ever 1, this would still pass while measuring nothing, and every
+        // caller reading a pitch back would look like dead caution.
+        assert!(wider_than_tight > 0, "no plane was aligned past its tight row");
     }
 
     /// Chroma rounds up, so an odd picture keeps a sample for its last row and column. A plane
     /// short of the luma it subsamples is one the decoder writes past.
     #[test]
     fn an_odd_extent_rounds_its_chroma_plane_up() {
-        assert_eq!(
-            PlanarFormat::BiPlanar420.planes(65, 33),
-            [
-                PlaneShape { width: 65, height: 33, bytes_per_element: 1 },
-                PlaneShape { width: 33, height: 17, bytes_per_element: 2 },
-            ]
-        );
+        let planes = PlanarFormat::BiPlanar420.planes(65, 33).expect("a device to align to");
+        assert_eq!((planes[0].width, planes[0].height, planes[0].bytes_per_element), (65, 33, 1));
+        assert_eq!((planes[1].width, planes[1].height, planes[1].bytes_per_element), (33, 17, 2));
         let surface =
             Surface::planar(65, 33, PlanarFormat::BiPlanar420).expect("the system minted");
         let (chroma, _) = surface.plane(1).expect("a chroma plane");
