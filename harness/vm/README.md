@@ -24,8 +24,23 @@ make every capture a mutation of their working set.
 
 The guest disks are **APFS clones** (`cp -c`). They cost no space until the guest writes, and the
 source images are never touched — an ordinary copy of two ~15 GB images would not fit on this
-host. The two tiers are both here on purpose: the enhanced image boots the venus desktop, the
-stock image exercises classic vrend and the VA-API video path.
+host.
+
+## What the three images are
+
+The tiers are **not** graphics capability tiers, and reading them as such is how a bug gets
+explained away as "the stock guest would never do that". Every foundational graphics capability is
+in all three.
+
+- **stock** — a stock Fedora Workstation. Renders through virgl/vrend, has venus available, and
+  hardware acceleration works.
+- **enhanced** — stock, plus a 16k-page-size kernel and fixes to guest-mesa issues we found. It
+  adds no foundational graphics capability over stock.
+- **synoik** — enhanced, with a Vulkan compositor in place of GNOME.
+
+So a difference in what a workload does between stock and enhanced is a guest-mesa behaviour
+difference or a workload difference, never "that tier can't". When a capture on one tier shows a
+command the other's corpus lacks, the question to ask is what the two sessions *did* differently.
 
 ## The three guests, and what each one needs
 
