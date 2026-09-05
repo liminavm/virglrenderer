@@ -20,8 +20,16 @@
 
 #define TRACE_MAGIC   0x4c4d5654u   /* "LMVT" */
 #define TRACE_VERSION 2
-/* Creates are never evicted, so this is a hard cap rather than a window. Overflow is loud. */
-#define TRACE_MAX_RES 32768u
+/* Creates are never evicted, so the log grows rather than windowing. It starts here and doubles;
+ * the ceiling is only there so a runaway guest cannot eat the host, and reaching it is loud.
+ *
+ * A fixed cap was wrong about which guests exist. A stock desktop fits in 32768 creates and an
+ * enhanced one does not -- it overflows during boot, long before the workload starts -- so the
+ * cap silently decided that the tier this renderer is being ported for could not be captured at
+ * all. A create is rare next to a draw, so growing on one costs nothing the ring's own budget
+ * does not already dwarf. */
+#define TRACE_RES_INITIAL 32768u
+#define TRACE_RES_MAX     4194304u
 #define MAX_AUX       8
 
 struct trace_state {
@@ -46,7 +54,7 @@ static struct trace_state tr;
  * needs are created once at client startup, so in a FIFO they are the first thing evicted once
  * transfer payloads inflate the stream. */
 static struct vrend_trace_res *tr_res;
-static uint32_t tr_res_n;
+static uint32_t tr_res_n, tr_res_cap;
 static bool tr_res_full;
 static bool tr_on;
 static bool tr_inited;
@@ -133,7 +141,8 @@ void vrend_trace_init(void)
    /* Touch it now: a first-touch page fault inside the hot path would be a timing
     * perturbation of exactly the kind this design exists to avoid. */
    memset(tr.buf, 0, tr.cap);
-   tr_res = calloc(TRACE_MAX_RES, sizeof *tr_res);
+   tr_res_cap = TRACE_RES_INITIAL;
+   tr_res = calloc(tr_res_cap, sizeof *tr_res);
    if (!tr_res) {
       free(tr.buf);
       tr.buf = NULL;
@@ -303,13 +312,23 @@ void vrend_trace_res_event(struct vrend_trace_res *res)
    if (!tr_on)
       return;
    pthread_mutex_lock(&tr_lock);
-   if (tr_res_n >= TRACE_MAX_RES) {
+   if (tr_res_n >= tr_res_cap) {
+      uint32_t want = tr_res_cap * 2u;
+      struct vrend_trace_res *bigger =
+         want > TRACE_RES_MAX ? NULL : realloc(tr_res, (size_t)want * sizeof *tr_res);
+      if (bigger) {
+         memset(bigger + tr_res_cap, 0, (size_t)(want - tr_res_cap) * sizeof *bigger);
+         tr_res = bigger;
+         tr_res_cap = want;
+      }
+   }
+   if (tr_res_n >= tr_res_cap) {
       /* Loud once. Silently dropping creates would produce a trace that looks complete and
        * replays into a context missing resources -- a failure that reads as a renderer bug. */
       if (!tr_res_full) {
          tr_res_full = true;
          fprintf(stderr, "[LIMINA-TRACE] resource log full at %u entries; trace is NOT replayable\n",
-                 TRACE_MAX_RES);
+                 tr_res_cap);
          fflush(stderr);
       }
       pthread_mutex_unlock(&tr_lock);
