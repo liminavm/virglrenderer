@@ -510,6 +510,53 @@ impl Surface {
         Ok(surface)
     }
 
+    /// Fill one plane with a single byte, through the CPU.
+    ///
+    /// Only a test wants this -- the decode path writes planes through GL -- and it exists for
+    /// one question that has no other answer: whether an image imported over plane *n* really
+    /// samples plane *n*. The image's own width and height cannot answer it, because they are
+    /// set from the geometry the import was handed rather than from whatever the driver went on
+    /// to sample. Content can: put a different byte in each plane and ask what comes back.
+    ///
+    /// `false` if the plane is not there or the surface will not lock.
+    #[cfg(test)]
+    pub fn fill_plane(&self, plane: u32, value: u8) -> bool {
+        // Declared here rather than beside the rest: nothing outside a test writes a plane from
+        // the CPU, and a declaration the shipped build never calls is one the linker still
+        // carries.
+        #[link(name = "IOSurface", kind = "framework")]
+        unsafe extern "C" {
+            fn IOSurfaceGetBaseAddressOfPlane(surface: CfTypeRef, plane: usize) -> *mut c_void;
+        }
+
+        let Some((shape, pitch)) = self.plane(plane) else {
+            return false;
+        };
+        // Read-write, unlike every other lock in this module: this one is writing.
+        const LOCK_READ_WRITE: u32 = 0;
+        // SAFETY: the surface is live and owned by `self`; the lock is balanced by the unlock
+        // below with the same options, as IOSurface requires.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut()) } != 0 {
+            return false;
+        }
+        // SAFETY: the plane index was checked against the surface's own plane count above, so
+        // the base address is the kernel's for a plane that exists, and the region written is
+        // the one the kernel reported: `shape.height` rows of `pitch` bytes, which is the
+        // plane's whole allocation and no more. Nothing else touches these bytes while the
+        // surface is locked to this thread.
+        unsafe {
+            let base = IOSurfaceGetBaseAddressOfPlane(self.as_ref(), plane as usize).cast::<u8>();
+            if !base.is_null() {
+                for row in 0..shape.height {
+                    std::ptr::write_bytes(base.add((row * pitch) as usize), value, pitch as usize);
+                }
+            }
+            // SAFETY: balanced against the lock above, with the same options.
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+        }
+        true
+    }
+
     /// How many planes the surface has. Zero for a surface that is not planar.
     pub fn plane_count(&self) -> u32 {
         // SAFETY: a read-only query of the live surface this type owns.
