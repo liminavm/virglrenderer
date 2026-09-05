@@ -26,7 +26,7 @@ use super::features::{Feature, Features};
 use super::gl::gles::*;
 use super::gl::{
     BufferName, FramebufferName, GLenum, GLint, GLsizei, Gl, ProgramName, ShaderName, TextureName,
-    VertexArrayName,
+    TextureUnit, VertexArrayName,
 };
 use super::pipe::{Swizzle, TexFilter, TextureTarget};
 use super::proto::Format;
@@ -50,6 +50,34 @@ out vec4 tc;\n\
 void main() {\n\
 \x20  gl_Position = arg0;\n\
 \x20  tc = arg1;\n\
+}\n";
+
+/// Two-plane YUV to RGBA, BT.601 limited range.
+///
+/// The matrix and the range are the C's, and the C's are its CPU converter's, so a composite
+/// target reads the same whichever path filled it. Nothing better is available to pick from: the
+/// guest's colourspace hint never reaches the host, so a target is converted by one rule and
+/// that rule has to be the one already in use.
+///
+/// Luma is an R8 plane and chroma an RG8 one, so `.r` and `.rg` are the samples themselves; the
+/// half-resolution chroma is upsampled by the texture's own `LINEAR` filter, at the same
+/// coordinates.
+const YUV_FRAGMENT: &str = "#version 310 es\n\
+// Blitter\n\
+precision mediump float;\n\
+uniform sampler2D luma;\n\
+uniform sampler2D chroma;\n\
+in vec4 tc;\n\
+out vec4 FragColor;\n\
+void main() {\n\
+\x20  float c = texture(luma, tc.xy).r - 16.0 / 255.0;\n\
+\x20  vec2 uv = texture(chroma, tc.xy).rg - vec2(0.5);\n\
+\x20  float d = uv.x;\n\
+\x20  float e = uv.y;\n\
+\x20  FragColor = vec4(clamp(1.1643 * c + 1.5977 * e, 0.0, 1.0),\n\
+\x20                   clamp(1.1643 * c - 0.3906 * d - 0.8125 * e, 0.0, 1.0),\n\
+\x20                   clamp(1.1643 * c + 2.0156 * d, 0.0, 1.0),\n\
+\x20                   1.0);\n\
 }\n";
 
 /// `FS_FUNC_COL_SRGB_DECODE`.
@@ -102,6 +130,11 @@ pub struct Blitter {
     fbo: FramebufferName,
     vs: ShaderName,
     programs: HashMap<ProgramKey, ProgramName>,
+    /// The two-plane YUV program, built on the first composite conversion. Not in `programs`:
+    /// it answers to nothing a [`ProgramKey`] describes -- two sources rather than one, a fixed
+    /// identity quad, no swizzle and no colourspace -- and a key with a field for it would carry
+    /// that field through every ordinary blit.
+    yuv: Option<ProgramName>,
 }
 
 /// One end of the quad in the destination's pixels, or the source's texels.
@@ -271,7 +304,7 @@ impl Blitter {
         gl.compile_shader(vs, VS_PASSTHROUGH).expect("the blitter's passthrough shader compiles");
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(GL_ARRAY_BUFFER, Some(vbo));
-        Ok(Blitter { ctx, vao, vbo, fbo, vs, programs: HashMap::new() })
+        Ok(Blitter { ctx, vao, vbo, fbo, vs, programs: HashMap::new(), yuv: None })
     }
 
     pub fn context(&self) -> &egl::Context {
@@ -383,6 +416,123 @@ impl Blitter {
         gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
         gl.bind_texture(job.src_gl_target, None);
         Ok(())
+    }
+
+    /// `vrend_renderer_convert_planes_gl`: a composite target's two planes into its base texture.
+    ///
+    /// A composite view samples the planar format whole and lands on the resource's own RGBA
+    /// texture, which nothing on the decode path fills -- delivery puts pixels in the surface
+    /// planes. So the planes are converted here, on the GPU, and the caller decides when: see
+    /// the resource's conversion state.
+    ///
+    /// The quad is the identity, both in position and in texture coordinates, because row 0 of
+    /// the planes is row 0 of the base texture and that is how the guest's view addresses both.
+    /// The chroma plane is half resolution and is sampled at the same coordinates, so the
+    /// texture's `LINEAR` filter is what upsamples it -- not an incidental parameter.
+    pub fn convert_planes(
+        &mut self,
+        gl: &Gl,
+        dst: TextureName,
+        dst_w: u32,
+        dst_h: u32,
+        planes: [TextureName; 2],
+    ) -> Result<(), Unserved> {
+        let prog = self.yuv_program(gl).ok_or(Unserved::NoProgram)?;
+        gl.use_program(Some(prog));
+        gl.bind_vertex_array(Some(self.vao));
+        gl.bind_framebuffer(GL_FRAMEBUFFER, Some(self.fbo));
+        gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(dst), 0);
+        gl.framebuffer_texture_2d(GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, None, 0);
+        gl.draw_buffers(&[GL_COLOR_ATTACHMENT0]);
+
+        let status = gl.check_framebuffer_status();
+        if status != GL_FRAMEBUFFER_COMPLETE {
+            eprintln!(
+                "[virglrs] vrend: the composite target's base texture will not take a \
+                 framebuffer (0x{status:x}); its planes stay unconverted"
+            );
+            gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
+            gl.use_program(None);
+            return Err(Unserved::NoProgram);
+        }
+
+        for (unit, plane) in planes.iter().enumerate() {
+            gl.active_texture(TextureUnit::at(unit as u32));
+            gl.bind_texture(GL_TEXTURE_2D, Some(*plane));
+        }
+
+        // Every piece of state the draw depends on, named rather than inherited: the blitter's
+        // ordinary path leaves depth testing on, and this pass has no depth buffer to test
+        // against.
+        gl.disable(GL_SCISSOR_TEST);
+        gl.disable(GL_DEPTH_TEST);
+        gl.disable(GL_STENCIL_TEST);
+        gl.disable(GL_BLEND);
+        gl.color_mask([true, true, true, true]);
+        gl.viewport(0, 0, dst_w as GLsizei, dst_h as GLsizei);
+
+        let pos = quad_positions(
+            dst_w,
+            dst_h,
+            Point { x: 0, y: 0 },
+            Point { x: dst_w as i32, y: dst_h as i32 },
+        );
+        let tex = quad_texcoords([0.0, 0.0, 1.0, 1.0]);
+        let mut vertices = [0f32; FLOATS_PER_VERTEX * VERTICES];
+        for i in 0..VERTICES {
+            let v = &mut vertices[i * FLOATS_PER_VERTEX..(i + 1) * FLOATS_PER_VERTEX];
+            v[0] = pos[i][0];
+            v[1] = pos[i][1];
+            v[3] = 1.0;
+            v[4] = tex[i][0];
+            v[5] = tex[i][1];
+        }
+        set_vertex_param(gl, prog);
+        gl.bind_buffer(GL_ARRAY_BUFFER, Some(self.vbo));
+        gl.buffer_data(GL_ARRAY_BUFFER, &vertex_bytes(&vertices), GL_STATIC_DRAW);
+        gl.draw_arrays(GL_TRIANGLE_FAN, 0, VERTICES as GLsizei);
+
+        for unit in (0..planes.len()).rev() {
+            gl.active_texture(TextureUnit::at(unit as u32));
+            gl.bind_texture(GL_TEXTURE_2D, None);
+        }
+        gl.use_program(None);
+        gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, None, 0);
+        Ok(())
+    }
+
+    /// The YUV program, built and cached on first use.
+    fn yuv_program(&mut self, gl: &Gl) -> Option<ProgramName> {
+        if let Some(p) = self.yuv {
+            return Some(p);
+        }
+        let fs = gl.create_shader(GL_FRAGMENT_SHADER)?;
+        if let Err(log) = gl.compile_shader(fs, YUV_FRAGMENT) {
+            eprintln!("[virglrs] vrend: the YUV fragment shader failed to compile: {log}");
+            gl.delete_shader(fs);
+            return None;
+        }
+        let prog = gl.create_program()?;
+        gl.attach_shader(prog, self.vs);
+        gl.attach_shader(prog, fs);
+        let linked = gl.link_program(prog);
+        gl.delete_shader(fs);
+        if let Err(log) = linked {
+            eprintln!("[virglrs] vrend: the YUV program failed to link: {log}");
+            gl.delete_program(prog);
+            return None;
+        }
+        // The sampler uniforms name texture units, and the units never change, so they are set
+        // once here rather than per pass.
+        gl.use_program(Some(prog));
+        for (name, unit) in [("luma", 0u32), ("chroma", 1)] {
+            if let Some(loc) = gl.get_uniform_location(prog, name) {
+                gl.uniform_1i(loc, TextureUnit::at(unit).uniform_value());
+            }
+        }
+        gl.use_program(None);
+        self.yuv = Some(prog);
+        Some(prog)
     }
 
     /// The program for this key, built and cached on first use. `None` when the shader would not
@@ -696,6 +846,118 @@ pub fn quad_texcoords(coord: [f32; 4]) -> [[f32; 2]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A composite target's planes become the picture a composite view samples.
+    ///
+    /// The end-to-end oracle for the conversion: bytes into the surface's two planes, the pass
+    /// over them, and RGBA read back out of the base texture. Nothing short of this checks the
+    /// thing that matters -- that the shader reads luma from the luma plane and chroma from the
+    /// chroma one, in BT.601 limited range. A wrong plane, a swapped chroma pair or a full-range
+    /// matrix all draw something, and only the values say which.
+    ///
+    /// The anchors are the conversion's own: Y=16 with neutral chroma is black, because 16 is
+    /// where limited range starts; Y=235 is white, because that is where it ends; and Y=128 is
+    /// the grey in between, which a full-range matrix would put at 128 rather than 130.
+    ///
+    /// Run it on its own (`--lib a_composite_target -- --ignored`) under the zink-on-KosmicKrisp
+    /// environment, for the reason the plane-import tests give: two displays opened in one
+    /// process leave this driver unable to make a shared context.
+    #[test]
+    #[ignore = "needs the zink-on-KosmicKrisp environment"]
+    fn a_composite_target_reads_as_the_picture_its_planes_hold() {
+        use super::super::egl::{Flavour, Winsys};
+        use super::super::gl::gles::{
+            GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER, GL_FRAMEBUFFER_COMPLETE, GL_RGBA, GL_RGBA8,
+            GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
+        };
+        use crate::metal::Held;
+        use crate::metal::{PlanarFormat, Surface};
+        use crate::vrend::egl::Plane;
+        use std::sync::Arc;
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let winsys = Winsys::open(Flavour::Gles).expect("the surfaceless display opens");
+        let version = Version { major: 3, minor: 1 };
+        let ctx = winsys.create_context(version, None).expect("a 3.1 context");
+        winsys.make_current(&ctx).expect("current");
+        let gl = Gl::new(winsys.gles());
+
+        // The base texture, as a composite target's own storage is: RGBA8, one level.
+        let base = gl.gen_texture();
+        gl.bind_texture(GL_TEXTURE_2D, Some(base));
+        gl.tex_storage_2d(GL_TEXTURE_2D, 1, GL_RGBA8, W as GLsizei, H as GLsizei);
+        gl.bind_texture(GL_TEXTURE_2D, None);
+
+        let mut blitter =
+            Blitter::open(&winsys, &gl, version, &ctx).expect("the blitter's context opens");
+
+        let convert = |blitter: &mut Blitter, luma: u8| -> [u8; 4] {
+            let surface = Surface::planar(W, H, PlanarFormat::BiPlanar420).expect("a surface");
+            assert!(surface.fill_plane(0, luma), "the luma plane fills");
+            // 128 in both chroma components is neutral: the picture is grey whatever Y is, so
+            // any colour in the readback is the conversion's own doing.
+            assert!(surface.fill_plane(1, 128), "the chroma plane fills");
+            let surface: Arc<dyn Held> = Arc::new(surface);
+            let planes = [Plane::Luma, Plane::ChromaPair].map(|which| {
+                let image = winsys
+                    .image_from_iosurface_plane(Arc::clone(&surface), which)
+                    .expect("the driver imports the plane");
+                let name = gl.gen_texture();
+                gl.bind_texture(GL_TEXTURE_2D, Some(name));
+                gl.egl_image_target_texture_2d(GL_TEXTURE_2D, &image);
+                gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as GLint);
+                gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as GLint);
+                gl.bind_texture(GL_TEXTURE_2D, None);
+                (name, image)
+            });
+            blitter
+                .convert_planes(&gl, base, W, H, [planes[0].0, planes[1].0])
+                .expect("the conversion runs");
+
+            let fb = gl.gen_framebuffer();
+            gl.bind_framebuffer(GL_FRAMEBUFFER, Some(fb));
+            gl.framebuffer_texture_2d(GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Some(base), 0);
+            assert_eq!(gl.check_framebuffer_status(), GL_FRAMEBUFFER_COMPLETE, "renderable");
+            let mut out = vec![0u8; (W * H) as usize * 4];
+            assert!(
+                gl.read_pixels(
+                    0,
+                    0,
+                    W as GLsizei,
+                    H as GLsizei,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    &mut out
+                ),
+                "readback"
+            );
+            gl.bind_framebuffer(GL_FRAMEBUFFER, None);
+            // Every pixel is the same colour -- the planes are flat -- so one is the answer and
+            // the rest are the check that the whole quad was covered.
+            let (pixels, _) = out.as_chunks::<4>();
+            let first = pixels[0];
+            for (i, px) in pixels.iter().enumerate() {
+                assert_eq!(*px, first, "pixel {i} differs; the quad did not cover the target");
+            }
+            first
+        };
+
+        let near = |got: [u8; 4], want: [u8; 4], what: &str| {
+            for c in 0..4 {
+                let d = got[c].abs_diff(want[c]);
+                assert!(d <= 2, "{what}: read {got:?}, expected about {want:?}");
+            }
+        };
+
+        // Y=16 is the floor of limited range: black, not the dark grey full range would give.
+        near(convert(&mut blitter, 16), [0, 0, 0, 255], "the black anchor");
+        // Y=235 is the ceiling: white.
+        near(convert(&mut blitter, 235), [255, 255, 255, 255], "the white anchor");
+        // Mid grey. 130, not 128 -- which is what tells limited range from full.
+        near(convert(&mut blitter, 128), [130, 130, 130, 255], "the mid-grey anchor");
+    }
 
     #[test]
     fn an_identity_swizzle_reads_every_channel_where_it_lies() {

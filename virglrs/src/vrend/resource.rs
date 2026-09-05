@@ -476,10 +476,80 @@ pub enum Storage {
 pub struct Planes {
     luma: Image,
     chroma: Image,
+    /// Whether the base texture a composite view samples is in step with these planes.
+    conversion: Mutex<Conversion>,
+    /// The conversion pass's own textures over the two plane images, made on its first run.
+    ///
+    /// Once per resource, never once per frame: each import adopts the IOSurface plane on the
+    /// driver side, and importing per frame leaks that adoption as surely as a per-frame view
+    /// would. Deleted with the texture they hang off.
+    ///
+    /// The lock is the one [`Texture::views`] documents -- uncontended, and what buys the share
+    /// the `Send` a `RefCell` would cost it.
+    textures: Mutex<Option<[TextureName; 2]>>,
     /// The layout the surface was minted in. Kept because the kernel does not report a plane's
     /// element size and every other half of a plane's geometry comes from the surface: keeping
     /// the format that does state it means nothing re-derives it from the resource's own.
     planar: PlanarFormat,
+}
+
+/// Whether a composite target's base texture is in step with its planes, and whether anything
+/// reads it.
+///
+/// The C keeps two booleans, `composite_sampled` and `planes_dirty`, and every site tests the
+/// pair. They only mean anything together: a target no composite view has sampled yet must still
+/// remember that a picture landed, so the first such view converts what is already there rather
+/// than showing an empty frame; and a target nothing has delivered into has nothing to convert
+/// however it is sampled. So they are one value, and the state the pair can spell but nothing
+/// establishes -- filled, with nobody looking -- is not in it.
+///
+/// The conversion runs at whichever of the two events comes second, and only then: a target only
+/// per-plane consumers ever read pays nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Conversion {
+    /// No composite view yet, and nothing delivered since the last fill.
+    #[default]
+    Unwatched,
+    /// No composite view yet, but a picture has landed. The first composite view converts it.
+    UnwatchedPending,
+    /// A composite view samples the base texture, and it is in step with the planes.
+    Current,
+    /// A composite view samples the base texture, and a picture has landed since it was filled.
+    Pending,
+}
+
+impl Conversion {
+    /// A picture was delivered into the planes.
+    pub fn delivered(self) -> Conversion {
+        match self {
+            Conversion::Unwatched | Conversion::UnwatchedPending => Conversion::UnwatchedPending,
+            Conversion::Current | Conversion::Pending => Conversion::Pending,
+        }
+    }
+
+    /// A composite view of the target was made. Sticky: nothing takes a target back to unwatched,
+    /// because a view that existed once may be sampled again at any time.
+    pub fn sampled(self) -> Conversion {
+        match self {
+            Conversion::Unwatched | Conversion::Current => Conversion::Current,
+            Conversion::UnwatchedPending | Conversion::Pending => Conversion::Pending,
+        }
+    }
+
+    /// The conversion ran and succeeded. A failed pass must not call this: leaving the state
+    /// pending is what makes the next event retry, where claiming success would leave the base
+    /// texture a frame behind for good.
+    pub fn filled(self) -> Conversion {
+        match self {
+            Conversion::Pending | Conversion::Current => Conversion::Current,
+            unwatched => unwatched,
+        }
+    }
+
+    /// Whether the pass should run now. The one question both trigger sites ask.
+    pub fn needs_fill(self) -> bool {
+        self == Conversion::Pending
+    }
 }
 
 /// The tight extent of one plane of a composite decode target.
@@ -589,6 +659,69 @@ impl Planes {
             height: shape.height,
             bytes_per_element: self.planar.bytes_per_element(index as usize),
         })
+    }
+
+    /// Note that a picture was delivered into the planes, and say whether the base texture must
+    /// now be converted.
+    pub fn delivered(&self) -> bool {
+        self.transition(Conversion::delivered)
+    }
+
+    /// Note that a composite view of the target was made, and say whether the base texture must
+    /// be converted before it is sampled.
+    pub fn sampled(&self) -> bool {
+        self.transition(Conversion::sampled)
+    }
+
+    /// Note that the conversion ran and succeeded. A failed pass does not call this -- see
+    /// [`Conversion::filled`].
+    pub fn filled(&self) {
+        self.transition(Conversion::filled);
+    }
+
+    fn transition(&self, step: impl FnOnce(Conversion) -> Conversion) -> bool {
+        let mut state =
+            self.conversion.lock().expect("the classic side never panics under this lock");
+        *state = step(*state);
+        state.needs_fill()
+    }
+
+    /// Whether the conversion pass is owed. See [`Conversion::needs_fill`].
+    pub fn needs_fill(&self) -> bool {
+        self.conversion.lock().expect("the classic side never panics under this lock").needs_fill()
+    }
+
+    /// The conversion pass's textures over the two plane images, made on the first call.
+    ///
+    /// The caller has the blitter's context current; these are made there and used only there.
+    pub fn textures(&self, gl: &Gl) -> [TextureName; 2] {
+        let mut slot = self.textures.lock().expect("the classic side never panics under this lock");
+        *slot.get_or_insert_with(|| {
+            [&self.luma, &self.chroma].map(|image| {
+                let name = gl.gen_texture();
+                gl.bind_texture(GL_TEXTURE_2D, Some(name));
+                gl.egl_image_target_texture_2d(GL_TEXTURE_2D, image);
+                for wrap in [GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T] {
+                    gl.tex_parameter_i(GL_TEXTURE_2D, wrap, GL_CLAMP_TO_EDGE as GLint);
+                }
+                // LINEAR is load-bearing on the chroma plane: it is half resolution and is
+                // sampled at the luma's coordinates, so this filter is the upsampler.
+                for filter in [GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER] {
+                    gl.tex_parameter_i(GL_TEXTURE_2D, filter, GL_LINEAR as GLint);
+                }
+                for level in [GL_TEXTURE_BASE_LEVEL, GL_TEXTURE_MAX_LEVEL] {
+                    gl.tex_parameter_i(GL_TEXTURE_2D, level, 0);
+                }
+                gl.bind_texture(GL_TEXTURE_2D, None);
+                name
+            })
+        })
+    }
+
+    /// The GL objects this made, given up so the caller can delete them. Called once, by the
+    /// texture these hang off, as it is destroyed.
+    fn into_textures(self) -> Option<[TextureName; 2]> {
+        self.textures.into_inner().expect("the classic side never panics under this lock")
     }
 
     /// The surface both planes are cut from. One surface, so either image answers.
@@ -860,6 +993,11 @@ impl Texture {
     pub fn destroy(self, gl: &Gl) {
         for v in self.views.into_inner().expect("the classic side never panics under this lock") {
             gl.delete_texture(v.1);
+        }
+        // The conversion pass's textures over the plane images. The images themselves, and the
+        // surface they share, go with the `Planes` this consumes.
+        for t in self.planes.and_then(Planes::into_textures).into_iter().flatten() {
+            gl.delete_texture(t);
         }
         // The image, and the surface it owns, go with the texture they were the storage of.
         gl.delete_texture(self.name);
@@ -1153,7 +1291,7 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
         a.format.name(),
         surface.id().0
     );
-    Some(Planes { luma, chroma, planar })
+    Some(Planes { luma, chroma, planar, conversion: Mutex::default(), textures: Mutex::default() })
 }
 
 /// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
