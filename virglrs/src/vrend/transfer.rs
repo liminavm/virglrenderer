@@ -741,6 +741,94 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(full[..4].try_into().unwrap()), 0xffff_fe00);
     }
 
+    /// The planar bug the C carries, expressed as the property that makes it impossible here.
+    ///
+    /// vrend registers NV12 with the `GL_RGBA8/GL_RGBA/GL_UNSIGNED_BYTE` triple while gallium
+    /// describes it as one byte per block, then bounds-checks the guest's pages with gallium's
+    /// number and hands GL the driver's -- so GL moves four times what was checked and runs off
+    /// the end of a correctly sized iov. Two descriptions of one format, and the bound taken from
+    /// the wrong one.
+    ///
+    /// Here there is one description at the moment of use: the staging buffer is sized from
+    /// `as_gl`, the same layout the driver reads, and `gather` fills it out of the guest's pages a
+    /// row at a time through `copy_out`, which answers false when the pages do not hold the row.
+    /// So the same transfer is refused rather than overrun, and it is refused because the buffer
+    /// and the bound are one number.
+    #[test]
+    fn a_planar_transfer_is_refused_because_its_buffer_and_its_bound_are_one_number() {
+        use crate::vrend::proto::Format;
+        let wire = super::super::formats::DESCRIPTIONS
+            .iter()
+            .position(|d| d.is_some_and(|d| d.name == "Y8_U8V8_420_UNORM"))
+            .expect("NV12 is a described format");
+        let nv12 = Format::from_wire(wire as u32).unwrap();
+        let desc = nv12.describe().unwrap();
+        assert_eq!(desc.block_bytes(), 1, "gallium describes NV12 as one byte per block");
+
+        let entry = Entry {
+            gl: super::super::formats::GlFormat {
+                format: nv12,
+                internalformat: GL_RGBA8,
+                glformat: GL_RGBA,
+                gltype: GL_UNSIGNED_BYTE,
+                swizzle: None,
+                view_class: super::super::formats::ViewClass::Bits32,
+            },
+            bindings: super::super::formats::Bindings {
+                sampler_view: true,
+                render_target: false,
+                depth_stencil: false,
+            },
+            can_texture_storage: true,
+            can_readback: false,
+            can_multisample: false,
+        };
+
+        // What gallium says a tight 64x64 NV12 box spans, which is what the C bounds-checks.
+        let gallium = Layout {
+            block: 1,
+            blocks_wide: 64,
+            blocks_high: 64,
+            depth: 1,
+            stride: 64,
+            layer_stride: 64 * 64,
+            compressed: false,
+        };
+        assert_eq!(gallium.total(), 64 * 64);
+
+        // What the driver actually moves, which is what this path allocates and fills.
+        let driver = gallium.as_gl(&entry, 64, 64);
+        assert_eq!(driver.block, 4);
+        assert_eq!(driver.total(), 4 * gallium.total());
+
+        // A guest that attached exactly the bytes gallium describes -- the shape the C reads four
+        // times over -- cannot satisfy the driver's layout, and gather says so instead.
+        let mut guest = vec![0xa5u8; (gallium.total()) as usize];
+        let entries = [crate::abi::GuestIov {
+            base: crate::abi::VmmPtr(guest.as_mut_ptr().cast()),
+            len: guest.len(),
+        }];
+        let pages = Iov::new(&entries);
+        let info = Info {
+            level: 0,
+            stride: 64,
+            layer_stride: 64 * 64,
+            offset: 0,
+            region: Box3 { x: 0, y: 0, z: 0, width: 64, height: 64, depth: 1 },
+            synchronized: false,
+        };
+        let mut by_gallium = vec![0u8; gallium.total() as usize];
+        assert!(
+            gather(&pages, &info, &gallium, &mut by_gallium),
+            "gallium's layout fits, which is why the C's bounds check passes this transfer"
+        );
+        let mut staging = vec![0u8; driver.total() as usize];
+        assert!(
+            !gather(&pages, &info, &driver, &mut staging),
+            "the driver's layout does not, and that is the answer the guest gets"
+        );
+    }
+
     #[test]
     fn a_span_counts_the_last_row_and_layer_tight() {
         let l = Layout {
