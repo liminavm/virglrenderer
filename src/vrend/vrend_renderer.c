@@ -12619,6 +12619,61 @@ static GLuint vrend_make_view(struct vrend_resource *res, enum virgl_formats for
    return view_id;
 }
 
+/* limina: bisection knob for the WebGL/MSAA device loss. Every antialias:true frame
+ * resolves an RGBA8 4-sample colour buffer into an exported BGRA8 scanout buffer, and the
+ * red/blue swizzle that mismatch requires drives the blit off the FBO path onto the shader
+ * blitter, in its own GL context, with a context switch per frame. Setting
+ * LIMINA_VREND_FORCE_FBO_BLIT=1 keeps such a blit on the FBO path -- the colours come out
+ * swapped, which is fine for an arm whose only question is whether the fallback is what
+ * kills the VM. */
+static bool vrend_limina_force_fbo_blit(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("LIMINA_VREND_FORCE_FBO_BLIT");
+      v = e && strcmp(e, "0") != 0;
+      if (v)
+         virgl_error("[LIMINA] vrend: FORCING FBO blit (colours will be wrong)\n");
+   }
+   return v;
+}
+
+/* limina: LIMINA_VREND_BLIT_LOG=1 reports each distinct blit shape once, with the route
+ * taken and why. VREND_DEBUG's dbg_blit is compiled out of the shipped release build, so
+ * there is otherwise no way to see which path a blit took on a real run. */
+static void vrend_limina_blit_log(const char *route, struct vrend_resource *src_res,
+                                  struct vrend_resource *dst_res,
+                                  const struct vrend_blit_info *info)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("LIMINA_VREND_BLIT_LOG") != NULL;
+   if (!on)
+      return;
+
+   uint64_t key = ((uint64_t)src_res->base.format << 40) ^
+                  ((uint64_t)dst_res->base.format << 24) ^
+                  ((uint64_t)src_res->base.nr_samples << 16) ^
+                  ((uint64_t)dst_res->base.nr_samples << 8) ^
+                  (uint64_t)route[3];
+   static uint64_t seen[64];
+   static unsigned seen_n;
+   for (unsigned i = 0; i < seen_n; i++)
+      if (seen[i] == key)
+         return;
+   if (seen_n < 64)
+      seen[seen_n++] = key;
+
+   virgl_error("[LIMINA-BLIT] %s src=fmt%d/s%d %dx%d -> dst=fmt%d/s%d %dx%d "
+               "(swizzle=%d redblue_or_fmt=%d srgb_dec=%d srgb_enc=%d)\n",
+               route, src_res->base.format, src_res->base.nr_samples,
+               src_res->base.width0, src_res->base.height0,
+               dst_res->base.format, dst_res->base.nr_samples,
+               dst_res->base.width0, dst_res->base.height0,
+               info->needs_swizzle, info->b.src.format != info->b.dst.format,
+               info->needs_manual_srgb_decode, info->needs_manual_srgb_encode);
+}
+
 static bool vrend_blit_needs_redblue_swizzle(struct vrend_resource *src_res,
                                              struct vrend_resource *dst_res,
                                              const struct pipe_blit_info *info)
@@ -12658,7 +12713,8 @@ static void vrend_renderer_prepare_blit_extra_info(struct vrend_context *ctx,
 
    if (vrend_blit_needs_swizzle(info->b.dst.format, info->b.src.format)) {
       info->needs_swizzle = true;
-      info->can_fbo_blit = false;
+      if (!vrend_limina_force_fbo_blit())
+         info->can_fbo_blit = false;
    }
 
    if (info->needs_swizzle && vrend_get_format_table_entry(dst_res->base.format)->flags & VIRGL_TEXTURE_NEED_SWIZZLE)
@@ -12669,7 +12725,8 @@ static void vrend_renderer_prepare_blit_extra_info(struct vrend_context *ctx,
       uint8_t temp = info->swizzle[0];
       info->swizzle[0] = info->swizzle[2];
       info->swizzle[2] = temp;
-      info->can_fbo_blit = false;
+      if (!vrend_limina_force_fbo_blit())
+         info->can_fbo_blit = false;
    }
 
    /* for scaled MS blits we either need extensions or hand roll */
@@ -12756,7 +12813,8 @@ static bool vrend_renderer_prepare_blit(struct vrend_context *ctx,
          (info->b.src.box.x != info->b.dst.box.x ||
           info->b.src.box.width != info->b.dst.box.width ||
           info->dst_y1 != info->src_y1 || info->dst_y2 != info->src_y2 ||
-          info->b.src.format != info->b.dst.format))
+          (info->b.src.format != info->b.dst.format &&
+           !vrend_limina_force_fbo_blit())))
         )) {
       VREND_DEBUG(dbg_blit, ctx, "Use GL fallback because dst:ms:%d src:ms:%d (%d %d %d %d) -> (%d %d %d %d)\n",
                   dst_res->base.nr_samples, src_res->base.nr_samples, info->b.src.box.x, info->b.src.box.x + info->b.src.box.width,
@@ -12964,12 +13022,14 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
 
    if (vrend_renderer_prepare_blit(ctx, src_res, dst_res, &blit_info)) {
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use FBO blit\n");
+      vrend_limina_blit_log("FBO", src_res, dst_res, &blit_info);
       vrend_renderer_blit_fbo(ctx, src_res, dst_res, &blit_info);
    } else {
       blit_info.has_srgb_write_control = has_feature(feat_texture_srgb_decode);
       blit_info.has_texture_srgb_decode = has_feature(feat_srgb_write_control);
 
       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use GL fallback\n");
+      vrend_limina_blit_log("GLFB", src_res, dst_res, &blit_info);
       vrend_renderer_blit_gl(ctx, src_res, dst_res, &blit_info);
       vrend_sync_make_current(ctx->sub->gl_context);
    }
