@@ -550,11 +550,12 @@ impl Context {
             // would leave the base texture a frame behind for the rest of the target's life.
             if let Some(Ok(())) = outcome {
                 planes.filled();
-            } else {
-                // Still owed, and possibly no longer reachable through a video buffer. Keeping
-                // it here is what makes the retry happen for a target whose decoder is gone.
-                self.owed.push(texture.clone());
             }
+            // A failure is not retried from here, and the entry goes. Neither way to fail is
+            // about this moment -- no GL context for the blitter, or no program for the pass --
+            // so a target kept on the list would fail again at every command for the rest of the
+            // context, holding its surface alive to do it. The debt stays recorded on the
+            // target, where the next composite view of it will find it and try once more.
         }
     }
 
