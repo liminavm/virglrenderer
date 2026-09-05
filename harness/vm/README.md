@@ -111,6 +111,37 @@ Two parser notes that cost nothing to know: `matroskademux ! vavp9dec` fails to 
 a `vp9parse` between them, and `ffplay` is not a route here at all — no `libopenh264`, and its
 vaapi-from-vulkan derivation fails.
 
+**A capture can tap keys.** `tap-keys.py` is `type-into-overview.py`'s other half: it taps named
+keys through `/dev/uinput` rather than typing words (`sudo python3 /tmp/tap-keys.py esc`). A guest
+boots into the overview, where every window is a still thumbnail and the compositor stops
+presenting -- so a client that draws continuously records its first frames and nothing after, and
+the captured frame stops being rewritten while everything else still looks healthy. Escaping to
+the focused window is what makes the rest of the capture move.
+
+## A WebGL client asking for MSAA takes the VM down
+
+`webgl.html` is the browser workload, run as `firefox --kiosk file:///tmp/webgl.html`. Requesting
+the WebGL context with `antialias:true` reliably kills the VM, and the sequence is worth knowing
+because only its first step names the cause:
+
+    MESA: error: ZINK: vkQueueSubmit failed (VK_ERROR_DEVICE_LOST)
+    [LIMINA-ALLOC-POOL] class 0 grew to 65 allocators -- in-flight depth is outrunning completion
+    ... to 7291 ...
+    VM stopped -- worker terminated by signal 6
+
+The device is lost first; after that nothing completes, so the allocator pool grows without bound
+until the abort about a minute later. The runaway pool is the loud part and is only the symptom.
+
+It is **not** ours, and the corpus must not be read as if it were: the same page kills the VM on
+the C leg and on virglrs alike, and a desktop booted without the page runs indefinitely. It is
+below virglrenderer, in the host's zink-on-KosmicKrisp path. Measured 2026-09-05 on alface: four
+runs with MSAA, all dead inside ~50 s of the page loading; the identical page with
+`antialias:false` runs on with `device-lost=0`.
+
+So the recorded corpus asks for `antialias:false`. That is a deliberate retreat from the crashing
+case, not a belief that MSAA works -- and the crash keeps a reproducer here rather than a fixture,
+because a corpus of it would only ever record the seconds before the host gave up.
+
 **A capture can type.** `type-into-overview.py` creates a keyboard on `/dev/uinput` and taps
 keys through it, so mutter sees a real device and a headless capture can drive the overview's
 search entry -- no window, no human. Copy it into the guest and run it as root
