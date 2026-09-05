@@ -10952,12 +10952,69 @@ static bool vrend_transfer_sync_after(void)
  * services a transfer to completion on the calling thread, so there is no interleaving to lose. */
 static __thread uint32_t limina_trace_xfer_handle;
 
+/* limina: refuse a transfer on a multi-plane format.
+ *
+ * The bound and the access disagree by exactly the ratio between two descriptions of
+ * the same format. yuv_planar_formats gives the planar YUV formats a four-byte GL
+ * triple (GL_RGBA8/GL_RGBA/GL_UNSIGNED_BYTE) so a converted blob can be SAMPLED as
+ * RGBA, while util_format_get_blocksize() for them is 1. Everything that bounds a
+ * transfer -- check_iov_bounds, and send_size inside the write path -- is computed from
+ * the blocksize; the glTexSubImage2D/glGetTexImage that follows uses the triple. So the
+ * access is four times what was checked, and it overruns for ANY iov size: a correctly
+ * sized NV12 iov (w*h*3/2) is overrun exactly as surely as a short one, because the
+ * guard admitted w*h and GL touches w*h*4.
+ *
+ * Refusing rather than re-deriving the bound, because the operation has no correct
+ * meaning today in either direction. There is no single glTexSubImage2D that fills two
+ * planes: a guest that CPU-writes a decode target hands us NV12 bytes we would upload
+ * as RGBA, and a guest that CPU-reads one gets RGBA bytes back to interpret as NV12.
+ * Both are garbage before any bounds question, so nothing correct can depend on this
+ * path and a refusal cannot regress it -- it converts silent garbage plus an
+ * out-of-bounds access into a loud, safe failure. Fixing only the bound would keep the
+ * memory safe and leave the meaningless conversion in place.
+ *
+ * This sits in the two iov wrappers rather than in vrend_renderer_transfer_internal
+ * because they are the funnel: TRANSFER3D arrives through transfer_internal, but
+ * RESOURCE_INLINE_WRITE (vrend_transfer_inline_write) and COPY_TRANSFER3D in both
+ * directions (vrend_renderer_copy_transfer3d{,_from_host}) do their own bounds check and
+ * then call these directly. Guarding transfer_internal alone leaves those three open.
+ *
+ * Neither of the paths that legitimately move planar pixels comes through here:
+ * vrend_resource_upload_guest_pixels and writeback_plane_to_guest both walk the guest's
+ * iovecs with vrend_read_from_iovec, which bounds-checks and refuses on short.
+ *
+ * Loud on purpose. No planar transfer destination was seen across seven guest command
+ * corpora, so a benign guest is not believed to reach this -- if one does we want to see
+ * it named here instead of losing frames quietly. */
+static bool
+vrend_transfer_is_multiplane(struct vrend_context *ctx, struct vrend_resource *res)
+{
+   struct guest_plane planes[VIRGL_GBM_MAX_PLANES];
+   uint32_t plane_count = 0;
+
+   vrend_guest_plane_layout(res->base.format, res->base.width0, res->base.height0,
+                            planes, &plane_count);
+   if (plane_count <= 1)
+      return false;
+
+   virgl_error("refusing a transfer on a %ux%u %s resource: a multi-plane format is "
+               "bounded by its gallium blocksize and accessed with its GL format, which "
+               "disagree, and no single transfer can fill its planes\n",
+               res->base.width0, res->base.height0,
+               util_format_name(res->base.format));
+   vrend_report_context_error(ctx, VIRGL_ERROR_CTX_TRANSFER_IOV_BOUNDS, res->gl_id);
+   return true;
+}
+
 static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
                                              struct vrend_resource *res,
                                              const struct iovec *iov, int num_iovs,
                                              const struct vrend_transfer_info *info)
 {
    int ret;
+
+   if (vrend_transfer_is_multiplane(ctx, res))
+      return EINVAL;
 
    /* limina: capture the BYTES, not just the fact of the transfer. Both guest->host paths
     * converge here -- TRANSFER3D through vrend_renderer_transfer_iov and COPY_TRANSFER3D
@@ -11366,6 +11423,9 @@ static int vrend_renderer_transfer_send_iov(struct vrend_context *ctx,
                                             const struct iovec *iov, int num_iovs,
                                             const struct vrend_transfer_info *info)
 {
+   if (vrend_transfer_is_multiplane(ctx, res))
+      return EINVAL;
+
    if ((is_only_bit(res->storage_bits, VREND_STORAGE_GUEST_MEMORY) ||
        has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) && res->iov) {
       return vrend_copy_iovec(res->iov, res->num_iovs, info->box->x,
