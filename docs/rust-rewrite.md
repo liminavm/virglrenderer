@@ -814,6 +814,12 @@ to have it, each because reproducing the C would mean reproducing a defect.
 Each of these is a question about the renderers rather than about the harness, and each is
 waiting on a call rather than on work.
 
+- **virglrs serves no push-descriptor command.** The C dispatches `vkCmdPushDescriptorSet` and
+  `vkCmdPushDescriptorSet2`; virglrs implements neither, so a guest using them lands on the
+  generated default and is counted rather than served. Nothing we capture uses them — zero
+  occurrences across all six venus corpora — so this is a gap with no workload behind it yet, and
+  the decision is whether to serve them before one appears or wait for one to.
+
 - **`MultisampleArrayUnsupported` is latent.** `vrend/resource.rs` refuses a multisampled array
   texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
   a known refusal waiting for either a workload that needs it or a decision that it never will be.
