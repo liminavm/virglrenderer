@@ -830,14 +830,26 @@ waiting on a call rather than on work.
   texture, which is wrong-but-not-a-leak and says so on stderr.
 
   Nothing we hold reaches it. Every fixture but `vrend-vkclient` leaves all its blobs untyped,
-  and vkclient's six typed blobs are `R16G16B16X16_FLOAT` — so no capture types a blob planar,
-  and no fixture could score a converter written today. The C's other planar consumer does not
-  reach this either: composite decode targets arrive through `resource_create`, and the C sets
+  and vkclient's six typed blobs are `R16G16B16X16_FLOAT`. The C's other planar consumer does not
+  reach it either: composite decode targets arrive through `resource_create`, and the C sets
   `guest_pixels` at one site only, in `SET_TYPE`.
 
-  Reaching it wants a corpus: a stock guest doing *software* video decode — GStreamer with
-  `glupload`, no VA-API — which delivers frames as guest-memory blobs typed NV12 or I420. The
-  decision is whether to record one and serve the conversion, or leave it refused.
+  **No video route on the rig types a blob at all**, which is stronger than the fixture census and
+  was measured rather than reasoned. Measured 2026-09-05, stock guest, one 267 s window over
+  819,698 records covering five arms: software H.264 into `waylandsink`; into
+  `glupload ! glimagesink`; Showtime with the VA decoders deranked; then hardware decode through
+  `vah264dec`, and Showtime's default. The window holds 3,506 `TRANSFER3D`, 1,372
+  `COPY_TRANSFER3D` and 165 `DECODE_BITSTREAM` — and zero `PIPE_RESOURCE_SET_TYPE`. Decoded
+  frames reach the renderer as transfers into ordinary resources, or as video buffers. Never as a
+  typed blob. The instrument is `harness/replay/vrend-trace-decode.py`, which names the command
+  and counts six of it in `vrend-vkclient.bin`.
+
+  So the C's own comment above this code — that the guest-pages fill is how "every GStreamer
+  glupload whose buffers qualify" reaches the GPU — names a route that does not run here: the
+  glupload arm decoded, drew, and typed nothing. Reaching the planar arm needs a guest that
+  allocates the frame as a planar dmabuf and imports it, which no route tried does. Until such a
+  workload is found the conversion is unreachable and unscoreable, and refusing it by name is the
+  resting state; the decision is whether to keep hunting for one.
 
 ## Consequences to accept
 
