@@ -18,6 +18,7 @@ mod abi;
 mod corpus;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::raw::c_int;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -601,43 +602,28 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// One pass over a context's capturable device memory: census, then read and hash each allocation.
-/// Returns the score lines, sorted, so two passes compare with a plain equality test.
-fn score_pass(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
-    let pairs = match r.memory_census(ctx_id) {
-        Ok(p) => p,
-        // A refused census is a fact about the run, not a reason to stop scoring the others.
-        Err(rc) => return vec![format!("census ctx={ctx_id} UNAVAILABLE rc={rc}")],
-    };
-    let mut lines: Vec<String> = Vec::with_capacity(pairs.len() + 1);
-    lines.push(format!("census ctx={ctx_id} allocations={}", pairs.len()));
+/// One pass over a context's capturable device memory: census, then read and hash each
+/// allocation. Keyed by id so passes can be compared allocation by allocation rather than as a
+/// block of text -- which is what lets one moving allocation be named instead of spoiling the
+/// whole context's score.
+fn census_pass(
+    r: &abi::Renderer,
+    ctx_id: u32,
+) -> Result<BTreeMap<u64, (u64, Result<u64, c_int>)>, c_int> {
+    let pairs = r.memory_census(ctx_id)?;
+    let mut out = BTreeMap::new();
     for (mem_id, size) in pairs {
         // Cap what a single allocation can cost us: a 64 MB scanout blob is real, and reading it
-        // whole on every settle pass is the difference between a score and a stall. The prefix is
-        // still content, and a divergence that misses the first megabyte is not one we can miss
-        // for long.
+        // whole on every pass is the difference between a score and a stall. The prefix is still
+        // content, and a divergence that misses the first megabyte is not one we can miss for long.
         let want = size.min(1 << 20) as usize;
         let mut buf = vec![0u8; want];
         let rc = r.memory_read(ctx_id, mem_id, &mut buf);
-        if rc != 0 {
-            lines.push(format!("mem ctx={ctx_id} id={mem_id} size={size} UNREADABLE rc={rc}"));
-            continue;
-        }
-        lines.push(format!(
-            "mem ctx={ctx_id} id={mem_id} size={size} read={want} hash={:016x}",
-            fnv1a(&buf)
-        ));
+        out.insert(mem_id, (size, if rc != 0 { Err(rc) } else { Ok(fnv1a(&buf)) }));
     }
-    lines.sort();
-    lines
+    Ok(out)
 }
 
-/// Score a context, waiting for it to settle first. The replay skips every ring flow-control
-/// command, so nothing in the stream waits on the GPU: a hash taken the instant replay_end returns
-/// can race queue work that is still executing and read as nondeterministic when the renderer is
-/// perfectly deterministic. Two consecutive agreeing passes are the evidence that what we hashed
-/// is the finished state; a context that never settles says so in its own score, because that is
-/// itself a difference between two implementations.
 /// How many of a context's blobs came back IOSurface-backed.
 ///
 /// A count, not the pixels. Reading a surface needs its geometry -- `read_iosurface` takes a byte
@@ -651,25 +637,84 @@ fn iosurf_line(map: &BTreeMap<u32, BTreeSet<u32>>, ctx_id: u32) -> String {
     format!("iosurface ctx={ctx_id} backed={n}")
 }
 
+/// Score a context's device memory, hashing only what holds still.
+///
+/// `replay_end` starts the deferred ring threads, and no ABI reports when they have drained, so a
+/// census taken afterwards races work that is still running. The old rule -- resample the whole
+/// context until two passes agreed -- fails in both directions. It can agree early, when two
+/// samples catch the same half-drawn frame, which happens readily on a host with a VM running,
+/// which is to say while anyone is capturing. And a single moving allocation makes the whole
+/// context look unsettled when every other allocation in it is long finished.
+///
+/// So stability is decided per allocation. An allocation whose hash is identical across every
+/// sample is scored by that hash. One that moves is scored as `unstable`, with how many distinct
+/// values it took, and is NOT given a hash -- because a hash of a moving target pins nothing and
+/// reads as a renderer divergence on the next run.
+///
+/// This is measured, not assumed: on `synoik-glclient` two 4,128,768-byte allocations are the
+/// compositor's framebuffers, and their contents never converge -- 500 ms, 3 s and 8 s of settling
+/// give three different answers, and the two renderer legs disagree by timing alone. Everything
+/// else in that corpus is rock stable. Waiting longer is not the fix and never was.
 fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
-    const SETTLE_TRIES: u32 = 20;
-    const SETTLE_WAIT: Duration = Duration::from_millis(50);
+    /// How many samples decide stability, and how far apart. The lead exists because the first
+    /// sample after `replay_end` is the least representative one.
+    const SAMPLES: u32 = 4;
+    const SAMPLE_WAIT: Duration = Duration::from_millis(200);
+    const SAMPLE_LEAD: Duration = Duration::from_millis(500);
 
-    let mut prev = score_pass(r, ctx_id);
-    for attempt in 1..=SETTLE_TRIES {
-        std::thread::sleep(SETTLE_WAIT);
-        let next = score_pass(r, ctx_id);
-        if next == prev {
-            if attempt > 1 {
-                eprintln!("settle: ctx {ctx_id} took {} passes", attempt + 1);
-            }
-            return next;
+    let lead = std::env::var("VKR_SETTLE_LEAD_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(SAMPLE_LEAD, Duration::from_millis);
+    std::thread::sleep(lead);
+
+    let mut samples = Vec::with_capacity(SAMPLES as usize);
+    for i in 0..SAMPLES {
+        if i > 0 {
+            std::thread::sleep(SAMPLE_WAIT);
         }
-        prev = next;
+        match census_pass(r, ctx_id) {
+            Ok(p) => samples.push(p),
+            // A refused census is a fact about the run, not a reason to stop scoring the others.
+            Err(rc) => return vec![format!("census ctx={ctx_id} UNAVAILABLE rc={rc}")],
+        }
     }
-    let mut out = prev;
-    out.insert(0, format!("census ctx={ctx_id} UNSETTLED after {SETTLE_TRIES} passes"));
-    out
+
+    let last = samples.last().expect("SAMPLES > 0");
+    let mut lines = Vec::with_capacity(last.len() + 2);
+    lines.push(format!("census ctx={ctx_id} allocations={}", last.len()));
+
+    // Membership that moves is a different fact from content that moves, and hiding it inside a
+    // per-allocation verdict would lose it: an allocation freed or made between samples is not an
+    // unstable hash, it is a census that has not stopped changing shape.
+    if samples.iter().any(|p| p.keys().ne(last.keys())) {
+        lines.push(format!("census ctx={ctx_id} MEMBERSHIP UNSETTLED over {SAMPLES} samples"));
+    }
+
+    for (&mem_id, &(size, ref v)) in last {
+        let seen: BTreeSet<_> =
+            samples.iter().filter_map(|p| p.get(&mem_id)).map(|(_, h)| h).collect();
+        if seen.len() > 1 {
+            lines.push(format!(
+                "mem ctx={ctx_id} id={mem_id} size={size} unstable values={}",
+                seen.len()
+            ));
+            continue;
+        }
+        match v {
+            Err(rc) => {
+                lines.push(format!("mem ctx={ctx_id} id={mem_id} size={size} UNREADABLE rc={rc}"))
+            }
+            Ok(h) => {
+                let want = size.min(1 << 20);
+                lines.push(format!(
+                    "mem ctx={ctx_id} id={mem_id} size={size} read={want} hash={h:016x}"
+                ))
+            }
+        }
+    }
+    lines.sort();
+    lines
 }
 
 /// The score: every fact a second implementation replaying the same corpus must reproduce, one

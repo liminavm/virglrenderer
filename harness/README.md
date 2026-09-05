@@ -675,11 +675,23 @@ stand-in carries `VREND_STORAGE_GL_BUFFER`, so vrend takes its texture-buffer pa
 blob is guest memory and never goes near it. `vrend-vkclient` cannot be pinned until a blob is
 modelled as what it is. (It is also what exposed the unguarded `glTexBuffer` — `../docs/rust-rewrite.md`.)
 
-**The venus census hashes memory the guest never wrote.** It reads 1 MiB of each live allocation,
-including allocations far larger that the workload only partly filled, so the tail is whatever the
-host allocator last left there. On `synoik-glclient` two allocations hash differently on every run
-on *both* legs. That makes the corpus unpinnable, and worse, it would make any real divergence in
-it unreadable. Hash what the guest wrote, or hash nothing.
+**Two of `synoik-glclient`'s allocations have no deterministic final content.** They are the
+compositor's framebuffers -- 4,128,768 bytes each, which is 1280x800 BGRA plus padding, and the
+bytes are pixels. Within one run they hold still; between runs they differ, on both legs. Settling
+longer does not converge them: 500 ms, 3 s and 8 s give three different answers.
+
+The cause is upstream of the census. The replay skips every ring flow-control command, so nothing
+in the stream waits on the GPU; `replay_end` starts the ring threads and where they come to rest
+is not determined by the corpus. Everything else in that corpus is rock stable, including the
+allocation-count difference between the two legs, so this is two allocations and not a sick
+oracle.
+
+The census now decides stability **per allocation** rather than for a context as a whole -- four
+samples, and an allocation that moves is scored `unstable` with the number of values it took
+rather than given a hash. That removes the old failure, where the whole-context settle could agree
+early on a half-drawn frame and pin it. It does not make these two allocations pinnable, because
+their variance is between runs and no single run can see it. What would: not skipping ring flow
+control, so the replay ends where the corpus says rather than where the scheduler leaves it.
 
 **`synoik-glclient` is captured but unpinned**, waiting on the census. Unlike the Vulkan client
 corpora, the C *can* replay it — the GL client's contexts are classic and are skipped — so it can
