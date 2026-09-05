@@ -596,8 +596,35 @@ impl av1::Carried for Owed {
 }
 
 /// One decoder the guest created.
+/// Which codec this is, and everything true of that codec alone.
+///
+/// One field rather than a profile beside an `Option` per codec: the AV1 serializer's state
+/// exists for an AV1 codec and cannot exist for any other, which a pair of fields can only be
+/// trusted to keep in step. The resolved codec profile lives here too, so the wire profile is
+/// mapped once, where the codec is created, rather than re-derived and unwrapped every frame.
+enum Kind {
+    Vp9,
+    H264(h264::H264Profile),
+    Hevc(h265::HevcProfile),
+    /// Boxed: the serializer's saved reference state is two and a half kilobytes, and every
+    /// other codec would carry it around as dead weight in the enum.
+    Av1(Box<Av1>),
+}
+
+impl Kind {
+    /// Which codec the host was asked for, for a message about the host.
+    fn name(&self) -> &'static str {
+        match self {
+            Kind::Vp9 => "VP9",
+            Kind::H264(_) => "H.264",
+            Kind::Hevc(_) => "HEVC",
+            Kind::Av1(_) => "AV1",
+        }
+    }
+}
+
 pub struct Codec {
-    pub profile: Profile,
+    kind: Kind,
     /// The extent the codec was created for, which is the fallback for a descriptor that
     /// declares none.
     width: u32,
@@ -610,8 +637,6 @@ pub struct Codec {
     /// decode, and that arrives with the descriptor rather than with the creation arguments --
     /// a VP9 stream may change resolution or bit depth at a key frame.
     session: Option<Session>,
-    /// The AV1 serializer's state. `None` for every other profile, which needs none.
-    av1: Option<Av1>,
 }
 
 impl Codec {
@@ -652,13 +677,13 @@ impl Codec {
         // pictures with it, and every frame after one that did not need it then predicts from
         // an empty buffer -- which decodes "successfully" and looks like slightly wrong colour.
         if !self.session.as_ref().is_some_and(|s| s.serves(&key)) && !self.adopt(&key, handle) {
-            let profile = self.profile;
+            let codec = self.kind.name();
             self.session = Some(Session::create(key).map_err(|status| {
                 // The probe advertised this codec, so a host that now says it has no such
                 // decoder is contradicting itself and every later frame will fail the same way.
                 assert!(
                     !status.is_no_such_decoder(),
-                    "VideoToolbox advertised {profile:?} and then had no decoder for it",
+                    "VideoToolbox advertised {codec} and then had no decoder for it",
                 );
                 eprintln!("[virglrs] video codec {handle}: no decode session ({status:?})");
                 Refusal::HostRefusedFrame
@@ -736,7 +761,9 @@ impl Codec {
 
         // The held frame first, under its own shape: decode order is preserved, and it is this
         // descriptor's reference map that makes its refresh exact.
-        let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
+        let Kind::Av1(av1) = &mut self.kind else {
+            unreachable!("only an AV1 codec decodes an AV1 frame");
+        };
         if let Some((unit, owed)) = av1.obu.flush_held(&desc) {
             self.submit(gl, handle, &owed.shape, &unit.bytes, owed.target.as_ref())?;
         }
@@ -768,7 +795,9 @@ impl Codec {
         let Shape::Av1 { desc, .. } = shape else {
             unreachable!("an AV1 codec's frames carry an AV1 shape");
         };
-        let av1 = self.av1.as_mut().expect("an AV1 codec has its serializer");
+        let Kind::Av1(av1) = &mut self.kind else {
+            unreachable!("only an AV1 codec ends an AV1 frame");
+        };
         let owed = Owed { shape: shape.clone(), target: Some(Arc::clone(&buffer)) };
         match av1.obu.build_temporal_unit(desc, tiles, owed) {
             // Nothing emitted: the serializer is holding this frame until the next descriptor
@@ -986,15 +1015,25 @@ impl Video {
             eprintln!("[virglrs] video codec {handle}: {profile:?} is not advertised by this host");
             return Err(Refusal::Unsupported("that profile is not advertised"));
         }
+        let kind = match profile {
+            Profile::Vp9Profile0 => Kind::Vp9,
+            Profile::Av1Main => Kind::Av1(Box::new(Av1 { obu: av1::ObuState::new() })),
+            _ => match (h264::H264Profile::of(profile), h265::HevcProfile::of(profile)) {
+                (Some(h264), _) => Kind::H264(h264),
+                (_, Some(hevc)) => Kind::Hevc(hevc),
+                // `advertised` is built from the same set, so a profile that got this far and
+                // names no codec is this build disagreeing with itself.
+                _ => unreachable!("{profile:?} is advertised and names no codec"),
+            },
+        };
         slot.insert(Codec {
-            profile,
+            kind,
             width,
             height,
             // Nothing has been decoded, so there are no reference pictures.
             gate: Gate::AwaitingKey { dropped: 0, freeze: None },
             frame: Frame::Idle,
             session: None,
-            av1: (profile == Profile::Av1Main).then(|| Av1 { obu: av1::ObuState::new() }),
         });
         Ok(())
     }
@@ -1083,12 +1122,12 @@ impl Video {
     ) -> Result<(), Refusal> {
         let handle = codec;
         let codec = self.codec_mut(codec)?;
-        let (profile, width, height) = (codec.profile, codec.width, codec.height);
+        let (width, height) = (codec.width, codec.height);
         // AV1 is the odd one and takes the whole call: its descriptor settles the *previous*
         // frame's reference slot, so a frame the serializer is holding goes out here rather than
         // at END_FRAME -- and a stream may display a hidden frame just one decode later, which
         // leaves no margin.
-        if profile == Profile::Av1Main {
+        if matches!(codec.kind, Kind::Av1(_)) {
             return codec.decode_av1(gl, handle, target, descriptor, bitstream);
         }
 
@@ -1097,15 +1136,10 @@ impl Video {
         // depends on the bytes this very call carried.
         accumulated.extend_from_slice(bitstream);
 
-        match profile {
-            Profile::Vp9Profile0 => {
-                *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height)))
-            }
-            Profile::H264Baseline
-            | Profile::H264ConstrainedBaseline
-            | Profile::H264Main
-            | Profile::H264High => {
-                let h264_profile = h264::H264Profile::of(profile).expect("an H.264 profile");
+        match &codec.kind {
+            Kind::Vp9 => *shape = Some(Shape::Vp9(Vp9Frame::read(descriptor, width, height))),
+            Kind::H264(h264_profile) => {
+                let h264_profile = *h264_profile;
                 // Nothing on the wire says which `pic_parameter_set_id` the guest's slices
                 // reference, so it is read back out of them -- and until one arrives there is
                 // nothing to guess with: a PPS bearing an id the slices do not use is simply not
@@ -1131,8 +1165,8 @@ impl Video {
                 let key = shape.as_ref().is_some_and(Shape::key) || h264::has_idr(accumulated);
                 *shape = Some(Shape::H264 { sets, key, width, height });
             }
-            Profile::HevcMain => {
-                let hevc_profile = h265::HevcProfile::of(profile).expect("an HEVC profile");
+            Kind::Hevc(hevc_profile) => {
+                let hevc_profile = *hevc_profile;
                 let desc = h265::PictureDesc::read(descriptor);
                 // The inspection is not only for the id: it establishes that the stream does not
                 // depend on reference picture sets declared in the SPS, which are absent from the
@@ -1157,8 +1191,9 @@ impl Video {
                 let key = shape.as_ref().is_some_and(Shape::key) || desc.key;
                 *shape = Some(Shape::Hevc { sets, key, width, height });
             }
-            // Handled above, before the frame was even reached.
-            Profile::Av1Main => unreachable!("AV1 takes the whole call"),
+            // Returned above, before the frame was even reached: an AV1 descriptor settles the
+            // previous frame, so it cannot wait for the accumulation this match feeds.
+            Kind::Av1(_) => unreachable!("AV1 takes the whole call"),
         }
         Ok(())
     }
