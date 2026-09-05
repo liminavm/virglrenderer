@@ -824,6 +824,21 @@ waiting on a call rather than on work.
   texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
   a known refusal waiting for either a workload that needs it or a decision that it never will be.
 
+- **A blob typed with a planar format gets no picture.** The C converts one: `SET_TYPE` on an
+  NV12, NV21, I420 or YV12 blob runs a CPU YUV-to-RGBA pass over the guest's planes into an RGBA
+  texture at luma resolution. virglrs refuses it by name in `fill_texture` and blanks the
+  texture, which is wrong-but-not-a-leak and says so on stderr.
+
+  Nothing we hold reaches it. Every fixture but `vrend-vkclient` leaves all its blobs untyped,
+  and vkclient's six typed blobs are `R16G16B16X16_FLOAT` — so no capture types a blob planar,
+  and no fixture could score a converter written today. The C's other planar consumer does not
+  reach this either: composite decode targets arrive through `resource_create`, and the C sets
+  `guest_pixels` at one site only, in `SET_TYPE`.
+
+  Reaching it wants a corpus: a stock guest doing *software* video decode — GStreamer with
+  `glupload`, no VA-API — which delivers frames as guest-memory blobs typed NV12 or I420. The
+  decision is whether to record one and serve the conversion, or leave it refused.
+
 ## Consequences to accept
 
 - **Upstream gets the fixes made up to the switch, and nothing after.** The delta
