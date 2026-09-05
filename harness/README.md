@@ -184,6 +184,22 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
+  `vrend-composite.score` is hardware decode into the **composite planar** target -- one NV12
+  resource with its planes chained behind it, against the per-plane shape `vrend-vp9stock` holds.
+  Recorded from the enhanced guest with H.264 and VP9 played one after the other, so the decodes
+  land in two contexts: **`--ctx 8` is the H.264 leg and is what the fixture pins**, and `--ctx 10`
+  is the VP9 one, scoreable the same way. `--ctx` is not optional here for the usual reason -- the
+  busiest context is the shell's, and scoring it measures the desktop and none of the decode.
+
+  **What it does not measure is the decoded picture.** A composite target is an IOSurface-backed
+  planar surface: the sweep can read a resource as a GL texture or as a BGRA IOSurface, and a
+  planar surface is neither, so every decode target scores `sync=-22 read-failed=-22` on both
+  legs. What the fixture gates is everything around the picture -- 5018 resources created with
+  none refused, 334 IOSurface-backed, the decode commands served to the end with no submit
+  errors, the base textures staying untouched, and the 325 inked resources the session draws.
+  A content oracle for this shape needs the sweep to read a planar surface plane by plane, which
+  it cannot yet; until then `vrend-vp9stock` remains the corpus that scores decoded pixels.
+
   `vrend-overview.score` is the GNOME shell with someone **typing in the overview's search
   entry**, and it exists because that one act allocates a resource no other corpus contains: a
   `PIPE_BUFFER` carrying `SAMPLER_VIEW | RENDER_TARGET`, a texture buffer. virglrs refused that
