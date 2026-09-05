@@ -83,6 +83,19 @@ plus `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` for a windowed one. A **GL** client
 zink environment too, which an SSH shell does not inherit — without it the stack silently falls back
 to llvmpipe and the capture records nothing while looking healthy.
 
+**For a video workload, drive Showtime or `waylandsink` — not `glimagesink`.** A `gst-launch-1.0`
+pipeline ending in `glimagesink` decodes correctly and runs to EOS with rc=0, and never puts a
+window on the screen. It does this on **both** renderer legs, so it is the sink and not the port;
+the C leg's captured frame shows the same empty desktop after the same playback. It is worth
+finding out why, because a decoder whose only visible failure is an absent window is a workload
+that scores green while measuring nothing on screen — but until it is, a corpus recorded through
+it carries the decode and not the presentation. Showtime drives the whole path, composite planar
+decode target included, with the picture up.
+
+Two parser notes that cost nothing to know: `matroskademux ! vavp9dec` fails to negotiate without
+a `vp9parse` between them, and `ffplay` is not a route here at all — no `libopenh264`, and its
+vaapi-from-vulkan derivation fails.
+
 ## Two synoik corpora, and why one cannot do both jobs
 
 The synoik guest yields two corpora, and they measure different things because a capture cannot
