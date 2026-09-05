@@ -826,14 +826,6 @@ waiting on a call rather than on work.
   behaviour every fixture is recorded against, so it is not a change to make while debugging
   something else.
 
-- **virglrs keeps three imported client buffers the C frees.** On `synoik-glclient` the census
-  reports 26 live allocations against the C's 23, the difference being exactly three
-  1,920,000-byte buffers — 800x600x4, the GL client's window. Stable across runs on both legs.
-  Either virglrs retains an imported buffer past its use or the C drops one early, and which is
-  correct depends on whether the guest still holds a reference. Not chased. It is readable: the count is
-  stable on both legs across runs, and only the two framebuffer allocations beside it are not
-  (`../harness/README.md`).
-
 - **`MultisampleArrayUnsupported` is latent.** `vrend/resource.rs` refuses a multisampled array
   texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
   a known refusal waiting for either a workload that needs it or a decision that it never will be.
