@@ -101,6 +101,7 @@ unsafe extern "C" {
     fn IOSurfaceGetWidthOfPlane(surface: CfTypeRef, plane: usize) -> usize;
     fn IOSurfaceGetHeightOfPlane(surface: CfTypeRef, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerRowOfPlane(surface: CfTypeRef, plane: usize) -> usize;
+    fn IOSurfaceGetBaseAddressOfPlane(surface: CfTypeRef, plane: usize) -> *mut c_void;
     fn IOSurfaceLock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceUnlock(surface: CfTypeRef, options: u32, seed: *mut u32) -> i32;
 }
@@ -108,6 +109,10 @@ unsafe extern "C" {
 /// `kIOSurfaceLockReadOnly`. Read-only is not an optimisation here: locking for write would
 /// invalidate the GPU's copy of pixels the guest is still rendering into.
 const LOCK_READ_ONLY: u32 = 1;
+
+/// `kIOSurfaceLockReadWrite`, the absence of every option. The only writer here is the decode
+/// path putting a picture into a plane; everything else reads.
+const LOCK_READ_WRITE: u32 = 0;
 
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
@@ -267,6 +272,18 @@ impl PlanarFormat {
         }
     }
 
+    /// How many bytes one sample of a plane is.
+    ///
+    /// Stated here and read everywhere, because it is the number a copy into the plane strides
+    /// by and the one its row length is built from -- and a second statement of it somewhere
+    /// else is a sheared plane waiting to happen.
+    pub fn bytes_per_element(self, plane: usize) -> u32 {
+        match (self, plane) {
+            (PlanarFormat::BiPlanar420, 0) => 1,
+            (PlanarFormat::BiPlanar420, _) => 2,
+        }
+    }
+
     /// What each plane of a `width` x `height` surface is, laid out.
     ///
     /// Chroma rounds *up*: an odd-sized picture still has a chroma sample for its last column,
@@ -277,15 +294,14 @@ impl PlanarFormat {
     /// that is too large is silently wasted memory.
     pub fn planes(self, width: u32, height: u32) -> Option<[PlaneShape; 2]> {
         let extents = match self {
-            PlanarFormat::BiPlanar420 => {
-                [(width, height, 1u32), (width.div_ceil(2), height.div_ceil(2), 2u32)]
-            }
+            PlanarFormat::BiPlanar420 => [(width, height), (width.div_ceil(2), height.div_ceil(2))],
         };
         let mut offset = 0u32;
         let mut planes =
             [PlaneShape { width: 0, height: 0, bytes_per_element: 0, bytes_per_row: 0, offset: 0 };
                 2];
-        for (i, (width, height, bytes_per_element)) in extents.into_iter().enumerate() {
+        for (i, (width, height)) in extents.into_iter().enumerate() {
+            let bytes_per_element = self.bytes_per_element(i);
             let align = u32::try_from(linear_alignment(self.plane_mtl_format(i))?).ok()?;
             let bytes_per_row = (width * bytes_per_element).div_ceil(align) * align;
             planes[i] = PlaneShape { width, height, bytes_per_element, bytes_per_row, offset };
@@ -581,51 +597,112 @@ impl Surface {
         Ok(surface)
     }
 
-    /// Fill one plane with a single byte, through the CPU.
+    /// Copy a decoded plane's rows into one plane of this surface.
     ///
-    /// Only a test wants this -- the decode path writes planes through GL -- and it exists for
-    /// one question that has no other answer: whether an image imported over plane *n* really
-    /// samples plane *n*. The image's own width and height cannot answer it, because they are
-    /// set from the geometry the import was handed rather than from whatever the driver went on
-    /// to sample. Content can: put a different byte in each plane and ask what comes back.
+    /// This is the whole of delivery into a composite target. There is no GL upload on that path
+    /// and nothing to upload into: the guest samples this plane directly through a view of its
+    /// own, so the pixels belong in the surface and nowhere else.
     ///
-    /// `false` if the plane is not there or the surface will not lock.
-    #[cfg(test)]
-    pub fn fill_plane(&self, plane: u32, value: u8) -> bool {
-        // Declared here rather than beside the rest: nothing outside a test writes a plane from
-        // the CPU, and a declaration the shipped build never calls is one the linker still
-        // carries.
-        #[link(name = "IOSurface", kind = "framework")]
-        unsafe extern "C" {
-            fn IOSurfaceGetBaseAddressOfPlane(surface: CfTypeRef, plane: usize) -> *mut c_void;
-        }
-
+    /// The source's stride is the decoder's and this plane's is the kernel's, and neither pads
+    /// the way the other does, so the copy walks the two separately and moves `row_bytes` --
+    /// the picture's own row, tight -- out of each. Passing this plane's pitch as `row_bytes`
+    /// would write padding into the picture and shear it.
+    ///
+    /// Rows and bytes are clamped to what the plane holds. A source larger than the plane is a
+    /// source for a different picture; copying all of it would run off the end.
+    ///
+    /// `false` if the plane is not there, the surface will not lock, or `src` is short of the
+    /// rows it claims.
+    pub fn write_plane(
+        &self,
+        plane: u32,
+        src: &[u8],
+        src_pitch: usize,
+        rows: u32,
+        row_bytes: usize,
+    ) -> bool {
         let Some((shape, pitch)) = self.plane(plane) else {
             return false;
         };
-        // Read-write, unlike every other lock in this module: this one is writing.
-        const LOCK_READ_WRITE: u32 = 0;
+        let rows = rows.min(shape.height);
+        let row_bytes = row_bytes.min(pitch as usize);
+        if rows == 0 || row_bytes == 0 {
+            return true;
+        }
+        // The last row is only `row_bytes` long, not a whole stride: a source sized exactly to
+        // its picture ends there, and demanding a final stride would refuse it.
+        if src.len() < (rows as usize - 1) * src_pitch + row_bytes {
+            return false;
+        }
+
         // SAFETY: the surface is live and owned by `self`; the lock is balanced by the unlock
         // below with the same options, as IOSurface requires.
         if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut()) } != 0 {
             return false;
         }
         // SAFETY: the plane index was checked against the surface's own plane count above, so
-        // the base address is the kernel's for a plane that exists, and the region written is
-        // the one the kernel reported: `shape.height` rows of `pitch` bytes, which is the
-        // plane's whole allocation and no more. Nothing else touches these bytes while the
-        // surface is locked to this thread.
+        // the base address is the kernel's for a plane that exists. Each row writes `row_bytes`
+        // at an offset of at most `(rows - 1) * pitch`, with `rows <= shape.height` and
+        // `row_bytes <= pitch`, so every byte lands inside the region the kernel reported. The
+        // source is a slice whose length was just checked against what is read out of it, and
+        // the two regions cannot overlap -- one is this surface, the other is not.
         unsafe {
             let base = IOSurfaceGetBaseAddressOfPlane(self.as_ref(), plane as usize).cast::<u8>();
             if !base.is_null() {
-                for row in 0..shape.height {
-                    std::ptr::write_bytes(base.add((row * pitch) as usize), value, pitch as usize);
+                for row in 0..rows as usize {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(row * src_pitch),
+                        base.add(row * pitch as usize),
+                        row_bytes,
+                    );
                 }
             }
             // SAFETY: balanced against the lock above, with the same options.
             IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
         }
         true
+    }
+
+    /// Fill one plane with a single byte.
+    ///
+    /// Only a test wants this, and it exists for one question that has no other answer: whether
+    /// an image imported over plane *n* really samples plane *n*. The image's own width and
+    /// height cannot answer it, because they are set from the geometry the import was handed
+    /// rather than from whatever the driver went on to sample. Content can: put a different byte
+    /// in each plane and ask what comes back.
+    #[cfg(test)]
+    pub fn fill_plane(&self, plane: u32, value: u8) -> bool {
+        let Some((shape, pitch)) = self.plane(plane) else {
+            return false;
+        };
+        // One row, replayed with a zero source stride: every destination row reads the same
+        // source bytes, so a whole plane costs one row's worth of memory.
+        let row = vec![value; pitch as usize];
+        self.write_plane(plane, &row, 0, shape.height, pitch as usize)
+    }
+
+    /// One row of a plane, read back. The other half of [`Self::write_plane`]'s oracle.
+    #[cfg(test)]
+    pub fn read_plane_row(&self, plane: u32, row: u32) -> Option<Vec<u8>> {
+        let (shape, pitch) = self.plane(plane)?;
+        if row >= shape.height {
+            return None;
+        }
+        // SAFETY: a read lock on the live surface this type owns, balanced below.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut()) } != 0 {
+            return None;
+        }
+        // SAFETY: the plane index and the row were both checked against what the kernel
+        // reports, so `pitch` bytes at `row * pitch` are inside the plane's own allocation.
+        unsafe {
+            let base = IOSurfaceGetBaseAddressOfPlane(self.as_ref(), plane as usize).cast::<u8>();
+            let out = (!base.is_null()).then(|| {
+                std::slice::from_raw_parts(base.add((row * pitch) as usize), pitch as usize)
+                    .to_vec()
+            });
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_ONLY, core::ptr::null_mut());
+            out
+        }
     }
 
     /// How many planes the surface has. Zero for a surface that is not planar.
@@ -889,6 +966,55 @@ mod tests {
         assert_eq!(surface.plane(2), None, "there is no third plane to index");
         let least = u64::from(luma_pitch) * 64 + u64::from(chroma_pitch) * 32;
         assert!(surface.alloc_size() >= least, "{} < {least}", surface.alloc_size());
+    }
+
+    /// A picture copied into a plane lands row by row at the plane's pitch, not the source's.
+    ///
+    /// The shear oracle. Three row lengths meet in this copy -- the decoder's pitch, the
+    /// surface's pitch, and the picture's own tight row -- and no two of them are equal at a
+    /// width the alignment does not divide. Getting the pairing wrong does not fail: it walks
+    /// one side by the other's stride and slides every row sideways by a little more than the
+    /// last, which is a picture that leans. So the test picks an extent where all three differ
+    /// and asks where each row actually landed.
+    #[test]
+    fn a_picture_copied_into_a_plane_lands_at_the_plane_pitch() {
+        let (w, h) = (65u32, 8u32);
+        let surface = Surface::planar(w, h, PlanarFormat::BiPlanar420).expect("minted");
+        let (shape, pitch) = surface.plane(0).expect("a luma plane");
+
+        // The decoder's stride is its own and is not either of the others.
+        let row_bytes = w as usize;
+        let src_pitch = row_bytes + 37;
+        assert!(pitch as usize != src_pitch && pitch as usize != row_bytes, "three lengths");
+
+        // Row `r` is filled with `r + 1`, and the padding with a byte no row uses -- so a row
+        // read back out of position, or a copy that took the padding for picture, is visible as
+        // a value rather than as an absence.
+        let mut src = vec![0xEEu8; src_pitch * h as usize];
+        for r in 0..h as usize {
+            src[r * src_pitch..r * src_pitch + row_bytes].fill(r as u8 + 1);
+        }
+
+        assert!(surface.write_plane(0, &src, src_pitch, h, row_bytes), "the plane took it");
+        for r in 0..h {
+            let got = surface.read_plane_row(0, r).expect("a row of the luma plane");
+            assert!(
+                got[..row_bytes].iter().all(|&b| b == r as u8 + 1),
+                "row {r} of the plane is not row {r} of the picture"
+            );
+        }
+        assert_eq!(shape.height, h);
+    }
+
+    /// A source shorter than the rows it claims is refused rather than read past.
+    #[test]
+    fn a_plane_write_refuses_a_source_that_is_not_all_there() {
+        let surface = Surface::planar(64, 8, PlanarFormat::BiPlanar420).expect("minted");
+        let short = vec![0u8; 64 * 7];
+        assert!(!surface.write_plane(0, &short, 64, 8, 64), "eight rows are not in seven");
+        // Exactly the rows it claims, with no final stride's worth of padding, is enough: a
+        // picture sized to itself ends at the last row's last byte.
+        assert!(surface.write_plane(0, &short, 64, 7, 64), "seven rows are in seven");
     }
 
     /// The surface is laid out as this side dictated, and that layout is not the tight one.
