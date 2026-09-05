@@ -710,5 +710,17 @@ is shared by both legs, which is exactly why the variance appeared on both and l
 property of the corpus. Measured 2026-09-05, with per-allocation sampling: 19 replays across both
 legs and all three settle leads produce one identical score.
 
+**The two renderers write identical descriptor slots.** Measured 2026-09-05 by tracing every
+`vkUpdateDescriptorSets` element on both legs in guest ids — set, binding, array element, type,
+count, and the view/sampler/buffer each slot names — across all six venus corpora: 197 elements,
+byte-identical. Guest ids and not host handles is the whole trick; the legs mint different handles
+for the same object, so a handle trace differs on every line and answers nothing.
+
+It is a bounded negative result, and the bounds are the point. No corpus we hold uses
+`vkCmdPushDescriptorSet` (zero occurrences on all six) or descriptor copies, and virglrs implements
+no push-descriptor command at all — so a guest that pushes descriptors is unmeasured here, and
+diverges. `vkUpdateDescriptorSetWithTemplate` needs no coverage: the C dispatches it to NULL, which
+means the guest expands templates before encoding and the plain path is the only path.
+
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
