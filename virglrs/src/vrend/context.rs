@@ -3386,6 +3386,12 @@ impl Context {
     /// again when a picture arrives, which is a lookup the guest can empty by freeing the plane
     /// mid-decode -- and the C's own delivery path logs "res not found" and drops the plane when
     /// it does. A share cannot be emptied.
+    ///
+    /// Two shapes arrive here, told apart by the resources themselves. A composite target is one
+    /// plane-backed resource sent once per plane -- mesa builds the command from
+    /// `plane_views[i]->texture`, and every plane view of a composite names the same texture --
+    /// so seeing that resource in the first slot settles it. Anything else is the per-plane
+    /// shape, a resource each.
     fn create_video_buffer(
         &mut self,
         host: &mut Host<'_>,
@@ -3396,6 +3402,33 @@ impl Context {
         planes: &[ResourceHandle],
     ) -> Result<(), Fault> {
         let cmd = Cmd::CreateVideoBuffer;
+        if let Some(&first) = planes.first()
+            && host.resource(cmd, first)?.planes().is_some()
+        {
+            // Every slot must name that one resource. Mesa sends nothing else, and a target
+            // whose planes were split across a composite and something else has no delivery
+            // that is right -- writing the composite's surface would leave the other resource
+            // holding a stale plane, with nothing to say so.
+            if planes.iter().any(|&plane| plane != first) {
+                return video_result(
+                    cmd,
+                    Err(video::Refusal::Malformed(
+                        "a composite decode target sharing its planes with another resource",
+                    )),
+                );
+            }
+            let texture = host
+                .resource(cmd, first)?
+                .texture()
+                .ok_or(Fault::UntypedResource { cmd, handle: first })?
+                .clone();
+            let destination = video::Destination::Composite(texture);
+            return video_result(
+                cmd,
+                self.video.create_buffer(handle, format, width, height, destination),
+            );
+        }
+
         let mut resolved = Vec::with_capacity(planes.len());
         for &plane in planes {
             let resource = host.resource(cmd, plane)?;
@@ -3418,7 +3451,16 @@ impl Context {
                 .ok_or(Fault::IllegalFormat { cmd, format })?,
             );
         }
-        video_result(cmd, self.video.create_buffer(handle, format, width, height, resolved))
+        video_result(
+            cmd,
+            self.video.create_buffer(
+                handle,
+                format,
+                width,
+                height,
+                video::Destination::PerPlane(resolved),
+            ),
+        )
     }
 
     /// DECODE_BITSTREAM: read the descriptor and the bitstream out of the guest's own pages.

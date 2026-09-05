@@ -476,6 +476,29 @@ pub enum Storage {
 pub struct Planes {
     luma: Image,
     chroma: Image,
+    /// The layout the surface was minted in. Kept because the kernel does not report a plane's
+    /// element size and every other half of a plane's geometry comes from the surface: keeping
+    /// the format that does state it means nothing re-derives it from the resource's own.
+    planar: PlanarFormat,
+}
+
+/// The tight extent of one plane of a composite decode target.
+///
+/// Tight is the point. A plane has three row lengths around it -- the decoder's pitch, the
+/// surface's pitch, and this -- and only this one is the picture. The other two are padded, and
+/// neither is padded the way the other is, so copying by either shears the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_element: u32,
+}
+
+impl PlaneGeometry {
+    /// The picture's own row.
+    pub fn row_bytes(self) -> usize {
+        (self.width as usize) * (self.bytes_per_element as usize)
+    }
 }
 
 /// Which plane a sampler view of a plane-backed resource is asking for -- see [`PlaneRequest`].
@@ -551,6 +574,21 @@ impl Planes {
             1 => Some(&self.chroma),
             _ => None,
         }
+    }
+
+    /// The extent and element size of plane `index`, or `None` past the planes there are.
+    ///
+    /// The extent is read back from the surface rather than derived from the decode target's
+    /// own width and height. Those are two separately stated numbers -- the resource's, which
+    /// the surface was cut to, and the video buffer's, which the guest sends again in
+    /// CREATE_VIDEO_BUFFER -- and only the first describes what is actually there.
+    pub fn geometry(&self, index: u32) -> Option<PlaneGeometry> {
+        let (shape, _pitch) = self.surface().plane(index)?;
+        Some(PlaneGeometry {
+            width: shape.width,
+            height: shape.height,
+            bytes_per_element: self.planar.bytes_per_element(index as usize),
+        })
     }
 
     /// The surface both planes are cut from. One surface, so either image answers.
@@ -1077,7 +1115,10 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
         // Known at init and reported there.
         return None;
     }
-    let surface = match Surface::planar(a.width, a.height, PlanarFormat::BiPlanar420) {
+    // Named once: the surface is cut to this layout and the planes are read back by it, and a
+    // second statement of it is the pair that drifts.
+    let planar = PlanarFormat::BiPlanar420;
+    let surface = match Surface::planar(a.width, a.height, planar) {
         Ok(surface) => Arc::new(surface),
         Err(e) => {
             eprintln!(
@@ -1112,7 +1153,7 @@ fn mint_planes(winsys: &Winsys, features: &Features, a: &Args) -> Option<Planes>
         a.format.name(),
         surface.id().0
     );
-    Some(Planes { luma, chroma })
+    Some(Planes { luma, chroma, planar })
 }
 
 /// `vrend_resource_iosurface_init`: the IOSurface a resource's storage is, when it is one.
