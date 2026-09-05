@@ -12,7 +12,7 @@ use super::egl::{self, Image, Winsys};
 use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
-use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, Gl, TextureName};
+use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, TextureName};
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
@@ -1710,6 +1710,12 @@ fn fill_texture(
             return false;
         }
     }
+    // The binding is put back, not cleared. This runs inside the draw's sampler loop, before the
+    // unit for this sampler is made active, so the unit that happens to be current belongs to
+    // some earlier sampler -- and a sampler whose view was not dirty is never re-bound, so
+    // leaving zero there is a texture that silently reads nothing for the rest of the batch.
+    // The C queries and restores at the same point and for the same reason.
+    let prev = gl.get_integer(binding_query(t.target));
     gl.bind_texture(t.target, Some(t.name));
     gl.unpack_tight();
     gl.tex_sub_image_2d(
@@ -1723,8 +1729,19 @@ fn fill_texture(
         entry.gl.gltype,
         &staging,
     );
-    gl.bind_texture(t.target, None);
+    gl.bind_texture_name(t.target, prev as GLuint);
     true
+}
+
+/// The `GL_TEXTURE_BINDING_*` query for a bind target, so a binding can be put back exactly.
+fn binding_query(target: GLenum) -> GLenum {
+    match target {
+        GL_TEXTURE_2D => GL_TEXTURE_BINDING_2D,
+        GL_TEXTURE_2D_ARRAY => GL_TEXTURE_BINDING_2D_ARRAY,
+        GL_TEXTURE_3D => GL_TEXTURE_BINDING_3D,
+        GL_TEXTURE_CUBE_MAP => GL_TEXTURE_BINDING_CUBE_MAP,
+        _ => GL_TEXTURE_BINDING_2D,
+    }
 }
 
 fn zero_texture(gl: &Gl, formats: &Table, a: &Args, storage: &Storage) {

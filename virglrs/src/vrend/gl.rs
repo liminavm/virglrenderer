@@ -481,6 +481,16 @@ impl Gl {
         unsafe { self.t.glBindTexture()(target, tex.map_or(0, |t| t.0)) };
     }
 
+    /// Put back a binding read out of GL with [`Gl::get_integer`].
+    ///
+    /// Raw rather than a [`TextureName`] on purpose: this name came from the driver and may
+    /// belong to anything, including zero. Minting a `TextureName` from it would claim it names
+    /// a texture this renderer owns, which is the claim the newtype exists to make.
+    pub fn bind_texture_name(&self, target: GLenum, name: GLuint) {
+        // SAFETY: plain scalars.
+        unsafe { self.t.glBindTexture()(target, name) };
+    }
+
     pub fn gen_buffer(&self) -> BufferName {
         let mut id: GLuint = 0;
         // SAFETY: room for the one name asked for.
