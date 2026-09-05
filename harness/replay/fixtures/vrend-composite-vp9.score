@@ -4705,3 +4705,4 @@ iosurface res=4740 plane=0 352x240 bpe=1 sync=0 hash=51976d1891c337c4 ink=84424/
 iosurface res=4740 plane=1 176x120 bpe=2 sync=0 hash=850e12a7953abf99 ink=42240/42240
 iosurface res=4743 plane=0 352x240 bpe=1 sync=0 hash=e4557ee8cf6176a7 ink=84465/84480
 iosurface res=4743 plane=1 176x120 bpe=2 sync=0 hash=cefdbeec6fd8a5b5 ink=42240/42240
+blobs 6 untyped 6

@@ -2168,3 +2168,4 @@ iosurface res=2192 64x64 sync=-22 read-failed=-22
 iosurface res=2208 64x64 sync=-22 read-failed=-22
 iosurface res=2230 64x64 sync=-22 read-failed=-22
 iosurface res=2252 64x64 sync=-22 read-failed=-22
+blobs 4 untyped 4
