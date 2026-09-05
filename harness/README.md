@@ -198,7 +198,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   censuses zero at its destroy — a port that leaks a VkDeviceMemory fails there. The two synoik
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
-  hash (`vm/README.md`).
+  hash (`vm/README.md`). `synoik-glclient.score` is glmark2 on the synoik session: a Vulkan
+  compositor compositing a *classic* client, so the GL contexts are skipped and the corpus can
+  carry a C-recorded fixture rather than gating virglrs against its own previous build. Skipping
+  them is also what makes four of its allocations imports that resolve to nothing — they name
+  resources belonging to a context the venus replay never stands up — and both legs must refuse
+  those. A leg that serves one instead censuses 26 allocations to the fixture's 23.
   `vrend-composite-h264.score` and `vrend-composite-vp9.score` are hardware decode into the
   **composite planar** target -- one NV12 resource with its two planes chained behind it, against
   the per-plane shape `vrend-vp9stock` holds. Both come from one capture on the enhanced guest,
@@ -683,27 +688,20 @@ guesses were correlates — a contended host, a cold start — because both make
 lose without being what loses it. The test that separates them costs one command: sample at two
 very different waits. Three waits giving three answers is not a settle problem.
 
-**Two of `synoik-glclient`'s allocations have no deterministic final content.** They are the
-compositor's framebuffers -- 4,128,768 bytes each, which is 1280x800 BGRA plus padding, and the
-bytes are pixels. Within one run they hold still; between runs they differ, on both legs. Settling
-longer does not converge them: 500 ms, 3 s and 8 s give three different answers.
+**The census decides stability per allocation, not per context.** Four samples, and an allocation
+whose bytes move between them is scored `unstable` with the number of values it took rather than
+given a hash. A whole-context settle cannot do this: it can find two passes agreeing early on the
+same half-drawn frame and pin that, which is a fixture recording the scheduler rather than the
+corpus.
 
-The cause is upstream of the census. The replay skips every ring flow-control command, so nothing
-in the stream waits on the GPU; `replay_end` starts the ring threads and where they come to rest
-is not determined by the corpus. Everything else in that corpus is rock stable, including the
-allocation-count difference between the two legs, so this is two allocations and not a sick
-oracle.
-
-The census now decides stability **per allocation** rather than for a context as a whole -- four
-samples, and an allocation that moves is scored `unstable` with the number of values it took
-rather than given a hash. That removes the old failure, where the whole-context settle could agree
-early on a half-drawn frame and pin it. It does not make these two allocations pinnable, because
-their variance is between runs and no single run can see it. What would: not skipping ring flow
-control, so the replay ends where the corpus says rather than where the scheduler leaves it.
-
-**`synoik-glclient` is captured but unpinned**, waiting on the census. Unlike the Vulkan client
-corpora, the C *can* replay it — the GL client's contexts are classic and are skipped — so it can
-carry a real C-recorded fixture rather than gating virglrs against its own previous build.
+That distinction is what `synoik-glclient` cost to learn. Its two 4,128,768-byte allocations are
+the compositor's framebuffers -- 1280x800 BGRA plus padding, and the bytes are pixels -- and under
+the old whole-context settle they read differently at 500 ms, 3 s and 8 s. That looked like ring
+flow control, which the replay skips: nothing in the stream waits on the GPU, so where the ring
+threads come to rest is the scheduler's to say. It was not. The sampler lives in the replayer and
+is shared by both legs, which is exactly why the variance appeared on both and looked like a
+property of the corpus. Measured 2026-09-05, with per-allocation sampling: 19 replays across both
+legs and all three settle leads produce one identical score.
 
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
