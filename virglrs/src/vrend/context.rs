@@ -1801,62 +1801,116 @@ impl Context {
             if !res_is_ds && v.format != res_format {
                 needs_view = true;
             }
-            // A plane index, not a layer range: see the C's comment. Nothing here has an aux
-            // plane image, so the index is spent and the range is the whole texture.
-            if last_layer < first_layer {
-                first_layer = 0;
-                last_layer = 0;
-            }
-            if first_layer > 0 || first_level > 0 {
-                needs_view = true;
-            }
-            if needs_view && immutable && features.has(Feature::texture_view) {
-                let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
-                let layers = last_layer as i64 - first_layer as i64 + 1;
-                if levels == 0 || layers <= 0 {
-                    return Err(Fault::OutOfRange { cmd, what: "sampler view layers or levels" });
-                }
-                let ifmt = formats
-                    .get(view_format)
-                    .ok_or(Fault::IllegalFormat { cmd, format: view_format })?
-                    .gl
-                    .internalformat;
+            // A plane index, not a layer range. Sampling plane N of a planar surface, the
+            // guest writes the index into the same dword the layer range is packed in
+            // (`virgl_encode_sampler_view`), so it arrives as first_layer = N, last_layer = 0.
+            // A genuine range never has last_layer below first_layer, which is what makes this
+            // unambiguous rather than a guess.
+            let indexed = (last_layer < first_layer).then_some(first_layer);
+            let request = res.planes().map_or(resource::PlaneRequest::Ordinary, |p| {
+                p.request(res_format, v.format, indexed)
+            });
+            if let resource::PlaneRequest::Plane(index) = request {
+                // Ahead of the texture-view branch, not below it: the index that names a plane
+                // is exactly what would set `needs_view`, and `glTextureView` would then be
+                // asked for a zero-layer view and refuse -- which puts the whole context in
+                // error for its lifetime. One chroma plane is enough to take a browser down.
+                let planes = res.planes().expect("a plane request comes from the planes");
+                let image = planes.image(index).expect("the request named a plane it has");
                 let name = gl.gen_texture();
-                // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
-                // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
-                // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
-                if !supports_view && resource::is_bgra(v.format) {
-                    gl_swizzle.swap(0, 2);
-                }
-                gl.texture_view(
-                    name,
-                    target,
-                    tex,
-                    ifmt,
-                    first_level,
-                    levels,
-                    first_layer,
-                    layers as GLuint,
-                );
                 gl.bind_texture(target, Some(name));
-                if desc.is_some_and(|d| d.is_depth_or_stencil())
-                    && features.has(Feature::stencil_texturing)
-                {
-                    let mode = if desc.is_some_and(|d| d.has_depth()) {
-                        GL_DEPTH_COMPONENT
-                    } else {
-                        GL_STENCIL_INDEX
-                    };
-                    gl.tex_parameter_i(target, GL_DEPTH_STENCIL_TEXTURE_MODE, mode as GLint);
-                }
-                for (i, s) in gl_swizzle.iter().enumerate() {
-                    gl.tex_parameter_i(target, GL_TEXTURE_SWIZZLE_R + i as GLenum, *s);
-                }
-                if desc.is_some_and(|d| d.is_srgb()) && features.has(Feature::texture_srgb_decode) {
-                    gl.tex_parameter_i(target, GL_TEXTURE_SRGB_DECODE_EXT, GL_DECODE_EXT as GLint);
+                gl.egl_image_target_texture_2d(target, image);
+                // The plane is a one- or two-component texture and the guest's view says which
+                // of its channels land where. Dropping the swizzle would silently zero whatever
+                // the shader reads past the components the plane has.
+                for (i, sw) in gl_swizzle.iter().enumerate() {
+                    gl.tex_parameter_i(target, GL_TEXTURE_SWIZZLE_R + i as GLenum, *sw);
                 }
                 gl.bind_texture(target, None);
                 view = Some(name);
+            } else {
+                if matches!(request, resource::PlaneRequest::Composite) {
+                    // The guest is sampling the planar format itself, which lands on the base
+                    // texture -- and on a plane-backed target nothing fills that but the
+                    // conversion of the planes into it, which this build does not do yet. No
+                    // guest can reach this: the capset offers no planar format, so nothing is
+                    // ever created in one. It arrives with the delivery path, together with the
+                    // advertisement that would let a guest ask.
+                    eprintln!(
+                        "[virglrs] vrend: a composite view of a {}x{} {} target, which this \
+                         build cannot convert; it will sample an unfilled texture",
+                        res.args.width,
+                        res.args.height,
+                        res_format.name()
+                    );
+                }
+                // An index with no plane behind it is spent rather than refused: the C does the
+                // same, and a refused view costs the guest its context for the rest of its life,
+                // which is far past what a bad index is worth.
+                if last_layer < first_layer {
+                    first_layer = 0;
+                    last_layer = 0;
+                }
+                if first_layer > 0 || first_level > 0 {
+                    needs_view = true;
+                }
+                if needs_view && immutable && features.has(Feature::texture_view) {
+                    let levels = last_level.wrapping_sub(first_level).wrapping_add(1);
+                    let layers = last_layer as i64 - first_layer as i64 + 1;
+                    if levels == 0 || layers <= 0 {
+                        return Err(Fault::OutOfRange {
+                            cmd,
+                            what: "sampler view layers or levels",
+                        });
+                    }
+                    let ifmt = formats
+                        .get(view_format)
+                        .ok_or(Fault::IllegalFormat { cmd, format: view_format })?
+                        .gl
+                        .internalformat;
+                    let name = gl.gen_texture();
+                    // A view of an IOSurface-backed BGR* texture reads its red and blue swapped
+                    // (`Resource::supports_view`); the sampler's swizzle is ours to set, so the
+                    // swap is undone there. A BGR*-to-RGB* swap the guest asked for is left alone.
+                    if !supports_view && resource::is_bgra(v.format) {
+                        gl_swizzle.swap(0, 2);
+                    }
+                    gl.texture_view(
+                        name,
+                        target,
+                        tex,
+                        ifmt,
+                        first_level,
+                        levels,
+                        first_layer,
+                        layers as GLuint,
+                    );
+                    gl.bind_texture(target, Some(name));
+                    if desc.is_some_and(|d| d.is_depth_or_stencil())
+                        && features.has(Feature::stencil_texturing)
+                    {
+                        let mode = if desc.is_some_and(|d| d.has_depth()) {
+                            GL_DEPTH_COMPONENT
+                        } else {
+                            GL_STENCIL_INDEX
+                        };
+                        gl.tex_parameter_i(target, GL_DEPTH_STENCIL_TEXTURE_MODE, mode as GLint);
+                    }
+                    for (i, s) in gl_swizzle.iter().enumerate() {
+                        gl.tex_parameter_i(target, GL_TEXTURE_SWIZZLE_R + i as GLenum, *s);
+                    }
+                    if desc.is_some_and(|d| d.is_srgb())
+                        && features.has(Feature::texture_srgb_decode)
+                    {
+                        gl.tex_parameter_i(
+                            target,
+                            GL_TEXTURE_SRGB_DECODE_EXT,
+                            GL_DECODE_EXT as GLint,
+                        );
+                    }
+                    gl.bind_texture(target, None);
+                    view = Some(name);
+                }
             }
         }
         Ok(View {

@@ -478,7 +478,72 @@ pub struct Planes {
     chroma: Image,
 }
 
+/// Which plane a sampler view of a plane-backed resource is asking for -- see [`PlaneRequest`].
+///
+/// Free of the planes themselves so it can be reasoned about without a driver to make them; the
+/// only thing it needs from them is how many there are.
+pub fn plane_request(
+    planes: u32,
+    resource_format: Format,
+    view_format: Format,
+    indexed: Option<u32>,
+) -> PlaneRequest {
+    if let Some(index) = indexed {
+        // An index past the planes there are is spent, not refused: the C does the same, and a
+        // refused view costs the guest its context for the rest of its life, which is far past
+        // what a bad index is worth.
+        return if index < planes { PlaneRequest::Plane(index) } else { PlaneRequest::Ordinary };
+    }
+    if view_format == resource_format {
+        return PlaneRequest::Composite;
+    }
+    // Unindexed and naming something else: a plane, and its own format says which. Two
+    // components is the interleaved chroma plane; anything else is luma. Only a two-plane
+    // surface can be named this way at all -- a three-plane format has R8 for every plane and
+    // so says nothing -- which is what this type being biplanar already settles.
+    let components = view_format.describe().map_or(0, |d| d.nr_channels);
+    PlaneRequest::Plane(u32::from(components == 2))
+}
+
+/// What a sampler view of a plane-backed resource is asking for.
+///
+/// One decision read from both ends. A view naming a *component* format on a planar resource is
+/// asking for a plane; a view naming the resource's own planar format is a consumer asking for
+/// the whole thing, which only exists once the planes have been converted into the base texture.
+/// Deciding the two apart, in two places, is how they drift -- and the pair that drifts here is a
+/// luma view sampling RGBA and a composite view that never arms the conversion, neither of which
+/// reports anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlaneRequest {
+    /// Plane `n` of the surface, sampled through its own image.
+    Plane(u32),
+    /// The planar format itself. Nothing fills the base texture on this path but the conversion,
+    /// so a resource sampled this way owes one.
+    Composite,
+    /// Neither: an ordinary view, of an ordinary resource or of a plane-backed one in a way that
+    /// names no plane.
+    Ordinary,
+}
+
 impl Planes {
+    /// Which plane, if any, a sampler view of this resource is asking for.
+    ///
+    /// `indexed` is the plane the guest packed into the layer range, which arrives only when it
+    /// is nonzero: `virgl_encode_sampler_view` writes the index only then, so plane 0 has to be
+    /// recognised some other way. Its view format is that other way -- a component format on a
+    /// planar resource can be nothing but a plane request.
+    ///
+    /// Both signals are gated on the planes actually being here, so a resource that was never
+    /// given any cannot reach this however it is sampled.
+    pub fn request(
+        &self,
+        resource_format: Format,
+        view_format: Format,
+        indexed: Option<u32>,
+    ) -> PlaneRequest {
+        plane_request(self.count(), resource_format, view_format, indexed)
+    }
+
     /// The image for plane `index`, or `None` past the planes there are.
     pub fn image(&self, index: u32) -> Option<&Image> {
         match index {
@@ -577,6 +642,14 @@ impl Resource {
             | TextureTarget::Texture1d
             | TextureTarget::Texture2d
             | TextureTarget::Rect => 1,
+        }
+    }
+
+    /// The planes, if this resource is a composite decode target.
+    pub fn planes(&self) -> Option<&Planes> {
+        match &self.storage {
+            Storage::Texture(t) => t.planes.as_ref(),
+            _ => None,
         }
     }
 
@@ -1296,6 +1369,48 @@ fn alloc_texture(
 
 #[cfg(test)]
 mod tests {
+    use super::Format;
+    use super::{PlaneRequest, plane_request};
+
+    /// One decision, read from both ends: which view is a plane and which is the whole thing.
+    ///
+    /// Both halves are here together because deciding them apart is how they drift, and the pair
+    /// that drifts is a luma view sampling RGBA and a composite view that never arms the
+    /// conversion -- neither of which reports anything.
+    #[test]
+    fn a_plane_view_and_a_composite_view_are_told_apart_by_format() {
+        // By name, because a wire number written down here is a number that goes stale
+        // silently: the table is generated, and the two that matter are the plane formats.
+        let by_name = |name: &str| {
+            (0..1024)
+                .filter_map(Format::from_wire)
+                .find(|f| f.describe().is_some_and(|d| d.name == name))
+                .unwrap_or_else(|| panic!("no format {name}"))
+        };
+        let nv12 = by_name("Y8_U8V8_420_UNORM");
+        let r8 = by_name("R8_UNORM");
+        let rg88 = by_name("R8G8_UNORM");
+        // The composite target path and the video capset name this format by two different
+        // routes; they have to be the same format or the two halves guard different things.
+        assert_eq!(nv12.wire(), 166, "NV12's wire number moved");
+        assert_eq!(rg88.describe().expect("described").nr_channels, 2, "chroma is two channels");
+
+        // The index arrives only when it is nonzero, so plane 0 is named by its format alone.
+        assert_eq!(plane_request(2, nv12, r8, None), PlaneRequest::Plane(0));
+        assert_eq!(plane_request(2, nv12, rg88, None), PlaneRequest::Plane(1));
+        // ... and an index, when there is one, is the whole answer.
+        assert_eq!(plane_request(2, nv12, r8, Some(1)), PlaneRequest::Plane(1));
+        assert_eq!(plane_request(2, nv12, rg88, Some(0)), PlaneRequest::Plane(0));
+
+        // The resource's own format is the consumer asking for the converted whole.
+        assert_eq!(plane_request(2, nv12, nv12, None), PlaneRequest::Composite);
+
+        // An index past the planes is spent rather than refused: a refused view would cost the
+        // guest its context for the rest of its life.
+        assert_eq!(plane_request(2, nv12, r8, Some(2)), PlaneRequest::Ordinary);
+        assert_eq!(plane_request(2, nv12, r8, Some(9)), PlaneRequest::Ordinary);
+    }
+
     use super::*;
     use crate::vrend::formats::{Bindings, Entry, GlFormat, ViewClass};
 
