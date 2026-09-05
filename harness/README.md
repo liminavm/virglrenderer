@@ -675,6 +675,14 @@ stand-in carries `VREND_STORAGE_GL_BUFFER`, so vrend takes its texture-buffer pa
 blob is guest memory and never goes near it. `vrend-vkclient` cannot be pinned until a blob is
 modelled as what it is. (It is also what exposed the unguarded `glTexBuffer` — `../docs/rust-rewrite.md`.)
 
+**Stable within a run, different between runs, means the fix is upstream of the comparison.**
+Never in the settle time. A value the corpus determines converges as you wait; a value it does not
+determine settles just as firmly on a different answer each run, and waiting longer only buys a
+more confident wrong number. Two oracles here have failed this way, and both times the first
+guesses were correlates — a contended host, a cold start — because both make the race easier to
+lose without being what loses it. The test that separates them costs one command: sample at two
+very different waits. Three waits giving three answers is not a settle problem.
+
 **Two of `synoik-glclient`'s allocations have no deterministic final content.** They are the
 compositor's framebuffers -- 4,128,768 bytes each, which is 1280x800 BGRA plus padding, and the
 bytes are pixels. Within one run they hold still; between runs they differ, on both legs. Settling
