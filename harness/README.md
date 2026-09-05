@@ -256,6 +256,21 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   It also carries 58 composite planar decode targets, which GNOME probes at 64x64 during boot,
   so it gates the composite target path against a build that cannot make one.
 
+  `vrend-shm.score` is the workload with **no GPU client in it at all**: a GTK4 terminal run with
+  `GSK_RENDERER=cairo`, `GDK_DEBUG=gl-disable` and `LIBGL_ALWAYS_SOFTWARE=1`, so its surface
+  reaches the compositor as a `wl_shm` buffer. The client issues no GL, and the corpus is
+  therefore entirely the shell uploading and sampling somebody else's pixels. That inverts the
+  usual balance and is the point of keeping it: `COPY_TRANSFER3D` dominates at 7760 against the
+  browser corpus's 1532, and no draw target belongs to the client. Every accelerated corpus here
+  measures the path a client's own rendering takes; this one measures the path taken when a
+  client has none, which is what a guest without working acceleration falls back to.
+
+  ```sh
+  ./capture.sh vrend --renderer c --out shm --mb 1024   # then, in the guest, with the session
+  #   env: GSK_RENDERER=cairo GDK_DEBUG=gl-disable LIBGL_ALWAYS_SOFTWARE=1 ptyxis -x ...
+  ./dump.sh vrend-shm      # replayed at --ctx 2
+  ```
+
   `vrend.caps` is the classic capsets, `virgl_caps_v1` and `virgl_caps_v2`, as the C fills
   them on this host: `./vrend-replay.sh ../vm/captures/vrend.bin --renderer c --caps FILE` writes
   them a field a line, and `--renderer rs` diffs the Rust side against the fixture. The guest's virgl driver
