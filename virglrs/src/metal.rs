@@ -766,6 +766,35 @@ mod tests {
         assert!(surface.alloc_size() >= least, "{} < {least}", surface.alloc_size());
     }
 
+    /// A plane's row pitch is the kernel's, and it is not the tight one.
+    ///
+    /// The guest computes a canonical layout for the same surface -- tight, stride is plane
+    /// width times plane block size, no row alignment -- and both ends are supposed to arrive at
+    /// the same arithmetic. They do not: the kernel pads. Measured here, a plane 352 bytes wide
+    /// gets a 384-byte pitch and a 64-byte one gets 128, while 1280 and 1920 come back tight
+    /// because they are already whatever the kernel rounds to.
+    ///
+    /// So the pitch is read off the surface and never computed. The two widths that pad are not
+    /// exotic: 352x240 is a real clip size, and 64x64 is the extent gst-va probes every fourcc it
+    /// knows at.
+    #[test]
+    fn a_planes_pitch_is_the_kernels_and_can_exceed_the_tight_one() {
+        let mut padded = 0;
+        for (w, h) in [(64u32, 64u32), (65, 33), (352, 240), (1280, 720), (1920, 1080)] {
+            let surface = Surface::planar(w, h, PlanarFormat::BiPlanar420).expect("minted");
+            for (i, shape) in PlanarFormat::BiPlanar420.planes(w, h).iter().enumerate() {
+                let (got, pitch) = surface.plane(i as u32).expect("a plane");
+                assert_eq!((got.width, got.height), (shape.width, shape.height), "{w}x{h}/{i}");
+                let tight = shape.width * shape.bytes_per_element;
+                assert!(pitch >= tight, "{w}x{h}/{i}: pitch {pitch} < tight {tight}");
+                padded += u32::from(pitch > tight);
+            }
+        }
+        // A kernel that stopped padding would make every caller that reads the pitch back look
+        // like dead caution. It pads; this says so.
+        assert!(padded > 0, "no plane was padded, so nothing here is measuring what it claims");
+    }
+
     /// Chroma rounds up, so an odd picture keeps a sample for its last row and column. A plane
     /// short of the luma it subsamples is one the decoder writes past.
     #[test]
