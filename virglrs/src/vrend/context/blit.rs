@@ -520,8 +520,21 @@ impl Context {
     /// Called after every command in a batch. A target only per-plane consumers ever read never
     /// owes a fill and so costs nothing but the walk.
     pub(super) fn fill_composites(&mut self, host: &mut Host<'_>) {
-        for texture in self.video.owed_fills() {
+        // Two ways in, because neither reaches every target: the live video buffers cover
+        // everything delivery touches, and `owed` covers a target sampled whole after its
+        // buffer is gone. A target on both lists is visited once; the state on it is what
+        // decides, so a second visit would be a no-op anyway.
+        let mut visit = self.video.owed_fills();
+        for texture in std::mem::take(&mut self.owed) {
+            if !visit.iter().any(|t| t.name == texture.name) {
+                visit.push(texture);
+            }
+        }
+        for texture in visit {
             let planes = texture.planes.as_ref().expect("a target that owes a fill has planes");
+            if !planes.needs_fill() {
+                continue;
+            }
             // The extent is the luma plane's, which is the surface's, which is what the base
             // texture was allocated alongside. Not the video buffer's -- that is a second number
             // the guest states separately.
@@ -537,6 +550,10 @@ impl Context {
             // would leave the base texture a frame behind for the rest of the target's life.
             if let Some(Ok(())) = outcome {
                 planes.filled();
+            } else {
+                // Still owed, and possibly no longer reachable through a video buffer. Keeping
+                // it here is what makes the retry happen for a target whose decoder is gone.
+                self.owed.push(texture.clone());
             }
         }
     }

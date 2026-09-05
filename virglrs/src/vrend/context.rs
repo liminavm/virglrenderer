@@ -34,7 +34,7 @@ use super::pipe::slots::{
 };
 use super::pipe::*;
 use super::proto::{self, *};
-use super::resource::{self, Limits, Resource, Storage, ViewKey};
+use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi, video};
 use crate::guest_mem::{HostSpan, Iov};
@@ -909,6 +909,17 @@ pub struct Context {
     /// The codecs and decode targets this context owns. Context-global: the video handles are
     /// not sub-scoped, so a sub-context switch does not change which codec a handle names.
     video: video::Video,
+    /// Composite targets to look at when the current command finishes.
+    ///
+    /// A visit list, not a record: whether a target owes a conversion is on the target, and this
+    /// only says where to go and ask. So an entry that turns out to owe nothing is dropped, and
+    /// a stale one costs a question and not a wrong answer.
+    ///
+    /// It exists because the other trigger site outlives the video buffer. `Video::owed_fills`
+    /// walks the live buffers, which is every target delivery can reach; a composite sampler
+    /// view is made against the resource, and a guest that tears its decoder down with the last
+    /// frame still on screen has no buffer left to be found through.
+    owed: Vec<Arc<Texture>>,
 }
 
 impl Context {
@@ -919,6 +930,7 @@ impl Context {
             current: SubContextId(0),
             fault: None,
             video: video::Video::default(),
+            owed: Vec::new(),
         };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
@@ -1837,7 +1849,13 @@ impl Context {
                     // this target's planes are converted into it. The pass itself runs at the
                     // end of this command, with the rest of what the batch has left owing.
                     let planes = res.planes().expect("a plane request comes from the planes");
-                    if planes.sampled() {
+                    let owed = planes.sampled();
+                    if let Some(texture) = res.texture()
+                        && !self.owed.iter().any(|t| t.name == texture.name)
+                    {
+                        self.owed.push(texture.clone());
+                    }
+                    if owed {
                         eprintln!(
                             "[virglrs] vrend: a {}x{} {} target is sampled whole; its planes \
                              will be converted into the base texture",
