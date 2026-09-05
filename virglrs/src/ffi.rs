@@ -991,7 +991,7 @@ pub extern "C" fn virgl_renderer_transfer_read_iov(
     iovec_cnt: c_int,
 ) -> c_int {
     let Ok(n) = u32::try_from(iovec_cnt) else {
-        return EINVAL;
+        return TRANSFER_EINVAL;
     };
     transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iov, n, false)
 }
@@ -1010,9 +1010,28 @@ pub extern "C" fn virgl_renderer_transfer_write_iov(
     iovec_cnt: c_uint,
 ) -> c_int {
     let Ok(level) = u32::try_from(level) else {
-        return EINVAL;
+        return TRANSFER_EINVAL;
     };
     transfer_iov(handle, ctx_id, level, stride, layer_stride, box_, offset, iovec, iovec_cnt, true)
+}
+
+/// virglrenderer answers a transfer with a POSITIVE errno, unlike almost everything else in its
+/// ABI. `virgl_renderer_transfer_{read,write}_iov` return a bare `EINVAL` on every refusal, and
+/// pass through whatever vrend hands back, which is positive too -- with `-1` reserved for the
+/// readback it cannot serve, which the VMM tells apart from an errno by its sign. Answering -22
+/// where the reference answers 22 is a shim that reports the wrong thing about a refusal, so the
+/// two entry points and this helper use this constant and never the module-level one.
+const TRANSFER_EINVAL: c_int = libc::EINVAL;
+
+/// `errno` in the transfer entry points' convention: the same code, positive.
+///
+/// `-1` is not an errno and passes through -- it is the sentinel for a readback the renderer
+/// cannot serve, which the VMM tells apart from a failure by its sign.
+fn transfer_errno(e: renderer::Error) -> c_int {
+    match errno(e) {
+        -1 => -1,
+        n => n.abs(),
+    }
 }
 
 /// Both transfer entry points, which differ only in direction and in the signedness of two
@@ -1031,7 +1050,7 @@ fn transfer_iov(
     to_host: bool,
 ) -> c_int {
     let (Some(handle), false) = (ResourceHandle::new(handle), box_.is_null()) else {
-        return EINVAL;
+        return TRANSFER_EINVAL;
     };
     // SAFETY: the VMM's contract is that `box_` is valid for the call; it is copied out.
     let b = unsafe { &*box_ };
@@ -1048,7 +1067,7 @@ fn transfer_iov(
         (Ok(x), Ok(y), Ok(z), Ok(width), Ok(height), Ok(depth)) => {
             proto::Box3 { x, y, z, width, height, depth }
         }
-        _ => return EINVAL,
+        _ => return TRANSFER_EINVAL,
     };
     let info = transfer::Info { level, stride, layer_stride, offset, region, synchronized: false };
     let ctx = match AbiCtx::new(ctx_id) {
@@ -1056,11 +1075,11 @@ fn transfer_iov(
         AbiCtx::Context(id) => Some(id),
     };
     let iov = read_iov(iov, iovec_cnt);
-    with(EINVAL, |r| match r.transfer(handle, ctx, to_host, &info, iov) {
+    with(TRANSFER_EINVAL, |r| match r.transfer(handle, ctx, to_host, &info, iov) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("[virglrs] transfer on resource {}: {e}", handle.get());
-            errno(e)
+            transfer_errno(e)
         }
     })
 }
