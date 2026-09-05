@@ -379,6 +379,12 @@ static void score_iosurface(uint32_t handle, uint32_t w, uint32_t h)
  * A format that refuses the transfer -- depth/stencil, compressed -- is left alone: a refusal
  * here is not a failure of the run.
  */
+/* The four planar YUV formats, which must NOT be zeroed -- see zero_resource. */
+static bool format_is_planar_yuv(uint32_t format)
+{
+   return format == 163 || format == 165 || format == 166 || format == 167;
+}
+
 static void zero_resource(uint32_t handle, uint32_t width, uint32_t height, int ctx)
 {
    uint32_t w = width ? width : 1, h = height ? height : 1;
@@ -816,7 +822,17 @@ int main(int argc, char **argv)
             virgl_renderer_resource_attach_iov((int)r->handle, &b->iov, 1);
             virgl_renderer_ctx_attach_resource(want_ctx, (int)r->handle);
             /* After the attach, which is what gives vrend the resource a transfer can reach. */
-            if (zero_new && r->kind != RES_BLOB)
+            /* Not a planar YUV one. Zeroing writes at four bytes per texel, which is what
+             * every format this scores actually is -- but a planar resource cannot take a
+             * transfer at all: vrend guards the upload with gallium's blocksize for the format
+             * (1 for NV12) and then performs it with the format's GL triple, which
+             * vrend_formats.c registers as GL_RGBA/GL_UNSIGNED_BYTE, four bytes. The guard is
+             * computed at a quarter of what the upload reads, so GL walks off the end of the
+             * iov whatever size it is given. On a 2560x1440 NV12 target that is a segfault in
+             * util_copy_rect; at 64x64 it merely reads 48 KB of somebody else's heap. Skipping
+             * leaves such a resource undefined, which costs nothing: nothing reads its texture,
+             * and the sweep scores it through its IOSurface. */
+            if (zero_new && r->kind != RES_BLOB && !format_is_planar_yuv(r->format))
                zero_resource(r->handle, r->width, r->height, want_ctx);
          }
 
