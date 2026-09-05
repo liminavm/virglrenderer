@@ -57,6 +57,18 @@ static struct vrend_trace_res *tr_res;
 static uint32_t tr_res_n, tr_res_cap;
 static bool tr_res_full;
 static bool tr_on;
+#define TR_BLOB_SEEN 64
+static struct { uint32_t handle; uint64_t hash; uint32_t kept, dropped; bool used; }
+   tr_blob_seen[TR_BLOB_SEEN];
+
+/* How many distinct frames to keep per blob. A client that animates changes its window every
+ * frame, so dedup alone bounds nothing: vkcube at 2 MB a frame fills a 512 MB ring in seconds
+ * and FIFO eviction then eats the command records the corpus is actually made of. A handful of
+ * real frames is all the fixture needs -- it scores each blob once, and what it is testing is
+ * that both renderers read one set of bytes the same way, not that they can be fed many.
+ * LIMINA_VREND_TRACE_BLOB_MAX overrides; 0 disables blob content capture entirely. */
+static uint32_t tr_blob_max = 4;
+
 static bool tr_inited;
 static atomic_int tr_dump_req;
 /* Records do NOT all arrive on the decode thread: fences are created there, but they RETIRE on
@@ -148,6 +160,11 @@ void vrend_trace_init(void)
       tr.buf = NULL;
       return;
    }
+
+   env = getenv("LIMINA_VREND_TRACE_BLOB_MAX");
+   if (env)
+      tr_blob_max = (uint32_t)strtoul(env, NULL, 10);
+   fprintf(stderr, "[LIMINA-TRACE] blob content: up to %u frame(s) per blob\n", tr_blob_max);
 
    p = getenv("LIMINA_VREND_TRACE_OUT");
    snprintf(tr.out_path, sizeof tr.out_path, "%s",
@@ -354,8 +371,7 @@ void vrend_trace_transfer_data(uint32_t ctx_id, uint32_t res_handle, uint64_t of
 /* The last blob bytes recorded per handle, as a 64-bit FNV-1a. A handle table rather than a
  * per-resource field because the tracer is deliberately reachable from vrend without owning
  * anything of vrend's: it records, and holds no resource state. */
-#define TR_BLOB_SEEN 64
-static struct { uint32_t handle; uint64_t hash; bool used; } tr_blob_seen[TR_BLOB_SEEN];
+
 
 void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
                            const void *data, uint32_t len)
@@ -365,7 +381,7 @@ void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
    const uint8_t *p = data;
    uint32_t slot;
 
-   if (!tr_on || !data || !len)
+   if (!tr_on || !data || !len || !tr_blob_max)
       return;
 
    for (uint32_t i = 0; i < len; i++) {
@@ -383,12 +399,18 @@ void vrend_trace_blob_data(uint32_t ctx_id, uint32_t res_handle,
          if (tr_blob_seen[k].hash == hash)
             return;
          tr_blob_seen[k].hash = hash;
+         if (tr_blob_seen[k].kept >= tr_blob_max) {
+            tr_blob_seen[k].dropped++;
+            return;
+         }
+         tr_blob_seen[k].kept++;
          break;
       }
       if (!tr_blob_seen[k].used) {
          tr_blob_seen[k].used = true;
          tr_blob_seen[k].handle = res_handle;
          tr_blob_seen[k].hash = hash;
+         tr_blob_seen[k].kept = 1;
          break;
       }
    }

@@ -98,7 +98,7 @@ CCMD = {
 }
 
 TYPES = {1: "SUBMIT", 2: "CMD", 3: "DRAW_FB", 4: "TRANSFER", 5: "FENCE", 6: "RETIRE", 7: "PAD",
-         9: "XFERDATA"}
+         9: "XFERDATA", 10: "BLOBDATA"}
 RES_KIND = {0: "create", 1: "blob", 2: "unref"}
 # struct vrend_trace_res: u64 seq, then kind + 11 u32 fields.
 RES = struct.Struct("<Q12I")
