@@ -111,6 +111,12 @@ Two parser notes that cost nothing to know: `matroskademux ! vavp9dec` fails to 
 a `vp9parse` between them, and `ffplay` is not a route here at all — no `libopenh264`, and its
 vaapi-from-vulkan derivation fails.
 
+**A capture can type.** `type-into-overview.py` creates a keyboard on `/dev/uinput` and taps
+keys through it, so mutter sees a real device and a headless capture can drive the overview's
+search entry -- no window, no human. Copy it into the guest and run it as root
+(`sudo python3 /tmp/type.py firefox settings`). It is how `vrend-overview.bin` was recorded, and
+that corpus exists because typing allocates a resource nothing else in the tree did.
+
 ## Two synoik corpora, and why one cannot do both jobs
 
 The synoik guest yields two corpora, and they measure different things because a capture cannot
