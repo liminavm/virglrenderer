@@ -148,6 +148,33 @@ search entry -- no window, no human. Copy it into the guest and run it as root
 (`sudo python3 /tmp/type.py firefox settings`). It is how `vrend-overview.bin` was recorded, and
 that corpus exists because typing allocates a resource nothing else in the tree did.
 
+## Cross-path corpora: a client and a compositor on opposite stacks
+
+Three workloads live here as scripts, because quoting a workload through `ssh` is where these
+captures go wrong silently -- the client starts, a window appears, the capture completes, and it
+recorded the wrong stack.
+
+`client-shm.sh` runs a GTK4 terminal with `GSK_RENDERER=cairo`, `GDK_DEBUG=gl-disable` and
+`LIBGL_ALWAYS_SOFTWARE=1`, so its surface arrives as a `wl_shm` buffer and the client issues no
+GL at all. Captured with `capture.sh vrend --out shm`.
+
+`client-vulkan.sh` runs `vkcube` on the **stock** guest. Its Vulkan goes out through venus while
+the classic tracer records the other half -- the GL shell importing and compositing a buffer a
+Vulkan client produced. Neither recorder sees both halves, which is the point: this is the
+import side, in classic commands.
+
+`client-gl-synoik.sh` is the mirror, and the harder one to get right. A GL client on the Vulkan
+compositor needs the session's environment, which an SSH shell does not inherit -- without it the
+stack falls back to llvmpipe and records nothing while looking healthy -- so the script reads it
+out of the compositor's own `/proc/<pid>/environ` rather than assuming. Two traps found the hard
+way: `WAYLAND_DISPLAY` is *absent* from that environ, because the compositor is what serves it,
+and the socket here is `wayland-1`, not `wayland-0`; and `glxgears` is not a route at all, being
+GLX on a guest with no X server. `glmark2-wayland` is, and it prints the renderer it actually
+got -- check for `GL_RENDERER: virgl` before trusting a capture.
+
+Unlike the Vulkan client corpora below, the C **can** replay this one: the GL client's contexts
+are classic and are skipped, so nothing is recorded out of execution order.
+
 ## Two synoik corpora, and why one cannot do both jobs
 
 The synoik guest yields two corpora, and they measure different things because a capture cannot
