@@ -184,6 +184,27 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   fixtures are one workload measured twice on purpose, and neither one can be the other: the
   census scores memory that is still live, so the corpus that proves teardown has nothing left to
   hash (`vm/README.md`).
+  `vrend-overview.score` is the GNOME shell with someone **typing in the overview's search
+  entry**, and it exists because that one act allocates a resource no other corpus contains: a
+  `PIPE_BUFFER` carrying `SAMPLER_VIEW | RENDER_TARGET`, a texture buffer. virglrs refused that
+  shape, which killed the session on the first glyph -- and no pinned corpus held one, because
+  every capture had been a boot and a workload and nobody had ever typed. The tier had nothing
+  to do with it: it is the same GNOME on the same virgl driver on all three images.
+
+  Recorded headless, because typing needs no window: `/tmp/type.py` in the guest drives
+  `/dev/uinput` directly, so mutter sees a real keyboard and a capture can search for four words
+  without a human in front of it. That is worth keeping for any corpus needing input.
+
+  ```sh
+  ./capture.sh video --renderer c --out overview --mb 2048   # then, in the guest:
+  #   sudo systemctl isolate graphical.target
+  #   sudo python3 /tmp/type.py firefox settings terminal files
+  ./dump.sh vrend-overview
+  ```
+
+  It also carries 58 composite planar decode targets, which GNOME probes at 64x64 during boot,
+  so it gates the composite target path against a build that cannot make one.
+
   `vrend.caps` is the classic capsets, `virgl_caps_v1` and `virgl_caps_v2`, as the C fills
   them on this host: `./vrend-replay.sh ../vm/captures/vrend.bin --renderer c --caps FILE` writes
   them a field a line, and `--renderer rs` diffs the Rust side against the fixture. The guest's virgl driver

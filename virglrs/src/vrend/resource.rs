@@ -965,10 +965,19 @@ impl Resource {
         }
     }
 
-    /// The IOSurface this resource is presented from, if its storage is one.
+    /// The IOSurface this resource's storage is, if it is one.
+    ///
+    /// Either way it is held: an ordinary surface-backed texture keeps the image that is its
+    /// storage, and a composite decode target has no base image at all -- its surface is behind
+    /// the plane images, one per plane, cut from the one surface. Both are "the storage is this
+    /// surface", so both answer here. Reading only the first left a plane-backed target claiming
+    /// to have no surface while holding one, which the C ABI reports as "not IOSurface-backed"
+    /// and the C does not.
     pub fn surface(&self) -> Option<&Surface> {
         match &self.storage {
-            Storage::Texture(t) => t.image.as_ref().map(|i| i.surface()),
+            Storage::Texture(t) => {
+                t.image.as_ref().map(|i| i.surface()).or_else(|| Some(t.planes.as_ref()?.surface()))
+            }
             _ => None,
         }
     }
