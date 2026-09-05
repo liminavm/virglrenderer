@@ -60,6 +60,8 @@
 #include <string.h>
 #include <sys/uio.h>
 
+#include "vrend-replay-formats.h"
+
 #define TRACE_MAGIC 0x4c4d5654u
 
 enum { T_SUBMIT = 1, T_CMD = 2, T_DRAW_FB = 3, T_TRANSFER = 4, T_FENCE = 5, T_RETIRE = 6,
@@ -469,15 +471,44 @@ static bool format_is_planar_yuv(uint32_t format)
    return format == 163 || format == 165 || format == 166 || format == 167;
 }
 
-static void zero_resource(uint32_t handle, uint32_t width, uint32_t height, int ctx)
+/* A tight w x h image's row stride and total size, from the format and nothing else.
+ *
+ * This used to be `w * h * 4` in two places, under the belief -- written into the comment -- that
+ * four bytes per texel "is what every format this scores actually is". A browser corpus disproved
+ * it with an R32G32B32A32_FLOAT render target: the transfer then offers a stride a quarter of the
+ * minimum, vrend refuses it, the refusal latches the context's in_error, and every later submit in
+ * the corpus is dropped. The damage reads as a renderer that stopped drawing, which is the
+ * expensive kind of harness bug.
+ *
+ * false means this tree's format table does not describe the format -- compressed, subsampled, or
+ * simply unknown. The caller must then leave the resource alone. It must NOT fall back to a
+ * guess, because a guess is exactly what this replaces. */
+static bool format_geometry(uint32_t format, uint32_t w, uint32_t h, uint32_t *stride, size_t *size)
+{
+   if (format > VREND_REPLAY_MAX_FORMAT)
+      return false;
+   const struct vrend_replay_format *f = &vrend_replay_formats[format];
+   if (!f->block_bytes || f->block_w != 1 || f->block_h != 1)
+      return false;
+   *stride = w * f->block_bytes;
+   *size = (size_t)*stride * h;
+   return true;
+}
+
+static void zero_resource(uint32_t handle, uint32_t format, uint32_t width, uint32_t height,
+                          int ctx)
 {
    uint32_t w = width ? width : 1, h = height ? height : 1;
-   size_t need = (size_t)w * h * 4;
+   uint32_t stride;
+   size_t need;
+   if (!format_geometry(format, w, h, &stride, &need))
+      return;
    uint8_t *zeros = calloc(1, need);
    if (!zeros) return;
    struct iovec ziov = { .iov_base = zeros, .iov_len = need };
    struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
-   (void)virgl_renderer_transfer_write_iov(handle, (uint32_t)ctx, 0, w * 4, 0, &box, 0, &ziov, 1);
+   (void)virgl_renderer_transfer_write_iov(handle, (uint32_t)ctx, 0, stride, 0, &box,
+                                           0, &ziov, 1);
    free(zeros);
 }
 
@@ -491,7 +522,19 @@ static void score_resource(const struct res_ev *ev)
    if (format_is_planar_yuv(ev->format))
       return;
    uint32_t w = ev->width ? ev->width : 1, h = ev->height ? ev->height : 1;
-   size_t need = (size_t)w * h * 4;
+   /* Ask for the resource at ITS bytes per texel, not at four. Asking at four for a 16-byte
+    * format offers a stride a quarter of the minimum, which vrend refuses -- and that refusal
+    * used to be recorded as `failed=22`, a renderer's answer to a question the sweep had asked
+    * wrong. A format this tree cannot size is declined openly instead, because a request the
+    * sweep knows it cannot phrase is not a result about the renderer. */
+   uint32_t stride;
+   size_t need;
+   if (!format_geometry(ev->format, w, h, &stride, &need)) {
+      score_addf("readback res=%u %ux%u fmt=%u declined=block-size-unknown\n",
+                 ev->handle, w, h, ev->format);
+      return;
+   }
+   const uint32_t texel = stride / w;
    uint8_t *px = calloc(1, need);
    struct iovec riov = { .iov_base = px, .iov_len = need };
    struct virgl_box box = { .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 };
@@ -500,7 +543,7 @@ static void score_resource(const struct res_ev *ev)
     * non-zero ctx_id reaches vrend_renderer_transfer_internal, which calls vrend_hw_switch_context
     * on the replayed context and leaves it current -- so forcing ctx0 first only added a switch
     * away and back. */
-   int rr = virgl_renderer_transfer_read_iov(ev->handle, (uint32_t)want_ctx, 0, w * 4, 0,
+   int rr = virgl_renderer_transfer_read_iov(ev->handle, (uint32_t)want_ctx, 0, stride, 0,
                                              &box, 0, &riov, 1);
    if (rr) {
       /* A refusal is a result, not an absence of one. Dropping it here meant a renderer that
@@ -514,9 +557,14 @@ static void score_resource(const struct res_ev *ev)
       return;
    }
 
+   /* Ink is counted per TEXEL, so the denominator is the texel count whatever the format's
+    * width -- stepping four bytes at a time counted a 16-byte texel four times. */
    size_t ink = 0;
-   for (size_t i = 0; i < need; i += 4)
-      if (px[i] | px[i + 1] | px[i + 2] | px[i + 3]) ink++;
+   for (size_t i = 0; i < need; i += texel) {
+      uint8_t any = 0;
+      for (uint32_t b = 0; b < texel; b++) any |= px[i + b];
+      if (any) ink++;
+   }
 
    /* FNV-1a over the readback. This line IS the golden: a content hash compares two
     * implementations without carrying megabytes of reference pixels in the tree, and it is
@@ -525,7 +573,7 @@ static void score_resource(const struct res_ev *ev)
    for (size_t i = 0; i < need; i++) { hash ^= px[i]; hash *= 1099511628211ull; }
 
    score_addf("res=%u %ux%u hash=%016llx ink=%zu/%zu\n",
-              ev->handle, w, h, (unsigned long long)hash, ink, need / 4);
+              ev->handle, w, h, (unsigned long long)hash, ink, need / texel);
 
    /* An ink COUNT cannot say which offscreen is the header and which is the body, and that
     * mapping is what any verdict about "the title is lost" rests on. Dump the pixels and look. */
@@ -978,7 +1026,7 @@ int main(int argc, char **argv)
              * leaves such a resource undefined, which costs nothing: nothing reads its texture,
              * and the sweep scores it through its IOSurface. */
             if (zero_new && r->kind != RES_BLOB && !format_is_planar_yuv(r->format))
-               zero_resource(r->handle, r->width, r->height, want_ctx);
+               zero_resource(r->handle, r->format, r->width, r->height, want_ctx);
          }
 
          p += h.total_len;
