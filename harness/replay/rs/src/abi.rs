@@ -124,6 +124,9 @@ syms! {
 /// never unloaded, because venus keeps ring threads that outlive any single call.
 pub struct Renderer {
     syms: Syms,
+    /// Resolved separately because it is a virglrs extension the C reference does not export, and
+    /// this harness must keep driving both. Absent means "cannot answer", never "zero".
+    journal_held: Option<extern "C" fn(u32) -> u64>,
 }
 
 /// Venus fences retire through this. A replay has no guest to notify, so the only job is to not
@@ -150,7 +153,14 @@ impl Renderer {
         }
         // SAFETY: `h` is a live handle from the dlopen above.
         let syms = unsafe { Syms::resolve(h) }?;
-        Ok(Renderer { syms })
+        let n = CString::new("virgl_renderer_limina_journal_held").unwrap();
+        // SAFETY: `h` is live, and the signature is the one `virglrs/src/ffi.rs` defines this
+        // symbol with -- it is a virglrs extension and `src/virglrenderer.h` does not declare it.
+        let held = unsafe {
+            let p = libc::dlsym(h, n.as_ptr());
+            (!p.is_null()).then(|| std::mem::transmute::<*mut c_void, extern "C" fn(u32) -> u64>(p))
+        };
+        Ok(Renderer { syms, journal_held: held })
     }
 
     pub fn init(&self, flags: c_int) -> Result<(), String> {
@@ -251,6 +261,13 @@ impl Renderer {
     /// an absent journal alone cannot.
     pub fn journal_seq(&self, ctx_id: u32) -> u64 {
         (self.syms.journal_seq)(ctx_id)
+    }
+
+    /// How many of a context's allocations a blob resource still holds -- the entries the journal
+    /// keeps because the VMM, not the guest, is still using what they made. `None` from a renderer
+    /// that does not export the query.
+    pub fn journal_held(&self, ctx_id: u32) -> Option<u64> {
+        self.journal_held.map(|f| f(ctx_id))
     }
 
     pub fn journal_replay_upto(&self, ctx_id: u32, upto: u64) -> c_int {

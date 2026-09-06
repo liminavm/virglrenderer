@@ -36,6 +36,12 @@ shift
 # script's own, and a relative golden path would otherwise land somewhere the caller cannot see.
 ARGS=()
 CHOICE=""
+# The snapshot-journal gate runs by default on the Rust tree, the same as the classic replayer's.
+# A gate that has to be remembered is a gate that stops being run. --no-rebuild opts out; the C
+# tree is not asked, because journal_held is a virglrs extension it does not export.
+REBUILD=1
+ASKED=0
+AT=0        # whether the caller named --rebuild-at, which already implies --rebuild
 while [ $# -gt 0 ]; do
   case "$1" in
     --renderer)
@@ -49,9 +55,27 @@ while [ $# -gt 0 ]; do
         *)  ARGS+=("$1" "$PWD/$2") ;;
       esac
       shift 2 ;;
+    --rebuild)    REBUILD=1; ASKED=1; shift ;;
+    --no-rebuild) REBUILD=0; shift ;;
+    --rebuild-at)
+      [ -n "${2:-}" ] || { echo "--rebuild-at wants a command count" >&2; exit 2; }
+      AT=1; ASKED=1; ARGS+=("$1" "$2"); shift 2 ;;
+    --smoke)      REBUILD=0; ARGS+=("$1"); shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
+# The C reference has no journal_held and the replayer resolves the rest of the journal ABI
+# eagerly, so asking it to rebuild reports about the ABI rather than about the corpus. Refuse
+# rather than quietly skip: a gate that silently does not run is worse than one not asked for.
+if [ "$CHOICE" = c ]; then
+  if [ "$ASKED" = 1 ]; then
+    echo "--rebuild needs --renderer rs (the C tree has no journal_held)" >&2; exit 2
+  fi
+  REBUILD=0
+fi
+if [ "$REBUILD" = 1 ] && [ "$AT" = 0 ]; then
+  ARGS+=(--rebuild)
+fi
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 cd "$(dirname "$0")"

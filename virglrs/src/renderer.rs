@@ -24,7 +24,7 @@ use crate::vrend;
 use crate::vrend::context::Guest;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -244,12 +244,23 @@ pub enum BlobStorage {
     /// guest attached it to, and what keeps the bytes alive for as long as the resource stands,
     /// including after the context that minted them is gone. `caching` is how the exporter's
     /// memory type said the host reaches them, decided at the export.
-    Shared { storage: Storage, caching: Caching },
+    Shared { storage: Storage, caching: Caching, from: Exporter },
     /// The exporting allocation's own `vkMapMemory` pointer, resolved once at the export and
-    /// kept -- what the C keeps too. Good only in the context that mapped it, and only while
-    /// that allocation stands: `key` is what says whether it still does, and it says so about
-    /// the *object*, not the id, which the guest may have given to something else since.
-    Borrowed { ctx: ContextId, mem: BlobId, key: ObjectKey, mapping: HostMapping },
+    /// kept -- what the C keeps too. Good only in the context that mapped it, and only while that
+    /// allocation stands, which `from` is what says.
+    Borrowed { from: Exporter, mem: BlobId, mapping: HostMapping },
+}
+
+/// The allocation a blob was exported from: whose it is, and which object it was.
+///
+/// One value rather than a context beside a key, because neither means anything without the other:
+/// an [`ObjectKey`] indexes one context's arena, so the same key names a different object in every
+/// other context. Passing them separately would let a caller ask one context's table about another
+/// context's key and get a confident wrong answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Exporter {
+    pub ctx: ContextId,
+    pub key: ObjectKey,
 }
 
 /// How a guest may cache memory the host published to it.
@@ -350,7 +361,7 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
             Backing::Blob { desc, storage } => match storage {
                 // A share resolves for anyone holding it: no table is asked.
                 BlobStorage::Shared { storage, .. } => Some(ResourceBytes::Shared(storage.clone())),
-                BlobStorage::Borrowed { ctx: owner, mem, .. } if *owner == ctx => {
+                BlobStorage::Borrowed { from, mem, .. } if from.ctx == ctx => {
                     Some(ResourceBytes::Allocation(Published {
                         memory: ObjectId(mem.0),
                         size: desc.size,
@@ -362,13 +373,13 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
                 // `vkMapMemory` pointer into ctx `owner`'s device, and this renderer cannot keep
                 // that alive for anyone else. Refused loudly rather than shared: handing it over
                 // would dangle the moment `owner` freed the memory or went away.
-                BlobStorage::Borrowed { ctx: owner, .. } => {
+                BlobStorage::Borrowed { from, .. } => {
                     eprintln!(
                         "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, and ordinary \
                          device memory is published as a borrowed mapping this renderer cannot \
                          share across contexts",
                         ctx.get(),
-                        owner.get(),
+                        from.ctx.get(),
                     );
                     None
                 }
@@ -432,13 +443,13 @@ impl Guest for BTreeMap<ResourceHandle, Resource> {
             // the context that mapped it and only while that allocation stands, so it is not
             // this renderer's to hand anyone else -- the same refusal `bytes()` gives, and for
             // the same lifetime reason.
-            BlobStorage::Borrowed { ctx: owner, .. } => {
-                if *owner != ctx {
+            BlobStorage::Borrowed { from, .. } => {
+                if from.ctx != ctx {
                     eprintln!(
                         "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, published as a \
                          borrowed mapping this renderer cannot share across contexts",
                         ctx.get(),
-                        owner.get(),
+                        from.ctx.get(),
                     );
                 }
                 None
@@ -622,13 +633,16 @@ impl Renderer {
                             Caching::WriteCombining
                         };
                         match share {
-                            Some(storage) => BlobStorage::Shared { storage, caching },
+                            Some(storage) => BlobStorage::Shared {
+                                storage,
+                                caching,
+                                from: Exporter { ctx, key },
+                            },
                             // The VMM publishes the *blob's* size from this address, which the
                             // export held to the allocation's.
                             None => BlobStorage::Borrowed {
-                                ctx,
+                                from: Exporter { ctx, key },
                                 mem,
-                                key,
                                 mapping: HostMapping {
                                     addr: exported.addr,
                                     size: desc.size,
@@ -1070,8 +1084,48 @@ impl Renderer {
     }
 
     /// One venus context's journal.
+    ///
+    /// The held set is the reachability the object table cannot see. A blob resource holds a share
+    /// of the storage a venus allocation was published from, and that share keeps the bytes alive
+    /// after the guest has freed the allocation -- so the resource goes on working, and a restore
+    /// that did not rebuild the allocation would produce a dead blob where the original had a live
+    /// one. Collected here because this is the only layer that can see both tables at once.
     pub fn venus_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
-        self.venus.as_ref()?.journal_export(id)
+        let held = self.exported_allocations(id);
+        self.venus.as_ref()?.journal_export(id, &held)
+    }
+
+    /// How many of `ctx`'s allocations a resource still holds a share of.
+    ///
+    /// Diagnostic. The harness's rebuild gate asks because it cannot compare a journal against a
+    /// rebuilt one while this is non-zero: those entries are retained on the strength of resources
+    /// holding the *original* context's allocations, and reproducing them in the rebuilt context
+    /// means replaying the VMM's blob creates against it -- the fence, which that gate does not
+    /// exercise. Better to decline the comparison and say why than to report a difference that is
+    /// the gate's own gap.
+    pub fn venus_held_allocations(&self, ctx: ContextId) -> usize {
+        self.exported_allocations(ctx).len()
+    }
+
+    /// The allocations of `ctx` that a resource still holds a share of.
+    ///
+    /// Only `Shared`. A `Borrowed` blob keeps no share -- it holds the allocation's own
+    /// `vkMapMemory` pointer, which the free takes away -- so such a resource genuinely stops
+    /// working when the guest frees, and retaining its allocation would rebuild a world *better*
+    /// than the one snapshotted. When that arm gains a real share, it belongs here too.
+    fn exported_allocations(&self, ctx: ContextId) -> BTreeSet<ObjectKey> {
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        table
+            .values()
+            .filter_map(|res| match &res.backing {
+                Backing::Blob { storage: BlobStorage::Shared { from, .. }, .. }
+                    if from.ctx == ctx =>
+                {
+                    Some(from.key)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// How far a venus context's journal has been written, for the VMM's fence.
@@ -1289,13 +1343,13 @@ impl Renderer {
                         caching: Caching::Cached,
                     })),
                     // The blob's size, not the storage's: the export held the one to the other.
-                    BlobStorage::Shared { storage, caching } => Some(Ok(HostMapping {
+                    BlobStorage::Shared { storage, caching, .. } => Some(Ok(HostMapping {
                         addr: storage.span().0,
                         size: desc.size,
                         caching: *caching,
                     })),
-                    BlobStorage::Borrowed { ctx, key, mapping, .. } => {
-                        Some(Err((*ctx, *key, *mapping)))
+                    BlobStorage::Borrowed { from, mapping, .. } => {
+                        Some(Err((from.ctx, from.key, *mapping)))
                     }
                     BlobStorage::Guest => None,
                 },
@@ -1359,6 +1413,23 @@ pub fn unsupported_renderers(config: Config) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// Some allocation key, for the tests whose subject is not an allocation's lifetime.
+    ///
+    /// `Exporter` names the allocation a blob came from, and every blob has one -- but a test about
+    /// which contexts may reach a share does not care which allocation that was. Minting one here
+    /// keeps those tests saying only what they are about.
+    fn any_key() -> super::ObjectKey {
+        let mut t = crate::venus::objects::Table::new();
+        t.add(
+            crate::venus::cs::ObjectId(1),
+            crate::venus::proto::types::VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY,
+            crate::venus::cs::HostHandle(1),
+            None,
+        )
+        .expect("a fresh table takes any id");
+        t.key_of(crate::venus::cs::ObjectId(1)).expect("just added")
+    }
+
     use super::*;
 
     /// A sink that goes nowhere. Nothing here retires a fence; the renderer needs one to exist.
@@ -1469,9 +1540,8 @@ mod tests {
                 // Ordinary device memory: published as a borrowed `vkMapMemory` pointer, which
                 // is storage this renderer cannot keep alive on anyone else's behalf.
                 storage: BlobStorage::Borrowed {
-                    ctx: one,
+                    from: Exporter { ctx: one, key },
                     mem: BlobId(66),
-                    key,
                     mapping: HostMapping { addr: 0x1000, size: 4128768, caching: Caching::Cached },
                 },
             },
@@ -1607,6 +1677,7 @@ mod tests {
                     storage: BlobStorage::Shared {
                         storage: share.clone(),
                         caching: Caching::Cached,
+                        from: Exporter { ctx: one, key: any_key() },
                     },
                 },
                 iov: Vec::new(),
@@ -1653,6 +1724,7 @@ mod tests {
                     storage: BlobStorage::Shared {
                         storage: pages.clone(),
                         caching: Caching::Cached,
+                        from: Exporter { ctx: one, key: any_key() },
                     },
                 },
                 iov: Vec::new(),
@@ -1822,7 +1894,11 @@ mod tests {
                     source: BlobSource::Exported { ctx: one, mem: BlobId(MEM.0) },
                     size: 4096,
                 },
-                storage: BlobStorage::Borrowed { ctx: one, mem: BlobId(MEM.0), key, mapping },
+                storage: BlobStorage::Borrowed {
+                    from: Exporter { ctx: one, key },
+                    mem: BlobId(MEM.0),
+                    mapping,
+                },
             },
             Vec::new(),
         );
@@ -1869,7 +1945,11 @@ mod tests {
                     source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
                     size: 4096,
                 },
-                storage: BlobStorage::Shared { storage: pages.clone(), caching: Caching::Cached },
+                storage: BlobStorage::Shared {
+                    storage: pages.clone(),
+                    caching: Caching::Cached,
+                    from: Exporter { ctx: one, key: any_key() },
+                },
             },
             Vec::new(),
         );

@@ -24,7 +24,7 @@
 //! `vkDestroyRingMESA` runs inside a dispatch that already holds the context lock and then joins
 //! the thread, so a thread that could block on that lock would deadlock with its own destroy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::config::Config;
@@ -33,6 +33,7 @@ use crate::ids::{ContextId, RingId};
 use super::budget::Budget;
 use super::context::{Context, Submitted, Unimplemented, Wait};
 use super::journal::Seq;
+use super::objects::ObjectKey;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
 use crate::vulkan::Global;
@@ -312,10 +313,10 @@ impl Vkr {
     }
 
     /// One context's journal, for the VMM to store beside its own.
-    pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
+    pub fn journal_export(&self, id: ContextId, held: &BTreeSet<ObjectKey>) -> Option<Vec<u8>> {
         let ctx = self.contexts.get(&id)?;
         let ctx = ctx.lock().expect("a context lock is never poisoned");
-        ctx.journal_export()
+        ctx.journal_export(held)
     }
 
     /// How far a context's journal has been written.

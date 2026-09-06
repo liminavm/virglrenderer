@@ -1377,6 +1377,19 @@ pub extern "C" fn virgl_renderer_limina_journal_export(
     })
 }
 
+/// How many of a context's allocations a blob resource still holds a share of.
+///
+/// Diagnostic, and not part of the snapshot contract: the VMM never needs it. The harness's
+/// rebuild gate reads it to know when a journal cannot be compared against a rebuilt one -- see
+/// [`crate::renderer::Renderer::venus_held_allocations`].
+#[unsafe(no_mangle)]
+pub extern "C" fn virgl_renderer_limina_journal_held(ctx_id: u32) -> u64 {
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return 0;
+    };
+    with(0, |r| r.venus_held_allocations(ctx) as u64)
+}
+
 /// A copy of `bytes` the caller will `free`, or `None` if the allocation failed.
 ///
 /// The ABI's contract is a `malloc`ed buffer, which is why this is not a `Vec`: the VMM is C on

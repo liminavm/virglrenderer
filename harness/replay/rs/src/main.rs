@@ -99,7 +99,8 @@ fn parse_args() -> Result<Args, String> {
             "--rebuild" => rebuild = true,
             "--rebuild-at" => {
                 let v = it.next().ok_or("--rebuild-at wants a command count")?;
-                rebuild_at = Some(v.parse().map_err(|_| format!("--rebuild-at {v}: not a number"))?);
+                rebuild_at =
+                    Some(v.parse().map_err(|_| format!("--rebuild-at {v}: not a number"))?);
                 rebuild = true;
             }
             _ if corpus.is_none() => corpus = Some(a),
@@ -178,6 +179,19 @@ struct Backing {
     _bytes: Vec<u8>,
 }
 
+/// A `create_blob` that exported host-side memory: everything needed to make it again.
+#[derive(Clone, Copy)]
+struct ExportedBlob {
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    /// The context's journal watermark when this blob was created. This is the fence: the guest
+    /// may free the allocation later in the same journal, and a rebuilt context that replays the
+    /// whole journal before creating its blobs is asked to export something already gone.
+    at: u64,
+}
+
 struct Replay<'a> {
     r: &'a abi::Renderer,
     verbose: bool,
@@ -202,6 +216,13 @@ struct Replay<'a> {
     /// resource, and a context that cannot reach it fails that create -- which then reads as the
     /// journal having lost the allocation, when what it lost was the attachment.
     attached: BTreeMap<u32, BTreeSet<u32>>,
+    /// The exporting blobs each context currently has alive, by resource handle.
+    ///
+    /// These are the VMM's half of the world. A journal entry retained *because* a blob still
+    /// holds the allocation it exported has no counterpart in a rebuilt context until the same
+    /// blobs are created against it, so the gate replays these too -- which is the fence, taken
+    /// once, in the one shape this harness can reach.
+    exports: BTreeMap<u32, BTreeMap<u32, ExportedBlob>>,
     /// Gate after this many replayed commands, and how many have gone by.
     rebuild_at: Option<u64>,
     replayed: u64,
@@ -332,6 +353,7 @@ impl<'a> Replay<'a> {
                 // corpus reuses ctx 8 three times.
                 self.rebuilt.remove(ctx_id);
                 self.attached.remove(ctx_id);
+                self.exports.remove(ctx_id);
                 (rc, format!("context_create {ctx_id} flags={context_init:#x} {name:?}"))
             }
             Ctl::CtxDestroy { ctx_id } => {
@@ -350,7 +372,8 @@ impl<'a> Replay<'a> {
                     // asking a context that no longer exists and calling the silence a pass.
                     if self.rebuild {
                         let res = self.attached.get(ctx_id).cloned().unwrap_or_default();
-                        rebuild_gate(&self.r, *ctx_id, &res, &mut self.tally);
+                        let exp = self.exports.get(ctx_id).cloned().unwrap_or_default();
+                        rebuild_gate(&self.r, *ctx_id, &res, &exp, &mut self.tally);
                         self.rebuilt.insert(*ctx_id);
                     }
                 }
@@ -399,6 +422,18 @@ impl<'a> Replay<'a> {
                 if rc == 0 && self.r.iosurface_id(*res_handle).is_some() {
                     self.iosurf.entry(*ctx_id).or_default().insert(*res_handle);
                 }
+                if rc == 0 && *blob_id != 0 {
+                    self.exports.entry(*ctx_id).or_default().insert(
+                        *res_handle,
+                        ExportedBlob {
+                            blob_mem: *blob_mem,
+                            blob_flags: *blob_flags,
+                            blob_id: *blob_id,
+                            size: *size,
+                            at: self.r.journal_seq(*ctx_id),
+                        },
+                    );
+                }
                 (
                     rc,
                     format!(
@@ -431,6 +466,9 @@ impl<'a> Replay<'a> {
             Ctl::ResourceUnref { res_handle } => {
                 self.r.resource_unref(*res_handle);
                 self.backings.remove(res_handle);
+                for blobs in self.exports.values_mut() {
+                    blobs.remove(res_handle);
+                }
                 (0, format!("resource_unref res={res_handle}"))
             }
         };
@@ -473,7 +511,20 @@ impl<'a> Replay<'a> {
                         iovecs: std::ptr::null(),
                         num_iovs: 0,
                     };
-                    self.r.create_blob(&args) == 0
+                    let ok = self.r.create_blob(&args) == 0;
+                    if ok {
+                        self.exports.entry(*ctx_id).or_default().insert(
+                            *res_handle,
+                            ExportedBlob {
+                                blob_mem: *blob_mem,
+                                blob_flags: *blob_flags,
+                                blob_id: *blob_id,
+                                size: *size,
+                                at: self.r.journal_seq(*ctx_id),
+                            },
+                        );
+                    }
+                    ok
                 }
                 _ => true,
             };
@@ -520,6 +571,7 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         rebuild: args.rebuild,
         rebuilt: BTreeSet::new(),
         attached: BTreeMap::new(),
+        exports: BTreeMap::new(),
         rebuild_at: args.rebuild_at,
         replayed: 0,
     };
@@ -626,7 +678,8 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
                             continue;
                         }
                         let res = rp.attached.get(&ctx_id).cloned().unwrap_or_default();
-                        rebuild_gate(&rp.r, ctx_id, &res, &mut rp.tally);
+                        let exp = rp.exports.get(&ctx_id).cloned().unwrap_or_default();
+                        rebuild_gate(&rp.r, ctx_id, &res, &exp, &mut rp.tally);
                     }
                 }
             }
@@ -658,7 +711,8 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
                 continue;
             }
             let res = rp.attached.get(&ctx_id).cloned().unwrap_or_default();
-            rebuild_gate(&rp.r, ctx_id, &res, &mut rp.tally);
+            let exp = rp.exports.get(&ctx_id).cloned().unwrap_or_default();
+            rebuild_gate(&rp.r, ctx_id, &res, &exp, &mut rp.tally);
         }
     }
 
@@ -691,6 +745,10 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
 /// ctx 8 that could not be rebuilt.
 const REBUILT_BASE: u32 = 1000;
 
+/// Where a rebuilt context's re-exported blobs are stood up, added to the handle each had. Above
+/// every handle a corpus uses, for the same reason and read the same way.
+const REBUILT_RES_BASE: u32 = 0x0100_0000;
+
 /// Require that replaying a context's journal yields a context whose journal is that same journal.
 ///
 /// This is a fixed point, and so it is the floor rather than the ceiling. It cannot see what the
@@ -700,9 +758,12 @@ const REBUILT_BASE: u32 = 1000;
 /// order, one that names something the closure did not drag in, and any retention rule that is not
 /// stable under being applied twice.
 ///
-/// It also rebuilds only the end-of-stream world and feeds the whole journal at once, so it never
-/// exercises the fence -- the interleave where the VMM creates a blob partway through the replay.
-/// Only a real suspend and resume scores that.
+/// It does cross the fence -- the interleave where the VMM creates a blob against a half-replayed
+/// context. Each blob the original exported is remade at the journal watermark it was first made
+/// at, which is what a resuming VMM does and what a single `replay_upto(MAX)` cannot: an
+/// allocation the guest frees later in the same journal is exportable only before that free.
+/// What this cannot reach is the guest side of a resume -- there is no VM here, so nothing ever
+/// reads back what the rebuilt blobs point at.
 ///
 /// `seq` is deliberately not compared. A rebuilt context numbers its own journal from one, so the
 /// sequence numbers differ by construction; what has to match is which commands were retained, in
@@ -711,6 +772,7 @@ fn rebuild_gate(
     r: &abi::Renderer,
     ctx_id: u32,
     resources: &BTreeSet<u32>,
+    exports: &BTreeMap<u32, ExportedBlob>,
     tally: &mut Tally,
 ) {
     let before = match r.journal_export(ctx_id) {
@@ -756,22 +818,93 @@ fn rebuild_gate(
         r.context_destroy(fresh);
         return fail(format!("journal_restore {fresh} ({} bytes) -> {rc}", before.len()));
     }
-    // Everything, in one go. A real restore paces this against its own rebuilding; here there is
-    // nothing on the other side to pace against, which is exactly why this cannot score the fence.
-    let rc = r.journal_replay_upto(fresh, u64::MAX);
-    if rc != 0 {
+    // The fence, walked station by station. An entry is retained partly BECAUSE a blob still
+    // holds the allocation it exported, so a rebuilt context with no blobs keeps less than the
+    // original and the two journals differ by this gate's own gap rather than by anything the
+    // renderer did. And each blob has to be made where it was made: the guest may free the
+    // allocation later in the same journal, so a context that replays to the end first is asked
+    // to export memory that is already gone -- which is the interleave the watermark exists for.
+    let mut ordered: Vec<(&u32, &ExportedBlob)> = exports.iter().collect();
+    ordered.sort_by_key(|(res, b)| (b.at, **res));
+
+    let mut remade = Vec::with_capacity(ordered.len());
+    let feed = |upto: u64| {
+        let rc = r.journal_replay_upto(fresh, upto);
+        if rc != 0 {
+            Err(format!("journal_replay_upto {fresh} to {upto} -> {rc}"))
+        } else {
+            Ok(())
+        }
+    };
+
+    let mut trouble = None;
+    for (res_handle, b) in ordered {
+        if let Err(e) = feed(b.at) {
+            trouble = Some(e);
+            break;
+        }
+        let handle = res_handle + REBUILT_RES_BASE;
+        let args = abi::CreateBlobArgs {
+            res_handle: handle,
+            ctx_id: fresh,
+            blob_mem: b.blob_mem,
+            blob_flags: b.blob_flags,
+            blob_id: b.blob_id,
+            size: b.size,
+            iovecs: std::ptr::null(),
+            num_iovs: 0,
+        };
+        let rc = r.create_blob(&args);
+        if rc != 0 {
+            trouble = Some(format!(
+                "re-exporting blob_id {} ({} bytes, was res {res_handle}) into {fresh} at seq {} \
+                 -> {rc} -- the rebuilt world does not have the allocation the original exported",
+                b.blob_id, b.size, b.at
+            ));
+            break;
+        }
+        remade.push(handle);
+    }
+    if trouble.is_none() {
+        if let Err(e) = feed(u64::MAX) {
+            trouble = Some(e);
+        }
+    }
+    if let Some(why) = trouble {
+        for h in &remade {
+            r.resource_unref(*h);
+        }
         r.replay_end(fresh);
         r.context_destroy(fresh);
-        return fail(format!("journal_replay_upto {fresh} -> {rc}"));
+        return fail(why);
     }
+
     let rc = r.replay_end(fresh);
     if rc != 0 {
+        for h in &remade {
+            r.resource_unref(*h);
+        }
         r.context_destroy(fresh);
         return fail(format!("replay_end {fresh} -> {rc}"));
     }
 
     let after = r.journal_export(fresh).unwrap_or_default();
+    // Said before the journals are compared, because it is the cause and they are the symptom: an
+    // entry retained by a held allocation on one side and not the other makes the two differ, and
+    // "the rebuilt journal has fewer entries" does not tell the reader which allocation went
+    // missing or that a blob is why.
+    let (held, held_after) = (r.journal_held(ctx_id), r.journal_held(fresh));
+    for h in &remade {
+        r.resource_unref(*h);
+    }
     r.context_destroy(fresh);
+    if held != held_after {
+        return fail(format!(
+            "{held_after:?} allocation(s) held by blobs in the rebuilt context, {held:?} in the \
+             original -- re-exporting {} blob(s) did not reproduce the same held set",
+            remade.len()
+        ));
+    }
 
     let key = |id| corpus::CtxKey { id, generation: 0 };
     let (a, b) = match (
