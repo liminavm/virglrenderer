@@ -795,6 +795,14 @@ to have it, each because reproducing the C would mean reproducing a defect.
   `feat_srgb_write_control` — a transposition, and the first of the pair gates whether the blit
   enables `GL_FRAMEBUFFER_SRGB`. Unobservable on this host, where the pinned `blit.score` matches
   the C on an sRGB blit either way, and a host with one extension and not the other would diverge.
+- **The sample-count ceiling is applied before the probe, not repaired after it.**
+  `VREND_MAX_SAMPLES` exists in both trees for the same reason — a host whose multisample path is
+  unsafe degrades instead of dying — but the C clamps `max_samples` after probing and then
+  `memset`s all eight `sample_locations` words, which blanks the positions of the counts still
+  under the ceiling too: a ceiling of 4 on a host with 8 leaves 2 and 4 selectable and describes
+  neither. virglrs hands the ceiling to the probe, which already skips every count above what it
+  is given, so the counts advertised and the positions published come from one pass and there is
+  nothing to repair. Unobservable at limina's setting of 1, where nothing survives either way.
 - **A blit leaves nothing on its source that a later draw can read.** `vrend_set_tex_param` writes
   the base and max level, the filters, the wrap modes and the format swizzle onto the *source
   texture object*, and the sampler-view bind skips its work when the same view handle is set into
@@ -863,12 +871,6 @@ waiting on a call rather than on work.
 
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
 it survives the session it was found in.
-
-- **virglrs advertises every sample count the host has.** The C fork carries a `VREND_MAX_SAMPLES`
-  ceiling on the multisample caps, and limina sets it to 1: a WebGL context asking for
-  `{antialias:true}` faults the GPU and kills the VM, and a guest cannot ask for multisampling it
-  has not been told exists. virglrs must read that exact variable name, or swapping the dylib in
-  silently removes the mitigation with nothing to say so.
 
 - **A classic resource does not import into a venus context.** The Vulkan compositor answers
   `create_immed failed and produced an invalid wl_buffer` and kills a classic-virgl GL client
