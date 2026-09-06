@@ -5016,6 +5016,23 @@ mod tests {
         drop(share);
 
         driver.free_memory(DEVICE, handle, LOCAL);
+
+        // A scanout publishes the same way, and the share it lends is the surface itself. The
+        // storage travels, never a name in this context's table -- which is what lets a
+        // compositor in another context import the blob after the exporter is gone.
+        const SCAN: ObjectId = ObjectId(15);
+        let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
+        let (scan_addr, scan_extent) = (surface.host_addr(), surface.alloc_size());
+        driver.plant_scanout_allocation(SCAN, surface);
+        let (scan, scan_share) = driver.memory_export(SCAN, 1024).expect("a scanout publishes too");
+        assert!(matches!(scan_share, Storage::Texture(_)), "the surface itself, not a copy of it");
+        assert_eq!(
+            scan_share.span(),
+            (scan_addr, scan_extent),
+            "and it is the surface's own pages"
+        );
+        assert_eq!(scan.addr, scan_addr, "which is the address the VMM was handed");
+
         driver.abandon_planted();
     }
 

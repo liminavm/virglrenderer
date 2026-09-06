@@ -583,7 +583,7 @@ SABOTAGES = [
             Storage::Linear(s) => Storage::Linear(Arc::clone(s)),
             Storage::Texture(_) => return Err(ExportError::NotMappable),
         };""",
-        '',
+        'memory_is_published_once_and_leaves_the_census_when_it_is',
     ),
     (
         "a context's destroy uncounts what still outlives it",
@@ -647,7 +647,7 @@ SABOTAGES = [
             return Err(ExportError::LargerThanAllocation);
         }""",
         """""",
-        'every_allocation_the_host_can_address_owns_the_bytes_it_lends',
+        'memory_is_published_once_and_leaves_the_census_when_it_is',
     ),
     (
         'minted pages lend no share, so the buffer stays trapped in one context',
