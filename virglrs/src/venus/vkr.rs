@@ -32,6 +32,7 @@ use crate::ids::{ContextId, RingId};
 
 use super::budget::Budget;
 use super::context::{Context, Submitted, Unimplemented, Wait};
+use super::journal::Seq;
 use super::ring::{ReplyStream, Ring, ShmResources};
 use super::ring_thread::{self, Dispatch, RingWaiter, Verdict};
 use crate::vulkan::Global;
@@ -308,6 +309,51 @@ impl Vkr {
     pub fn replay_begin(&mut self, id: ContextId) -> Result<(), Error> {
         self.with_context_mut(id, Context::replay_begin).ok_or(Error::NoContext)?;
         Ok(())
+    }
+
+    /// One context's journal, for the VMM to store beside its own.
+    pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
+        let ctx = self.contexts.get(&id)?;
+        let ctx = ctx.lock().expect("a context lock is never poisoned");
+        ctx.journal_export()
+    }
+
+    /// How far a context's journal has been written.
+    pub fn journal_seq(&self, id: ContextId) -> Option<Seq> {
+        let ctx = self.contexts.get(&id)?;
+        let ctx = ctx.lock().expect("a context lock is never poisoned");
+        Some(ctx.journal_seq())
+    }
+
+    /// Hand a context the journal it will be rebuilt from.
+    pub fn journal_restore(&mut self, id: ContextId, bytes: &[u8]) -> Result<usize, &'static str> {
+        let ctx = self.contexts.get(&id).ok_or("no such context")?;
+        let mut ctx = ctx.lock().expect("a context lock is never poisoned");
+        ctx.journal_restore(bytes)
+    }
+
+    /// Feed a context's restored entries up to `upto`.
+    ///
+    /// Nothing is promoted here: a ring the journal creates stays idle until `replay_end`, which is
+    /// what stops it reading a guest's buffer while the rest of the journal is still going in.
+    pub fn replay_upto(&mut self, id: ContextId, upto: Seq) -> Result<(), Error> {
+        self.on_context_ok(id, |ctx, todo, global, resources| {
+            ctx.replay_upto(upto, todo, global, resources)
+        })
+    }
+
+    /// What every context's recorder dropped, by command name, most-dropped first.
+    pub fn journal_transient(&self) -> Vec<(&'static str, u64)> {
+        let mut total: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for ctx in self.contexts.values() {
+            let ctx = ctx.lock().expect("a context lock is never poisoned");
+            for (name, n) in ctx.journal_transient() {
+                *total.entry(name).or_default() += n;
+            }
+        }
+        let mut out: Vec<(&'static str, u64)> = total.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        out
     }
 
     /// Leave replay mode, and start every ring the journal built.

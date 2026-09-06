@@ -1069,6 +1069,35 @@ impl Renderer {
         self.vrend.as_ref()?.journal_export(id)
     }
 
+    /// One venus context's journal.
+    pub fn venus_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
+        self.venus.as_ref()?.journal_export(id)
+    }
+
+    /// How far a venus context's journal has been written, for the VMM's fence.
+    pub fn venus_journal_seq(&self, id: ContextId) -> Option<u64> {
+        Some(self.venus.as_ref()?.journal_seq(id)?.0)
+    }
+
+    /// Hand a venus context the journal it will be rebuilt from.
+    pub fn venus_journal_restore(
+        &mut self,
+        ctx: ContextId,
+        bytes: &[u8],
+    ) -> Result<usize, &'static str> {
+        self.venus.as_mut().ok_or("no venus renderer")?.journal_restore(ctx, bytes)
+    }
+
+    /// Feed a venus context's retained commands up to `upto`.
+    pub fn venus_replay_upto(&mut self, ctx: ContextId, upto: u64) -> Result<(), Error> {
+        self.venus_mut()?.replay_upto(ctx, crate::venus::journal::Seq(upto)).map_err(venus_error)
+    }
+
+    /// What the venus recorder dropped, by command name, most-dropped first.
+    pub fn venus_journal_transient(&self) -> Vec<(&'static str, u64)> {
+        self.venus.as_ref().map(|v| v.journal_transient()).unwrap_or_default()
+    }
+
     /// Begin rebuilding a classic context from its journal.
     pub fn vrend_replay_begin(&mut self, ctx: ContextId) -> bool {
         self.vrend.as_mut().is_some_and(|v| v.replay_begin(ctx))

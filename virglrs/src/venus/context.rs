@@ -10,7 +10,7 @@
 //! ends the loop.
 
 use bumpalo::Bump;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,7 +21,7 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
-use super::journal::Journal;
+use super::journal::{self, Journal, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -155,6 +155,25 @@ pub struct Context {
     /// What this context would have to be told again to be itself. Written by the dispatch loop as
     /// commands go by; read only by an export.
     journal: Journal,
+    /// Entries a restore handed over and the fence has not yet released.
+    ///
+    /// A queue rather than an index beside a vector: the two would be a count and the thing it
+    /// counts, and a feed that resumed from the wrong one would replay a command twice. Popping
+    /// from the front makes "what is left" and "where we are" the same fact.
+    restoring: VecDeque<journal::Parsed>,
+}
+
+/// The object table, answering the journal's one question about it.
+///
+/// A wrapper rather than an `impl` on `Shared` so the borrow is taken here, for the length of one
+/// export, and never while a dispatch is running -- the table lives in a `RefCell` the handlers
+/// hold across a command.
+struct LiveObjects<'a>(&'a Shared);
+
+impl journal::Live for LiveObjects<'_> {
+    fn holds(&self, key: ObjectKey) -> bool {
+        self.0.borrow().holds(key)
+    }
 }
 
 /// A context must be `Send`: each one is owned by whoever is driving it, and a ring's thread will
@@ -271,6 +290,7 @@ impl Context {
             wait_ring: Arc::new(WaitRing::default()),
             monitor: None,
             journal: Journal::new(),
+            restoring: VecDeque::new(),
         }
     }
 
@@ -332,6 +352,78 @@ impl Context {
     /// still being fed to it. This is the C's `ctx->replaying`, consulted at the same decision.
     pub fn replaying(&self) -> bool {
         self.replay
+    }
+
+    /// Everything this context would have to be told again, as bytes for the VMM to store.
+    ///
+    /// `None` when there is nothing to say, which is not the same as an empty blob: a caller that
+    /// stored zero bytes and later restored them would have rebuilt nothing and been told it
+    /// succeeded.
+    pub fn journal_export(&self) -> Option<Vec<u8>> {
+        self.journal.export(&LiveObjects(&self.objects))
+    }
+
+    /// How far this context's journal has been written, for the VMM's cross-layer fence.
+    pub fn journal_seq(&self) -> Seq {
+        self.journal.seq()
+    }
+
+    /// What the recorder dropped, by command type. A fact about the recorder, for the census.
+    pub fn journal_transient(&self) -> Vec<(&'static str, u64)> {
+        self.journal
+            .transient()
+            .iter()
+            .map(|(c, n)| (vn_command_name(VkCommandTypeEXT(*c as i32)).unwrap_or("?"), *n))
+            .collect()
+    }
+
+    /// Hand this context the journal it will be rebuilt from, and say how many entries it holds.
+    ///
+    /// Stored, not fed. Nothing replays until [`Context::replay_upto`] says how far, because what
+    /// the entries name is created on the VMM's side as its own rebuild walks on -- the fence is
+    /// the whole reason these are two calls.
+    pub fn journal_restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let entries = journal::parse(bytes)?;
+        let n = entries.len();
+        self.restoring = entries.into();
+        Ok(n)
+    }
+
+    /// Feed every restored entry up to and including `upto`, in the order they were recorded.
+    ///
+    /// Entries are consumed from the front, so a second call resumes where the first stopped and
+    /// nothing is replayed twice. A poisoned context stops the feed: the remaining entries name a
+    /// world we no longer built, and running them would be building on a lie.
+    pub fn replay_upto(
+        &mut self,
+        upto: Seq,
+        todo: &mut Unimplemented,
+        global: &Global,
+        resources: &dyn ShmResources,
+    ) -> bool {
+        while let Some(entry) = self.restoring.front() {
+            if entry.seq > upto {
+                break;
+            }
+            let entry = self.restoring.pop_front().expect("just looked at it");
+            let ok = match entry.ring_key {
+                0 => matches!(self.submit(&entry.wire, todo, global, resources), Submitted::Done),
+                // A ring the journal itself created earlier in this same feed: the create was
+                // routed to the context's decoder precisely so it would exist by now.
+                key => self.submit_ring(RingId(key), &entry.wire, todo, global, resources),
+            };
+            if !ok {
+                eprintln!(
+                    "[virglrs] ctx {}: journal entry {} did not replay; {} entries abandoned",
+                    self.id.get(),
+                    entry.seq,
+                    self.restoring.len()
+                );
+                self.restoring.clear();
+                return false;
+            }
+        }
+        true
     }
 
     /// Drain one submission, dispatching every command in it.
