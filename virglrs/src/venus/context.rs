@@ -133,6 +133,9 @@ pub struct Context {
     /// The second number is what says how far a corpus actually got.
     pub dispatched: u64,
     pub unhandled: u64,
+    /// Commands a replay dropped because their objects could not be rebuilt. A restore that ends
+    /// with this above zero did not rebuild the world it was given.
+    pub replay_ghosted: u64,
     /// The rings this context has stood up, by the object id the guest named them with.
     ///
     /// One map, so a ring has exactly one owner. Destroying the context drops it, which is what
@@ -285,6 +288,7 @@ impl Context {
             replay: false,
             dispatched: 0,
             unhandled: 0,
+            replay_ghosted: 0,
             rings: BTreeMap::new(),
             reply: None,
             wait_ring: Arc::new(WaitRing::default()),
@@ -401,6 +405,7 @@ impl Context {
         global: &Global,
         resources: &dyn ShmResources,
     ) -> bool {
+        let ghosted_before = self.replay_ghosted;
         while let Some(entry) = self.restoring.front() {
             if entry.seq > upto {
                 break;
@@ -422,6 +427,18 @@ impl Context {
                 self.restoring.clear();
                 return false;
             }
+        }
+        // Every entry was accepted, which is not the same as every entry having worked. A command
+        // skipped because its object could not be rebuilt leaves a hole nothing above can see, and
+        // reporting success here is how a black screen after a resume becomes a mystery.
+        let lost = self.replay_ghosted - ghosted_before;
+        if lost > 0 {
+            eprintln!(
+                "[virglrs] ctx {}: {lost} replayed commands named objects the rebuild could not \
+                 produce; the restored context is not the one that was snapshotted",
+                self.id.get()
+            );
+            return false;
         }
         true
     }
@@ -496,6 +513,7 @@ impl Context {
 
         self.dispatched += counts.dispatched;
         self.unhandled += counts.unhandled;
+        self.replay_ghosted += counts.replay_ghosted;
         // Every exit from the loop is one place, so a branch that poisons and breaks cannot report
         // success on the way out. The poison check comes first: a batch that suspended *and* then
         // poisoned has nothing left to resume into.
@@ -738,6 +756,14 @@ fn monitor_period(info: &VkRingCreateInfoMESA) -> Option<Option<u32>> {
 struct Counts {
     dispatched: u64,
     unhandled: u64,
+    /// Commands skipped during a *replay* because they named an object the host refused.
+    ///
+    /// Counted apart from `unhandled` because it means something entirely different. From a guest
+    /// a ghost is containment working as designed -- one command lost instead of a poisoned ring,
+    /// because the guest had already pipelined it behind a create the host refused. During a
+    /// replay there is no guest and nothing was pipelined: the create that failed is one *we*
+    /// replayed, so this is the rebuild failing to rebuild.
+    replay_ghosted: u64,
 }
 
 /// Command streams a handler asked to have executed, and where each one's answers go.
@@ -851,6 +877,20 @@ fn run_batch(
                         &format!("wanted a reply, and names object {} the host refused", ghost.0),
                     );
                     break;
+                }
+                // Silent from a guest, never from a replay. A restore with holes in it looks
+                // exactly like a clean one from the outside -- the commands were accepted, the
+                // context is alive, and what is missing is only visible to the guest that will
+                // shortly use it. Name the command and let the caller fail.
+                if replay {
+                    counts.replay_ghosted += 1;
+                    eprintln!(
+                        "[virglrs] ctx {}: replaying {} names object {}, whose create this \
+                         replay could not rebuild -- the restored world is missing it",
+                        id.get(),
+                        vn_command_name(cmd).unwrap_or("an unnamed command"),
+                        ghost.0
+                    );
                 }
                 continue;
             }
