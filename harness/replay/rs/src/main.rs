@@ -887,6 +887,7 @@ fn rebuild_gate(
     // until the journals have been compared -- a held mismatch is the cause and a write refused
     // for an allocation the rebuild did not make is its symptom.
     let content = content_gate(r, ctx_id, fresh);
+    let sync = sync_gate(r, ctx_id, fresh);
 
     let rc = r.replay_end(fresh);
     if rc != 0 {
@@ -950,6 +951,23 @@ fn rebuild_gate(
         Ok(n) => println!("rebuild ctx={ctx_id} contents restored into {n} allocation(s)"),
         Err(why) => return fail(why),
     }
+    match sync {
+        Ok((n, moved)) => {
+            println!("rebuild ctx={ctx_id} sync {n} object(s), {moved} fast-forwarded");
+            // The one number that says whether this scored anything. A rebuilt world that already
+            // agrees with the capture is compared against itself, and the fixed point passes
+            // whatever either half does -- so a corpus that reports zero here says so on every
+            // run rather than reading as a pass. It cannot be pinned: gate results stay out of
+            // the score deliberately (see `Tally::failed`), and this is the substitute.
+            if moved == 0 {
+                eprintln!(
+                    "sync: ctx {ctx_id} scored nothing -- the rebuilt world already matched the \
+                     capture. Only a world with work in flight exercises this; try --rebuild-at."
+                );
+            }
+        }
+        Err(why) => return fail(why),
+    }
     tally.rebuild_ok += 1;
     println!("rebuild ctx={ctx_id} {} entries, {} bytes, identical", a.len(), before.len());
 }
@@ -992,6 +1010,72 @@ const READ_CAP: usize = 1 << 20;
 /// buffer twice -- so without this the whole exported half of a context is unscored. It is also
 /// the only read that survives the guest freeing the allocation: the resource holds a share of the
 /// storage, so `vkFreeMemory` retires the record and leaves these bytes standing. Every venus
+
+/// Put the original context's sync state into the rebuilt one, and require a capture of the
+/// result to be the capture that went in.
+///
+/// The third half of a snapshot, after the world and its bytes. A rebuilt fence is freshly
+/// created and unsignalled and a rebuilt timeline sits at its create value, so a resume that
+/// stopped at the journal comes back to a guest waiting on fences that will never signal --
+/// the submits that would have signalled them died with the renderer.
+///
+/// What makes it non-vacuous is the count reported here: `moved` is how many entries the blank
+/// world disagreed with the capture about, and a corpus whose blank world already matches scores
+/// nothing for sync however green it looks. That number is in the score, so a pin is what says
+/// which corpora actually exercise this -- run at end of stream it is usually zero, and
+/// `--rebuild-at` mid-stream is where a live world has fences in flight.
+///
+/// Before `replay_end` for the reason the contents are: the VMM restores sync while the rings are
+/// still idle, because a started ring can consume a guest wait rooted in the pre-suspend epoch
+/// before the fast-forward has run.
+fn sync_gate(r: &abi::Renderer, ctx_id: u32, fresh: u32) -> Result<(usize, usize), String> {
+    let want = match r.sync_export(ctx_id) {
+        Ok(b) => b,
+        Err(rc) => return Err(format!("sync_export {ctx_id} -> {rc}")),
+    };
+    let blank = match r.sync_export(fresh) {
+        Ok(b) => b,
+        Err(rc) => return Err(format!("sync_export {fresh} -> {rc}")),
+    };
+    let entries = sync_entries(&want)?;
+    let moved = sync_entries(&blank).map(|b| entries.iter().filter(|e| !b.contains(e)).count())?;
+
+    let rc = r.sync_restore(fresh, &want);
+    if rc != 0 {
+        return Err(format!("sync_restore {fresh} -> {rc}"));
+    }
+    let got = match r.sync_export(fresh) {
+        Ok(b) => b,
+        Err(rc) => return Err(format!("sync_export {fresh} after restore -> {rc}")),
+    };
+    if got != want {
+        return Err(format!(
+            "sync ctx={ctx_id}: the restored state is not the captured one ({} vs {} bytes)",
+            got.len(),
+            want.len()
+        ));
+    }
+    Ok((entries.len(), moved))
+}
+
+/// A sync blob's entries, as opaque fixed-size records.
+///
+/// The harness parses the blob only far enough to count and compare entries -- what each field
+/// means is the renderer's business, and a second reading of it here would be a second
+/// implementation to keep in step.
+fn sync_entries(blob: &[u8]) -> Result<Vec<[u8; 24]>, String> {
+    if blob.len() < 8 || blob[0..4] != 0x4e59_5a4cu32.to_le_bytes() {
+        return Err(format!("sync: {} bytes that are not a sync blob", blob.len()));
+    }
+    let count = u32::from_le_bytes(blob[4..8].try_into().expect("four bytes")) as usize;
+    if blob.len() - 8 != count * 24 {
+        return Err(format!("sync: {count} entries in {} bytes", blob.len()));
+    }
+    Ok((0..count)
+        .map(|i| blob[8 + i * 24..8 + (i + 1) * 24].try_into().expect("24 bytes"))
+        .collect())
+}
+
 /// Put the original context's allocation contents into the rebuilt one, and require them to read
 /// back as themselves.
 ///

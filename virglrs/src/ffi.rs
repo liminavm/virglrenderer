@@ -118,6 +118,7 @@ fn errno(e: renderer::Error) -> c_int {
         | BlobLargerThanAllocation
         | ContentLargerThanAllocation
         | MalformedContent(_)
+        | MalformedSync(_)
         | ClassicRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
@@ -1593,22 +1594,75 @@ fn with_bytes<R>(p: *mut c_void, len: usize, f: impl FnOnce(&[u8]) -> R) -> Opti
     Some(f(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) }))
 }
 
+/// One venus context's sync state, as a blob the caller frees.
+///
+/// `ENOENT` for a context this renderer does not serve as a venus one, the way the journal export
+/// answers. There is no third answer: a capture reads polls and records, never the GPU's
+/// attention, so a suspend cannot be refused here.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_sync_export(
-    _ctx_id: u32,
-    _out_buf: *mut *mut c_void,
-    _out_size: *mut u64,
+    ctx_id: u32,
+    out_buf: *mut *mut c_void,
+    out_size: *mut u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    if out_buf.is_null() || out_size.is_null() {
+        return EINVAL;
+    }
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| {
+        let Ok(bytes) = r.venus_sync_export(ctx) else {
+            return ENOENT;
+        };
+        match malloc_bytes(&bytes) {
+            // SAFETY: both checked non-null above; the VMM's contract is that they are writable,
+            // and the buffer becomes its to `free`.
+            Some(p) => unsafe {
+                *out_buf = p;
+                *out_size = bytes.len() as u64;
+                0
+            },
+            None => ENOMEM,
+        }
+    })
 }
 
+/// Put a captured sync state back, before the context's rings start.
+///
+/// Zero only when every object the blob named came back. A dropped entry is not a malformed blob
+/// -- the journal is allowed to lose a create -- but it is still a restore with a hole in it, and
+/// the ABI has one integer to say so with, so the ids go to the log.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_sync_restore(
-    _ctx_id: u32,
-    _data: *const c_void,
-    _size: u64,
+    ctx_id: u32,
+    data: *const c_void,
+    size: u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    let Ok(len) = usize::try_from(size) else {
+        return EINVAL;
+    };
+    with_bytes(data.cast_mut(), len, |blob| {
+        with(EINVAL, |r| match r.venus_sync_restore(ctx, blob) {
+            Ok(account) => {
+                if account.whole() {
+                    0
+                } else {
+                    eprintln!(
+                        "[virglrs] sync restore ctx {ctx}: {} agreed, {} applied, dropped {:?}, \
+                         failed {:?}",
+                        account.agreed, account.applied, account.dropped, account.failed
+                    );
+                    EINVAL
+                }
+            }
+            Err(e) => errno(e),
+        })
+    })
+    .unwrap_or(EINVAL)
 }
 
 #[unsafe(no_mangle)]

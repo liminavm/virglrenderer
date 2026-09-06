@@ -41,7 +41,8 @@ use super::proto::types::{
     VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
     VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
     VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo,
-    VkSubpassContents, VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
+    VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo, VkViewport,
+    VkWriteDescriptorSet,
 };
 use std::sync::Arc;
 
@@ -340,7 +341,15 @@ pub struct Driver {
     ///
     /// Keyed by host handle for the reason `images` and `query_pools` are, and kept honest the
     /// same way: the record dies at both places the semaphore does.
-    semaphores: BTreeMap<VkSemaphore, SemaphoreKind>,
+    semaphores: BTreeMap<VkSemaphore, SemaphoreFacts>,
+    /// Fences with a submit outstanding: submitted, and not reset since.
+    ///
+    /// The other half of what a snapshot needs and Vulkan cannot be asked. A fence's *status* is
+    /// a poll away, but a fence whose work is still in flight polls unsignalled and would be
+    /// captured that way -- and the submit that would have signalled it does not survive the
+    /// snapshot, so the guest would wait on it forever. What crosses instead is what the guest
+    /// asked for, and this is that record. See [`sync`](super::sync).
+    pending_fences: std::collections::BTreeSet<VkFence>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
     /// The device each queue belongs to, by host handle.
@@ -478,6 +487,7 @@ impl Driver {
             images: BTreeMap::new(),
             query_pools: BTreeMap::new(),
             semaphores: BTreeMap::new(),
+            pending_fences: std::collections::BTreeSet::new(),
             pools: Pools::default(),
             queues: BTreeMap::new(),
         }
@@ -1064,20 +1074,180 @@ impl Driver {
             }
             _ => SemaphoreKind::Binary,
         };
+        // The initial value is a `requested` like any other: a timeline created at 7 has been
+        // asked to reach 7, and a restore that put it back at 0 would be moving it backwards.
+        let requested = match chained::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
+            Some(t) => t.initialValue,
+            None => 0,
+        };
         let sem = self.create_object(device, |d| d.vkCreateSemaphore(), info, alloc)?;
-        self.semaphores.insert(sem, kind);
+        self.semaphores.insert(sem, SemaphoreFacts { kind, requested });
         Ok(sem)
     }
 
     /// Which kind `sem` is, or `None` for a handle no create here recorded.
     pub fn semaphore_kind(&self, sem: VkSemaphore) -> Option<SemaphoreKind> {
-        self.semaphores.get(&sem).copied()
+        self.semaphores.get(&sem).map(|f| f.kind)
+    }
+
+    /// The highest value the guest has asked this timeline to reach, whether or not it has.
+    pub fn semaphore_requested(&self, sem: VkSemaphore) -> u64 {
+        self.semaphores.get(&sem).map_or(0, |f| f.requested)
+    }
+
+    /// Whether a submit naming this fence is outstanding.
+    pub fn fence_pending(&self, fence: VkFence) -> bool {
+        self.pending_fences.contains(&fence)
     }
 
     /// Drop a semaphore's record, at both places Vulkan destroys one: the guest's own
     /// `vkDestroySemaphore`, and the teardown that empties a device the guest left full.
     pub fn forget_semaphore(&mut self, sem: VkSemaphore) {
         self.semaphores.remove(&sem);
+    }
+
+    /// Drop a fence's record, at the same two places.
+    pub fn forget_fence(&mut self, fence: VkFence) {
+        self.pending_fences.remove(&fence);
+    }
+
+    // ------------------------------------------------------------------ the snapshot's sync
+    //
+    // What a capture reads and what a restore does to put it back. The rule both halves follow is
+    // in [`sync`](super::sync): the world to come back to is the world as if everything the guest
+    // had already submitted had completed, because that is the only one a rebuilt context can
+    // represent. Nothing here waits on the GPU -- `vkGetFenceStatus` and
+    // `vkGetSemaphoreCounterValue` are polls -- so a snapshot cannot fail.
+
+    /// Whether a fence should come back signalled: it is signalled now, or a submit that promised
+    /// to signal it is outstanding and will not survive the snapshot.
+    pub fn fence_captured(&self, device: VkDevice, fence: VkFence) -> bool {
+        if self.pending_fences.contains(&fence) {
+            return true;
+        }
+        let Some(d) = self.devices.get(&device) else {
+            return false;
+        };
+        // SAFETY: a device in this table and a fence created on it. `vkGetFenceStatus` polls; it
+        // does not wait.
+        unsafe { (d.fns.vkGetFenceStatus())(device, fence) == VkResult::VK_SUCCESS }
+    }
+
+    /// The value a timeline should come back at: the highest of what it has reached and what it
+    /// has been asked to reach.
+    pub fn timeline_captured(&self, device: VkDevice, sem: VkSemaphore) -> u64 {
+        let requested = self.semaphore_requested(sem);
+        let mut now = 0u64;
+        let reached = match self.semaphore_counter(device, sem, &mut now) {
+            Ok(Ok(VkResult::VK_SUCCESS)) => now,
+            _ => 0,
+        };
+        reached.max(requested)
+    }
+
+    /// A queue of `device` to put a fast-forward submit on, or `None` for a device the guest never
+    /// took a queue from -- which is a device it also never submitted to.
+    fn first_queue(&self, device: VkDevice) -> Option<VkQueue> {
+        self.queues.iter().find(|(_, owner)| **owner == device).map(|(q, _)| *q)
+    }
+
+    /// Signal a fence, a binary semaphore, or both, with an empty submit.
+    ///
+    /// An empty submit and not a bookkeeping flip: what the guest waits on is the driver's own
+    /// object -- a Metal shared event under KosmicKrisp -- and only an execution of the queue
+    /// moves it. `vkSignalSemaphore` would do for a timeline and does not exist for either of
+    /// these.
+    pub fn fast_forward(&self, device: VkDevice, sem: VkSemaphore, fence: VkFence) -> bool {
+        let Some(queue) = self.first_queue(device) else {
+            return false;
+        };
+        let Some(d) = self.devices.get(&device) else {
+            return false;
+        };
+        let submit = VkSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            signalSemaphoreCount: u32::from(sem != VkSemaphore(0)),
+            pSignalSemaphores: if sem != VkSemaphore(0) { &sem } else { core::ptr::null() },
+            ..Default::default()
+        };
+        // SAFETY: a queue this context retrieved, one submit whose count is 1, and handles created
+        // on the device that queue belongs to.
+        let ret = unsafe { (d.fns.vkQueueSubmit())(queue, 1, &submit, fence) };
+        ret == VkResult::VK_SUCCESS
+    }
+
+    /// Put a fence back to unsignalled, for a capture taken while it was.
+    pub fn unsignal_fence(&self, device: VkDevice, fence: VkFence) -> bool {
+        let Some(d) = self.devices.get(&device) else {
+            return false;
+        };
+        // SAFETY: a device in this table and one fence created on it.
+        unsafe { (d.fns.vkResetFences())(device, 1, &fence) == VkResult::VK_SUCCESS }
+    }
+
+    /// Raise a timeline to a value it has not reached.
+    pub fn raise_timeline(&self, device: VkDevice, sem: VkSemaphore, value: u64) -> bool {
+        let info = VkSemaphoreSignalInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            semaphore: sem,
+            value,
+            ..Default::default()
+        };
+        self.dev_op_info(device, &info, |d| d.try_vkSignalSemaphore()) == VkResult::VK_SUCCESS
+    }
+
+    /// Let the fast-forward submits retire before the guest is allowed to see anything.
+    ///
+    /// Bounded here in a way it would not be elsewhere: a restore runs before `replay_end` starts
+    /// the rings, so the only work on this queue is the empty submits just made. Without it the
+    /// guest's first `vkResetFences` can race a signal still in flight.
+    pub fn drain_fast_forward(&self, device: VkDevice) -> bool {
+        let Some(queue) = self.first_queue(device) else {
+            return false;
+        };
+        let Some(d) = self.devices.get(&device) else {
+            return false;
+        };
+        // SAFETY: a queue this context retrieved, on a device in this table.
+        unsafe { (d.fns.vkQueueWaitIdle())(queue) == VkResult::VK_SUCCESS }
+    }
+
+    /// Note what a submit promises: its fence will signal, and each timeline it names will reach
+    /// the value the guest paired with it.
+    ///
+    /// Read off the submit rather than polled afterwards, because the promise is what survives a
+    /// snapshot and the completion is not.
+    fn note_submit(&mut self, submits: &[VkSubmitInfo], fence: VkFence) {
+        if fence != VkFence(0) {
+            self.pending_fences.insert(fence);
+        }
+        for s in submits {
+            let Some(t) = chained::<VkTimelineSemaphoreSubmitInfo>(&s.pNext) else { continue };
+            // SAFETY: both arrays were allocated by the decoder from the batch arena, each sized
+            // to the count beside it, and both outlive this call. `wire_array` is the same
+            // reconciliation the generated accessors use.
+            let (sems, values) = unsafe {
+                (
+                    crate::venus::cs::wire_array::<VkSemaphore>(
+                        s.signalSemaphoreCount as usize,
+                        s.pSignalSemaphores,
+                    ),
+                    crate::venus::cs::wire_array::<u64>(
+                        t.signalSemaphoreValueCount as usize,
+                        t.pSignalSemaphoreValues,
+                    ),
+                )
+            };
+            // Vulkan pairs the two by position and lets the value array be shorter than the
+            // semaphore array -- the entries past its end belong to binary semaphores, which have
+            // no value. So the walk is over what both actually have.
+            let (Some(sems), Some(values)) = (sems, values) else { continue };
+            for (sem, value) in sems.iter().zip(values) {
+                if let Some(f) = self.semaphores.get_mut(sem) {
+                    f.requested = f.requested.max(*value);
+                }
+            }
+        }
     }
 
     /// Whether `sem` is a timeline, checked only where the call would actually be made.
@@ -1090,7 +1260,7 @@ impl Driver {
         if !self.devices.contains_key(&device) {
             return Ok(());
         }
-        match self.semaphores.get(&sem) {
+        match self.semaphores.get(&sem).map(|f| f.kind) {
             Some(SemaphoreKind::Timeline) => Ok(()),
             Some(SemaphoreKind::Binary) => Err(NotATimeline::Binary),
             None => Err(NotATimeline::Unrecorded),
@@ -1110,12 +1280,18 @@ impl Driver {
 
     /// `vkSignalSemaphore`, on a semaphore that has a counter to raise.
     pub fn signal_semaphore(
-        &self,
+        &mut self,
         device: VkDevice,
         info: &VkSemaphoreSignalInfo,
     ) -> Result<VkResult, NotATimeline> {
         self.as_timeline(device, info.semaphore)?;
-        Ok(self.dev_op_info(device, info, |d| d.try_vkSignalSemaphore()))
+        let ret = self.dev_op_info(device, info, |d| d.try_vkSignalSemaphore());
+        if ret == VkResult::VK_SUCCESS
+            && let Some(f) = self.semaphores.get_mut(&info.semaphore)
+        {
+            f.requested = f.requested.max(info.value);
+        }
+        Ok(ret)
     }
 
     /// `vkWaitSemaphores`, on semaphores that all have counters.
@@ -1618,6 +1794,9 @@ impl Driver {
                 VkObjectType::VK_OBJECT_TYPE_SEMAPHORE => {
                     self.forget_semaphore(VkSemaphore::from_host(handle));
                 }
+                VkObjectType::VK_OBJECT_TYPE_FENCE => {
+                    self.forget_fence(VkFence::from_host(handle));
+                }
                 _ => {}
             }
         }
@@ -1989,6 +2168,7 @@ impl Driver {
         self.images.clear();
         self.query_pools.clear();
         self.semaphores.clear();
+        self.pending_fences.clear();
     }
 
     /// Stand a pool up with contents already in it, as a run of allocations would have left it.
@@ -2030,7 +2210,7 @@ impl Driver {
     /// three entry points that check it.
     #[cfg(test)]
     pub(super) fn plant_semaphore(&mut self, sem: VkSemaphore, kind: SemaphoreKind) {
-        self.semaphores.insert(sem, kind);
+        self.semaphores.insert(sem, SemaphoreFacts { kind, requested: 0 });
     }
 
     /// Point a queue at a device, as `device_queue` would have.
@@ -2616,11 +2796,13 @@ impl Driver {
     /// the command buffers -- was resolved by the decoder as it read them, so what arrives here is
     /// already the driver's own.
     pub fn queue_submit(
-        &self,
+        &mut self,
         queue: VkQueue,
         submits: &[VkSubmitInfo],
         fence: VkFence,
     ) -> Option<VkResult> {
+        self.submitter(queue)?;
+        self.note_submit(submits, fence);
         let d = self.submitter(queue)?;
         // Submitting no work to signal a fence is a normal thing for a guest to do, and Vulkan
         // takes a null array for it -- so the slice's own pointer is passed either way.
@@ -2630,13 +2812,21 @@ impl Driver {
     }
 
     /// `vkResetFences`.
-    pub fn reset_fences(&self, device: VkDevice, fences: &[VkFence]) -> VkResult {
+    pub fn reset_fences(&mut self, device: VkDevice, fences: &[VkFence]) -> VkResult {
         let Some(d) = self.devices.get(&device) else {
             return VkResult::VK_ERROR_INITIALIZATION_FAILED;
         };
         // SAFETY: `device` is a handle in this table, and the count Vulkan wants is the slice's
         // own length. The same holds for the wait below.
-        unsafe { (d.fns.vkResetFences())(device, fences.len() as u32, fences.as_ptr()) }
+        let ret = unsafe { (d.fns.vkResetFences())(device, fences.len() as u32, fences.as_ptr()) };
+        // A reset unmakes the promise: whatever submit named this fence, the guest has said it is
+        // done with the answer.
+        if ret == VkResult::VK_SUCCESS {
+            for f in fences {
+                self.pending_fences.remove(f);
+            }
+        }
+        ret
     }
 
     /// `vkWaitForFences`. Blocks for up to `timeout` nanoseconds, as the guest asked.
@@ -4080,6 +4270,15 @@ pub enum NotATimeline {
     Malformed,
 }
 
+/// What a live semaphore is, and what it has been asked to do.
+struct SemaphoreFacts {
+    kind: SemaphoreKind,
+    /// A timeline's highest requested value: its initial value, raised by every submit that
+    /// promises to signal it and every `vkSignalSemaphore`. Always zero for a binary, which has
+    /// no counter to ask about.
+    requested: u64,
+}
+
 /// Which kind of semaphore a handle is, which Vulkan fixes at create and never answers again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SemaphoreKind {
@@ -4088,6 +4287,12 @@ pub enum SemaphoreKind {
     Binary,
     /// A counter the guest can read, raise and block on from outside a submit.
     Timeline,
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkTimelineSemaphoreSubmitInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the

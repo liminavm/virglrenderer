@@ -156,6 +156,28 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   not the same as captured-empty: the entry is absent rather than present and zero, which is why
   the report prints both counts.
 
+  **The third half is the sync state, and it is the one that decides whether the guest wakes up.**
+  A rebuilt fence is freshly created and unsignalled and a rebuilt timeline sits at its create
+  value, so a resume that stopped at the journal and the bytes comes back to a guest waiting on
+  fences that will never signal -- the submits that would have signalled them died with the
+  renderer. The gate exports the live context's sync state, restores it into the rebuilt one and
+  requires a capture of the result to be the capture that went in.
+
+  **What crosses is what the guest asked for, not what the GPU had got round to**, and that is why
+  a snapshot here cannot fail. Work in flight is lost whatever is observed -- the journal replays
+  creates and never submits -- so "this fence has a submit pending" is not a state a rebuilt
+  context can represent, and the only self-consistent world to come back to is the one where
+  everything already submitted has completed. That is a poll and a ledger lookup, never a device
+  wait that could hang and never a refusal.
+
+  **A sync gate can score nothing, and it says so.** `moved` on the report line is how many
+  entries the blank rebuilt world disagreed with; a context that reports zero was compared against
+  a world that already matched, and the fixed point passes whatever either half does. Measured:
+  the synoik corpora move 1 at end of stream, `venus.vkrc` moves 0 there and 8 at
+  `--rebuild-at 20000`, which is the run that scores this. The number is not pinned because gate
+  results deliberately stay out of the score (`Tally::failed` says why), so a stderr line names a
+  vacuous run on every pass instead.
+
   **The venus gate crosses the fence**, unlike the classic one. Part of what a journal retains is
   retained because a *blob*, not the guest, still holds what an entry made, so a rebuilt context
   with no blobs keeps strictly less and the two journals differ by the gate's own gap. So the

@@ -19,4 +19,5 @@ pub mod objects;
 pub mod proto;
 pub mod ring;
 pub mod ring_thread;
+pub mod sync;
 pub mod vkr;
