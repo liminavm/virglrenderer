@@ -172,6 +172,14 @@ and the socket here is `wayland-1`, not `wayland-0`; and `glxgears` is not a rou
 GLX on a guest with no X server. `glmark2-wayland` is, and it prints the renderer it actually
 got -- check for `GL_RENDERER: virgl` before trusting a capture.
 
+**This leg does not work on virglrs, and the failure is attributed.** The compositor rejects the
+client's buffer with `create_immed failed and produced an invalid wl_buffer` and kills it after
+one benchmark; the C renders the same client into the same desktop on the same guest. It is not
+the tiling rule and not the minting change -- the pre-minting build fails identically -- so it is
+a standing gap in importing a classic resource into a venus context, and this script is what
+reproduces it. `synoik-glclient.vkrc` was recorded from the C, which is why the corpus has traffic
+this tree cannot yet produce live.
+
 Unlike the Vulkan client corpora below, the C **can** replay this one: the GL client's contexts
 are classic and are skipped, so nothing is recorded out of execution order.
 
