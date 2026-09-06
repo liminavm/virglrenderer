@@ -690,10 +690,26 @@ one that matters.
 Each context is scored when it is destroyed, and once more at the end if it is still alive. A
 workload that exits cleanly frees everything, so scoring only at the end would score nothing.
 
-Each score is taken twice, 50 ms apart, and re-taken until two passes agree. The replay skips
-every ring flow-control command, so nothing in the stream waits on the GPU: a hash read the
-instant `replay_end` returns can race queue work still executing and look nondeterministic when
-the renderer is perfectly deterministic.
+**`blob` lines score the other half, and the half that outlives the guest.** The census skips an
+exported allocation on purpose — its bytes are the blob's, and reporting them under both would read
+one buffer twice — so every exporting blob is read separately, through
+`virgl_renderer_resource_map`, which is the address the VMM publishes and the guest loads from.
+Same sampler, same stability rule, one line per blob: `blob ctx=<c> res=<h> size=<n> read=<n>
+hash=<h>`, where `size` is the extent the renderer maps rather than the size the blob was created
+for, because a resource that maps short is the divergence worth catching.
+
+It is also the only read that survives the allocation. A host-visible venus allocation is minted
+pages the blob holds a *share* of, so `vkFreeMemory` retires the record and leaves the mapping
+good — and every venus corpus reaches that state: measured 2026-09-06, `venus` frees all 26 of its
+exported allocations and still has five blobs alive to read at scoring, `synoik-lifecycle` frees
+nine. A resource that kept the published address without the share would fault or read rubbish on
+exactly those lines.
+
+Each score is sampled four times, 200 ms apart after a 500 ms lead, and stability is decided per
+allocation — see "The census decides stability per allocation" below. The replay skips every ring
+flow-control command, so nothing in the stream waits on the GPU: a hash read the instant
+`replay_end` returns can race queue work still executing and look nondeterministic when the
+renderer is perfectly deterministic.
 
 ### Scoring the port against the C
 
@@ -853,12 +869,7 @@ Vulkan's state machine and `UNDEFINED` would discard the texels the census came 
 symmetric — `memory_write` restores *pages*, so texels the census cannot see are texels a restore
 cannot put back either. A census that read through the image alone would report content the restore
 cannot reproduce, which is a stricter gate than the mechanism it gates. Either both sides go
-through the image, or neither does and the hole is documented. Until that is settled the venus
-score is a weak oracle on those two corpora, and the pixel gate is the one that carries them.
+through the image, or neither does — and neither is the decision: census and restore both read and
+write pages, the 41 stay a hole, and the pixel gate is what carries those two corpora. Reopening it
+means committing to guest image-layout tracking on both sides, not to a census change.
 
-**No case makes a shared blob outlive the allocation it came from.** Every host-visible venus
-allocation is minted pages the blob holds a share of, so the guest's `vkFreeMemory` retires the
-allocation while the mapping stays good — which is the point of the design and is exactly what no
-fixture exercises, because a recorded guest frees its memory last. It wants a synthetic
-`--rebuild` case: export a blob, free the memory, then read through the published address and get
-the bytes rather than a fault. Written by hand against the replayer, not captured.

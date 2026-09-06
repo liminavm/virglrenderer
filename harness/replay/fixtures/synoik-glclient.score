@@ -5,6 +5,11 @@ skipped flow-control 2277
 skipped classic [3, 4, 5]
 unreplayable imports []
 parked 0
+blob ctx=2 res=12 size=4096000 read=1048576 hash=f4c53273496207d5
+blob ctx=2 res=16 size=67108864 read=1048576 hash=a96777069d622325
+blob ctx=2 res=5 size=16384 read=16384 hash=9c1bda7f8c872325
+blob ctx=2 res=7 size=4096000 read=1048576 hash=f4c53273496207d5
+blob ctx=2 res=8 size=4194304 read=1048576 hash=a96777069d622325
 census ctx=2 allocations=23
 mem ctx=2 id=1160 size=65536 read=65536 hash=eb05052ea5b62325
 mem ctx=2 id=117 size=262144 read=262144 hash=9c735bed0a722325

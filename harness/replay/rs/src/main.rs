@@ -363,7 +363,8 @@ impl<'a> Replay<'a> {
                 // Score before destroying: this is the last moment the context's device memory
                 // exists, and for a workload that exits cleanly it is the ONLY moment.
                 if !self.smoke {
-                    let lines = score_context(&self.r, *ctx_id);
+                    let blobs = self.exports.get(ctx_id).cloned().unwrap_or_default();
+                    let lines = score_context(&self.r, *ctx_id, &blobs);
                     self.score.extend(lines);
                     self.score.push(iosurf_line(&self.iosurf, *ctx_id));
                     // And rebuild it here for the same reason it is scored here. A capture of a
@@ -727,7 +728,8 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         if rp.smoke {
             continue;
         }
-        rp.score.extend(score_context(&rp.r, ctx_id));
+        let blobs = rp.exports.get(&ctx_id).cloned().unwrap_or_default();
+        rp.score.extend(score_context(&rp.r, ctx_id, &blobs));
         rp.score.push(iosurf_line(&rp.iosurf, ctx_id));
     }
     let score = std::mem::take(&mut rp.score);
@@ -952,24 +954,55 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// One pass over a context's capturable device memory: census, then read and hash each
-/// allocation. Keyed by id so passes can be compared allocation by allocation rather than as a
-/// block of text -- which is what lets one moving allocation be named instead of spoiling the
-/// whole context's score.
+/// What one sampled read is of: an allocation the context still holds, or a blob the VMM holds
+/// over one.
+///
+/// The two are sampled together and scored by one stability rule, because they are two views of
+/// the same bytes and an answer that moves moves in both. `Mem` sorts first so the score reads
+/// allocation-then-blob for a context.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+enum Read {
+    Mem(u64),
+    Blob(u32),
+}
+
+/// Cap what a single read can cost us: a 64 MB scanout blob is real, and reading it whole on
+/// every pass is the difference between a score and a stall. The prefix is still content, and a
+/// divergence that misses the first megabyte is not one we can miss for long.
+const READ_CAP: usize = 1 << 20;
+
+/// One pass over what a context's memory holds: the census, read allocation by allocation, and
+/// every exporting blob read the way the guest reads it. Keyed by what was read so passes can be
+/// compared entry by entry rather than as a block of text -- which is what lets one moving
+/// allocation be named instead of spoiling the whole context's score.
+///
+/// The blobs are here and not beside the census on purpose. `memory_census` deliberately skips an
+/// exported allocation -- its bytes are the blob's, and reporting them under both would read one
+/// buffer twice -- so without this the whole exported half of a context is unscored. It is also
+/// the only read that survives the guest freeing the allocation: the resource holds a share of the
+/// storage, so `vkFreeMemory` retires the record and leaves these bytes standing. Every venus
+/// corpus we hold reaches that state.
 fn census_pass(
     r: &abi::Renderer,
     ctx_id: u32,
-) -> Result<BTreeMap<u64, (u64, Result<u64, c_int>)>, c_int> {
+    blobs: &BTreeMap<u32, ExportedBlob>,
+) -> Result<BTreeMap<Read, (u64, Result<u64, c_int>)>, c_int> {
     let pairs = r.memory_census(ctx_id)?;
     let mut out = BTreeMap::new();
     for (mem_id, size) in pairs {
-        // Cap what a single allocation can cost us: a 64 MB scanout blob is real, and reading it
-        // whole on every pass is the difference between a score and a stall. The prefix is still
-        // content, and a divergence that misses the first megabyte is not one we can miss for long.
-        let want = size.min(1 << 20) as usize;
-        let mut buf = vec![0u8; want];
+        let mut buf = vec![0u8; size.min(READ_CAP as u64) as usize];
         let rc = r.memory_read(ctx_id, mem_id, &mut buf);
-        out.insert(mem_id, (size, if rc != 0 { Err(rc) } else { Ok(fnv1a(&buf)) }));
+        out.insert(Read::Mem(mem_id), (size, if rc != 0 { Err(rc) } else { Ok(fnv1a(&buf)) }));
+    }
+    for (&res_handle, b) in blobs {
+        // The mapped extent is the renderer's answer, not the blob's recorded size: a resource
+        // that maps short of what it was created for is the divergence this is here to catch.
+        let entry = match r.blob_read(res_handle, READ_CAP) {
+            Ok((size, buf)) => (size, Ok(fnv1a(&buf))),
+            // The size it was created for, so a refusal still says which blob was refused.
+            Err(rc) => (b.size, Err(rc)),
+        };
+        out.insert(Read::Blob(res_handle), entry);
     }
     Ok(out)
 }
@@ -1005,7 +1038,11 @@ fn iosurf_line(map: &BTreeMap<u32, BTreeSet<u32>>, ctx_id: u32) -> String {
 /// compositor's framebuffers, and their contents never converge -- 500 ms, 3 s and 8 s of settling
 /// give three different answers, and the two renderer legs disagree by timing alone. Everything
 /// else in that corpus is rock stable. Waiting longer is not the fix and never was.
-fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
+fn score_context(
+    r: &abi::Renderer,
+    ctx_id: u32,
+    blobs: &BTreeMap<u32, ExportedBlob>,
+) -> Vec<String> {
     /// How many samples decide stability, and how far apart. The lead exists because the first
     /// sample after `replay_end` is the least representative one.
     const SAMPLES: u32 = 4;
@@ -1023,7 +1060,7 @@ fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
         if i > 0 {
             std::thread::sleep(SAMPLE_WAIT);
         }
-        match census_pass(r, ctx_id) {
+        match census_pass(r, ctx_id, blobs) {
             Ok(p) => samples.push(p),
             // A refused census is a fact about the run, not a reason to stop scoring the others.
             Err(rc) => return vec![format!("census ctx={ctx_id} UNAVAILABLE rc={rc}")],
@@ -1032,7 +1069,8 @@ fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
 
     let last = samples.last().expect("SAMPLES > 0");
     let mut lines = Vec::with_capacity(last.len() + 2);
-    lines.push(format!("census ctx={ctx_id} allocations={}", last.len()));
+    let allocations = last.keys().filter(|k| matches!(k, Read::Mem(_))).count();
+    lines.push(format!("census ctx={ctx_id} allocations={allocations}"));
 
     // Membership that moves is a different fact from content that moves, and hiding it inside a
     // per-allocation verdict would lose it: an allocation freed or made between samples is not an
@@ -1041,25 +1079,24 @@ fn score_context(r: &abi::Renderer, ctx_id: u32) -> Vec<String> {
         lines.push(format!("census ctx={ctx_id} MEMBERSHIP UNSETTLED over {SAMPLES} samples"));
     }
 
-    for (&mem_id, &(size, ref v)) in last {
+    for (&what, &(size, ref v)) in last {
+        // What each line is about, spelled once: the rest of the line is the same question asked
+        // of an allocation and of the blob published over one.
+        let subject = match what {
+            Read::Mem(mem_id) => format!("mem ctx={ctx_id} id={mem_id}"),
+            Read::Blob(res_handle) => format!("blob ctx={ctx_id} res={res_handle}"),
+        };
         let seen: BTreeSet<_> =
-            samples.iter().filter_map(|p| p.get(&mem_id)).map(|(_, h)| h).collect();
+            samples.iter().filter_map(|p| p.get(&what)).map(|(_, h)| h).collect();
         if seen.len() > 1 {
-            lines.push(format!(
-                "mem ctx={ctx_id} id={mem_id} size={size} unstable values={}",
-                seen.len()
-            ));
+            lines.push(format!("{subject} size={size} unstable values={}", seen.len()));
             continue;
         }
         match v {
-            Err(rc) => {
-                lines.push(format!("mem ctx={ctx_id} id={mem_id} size={size} UNREADABLE rc={rc}"))
-            }
+            Err(rc) => lines.push(format!("{subject} size={size} UNREADABLE rc={rc}")),
             Ok(h) => {
-                let want = size.min(1 << 20);
-                lines.push(format!(
-                    "mem ctx={ctx_id} id={mem_id} size={size} read={want} hash={h:016x}"
-                ))
+                let want = size.min(READ_CAP as u64);
+                lines.push(format!("{subject} size={size} read={want} hash={h:016x}"))
             }
         }
     }
