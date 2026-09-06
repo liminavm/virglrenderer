@@ -1368,6 +1368,28 @@ impl Context {
         args: resource::Args,
         wire: &[u32],
     ) -> Result<(), Fault> {
+        self.describable(blob_id)?;
+        self.make_current(host);
+        let res =
+            Resource::create(host.gl, host.winsys, host.features, host.formats, host.limits, args)
+                .map_err(|why| Fault::DescribedResource {
+                    cmd: Cmd::PipeResourceCreate,
+                    blob: blob_id,
+                    why,
+                })?;
+        self.described.insert(blob_id, (res, wire.to_vec()));
+        Ok(())
+    }
+
+    /// Whether this context may describe a resource under `blob_id`.
+    ///
+    /// Zero is not an id: it is the wire's way of saying "no blob", so a `CREATE_BLOB` can never
+    /// come back for it and the allocation would be one nothing can reach. Nor is an id this
+    /// context is already holding: the C's list quietly keeps both and `vrend_get_blob_pipe`
+    /// hands out whichever it finds first, which is a guest reading an allocation it believes it
+    /// replaced. Both are the guest's error, and neither can be repaired here -- there is no
+    /// second id to move one of them to.
+    fn describable(&self, blob_id: BlobId) -> Result<(), Fault> {
         let cmd = Cmd::PipeResourceCreate;
         if blob_id.0 == 0 {
             return Err(Fault::OutOfRange { cmd, what: "a blob id of zero names nothing" });
@@ -1375,11 +1397,6 @@ impl Context {
         if self.described.contains_key(&blob_id) {
             return Err(Fault::OutOfRange { cmd, what: "that blob id is already described" });
         }
-        self.make_current(host);
-        let res =
-            Resource::create(host.gl, host.winsys, host.features, host.formats, host.limits, args)
-                .map_err(|why| Fault::DescribedResource { cmd, blob: blob_id, why })?;
-        self.described.insert(blob_id, (res, wire.to_vec()));
         Ok(())
     }
 
@@ -4013,6 +4030,69 @@ fn video_result(cmd: Cmd, result: Result<(), video::Refusal>) -> Result<(), Faul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A context holding nothing, for the bookkeeping a described blob needs and no GL at all.
+    fn bare() -> Context {
+        Context {
+            subs: BTreeMap::new(),
+            current: SubContextId(0),
+            fault: None,
+            video: video::Video::default(),
+            owed: Vec::new(),
+            replay: None,
+            seq: Seq::default(),
+            described: BTreeMap::new(),
+        }
+    }
+
+    fn buffer_args(width: u32) -> resource::Args {
+        resource::Args {
+            target: TextureTarget::Buffer,
+            format: Format::from_wire(64).expect("R8_UNORM"),
+            bind: resource::Bind::VERTEX_BUFFER,
+            width,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: resource::ResourceFlags::MAP_PERSISTENT,
+        }
+    }
+
+    #[test]
+    fn a_described_blob_is_claimed_once_and_by_the_context_that_described_it() {
+        let mut ctx = bare();
+        let id = BlobId(7);
+        ctx.describable(id).expect("nothing holds it yet");
+        ctx.described.insert(id, (Resource::unbacked(buffer_args(0x1000)), vec![1, 2, 3]));
+
+        // Describing it again would leave two allocations under one name, and the claim would
+        // hand out whichever the container found first -- a guest reading memory it believes it
+        // replaced.
+        assert!(
+            matches!(ctx.describable(id), Err(Fault::OutOfRange { .. })),
+            "an id already described cannot be described again"
+        );
+
+        // Zero is the wire's "no blob": no CREATE_BLOB can ever name it, so an allocation parked
+        // under it is one nothing can reach and nothing will free until the context dies.
+        assert!(
+            matches!(ctx.describable(BlobId(0)), Err(Fault::OutOfRange { .. })),
+            "zero names nothing, so it may not name a described resource"
+        );
+
+        // Another id is another resource, and untouched by either refusal.
+        ctx.describable(BlobId(8)).expect("a free id is free");
+
+        // The claim takes. Leaving the entry behind would let a second CREATE_BLOB give a
+        // second handle to one allocation, and the two handles would free it twice.
+        let (res, wire) = ctx.claim_described(id).expect("described");
+        assert_eq!(res.args.width, 0x1000);
+        assert_eq!(wire, vec![1, 2, 3], "the claim carries what described it, for a rebuild");
+        assert!(ctx.claim_described(id).is_none(), "and the id names nothing afterwards");
+        assert!(ctx.describable(id).is_ok(), "so the guest may describe it again");
+    }
 
     fn format(name: &str) -> Format {
         (0..FORMAT_MAX)

@@ -382,6 +382,36 @@ SABOTAGES = [
         '        unsafe { (d.vkCmdDispatch())(cb, z, y, x) };',
         'the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it',
     ),
+    # The classic blob a context describes for itself. The claim's GL half needs the live host,
+    # so what is scored here is the reconciliation and the bookkeeping -- which is where every
+    # defect the C carries on this path lives.
+    (
+        "a blob larger than the resource backing it is trimmed to fit",
+        'virglrs/src/vrend/vrend.rs',
+        """    if size > width as u64 {
+        return Err(ClaimRefused::Oversize { asked: size, allocated: width });
+    }
+    Ok(())""",
+        """    let _ = (size, width);
+    Ok(())""",
+        'a_blob_is_never_published_past_the_resource_backing_it',
+    ),
+    (
+        'a described blob id may be described twice, and the first claim wins',
+        'virglrs/src/vrend/context.rs',
+        """        if self.described.contains_key(&blob_id) {
+            return Err(Fault::OutOfRange { cmd, what: "that blob id is already described" });
+        }""",
+        """""",
+        'a_described_blob_is_claimed_once_and_by_the_context_that_described_it',
+    ),
+    (
+        'a claim drops the command that described it, so a rebuild has nothing to send',
+        'virglrs/src/vrend/context.rs',
+        '        self.described.remove(&blob_id)',
+        '        self.described.remove(&blob_id).map(|(r, _)| (r, Vec::new()))',
+        'a_described_blob_is_claimed_once_and_by_the_context_that_described_it',
+    ),
     (
         "a scanout's restore goes through vkMapMemory like any other allocation",
         'virglrs/src/venus/driver.rs',

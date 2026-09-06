@@ -1348,6 +1348,21 @@ impl Resource {
 }
 
 #[cfg(test)]
+impl Resource {
+    /// A resource with no host storage, for tests about bookkeeping and nothing else.
+    pub fn unbacked(args: Args) -> Resource {
+        Resource {
+            args,
+            storage: Storage::Guest,
+            guest_pixels: None,
+            typed_by: None,
+            described_by: None,
+            mapped: None,
+        }
+    }
+}
+
+#[cfg(test)]
 impl Texture {
     /// Texture storage that names no GL object, for tests about identity and nothing else.
     pub fn unbacked(name: TextureName) -> Texture {

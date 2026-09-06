@@ -119,6 +119,24 @@ pub enum ClaimRefused {
     Unmappable,
 }
 
+/// Whether a blob of `size` bytes may be published from a resource of `width` bytes.
+///
+/// The wire carries the two independently and the C reconciles neither -- `vrend_get_blob_pipe`
+/// takes `blob_size` as `UNUSED`. They are one fact with two spellings, and the guest is the only
+/// thing that can make them disagree: asking to publish more than was allocated is asking the VMM
+/// to map whatever the driver put after the buffer. Refused here, where both halves are in hand,
+/// and never clamped -- a clamp reports success for a mapping the guest did not ask for and will
+/// index past.
+///
+/// Smaller is not a mismatch. A guest may publish part of what it allocated, and the mapping it
+/// is given is still bounded by the buffer.
+fn publishable(size: u64, width: u32) -> Result<(), ClaimRefused> {
+    if size > width as u64 {
+        return Err(ClaimRefused::Oversize { asked: size, allocated: width });
+    }
+    Ok(())
+}
+
 impl fmt::Display for ClaimRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -461,9 +479,9 @@ impl Vrend {
         // there, and using it means the answer does not depend on which sub-context the guest
         // happened to leave current.
         self.switch_ctx0();
-        if size > args.width as u64 {
+        if let Err(why) = publishable(size, args.width) {
             res.destroy(&self.gl);
-            return Err(ClaimRefused::Oversize { asked: size, allocated: args.width });
+            return Err(why);
         }
         if !res.map_persistent(&self.gl) {
             res.destroy(&self.gl);
@@ -682,6 +700,24 @@ fn parse_gles_version(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blob_is_never_published_past_the_resource_backing_it() {
+        // The size the guest asks to publish and the width it allocated are one fact sent twice,
+        // and the guest is the only thing that can make them disagree. Exactly is the ordinary
+        // case, and less is the guest publishing part of what it made.
+        publishable(0x21000, 0x21000).expect("exactly what was allocated");
+        publishable(0x1000, 0x21000).expect("part of what was allocated");
+
+        // More is the guest asking the VMM to map whatever the driver put after the buffer into
+        // its address space. There is no repair for it: mapping less than was asked reports
+        // success for a mapping that was not requested, and the guest indexes past the end of it.
+        assert_eq!(
+            publishable(0x22000, 0x21000),
+            Err(ClaimRefused::Oversize { asked: 0x22000, allocated: 0x21000 }),
+            "a blob larger than its resource is refused, not trimmed to fit"
+        );
+    }
 
     /// The probed table on the live host, for the formats the classic corpus creates. Needs the
     /// zink-on-KosmicKrisp environment, so it is opted into.
