@@ -13,7 +13,6 @@ use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, TextureName};
-use super::journal::Retained;
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
@@ -994,7 +993,14 @@ pub struct Resource {
     ///
     /// Typing is first-wins: `set_resource_type` returns early for a resource that already has a
     /// type, so this is written once and never contradicted.
-    pub typed_by: Option<Retained>,
+    ///
+    /// Dwords and no position, unlike an object's create. This table is shared by every context
+    /// while a [`Seq`](super::journal::Seq) counts one context's commands, so a position stored
+    /// here would be read by contexts it means nothing to -- a resource typed by one context and
+    /// exported by another would sort against a number from someone else's ordering. A type has
+    /// no position to keep: it must precede everything that views the resource and has no order
+    /// against another resource's, so the export emits it ahead of everything instead.
+    pub typed_by: Option<Vec<u32>>,
 }
 
 /// Which resources copy guest pages, as of one batch.

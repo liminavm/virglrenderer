@@ -745,6 +745,78 @@ static int dump_caps(const char *path)
    return 0;
 }
 
+/* A cursor over a "VRJ1" journal export, refusing anything that does not fit in what it was
+ * given. The replayer reads a blob the renderer under test produced, so a malformed one is a
+ * result to report, never something to walk off the end of. */
+struct vrj {
+   const uint8_t *p;
+   size_t left;
+   bool bad;
+};
+
+static uint32_t vrj_u32(struct vrj *c)
+{
+   if (c->left < 4) { c->bad = true; return 0; }
+   uint32_t v;
+   memcpy(&v, c->p, 4);
+   c->p += 4;
+   c->left -= 4;
+   return v;
+}
+
+/* Whether two journals describe the same rebuild.
+ *
+ * Positions are deliberately not compared: the rebuilt context re-records as it replays, so it
+ * numbers from 1 while the original numbers from wherever its guest got to. What must agree is
+ * the number of steps, their order, and each step's sub-context and dwords. */
+static bool journals_agree(const void *a, uint64_t a_len, const void *b, uint64_t b_len,
+                           uint32_t ctx)
+{
+   struct vrj ca = { a, (size_t)a_len, false }, cb = { b, (size_t)b_len, false };
+   uint32_t magic_a = vrj_u32(&ca), ver_a = vrj_u32(&ca), n_a = vrj_u32(&ca);
+   uint32_t magic_b = vrj_u32(&cb), ver_b = vrj_u32(&cb), n_b = vrj_u32(&cb);
+   (void)vrj_u32(&ca); (void)vrj_u32(&cb);            /* reserved */
+   if (magic_a != 0x314a5256u || magic_b != 0x314a5256u || ver_a != ver_b) {
+      fprintf(stderr, "rebuild: ctx %u: not a pair of journals\n", ctx);
+      return false;
+   }
+   if (n_a != n_b) {
+      fprintf(stderr, "rebuild: ctx %u: %u entries in, %u out\n", ctx, n_a, n_b);
+      return false;
+   }
+   for (uint32_t i = 0; i < n_a; i++) {
+      (void)vrj_u32(&ca); (void)vrj_u32(&ca);          /* seq, renumbered by the rebuild */
+      (void)vrj_u32(&cb); (void)vrj_u32(&cb);
+      uint32_t kind_a = vrj_u32(&ca), sub_a = vrj_u32(&ca), nc_a = vrj_u32(&ca);
+      uint32_t kind_b = vrj_u32(&cb), sub_b = vrj_u32(&cb), nc_b = vrj_u32(&cb);
+      if (kind_a != kind_b || sub_a != sub_b || nc_a != nc_b) {
+         fprintf(stderr,
+                 "rebuild: ctx %u entry %u: kind/sub/chunks %u/%u/%u became %u/%u/%u\n",
+                 ctx, i, kind_a, sub_a, nc_a, kind_b, sub_b, nc_b);
+         return false;
+      }
+      for (uint32_t c = 0; c < nc_a; c++) {
+         uint32_t la = vrj_u32(&ca), lb = vrj_u32(&cb);
+         if (la != lb) {
+            fprintf(stderr, "rebuild: ctx %u entry %u chunk %u: %u dwords became %u\n",
+                    ctx, i, c, la, lb);
+            return false;
+         }
+         for (uint32_t d = 0; d < la; d++)
+            if (vrj_u32(&ca) != vrj_u32(&cb)) {
+               fprintf(stderr, "rebuild: ctx %u entry %u chunk %u dword %u differs\n",
+                       ctx, i, c, d);
+               return false;
+            }
+      }
+      if (ca.bad || cb.bad) {
+         fprintf(stderr, "rebuild: ctx %u: a journal ran out at entry %u\n", ctx, i);
+         return false;
+      }
+   }
+   return true;
+}
+
 int main(int argc, char **argv)
 {
    const char *path = NULL;
@@ -755,6 +827,11 @@ int main(int argc, char **argv)
     * transfers, no scoring. This is P1's gate -- a renderer that gets through it has a working
     * ABI, resource table and context table, which is all a skeleton claims. */
    bool smoke = false;
+   /* --rebuild: after the stream, rebuild each context from its own journal and check the
+    * rebuild describes the same world. Off by default: it makes contexts and GL objects the
+    * corpus never asked for, and every pinned score was recorded without it. */
+   bool rebuild = false;
+   unsigned rebuild_failed = 0;
    bool sweep = false;
    uint64_t draws_from = 0;
    /* --until stops the stream after a sequence number and scores what is on the surfaces THEN.
@@ -791,6 +868,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--smoke")) smoke = true;
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
+      else if (!strcmp(argv[i], "--rebuild")) rebuild = true;
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
       else if (!strcmp(argv[i], "--caps") && i + 1 < argc) caps_path = argv[++i];
@@ -1269,6 +1347,66 @@ int main(int argc, char **argv)
          score_resource(born);
    }
 
+   /* --rebuild: the gate for the snapshot journal. Export what a context retained, feed it into
+    * a context that has never seen the stream, and export that one. The comparison is
+    * structural, not byte-for-byte: the rebuilt context re-records from seq 1 as it replays, so
+    * every position is renumbered, and what has to match is the steps and their order.
+    *
+    * What this catches is a journal that cannot rebuild what it came from -- an entry that fails
+    * to replay, an order that puts a bind before its object, a serializer that loses a shader's
+    * later chunks. What it cannot catch is a durable command the recorder never learned to keep:
+    * that is absent from both journals and both agree about it. Only pixels answer that, so this
+    * is the floor and not the ceiling. */
+   if (rebuild) {
+      for (int i = 0; i < n_ctx; i++) {
+         uint32_t src = (uint32_t)ctx_list[i];
+         void *a = NULL; uint64_t a_len = 0;
+         int rc = virgl_renderer_limina_journal_export(src, &a, &a_len);
+         if (rc) {
+            fprintf(stderr, "rebuild: ctx %u exported nothing (%d)\n", src, rc);
+            rebuild_failed++;
+            continue;
+         }
+         uint32_t dst = src + 1000;
+         const char *rname = "limina-rebuild";
+         if (virgl_renderer_context_create(dst, (uint32_t)strlen(rname), rname)) {
+            fprintf(stderr, "rebuild: context_create %u failed\n", dst);
+            rebuild_failed++;
+            free(a);
+            continue;
+         }
+         /* The journal names resources; a context that is not attached to them cannot rebuild a
+          * sampler view or a surface over one, and every such create would drop. */
+         for (uint32_t r = 0; r < backing_n; r++)
+            if (backings[r]->live)
+               virgl_renderer_ctx_attach_resource((int)dst, (int)backings[r]->handle);
+
+         virgl_renderer_limina_replay_begin(dst);
+         int rr = virgl_renderer_limina_journal_restore(dst, a, a_len);
+         if (rr) {
+            fprintf(stderr, "rebuild: ctx %u refused its own journal (%d)\n", src, rr);
+            rebuild_failed++;
+         }
+         virgl_renderer_limina_journal_replay_upto(dst, UINT64_MAX);
+         virgl_renderer_limina_replay_end(dst);
+
+         void *b = NULL; uint64_t b_len = 0;
+         if (virgl_renderer_limina_journal_export(dst, &b, &b_len)) {
+            fprintf(stderr, "rebuild: ctx %u rebuilt into nothing\n", src);
+            rebuild_failed++;
+            free(a);
+            continue;
+         }
+         if (!journals_agree(a, a_len, b, b_len, src))
+            rebuild_failed++;
+         else
+            fprintf(stderr, "rebuild: ctx %u -> %u rebuilt identically (%llu bytes)\n",
+                    src, dst, (unsigned long long)a_len);
+         free(a);
+         free(b);
+      }
+   }
+
    /* The journal census, on stderr and never in the score: it is a fact about what the recorder
     * retained, not about the pixels, and a number that moves whenever the recorder changes must
     * not be able to rewrite every pinned score in the tree. */
@@ -1360,6 +1498,14 @@ int main(int argc, char **argv)
          free(want);
          fclose(ef);
       }
+   }
+
+   /* A rebuild that did not describe the same world fails the run, whatever the score said: the
+    * score is about the pixels this stream drew, and the rebuild is about whether they could be
+    * drawn again after a resume. */
+   if (rebuild_failed) {
+      fprintf(stderr, "REBUILD FAILED for %u context(s)\n", rebuild_failed);
+      ok = 0;
    }
 
    free(text);

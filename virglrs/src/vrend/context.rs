@@ -1287,7 +1287,7 @@ impl Context {
     /// `typed` supplies the `PIPE_RESOURCE_SET_TYPE` of each live blob, which lives on the
     /// resource table rather than here: one table serves every context, so a context cannot walk
     /// it alone.
-    pub fn journal<'a>(&'a self, typed: impl Iterator<Item = &'a Retained>) -> Vec<Entry<'a>> {
+    pub fn journal<'a>(&'a self, typed: impl Iterator<Item = &'a Vec<u32>>) -> Vec<Entry<'a>> {
         let subs = self.subs.iter().flat_map(|(id, sub)| {
             // Sub-context 0 is never created: a fresh context already has it, and asking for it
             // again would be asking the rebuild to do what it has already done.
@@ -1305,9 +1305,12 @@ impl Context {
         });
         // A resource's type is not a sub-context's business -- it is filed under the one the
         // command arrived on, which is the current one at that point in the order anyway.
-        let types = typed.map(|at| Entry {
-            seq: at.seq,
-            step: Step::Feed { sub: self.current.0, chunks: &at.chunks },
+        // Ahead of everything: a blob's type has to be set before any view or surface over it is
+        // made, and one blob's type has no order against another's. Seq zero is before every
+        // recorded command, which start at one.
+        let types = typed.map(|wire| Entry {
+            seq: Seq::default(),
+            step: Step::Feed { sub: self.current.0, chunks: std::slice::from_ref(wire) },
         });
         order(subs.chain(types))
     }
@@ -3484,7 +3487,7 @@ impl Context {
             host.batch,
         ) {
             Ok(mut res) => {
-                res.typed_by = Some(Retained::new(self.seq.advance(), wire));
+                res.typed_by = Some(wire.to_vec());
                 host.resources.insert(resource, resource::Slot::Resource(res));
                 Ok(())
             }
