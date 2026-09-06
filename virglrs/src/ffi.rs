@@ -1394,9 +1394,63 @@ pub extern "C" fn virgl_renderer_limina_replay_begin(ctx_id: u32) -> c_int {
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match Some(r.venus_replay_begin(ctx)) {
-        Some(Ok(())) => 0,
-        _ => EINVAL,
+    with(EINVAL, |r| {
+        // A context belongs to one renderer, and each keeps its own journal. Asking which is the
+        // same split the C makes by having its classic lookup answer NULL for a venus capset.
+        if r.is_classic(ctx) {
+            return if r.vrend_replay_begin(ctx) { 0 } else { EINVAL };
+        }
+        match Some(r.venus_replay_begin(ctx)) {
+            Some(Ok(())) => 0,
+            _ => EINVAL,
+        }
+    })
+}
+
+/// Hand a classic context the journal it is to be rebuilt from.
+///
+/// Separate from the feed because the VMM interleaves the two rebuilds: it hands over the whole
+/// journal once, then says how far to get as its own side reaches the points this one depends on.
+#[unsafe(no_mangle)]
+pub extern "C" fn virgl_renderer_limina_journal_restore(
+    ctx_id: u32,
+    data: *const c_void,
+    size: u64,
+) -> c_int {
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with_bytes(data.cast_mut(), size as usize, |buf| {
+        with(EINVAL, |r| {
+            if !r.is_classic(ctx) {
+                return ENOENT;
+            }
+            match r.vrend_journal_restore(ctx, buf) {
+                Ok(_) => 0,
+                Err(why) => {
+                    // The blob has been through a snapshot file since we wrote it. Saying which
+                    // way it is wrong is the difference between a bug we can find and a resume
+                    // that is merely black.
+                    eprintln!("[virglrs] vrend: ctx {ctx_id}: journal refused: {why}");
+                    EINVAL
+                }
+            }
+        })
+    })
+    .unwrap_or(EINVAL)
+}
+
+/// Feed a classic context's retained commands up to `upto`.
+#[unsafe(no_mangle)]
+pub extern "C" fn virgl_renderer_limina_journal_replay_upto(ctx_id: u32, upto: u64) -> c_int {
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| {
+        if !r.is_classic(ctx) {
+            return ENOENT;
+        }
+        if r.vrend_replay_upto(ctx, upto) { 0 } else { EINVAL }
     })
 }
 
@@ -1446,9 +1500,14 @@ pub extern "C" fn virgl_renderer_limina_replay_end(ctx_id: u32) -> c_int {
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
-    with(EINVAL, |r| match Some(r.venus_replay_end(ctx)) {
-        Some(Ok(())) => 0,
-        _ => EINVAL,
+    with(EINVAL, |r| {
+        if r.is_classic(ctx) {
+            return if r.vrend_replay_end(ctx) { 0 } else { EINVAL };
+        }
+        match Some(r.venus_replay_end(ctx)) {
+            Some(Ok(())) => 0,
+            _ => EINVAL,
+        }
     })
 }
 

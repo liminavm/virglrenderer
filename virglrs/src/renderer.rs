@@ -1052,9 +1052,49 @@ impl Renderer {
         self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
     }
 
+    /// Whether this context is served by the classic renderer.
+    ///
+    /// The snapshot entry points ask because the two renderers keep separate journals and a
+    /// context belongs to exactly one of them. This is the same split the C makes by having
+    /// `limina_classic_ctx_lookup` answer NULL for a venus capset -- said once, as a question
+    /// about the context, rather than rediscovered at each entry point.
+    pub fn is_classic(&self, ctx: ContextId) -> bool {
+        self.contexts
+            .get(&ctx)
+            .is_some_and(|c| matches!(c.capset, CapsetId::Virgl | CapsetId::Virgl2))
+    }
+
     /// One classic context's journal, for the VMM to store beside its own.
     pub fn vrend_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
         self.vrend.as_ref()?.journal_export(id)
+    }
+
+    /// Begin rebuilding a classic context from its journal.
+    pub fn vrend_replay_begin(&mut self, ctx: ContextId) -> bool {
+        self.vrend.as_mut().is_some_and(|v| v.replay_begin(ctx))
+    }
+
+    /// Hand a classic context the journal it will be rebuilt from.
+    pub fn vrend_journal_restore(
+        &mut self,
+        ctx: ContextId,
+        bytes: &[u8],
+    ) -> Result<usize, &'static str> {
+        self.vrend.as_mut().ok_or("no classic renderer")?.journal_restore(ctx, bytes)
+    }
+
+    /// Feed a classic context's retained commands up to `upto`.
+    pub fn vrend_replay_upto(&mut self, ctx: ContextId, upto: u64) -> bool {
+        let table = self.resources.read().expect("the resource lock is never poisoned");
+        let Some(v) = self.vrend.as_mut() else {
+            return false;
+        };
+        v.replay_upto(ctx, &*table, crate::vrend::journal::Seq(upto))
+    }
+
+    /// Finish rebuilding a classic context, and report what it could not use.
+    pub fn vrend_replay_end(&mut self, ctx: ContextId) -> bool {
+        self.vrend.as_mut().is_some_and(|v| v.replay_end(ctx))
     }
 
     /// Each classic context's journal size and entry count, round-tripped.
