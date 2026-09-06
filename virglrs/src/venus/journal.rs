@@ -56,8 +56,15 @@ enum About {
     /// It is part of this command buffer's recording. True while the buffer lives, and dropped
     /// wholesale when the buffer is begun or reset, which is what discards a recording.
     Recording(ObjectKey),
-    /// It mutated these and owns none of them — a bind, a descriptor-set update. True only while
-    /// every one of them lives: a write into a descriptor set that is gone describes nothing.
+    /// It wrote into these and owns none of them — a bind, a descriptor-set update. True while
+    /// *any* of them lives, for the same reason a batch create is: one command may write into
+    /// several objects, and it goes on describing the ones that are still there.
+    ///
+    /// Only what the command wrote into is named here. What it merely pointed at — the memory a
+    /// bind binds, the buffers a descriptor write points a set at — is a reference, because the
+    /// entry does not stop being true when one of those is destroyed. Keying on both together is
+    /// what made a `vkBindBufferMemory2` over two buffers vanish when either went, and a binding
+    /// is never sent a second time.
     Mutated(Vec<ObjectKey>),
     /// It belongs to a ring rather than to any object, and is true until that ring is gone.
     ///
@@ -259,7 +266,6 @@ impl Journal {
     /// and must replay anyway or the entry that needs them cannot.
     fn retained(&self, live: &dyn Live) -> Vec<&Entry> {
         let alive = |keys: &[ObjectKey]| keys.iter().any(|k| live.holds(*k));
-        let all_alive = |keys: &[ObjectKey]| keys.iter().all(|k| live.holds(*k));
 
         // Which entry created a given key, so a reference can be resolved to the command that
         // would rebuild it.
@@ -278,7 +284,7 @@ impl Journal {
             let true_still = match &e.about {
                 About::Created(keys) => alive(keys),
                 About::Recording(b) => live.holds(*b),
-                About::Mutated(keys) => all_alive(keys),
+                About::Mutated(keys) => alive(keys),
                 About::Ring(_) => true,
             };
             if true_still && keep.insert(i) {
@@ -286,8 +292,21 @@ impl Journal {
             }
         }
         // The closure: everything a kept entry named has to be creatable, transitively.
+        //
+        // Both halves of "named", not just the references. An entry kept because one of the
+        // objects it wrote into survived still replays the whole command, so the objects that did
+        // *not* survive have to be rebuilt too -- otherwise the survivor's half of the command
+        // fails on a lookup for the other half. This is the price of one command being about more
+        // than one object, and it is the right way round: rebuilding an object the guest destroyed
+        // costs memory, and not rebuilding it costs the command.
         while let Some(i) = queue.pop() {
-            for r in &self.entries[i].refs {
+            let e = &self.entries[i];
+            let named = e.refs.iter().chain(match &e.about {
+                About::Created(keys) | About::Mutated(keys) => keys.iter(),
+                About::Recording(b) => std::slice::from_ref(b).iter(),
+                About::Ring(_) => [].iter(),
+            });
+            for r in named {
                 if let Some(&c) = creator.get(r)
                     && keep.insert(c)
                 {
@@ -475,6 +494,53 @@ mod tests {
         let out = j.retained(&Some_(vec![buffer]));
         assert_eq!(out.len(), 3, "the pipeline's create has to replay for the bind to");
         assert_eq!(out[0].seq, Seq(1));
+    }
+
+    /// A bind naming two buffers survives one of them being destroyed.
+    ///
+    /// The entry is about what it wrote into, so it stays true for the buffer that is still there.
+    /// Keyed on everything it named -- the old rule -- destroying either buffer, or the memory,
+    /// dropped the whole entry and took the survivor's binding with it. A binding is never sent
+    /// again, so that loss is permanent in a way a descriptor write's is not.
+    #[test]
+    fn a_bind_survives_one_of_its_targets_going() {
+        let k = keys(3);
+        let (memory, a, b) = (k[0], k[1], k[2]);
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![memory], Vec::new());
+        j.created(2, &[2; 4], vec![a], Vec::new());
+        j.created(3, &[3; 4], vec![b], Vec::new());
+        // One command binding both, as `vkBindBufferMemory2` does.
+        j.mutated(4, &[4; 4], vec![a, b], vec![memory]);
+
+        let out = j.retained(&Some_(vec![memory, b]));
+        assert!(
+            out.iter().any(|e| e.wire == vec![4; 4]),
+            "the bind is still true of the buffer that is still there"
+        );
+        // And the buffer that is gone comes back, because the retained command names it: replaying
+        // a bind of {A, B} with no A is a lookup miss, which poisons the whole restore.
+        assert_eq!(out.len(), 4, "the destroyed buffer's create is dragged in with the bind");
+        assert!(out.iter().any(|e| e.wire == vec![2; 4]), "A's create replays");
+        // And it goes when nothing it wrote into is left.
+        let out = j.retained(&Some_(vec![memory]));
+        assert!(!out.iter().any(|e| e.wire == vec![4; 4]), "a bind of nothing describes nothing");
+    }
+
+    /// The memory a bind names is a reference, so its allocate is dragged in rather than being
+    /// what keeps the bind alive.
+    #[test]
+    fn a_bind_drags_in_the_memory_it_named() {
+        let k = keys(2);
+        let (memory, buffer) = (k[0], k[1]);
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![memory], Vec::new());
+        j.created(2, &[2; 4], vec![buffer], Vec::new());
+        j.mutated(3, &[3; 4], vec![buffer], vec![memory]);
+
+        let out = j.retained(&Some_(vec![buffer]));
+        assert_eq!(out.len(), 3, "the allocate has to replay for the bind to");
+        assert_eq!(out[0].seq, Seq(1), "and it has to replay first");
     }
 
     /// A pool reset recycles every buffer without invalidating one, so no key changes and only
