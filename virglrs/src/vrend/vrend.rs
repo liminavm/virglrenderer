@@ -417,6 +417,13 @@ impl Vrend {
         self.resources.get(&handle)?.resource()?.surface()
     }
 
+    /// A share of that surface, for a holder outside vrend -- a venus context importing this
+    /// resource, which must keep the surface alive rather than name it. See
+    /// [`resource::Resource::surface_share`].
+    pub fn resource_surface_share(&self, handle: ResourceHandle) -> Option<Arc<dyn metal::Held>> {
+        self.resources.get(&handle)?.resource()?.surface_share()
+    }
+
     /// `vrend_renderer_resource_sync_iosurface`: make a surface-backed resource's contents whole
     /// before the surface is presented. The texture's storage *is* the surface, so there is
     /// nothing to copy -- only the renders queued into it to complete, since the present that

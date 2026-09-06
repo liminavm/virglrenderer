@@ -866,6 +866,13 @@ SABOTAGES = [
         'vrend',
     ),
     (
+        'a classic resource lends nothing, so a venus context cannot import one',
+        'virglrs/src/renderer.rs',
+        'Some(held) => Some(ResourceBytes::Shared(Storage::lent(Arc::clone(held)))),',
+        'Some(_) => None,',
+        'a_classic_resource_lends',
+    ),
+    (
         'the sample-count ceiling is ignored and the host maximum advertised anyway',
         'virglrs/src/vrend/caps.rs',
         'Some(c) if max_samples > c => {',

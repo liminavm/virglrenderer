@@ -48,7 +48,7 @@ use super::ring::ResourceBytes;
 use crate::guest_mem::GuestMap;
 use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
-use crate::metal::{PixelFormat, Surface};
+use crate::metal::{Held, PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
 
 /// The memory properties this renderer decides anything by: whether the host can address it at
@@ -3518,10 +3518,16 @@ pub enum NoSyncFd {
 /// keeps the storage *alive* instead of describing where it used to be.
 #[derive(Clone)]
 pub enum Storage {
-    /// An IOSurface this renderer minted. The pages are the surface's, and the surface outlives
-    /// every Vulkan object that ever imported them -- it depends on no device, no instance and no
+    /// A share of an IOSurface. The pages are the surface's, and the surface outlives every
+    /// Vulkan object that ever imported them -- it depends on no device, no instance and no
     /// object table, so nothing cascades from holding one.
-    Texture(Arc<Charged<Surface>>),
+    ///
+    /// The share and not the surface, because the owner is not always venus: an allocation minted
+    /// here lends a [`Charged`] one, so the budget is credited when the last holder lets go, and
+    /// a classic resource lends the share its EGL image already holds. Either way what travels is
+    /// the right to keep the surface alive, and the owner decides what that costs -- see
+    /// [`Held`].
+    Texture(Arc<dyn Held>),
     /// Pages this renderer minted for an allocation the guest meant to share, and handed the
     /// driver by host-pointer import. Plain memory with rows the CPU can address; the guest's
     /// fences are the only barrier over them, as they are for any host-visible allocation.
@@ -3607,9 +3613,22 @@ impl Storage {
     /// does -- see [`crate::metal::Held`].
     pub fn held(&self) -> Option<Arc<dyn crate::metal::Held>> {
         match self {
-            Storage::Texture(t) => Some(Arc::clone(t) as Arc<dyn crate::metal::Held>),
+            Storage::Texture(t) => Some(Arc::clone(t)),
             Storage::Linear(_) => None,
         }
+    }
+
+    /// Storage a classic resource owns, as a share venus can import.
+    ///
+    /// The one route from the classic side into a venus context, and the reason there is no
+    /// dma-buf here: a compositor rendering through Vulkan imports each client window as an
+    /// IOSurface, and a GL client's window buffer is one an EGL image already holds a share of.
+    /// Lending that share -- not minting a second one over the same surface, and not passing the
+    /// surface's id -- is what makes the import outlive the classic context that created it.
+    ///
+    /// It carries no charge, because vrend keeps no ledger; see the plan on what that costs.
+    pub fn lent(held: Arc<dyn Held>) -> Storage {
+        Storage::Texture(held)
     }
 
     /// A share over a real surface, charged to `account`, for a test outside this module.
@@ -3654,7 +3673,7 @@ impl Eq for Storage {}
 impl core::fmt::Debug for Storage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Storage::Texture(m) => f.debug_tuple("Texture").field(&m.it.id()).finish(),
+            Storage::Texture(m) => f.debug_tuple("Texture").field(&m.surface().id()).finish(),
             Storage::Linear(p) => {
                 f.debug_tuple("Linear").field(&p.it.map.len()).field(&p.it.why).finish()
             }
@@ -3666,7 +3685,7 @@ impl Storage {
     /// Where the bytes are and how far they run, as the one pair anything can act on.
     pub fn span(&self) -> (usize, u64) {
         match self {
-            Storage::Texture(m) => (m.it.host_addr(), m.it.alloc_size()),
+            Storage::Texture(m) => (m.surface().host_addr(), m.surface().alloc_size()),
             Storage::Linear(p) => (p.it.map.host_addr(), p.it.map.len() as u64),
         }
     }
@@ -3689,7 +3708,7 @@ impl Storage {
     /// is answered here once rather than per thing a caller wants from it.
     pub fn surface(&self) -> Result<&Surface, NoSurface> {
         match self {
-            Storage::Texture(m) => Ok(&m.it),
+            Storage::Texture(m) => Ok(m.surface()),
             Storage::Linear(p) => Err(p.it.why),
         }
     }

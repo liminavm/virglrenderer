@@ -735,7 +735,7 @@ pub extern "C" fn virgl_renderer_resource_get_info(
         // The C fills what it knows and reports success for any resource it holds; the shim
         // reads the classic half, which is the only kind with a format and a size.
         let filled = r.with_resource(handle, |res| match &res.backing {
-            renderer::Backing::Classic(a) => {
+            renderer::Backing::Classic { args: a, .. } => {
                 let desc = a.format.describe();
                 let stride = desc.map_or(0, |d| d.stride(a.width));
                 Some((a.format.wire(), a.width, a.height, a.depth, a.flags.0, stride))

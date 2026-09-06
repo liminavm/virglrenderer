@@ -236,6 +236,13 @@ impl Image {
         self.held.surface()
     }
 
+    /// A share of the surface this images, for a holder outside the classic side: a venus context
+    /// importing this resource keeps the surface alive for as long as it can still reach it,
+    /// which is past the classic context that created it and past the resource itself.
+    pub fn held(&self) -> Arc<dyn Held> {
+        Arc::clone(&self.held)
+    }
+
     /// The token GL binds as texture storage (`GLeglImageOES`). For the GL bindings only, which
     /// take the `Image` by reference and so cannot hold the token past it.
     pub(crate) fn raw(&self) -> EGLImageKHR {
