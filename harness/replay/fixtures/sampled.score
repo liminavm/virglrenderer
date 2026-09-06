@@ -1,4 +1,4 @@
-loop 0 created 21 failed 0 unrefs 10 submits 1 cmds 92 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 0
+loop 0 created 21 failed 0 unrefs 10 submits 1 cmds 104 xfers 0 copy-fed 0 copy-unmatched 0 submit-errors 0 iosurface-backed 0
 probe transfer-of-unknown-resource answered=22
 res=30 64x64 hash=72df905637076c83 ink=4096/4096
 res=32 64x64 hash=9805c840cc497003 ink=4096/4096
