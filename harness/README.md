@@ -353,6 +353,12 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the compositor. The page must not ask for MSAA; `../vm/README.md` says why, and it is not a
   renderer problem.
 
+  **It is the one corpus that fails the rebuild gate, and only at that `--ctx`.** The score is
+  bit-identical either way; with ctx 9 replayed as well, ctx 2 keeps five `CreateObject` entries
+  on a resource the browser unrefs, and the rebuild is 131 entries in and 126 out. Run it at the
+  default single context and the gate is green on a world where the browser never ran, which is
+  not the world the corpus is about. `docs/rust-rewrite.md` carries the decision that is owed.
+
   **Every readback asks at the format's own bytes per texel.** It used to ask at four, everywhere,
   under a belief written into the comment: four "is what every format this scores actually is".
   That survived seven corpora and died on the eighth, because a browser allocates

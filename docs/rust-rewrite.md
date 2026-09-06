@@ -873,6 +873,19 @@ waiting on a call rather than on work.
   conversion is unreachable and unscoreable, and refusing it by name is the resting state; the
   decision is whether to keep hunting for one.
 
+- **A real capture keeps a classic object on a resource the guest destroyed.** `vrend-webgl` at
+  the `--ctx 2,9` it is documented to replay at scores bit-identically to its pinned fixture and
+  then fails the rebuild gate: ctx 2 retains five `CreateObject` entries naming resource 1484,
+  which the stream unrefs, so 131 entries go in and 126 come out. The state was believed not to
+  occur, because mesa refcounts a `pipe_resource` under a live sampler view — and that holds
+  inside one guest process. It does not hold across two: ctx 2 is the shell and ctx 9 the browser,
+  sharing buffers through the compositor, and one process's unref does not consult the other's
+  views. This is not the replayer's own liveness view being wrong either — attaching every backing
+  it knows, live or not, drops the same five, because the resource is gone from the renderer and
+  not merely absent from the fresh context. The decision is what a fixed-point gate should say
+  about a drop the guest itself caused: dropping and naming it is the trust-boundary behaviour we
+  want, and a gate demanding an identical journal cannot also accept one.
+
 ## Owed, and waiting on work
 
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
