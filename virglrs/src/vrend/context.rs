@@ -28,7 +28,7 @@ use super::gl::{
     ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
     TransformFeedbackName, UniformLocation, VertexArrayName,
 };
-use super::journal::{Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
+use super::journal::{self, Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
 use super::pipe::slots::{
     MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
     MAX_VIEWPORTS,
@@ -487,6 +487,19 @@ pub enum Object {
     Surface(Surface),
     Query(Query),
     StreamoutTarget(StreamoutTarget),
+}
+
+/// A context being rebuilt from its journal.
+///
+/// Holds the whole journal rather than consuming it as it goes, because the VMM feeds it in
+/// stages: it replays its own control-queue work between calls, and `fed` is how far this side
+/// has got.
+#[derive(Default)]
+struct Replay {
+    entries: Vec<journal::Parsed>,
+    fed: usize,
+    /// What could not be used, by command name. See [`Context::replay_end`].
+    dropped: BTreeMap<&'static str, u64>,
 }
 
 /// A sub-context's objects, each holding the commands that created it.
@@ -1034,6 +1047,8 @@ pub struct Context {
     /// view is made against the resource, and a guest that tears its decoder down with the last
     /// frame still on screen has no buffer left to be found through.
     owed: Vec<Arc<Texture>>,
+    /// Set while this context is being rebuilt from a journal rather than driven by a guest.
+    replay: Option<Replay>,
     /// How far this context's journal has got. One counter, because the order a rebuild replays
     /// in, the create-before-use guarantee and the VMM's fence watermark are one order.
     seq: Seq,
@@ -1048,6 +1063,7 @@ impl Context {
             fault: None,
             video: video::Video::default(),
             owed: Vec::new(),
+            replay: None,
             seq: Seq::default(),
         };
         ctx.create_sub(host, SubContextId(0))?;
@@ -1106,7 +1122,8 @@ impl Context {
         Ok(())
     }
 
-    /// Run one batch. A fault stops it and sticks.
+    /// Run one batch. A fault stops it and sticks -- unless this context is being rebuilt from a
+    /// journal, where a fault drops one command and the rest still runs. See [`Replay`].
     pub fn submit(&mut self, host: &mut Host<'_>, words: &[u32]) -> Result<(), Fault> {
         if let Some(f) = &self.fault {
             return Err(f.clone());
@@ -1116,6 +1133,8 @@ impl Context {
         for item in batch {
             let framed = match item {
                 Ok(c) => c,
+                // A journal this renderer wrote and cannot frame back is our own bug, not a
+                // stale reference, so it poisons even during a replay.
                 Err(r) => return self.poison(Fault::Wire(r)),
             };
             let kind = framed.cmd.kind();
@@ -1124,7 +1143,10 @@ impl Context {
             let slot = state_key(&framed.cmd);
             let wire = framed.wire;
             if let Err(f) = self.run(host, framed.cmd, wire) {
-                return self.poison(f);
+                if !self.dropped_in_replay(kind, &f) {
+                    return self.poison(f);
+                }
+                continue;
             }
             if let Some(slot) = slot {
                 let at = Retained::new(self.seq.advance(), wire);
@@ -1134,10 +1156,116 @@ impl Context {
             // `vrend_check_no_error`: any GL error a command left is the context's error.
             let err = host.gl.drain_errors();
             if err != GL_NO_ERROR {
-                return self.poison(Fault::Gl { cmd: kind, error: err });
+                let f = Fault::Gl { cmd: kind, error: err };
+                if !self.dropped_in_replay(kind, &f) {
+                    return self.poison(f);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Begin rebuilding this context from a journal.
+    ///
+    /// What this changes is the response to a fault: a guest's bad command poisons the context,
+    /// because a guest must not be able to leave us in a state we cannot reason about, but during
+    /// a rebuild the same fault means one retained command could not be used. Poisoning there
+    /// would throw away every command after it and land exactly where doing nothing lands -- a
+    /// black screen -- so a replay drops the command, names it, and goes on.
+    pub fn replay_begin(&mut self) {
+        self.replay = Some(Replay::default());
+    }
+
+    /// Take the journal a rebuild will be fed from.
+    pub fn replay_restore(&mut self, bytes: &[u8]) -> Result<usize, &'static str> {
+        let entries = journal::parse(bytes)?;
+        let n = entries.len();
+        let r = self.replay.get_or_insert_with(Replay::default);
+        r.entries = entries;
+        r.fed = 0;
+        Ok(n)
+    }
+
+    /// Feed every retained command up to `upto`, in journal order.
+    ///
+    /// Called more than once, with a rising watermark, because the VMM interleaves its own
+    /// rebuilding with this one: some of what these commands name is created on its side, and it
+    /// knows where in this order that happens.
+    pub fn replay_upto(&mut self, host: &mut Host<'_>, upto: Seq) {
+        loop {
+            let Some(r) = self.replay.as_ref() else { return };
+            let Some(e) = r.entries.get(r.fed) else { return };
+            if e.seq > upto {
+                return;
+            }
+            // Cloned out of the journal rather than borrowed: running the command needs `self`
+            // mutably, and an entry is one command, not a frame's worth of data.
+            let (sub, chunks) = (e.sub, e.chunks.clone());
+            self.replay.as_mut().expect("just read").fed += 1;
+            self.replay_one(host, sub, &chunks);
+        }
+    }
+
+    fn replay_one(&mut self, host: &mut Host<'_>, sub: u32, chunks: &[Vec<u32>]) {
+        let id = SubContextId(sub);
+        if chunks.is_empty() {
+            // The one step that is not a command: the journal names the sub-context to make, and
+            // making it is all there is to do.
+            if let Err(e) = self.create_sub(host, id) {
+                eprintln!("[virglrs] vrend: replay: sub-context {sub}: no GL context: {e}");
+                self.note_drop("CreateSubCtx");
+            }
+            return;
+        }
+        self.set_sub_ctx(host, id);
+        for c in chunks {
+            // The fault is dropped and counted inside `submit`; the context is not poisoned, so
+            // the result carries nothing this level has to act on.
+            let _ = self.submit(host, c);
+        }
+    }
+
+    /// End the rebuild, and say what could not be used.
+    ///
+    /// The report is a worklist, not a footnote. Every dropped command is either something that
+    /// genuinely cannot be rebuilt, or a gap in what the recorder kept -- and the two look
+    /// identical from here, so the only way to tell them apart is to name them and go and look.
+    pub fn replay_end(&mut self) {
+        let Some(r) = self.replay.take() else { return };
+        let left = r.entries.len().saturating_sub(r.fed);
+        if left > 0 {
+            eprintln!("[virglrs] vrend: replay ended with {left} entries never fed");
+        }
+        if r.dropped.is_empty() {
+            return;
+        }
+        let total: u64 = r.dropped.values().sum();
+        eprintln!(
+            "[virglrs] vrend: replay could not use {total} of {} retained commands:",
+            r.entries.len()
+        );
+        for (cmd, n) in &r.dropped {
+            eprintln!("[virglrs]   {n:>6}  {cmd}");
+        }
+    }
+
+    /// Count a drop that has already been reported by name.
+    fn note_drop(&mut self, cmd: &'static str) {
+        if let Some(r) = self.replay.as_mut() {
+            *r.dropped.entry(cmd).or_insert(0) += 1;
+        }
+    }
+
+    /// Whether a fault is being dropped rather than poisoning, and count it if so.
+    fn dropped_in_replay(&mut self, cmd: Cmd, f: &Fault) -> bool {
+        let Some(r) = self.replay.as_mut() else { return false };
+        // Said once per command kind, not once per drop: a rebuild that loses a thousand binds
+        // to one missing object should not bury the other kinds it lost.
+        if !r.dropped.contains_key(cmd.name()) {
+            eprintln!("[virglrs] vrend: replay dropped {}: {f}", cmd.name());
+        }
+        *r.dropped.entry(cmd.name()).or_insert(0) += 1;
+        true
     }
 
     /// What this context has retained, over every sub-context it owns.

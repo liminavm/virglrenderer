@@ -498,6 +498,17 @@ VIRGL_EXPORT int virgl_renderer_limina_replay_ring_cmd(uint32_t ctx_id, uint64_t
                                                        void *cmd, uint32_t size);
 VIRGL_EXPORT int virgl_renderer_limina_replay_end(uint32_t ctx_id);
 
+/* limina snapshot-replay, classic contexts: the renderer keeps its own journal and the VMM
+ * stores the blob without reading it. journal_restore hands the blob back at restore;
+ * journal_replay_upto feeds the retained commands whose seq is at or below the watermark, so
+ * that the VMM can interleave its own control-queue rebuilding with this one.
+ *
+ * Not served by this implementation, which exports a vrend journal in the VKJR format the VMM
+ * parses itself; they are declared here so that both implementations export one ABI. */
+VIRGL_EXPORT int virgl_renderer_limina_journal_restore(uint32_t ctx_id, const void *data,
+                                                       uint64_t size);
+VIRGL_EXPORT int virgl_renderer_limina_journal_replay_upto(uint32_t ctx_id, uint64_t upto);
+
 /* limina snapshot-replay P2: full device-memory content capture. Census returns a
  * malloc'd array of 2*count u64s — (VkDeviceMemory object id, allocation size)
  * pairs — for every live capturable memory in the venus context (caller frees).

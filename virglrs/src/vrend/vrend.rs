@@ -21,6 +21,7 @@ use super::features::{Feature, Features};
 use super::formats::Table;
 use super::gl::Gl;
 use super::gl::gles::GL_VERSION;
+use super::journal::{Census, Seq};
 use super::resource::{self, Args, Limits, Refusal, Resource};
 use super::shader;
 use super::transfer::{self, Info};
@@ -254,8 +255,8 @@ impl Vrend {
     ///
     /// The resources are counted here and not in `Context` because that is where they live -- one
     /// table shared by every context, so no single context can answer for it.
-    pub fn journal_census(&self) -> crate::vrend::journal::Census {
-        let mut c = crate::vrend::journal::Census::default();
+    pub fn journal_census(&self) -> Census {
+        let mut c = Census::default();
         for ctx in self.contexts.values() {
             c += ctx.journal_census();
         }
@@ -294,6 +295,43 @@ impl Vrend {
                 Some((*id, bytes.len(), read_back))
             })
             .collect()
+    }
+
+    /// Begin rebuilding a classic context. `false` if it is not here.
+    pub fn replay_begin(&mut self, id: ContextId) -> bool {
+        match self.contexts.get_mut(&id) {
+            Some(c) => {
+                c.replay_begin();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Hand a classic context the journal it will be rebuilt from.
+    pub fn journal_restore(&mut self, id: ContextId, bytes: &[u8]) -> Result<usize, &'static str> {
+        self.contexts.get_mut(&id).ok_or("no such context")?.replay_restore(bytes)
+    }
+
+    /// Feed a classic context's retained commands up to `upto`.
+    pub fn replay_upto(&mut self, id: ContextId, guest: &dyn Guest, upto: Seq) -> bool {
+        if !self.contexts.contains_key(&id) {
+            return false;
+        }
+        let (mut host, contexts) = self.split(id, guest);
+        contexts.get_mut(&id).expect("checked above").replay_upto(&mut host, upto);
+        true
+    }
+
+    /// Finish rebuilding a classic context, and report what it could not use.
+    pub fn replay_end(&mut self, id: ContextId) -> bool {
+        match self.contexts.get_mut(&id) {
+            Some(c) => {
+                c.replay_end();
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- contexts ----

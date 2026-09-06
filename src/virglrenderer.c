@@ -1660,6 +1660,27 @@ int virgl_renderer_limina_journal_export(uint32_t ctx_id, void **out_buf, uint64
    return -ENOTSUP;
 }
 
+/* The renderer-owned-journal contract, which this implementation does not serve: its vrend
+ * journal is exported in the VKJR format the VMM parses and feeds back itself. Declared and
+ * defined so that both implementations export one ABI -- a VMM built against the newer contract
+ * still links and still boots against this dylib, and finds out here rather than at dlopen. */
+int virgl_renderer_limina_journal_restore(uint32_t ctx_id, const void *data, uint64_t size)
+{
+   TRACE_FUNC();
+   (void)ctx_id;
+   (void)data;
+   (void)size;
+   return -ENOTSUP;
+}
+
+int virgl_renderer_limina_journal_replay_upto(uint32_t ctx_id, uint64_t upto)
+{
+   TRACE_FUNC();
+   (void)ctx_id;
+   (void)upto;
+   return -ENOTSUP;
+}
+
 uint64_t virgl_renderer_limina_journal_seq(uint32_t ctx_id)
 {
    struct virgl_context *classic = limina_classic_ctx_lookup(ctx_id);
