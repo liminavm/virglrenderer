@@ -58,7 +58,7 @@ pub struct Object {
 /// A [`Key`] as something outside this module may hold: opaque, and answered only by
 /// [`Table::holds`]. What a record keeps when it has to know, later, whether the object it was
 /// made from is still the same object -- rather than whether the id still names *something*.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ObjectKey(Key);
 
 /// Where an object lives in the [`Arena`], and which occupant of that place it is.
@@ -67,7 +67,7 @@ pub struct ObjectKey(Key);
 /// the key was made, so a key to something destroyed resolves to nothing even after the slot has
 /// been handed to an unrelated object. That is what makes a stale reference fail on its own,
 /// rather than by someone remembering to go and delete it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Key {
     index: usize,
     /// Wide on purpose. A slot is reused every time the object in it is destroyed, so this counts
@@ -252,6 +252,10 @@ pub struct Table {
     /// forgotten no longer exists.
     slots: BTreeMap<ObjectId, Slot>,
     arena: Arena,
+    /// What has been created since the journal last looked, so a retained command can be keyed on
+    /// the objects it made. Only additions: a destroy needs no counterpart here, because a record
+    /// holds an [`ObjectKey`] and a key to a destroyed object already resolves to nothing.
+    added: Vec<ObjectKey>,
 }
 
 impl Table {
@@ -280,6 +284,7 @@ impl Table {
         }
         let parent = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);
         let key = self.arena.insert(Object { id, ty, handle, parent });
+        self.added.push(ObjectKey(key));
         // An id the host once refused can be created for real later, and so can one whose object
         // died with its parent: both leave an entry here that resolves to nothing, and both are
         // overwritten rather than left beside the new object to swallow its commands.
@@ -390,6 +395,15 @@ impl Table {
     /// Whether the object a key was taken for is still here.
     pub fn holds(&self, key: ObjectKey) -> bool {
         self.arena.get(key.0).is_some()
+    }
+
+    /// Take what has been created since the last call, and start counting again.
+    ///
+    /// Called once per dispatched command, so what comes back is what that command created --
+    /// which is how a retained command finds the objects to hang itself on without any handler
+    /// having to say. A command that created nothing hands back nothing, and is not a create.
+    pub fn take_added(&mut self) -> Vec<ObjectKey> {
+        std::mem::take(&mut self.added)
     }
 
     pub fn len(&self) -> usize {
