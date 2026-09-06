@@ -279,6 +279,13 @@ SABOTAGES = [
         '',
     ),
     (
+        'a blob is attributed to whichever context holds its id now',
+        'virglrs/src/renderer.rs',
+        '                    if from.ctx == key =>',
+        '                    if from.ctx.id() == key.id() =>',
+        'a_reused_context_id',
+    ),
+    (
         'the census reports storage a guest only borrowed',
         'virglrs/src/venus/driver.rs',
         '            .filter(|(_, a)| a.censused())',
