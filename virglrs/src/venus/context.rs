@@ -10,7 +10,7 @@
 //! ends the loop.
 
 use bumpalo::Bump;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -171,11 +171,22 @@ pub struct Context {
 /// A wrapper rather than an `impl` on `Shared` so the borrow is taken here, for the length of one
 /// export, and never while a dispatch is running -- the table lives in a `RefCell` the handlers
 /// hold across a command.
-struct LiveObjects<'a>(&'a Shared);
+struct LiveObjects<'a> {
+    objects: &'a Shared,
+    /// Allocations a blob resource still holds a share of.
+    ///
+    /// Reachability the object table cannot see, and the second half of the same rule the `refs`
+    /// closure serves: the guest may free an allocation it exported, and the resource holding a
+    /// share of that storage goes on working. Its create has to survive the guest's free or a
+    /// restore rebuilds a dead blob where the original had a live one -- which is every Xwayland
+    /// window buffer the compositor is still holding, and every swapchain resize it is still
+    /// presenting the old frame of.
+    held: &'a BTreeSet<ObjectKey>,
+}
 
 impl journal::Live for LiveObjects<'_> {
     fn holds(&self, key: ObjectKey) -> bool {
-        self.0.borrow().holds(key)
+        self.objects.borrow().holds(key) || self.held.contains(&key)
     }
 }
 
@@ -363,8 +374,8 @@ impl Context {
     /// `None` when there is nothing to say, which is not the same as an empty blob: a caller that
     /// stored zero bytes and later restored them would have rebuilt nothing and been told it
     /// succeeded.
-    pub fn journal_export(&self) -> Option<Vec<u8>> {
-        self.journal.export(&LiveObjects(&self.objects))
+    pub fn journal_export(&self, held: &BTreeSet<ObjectKey>) -> Option<Vec<u8>> {
+        self.journal.export(&LiveObjects { objects: &self.objects, held })
     }
 
     /// How far this context's journal has been written, for the VMM's cross-layer fence.
@@ -1094,10 +1105,10 @@ fn record(
         return;
     }
 
-    // A free from a pool, kept so a replay ends with the objects the guest actually holds rather
-    // than every object it ever allocated. Before the mutator test below, because these name a
-    // pool too and would otherwise be filed as writes into it.
-    if frees_from_a_pool(cmd) {
+    // A release, kept so a replay ends holding what the guest holds rather than everything it ever
+    // allocated. Before the mutator test below, because these name a pool too and would otherwise
+    // be filed as writes into it.
+    if releases_a_create(cmd) {
         if unmade.is_empty() {
             // It freed nothing -- a null handle, or a run the driver refused. There is nothing to
             // undo and replaying it would name objects no create will have made.
@@ -1189,21 +1200,28 @@ fn recording_class(cmd: VkCommandTypeEXT) -> Option<Recording> {
     }
 }
 
-/// Commands that hand objects back to the pool they came from.
+/// Commands that release objects whose create may still be retained without them.
 ///
-/// Journaled against the creates they undo. A batch allocate is retained while any one of its
-/// objects lives, so replaying it remakes the ones the guest freed as well -- harmless for a
-/// command pool, which grows, and fatal for a descriptor pool sized for exactly what the guest
-/// holds, where those extra sets are what make the next allocate return
-/// `VK_ERROR_OUT_OF_POOL_MEMORY`. Replaying the free restores the count.
+/// Journaled against the creates they undo, for two reasons that turn out to be one.
+///
+/// A batch allocate is retained while any one of its objects lives, so replaying it remakes the
+/// ones the guest freed as well -- harmless for a command pool, which grows, and fatal for a
+/// descriptor pool sized for exactly what the guest holds, where those extra sets are what make
+/// the next allocate return `VK_ERROR_OUT_OF_POOL_MEMORY`.
+///
+/// And an allocation a blob resource still holds a share of is retained past the guest's own
+/// `vkFreeMemory`, because the resource goes on working. Replaying the free after the blob's
+/// create has taken its share is what leaves the restored world in the state the original was in
+/// -- the memory freed, the blob alive -- rather than one live allocation richer every cycle.
 ///
 /// `vkResetDescriptorPool` is not here: it takes its sets out of the object table, so their
 /// entries stop being true on their own and there is nothing left to undo.
-fn frees_from_a_pool(cmd: VkCommandTypeEXT) -> bool {
+fn releases_a_create(cmd: VkCommandTypeEXT) -> bool {
     matches!(
         cmd,
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeDescriptorSets_EXT
             | VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeMemory_EXT
     )
 }
 
@@ -4297,7 +4315,10 @@ mod tests {
         assert_eq!(ctx.journal_seq(), Seq(1), "the recorder saw the command the dispatcher did");
         // It created nothing, so it is retained as nothing -- and named, not merely counted.
         assert_eq!(ctx.journal_transient(), vec![("vkDestroyInstance", 1)]);
-        assert!(ctx.journal_export().is_none(), "a journal of nothing exports nothing");
+        assert!(
+            ctx.journal_export(&BTreeSet::new()).is_none(),
+            "a journal of nothing exports nothing"
+        );
     }
 
     /// A window in the ring resource, for the reply-stream tests.

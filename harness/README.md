@@ -84,24 +84,37 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   loader at the ICD under test. `--score <file>` writes the score, `--expect <file>` diffs against a pinned one
   and exits non-zero, so `diff` is the whole comparison tool.
 
-  `--rebuild` is the venus snapshot gate, the same fixed point the classic one runs: export a
-  context's journal, replay it into a context that never saw the stream, and require the two
-  journals to describe the same commands in the same order on the same rings. Sequence numbers are
-  not compared — a rebuilt context numbers its own from one.
+  The venus snapshot gate is the same fixed point the classic one runs: export a context's journal,
+  replay it into a context that never saw the stream, and require the two journals to describe the
+  same commands in the same order on the same rings. Sequence numbers are not compared — a rebuilt
+  context numbers its own from one. It runs by default under `--renderer rs`; `--no-rebuild` opts
+  out, and asking for it under `--renderer c` is refused (`journal_held` is a virglrs extension).
 
   **Where it runs is the difference between a gate and a green light.** A capture of a workload
   that exits carries the guest's own teardown, so at end of stream the context has destroyed
   everything it built and its journal is empty — a gate there finds nothing to compare and passes.
   So it runs at each context's last living moment, beside the memory census, which sits there for
   the same reason. `--rebuild-at <n>` runs it after the nth replayed command instead, which is the
-  only shape a real suspend has: the guest still running, its world at its richest. Use it. On
-  `venus.vkrc`, `--rebuild-at 250000` rebuilds 156 entries and 20468 bytes identically, while the
-  teardown gate on the same run retains nothing and says so rather than claiming a pass.
+  only shape a real suspend has: the guest still running, its world at its richest. Use it as well
+  as the default, not instead: on `venus.vkrc` the two answer about different worlds, and a context
+  whose gate says "nothing retained" is reporting exactly that rather than claiming a pass.
 
   A rebuild that reports "identical" is worth only as much as the replay behind it: two journals
   can agree about a world neither of them built. What makes the claim load-bearing is that a
   replayed command naming an object the rebuild could not produce is named in the log and fails
   the restore — so "identical" and "complete" are one answer rather than two.
+
+  **The venus gate crosses the fence**, unlike the classic one. Part of what a journal retains is
+  retained because a *blob*, not the guest, still holds what an entry made, so a rebuilt context
+  with no blobs keeps strictly less and the two journals differ by the gate's own gap. So the
+  replayer remembers every exporting `create_blob` a context is still holding, and remakes each one
+  against the rebuilt context at the journal watermark it was first made at — `replay_upto` to that
+  seq, create the blob, carry on. The watermark is not decoration: a guest may free an allocation
+  later in the same journal, and a context replayed to the end first is then asked to export memory
+  that is already gone. That is the interleave the fence exists for, and it is why the VMM's blob
+  ops are ordered against a seq rather than replayed in a batch at either end. What no VM-free
+  replay reaches is the guest half of a resume — nothing here ever reads back what those blobs
+  point at.
 - `rs/` also builds `venus-roundtrip`, the venus decoder's differential test. It decodes every
   recorded command with the Rust decoder, encodes it straight back, and compares against the bytes
   the guest sent. There is no C dump to diff against because there does not need to be one: the

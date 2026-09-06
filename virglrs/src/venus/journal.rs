@@ -652,6 +652,35 @@ mod tests {
         assert_eq!(out.len(), 1, "only the pool's own create is left");
     }
 
+    /// An allocation a blob resource still holds survives the guest's own free, and the free
+    /// replays after the blob has taken its share.
+    ///
+    /// The compositor case: a client allocates memory, exports it as a blob, the compositor holds
+    /// the buffer, and the client frees -- or exits. The share keeps the bytes alive and the blob
+    /// goes on working, so a restore that dropped the allocation would rebuild a dead blob where
+    /// the original had a live one. Keeping the allocation alone is not enough either: the
+    /// restored world would then hold an allocation the guest had freed, one more of them per
+    /// suspend/resume cycle.
+    #[test]
+    fn an_allocation_a_resource_holds_survives_the_guests_free() {
+        let k = keys(1);
+        let memory = k[0];
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![memory], Vec::new());
+        j.undid(2, &[2; 4], vec![memory], Vec::new());
+
+        // The object is gone from the table, and nothing holds it: neither entry describes
+        // anything, which is the ordinary allocate-then-free.
+        assert!(j.retained(&Some_(vec![])).is_empty(), "an allocation nobody holds leaves nothing");
+
+        // A resource holds a share of its storage. `Live` answers for that as well as for the
+        // table -- see `LiveObjects` -- so both come back, in the order the guest sent them.
+        let out = j.retained(&Some_(vec![memory]));
+        assert_eq!(out.len(), 2, "the allocate is kept, and the free that must follow it");
+        assert_eq!(out[0].wire, vec![1; 4], "allocate first");
+        assert_eq!(out[1].wire, vec![2; 4], "then the free, once the blob has its share");
+    }
+
     /// A ring's create replays on the context's decoder, because at that moment the ring it makes
     /// does not exist to replay on -- and still dies with it.
     #[test]
