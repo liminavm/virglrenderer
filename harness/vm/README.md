@@ -177,9 +177,14 @@ replayer skips classic contexts, so `synoik-glclient.vkrc` replays green whether
 works -- it did, for as long as it did not. Booting is the only thing that scores it: run this
 script, then read the frame while glmark2 is still running. `glmark2 pids:` in its output is the
 first signal (a rejected buffer kills the client after one benchmark), and the frame is the
-verdict -- the client's window carries the scene, the scene changes between two samples, and the
-wood texture in `texture` reads brown rather than blue, which is what says the channels did not
-swap on the way through the surface.
+verdict -- the client's window carries the scene, and the scene changes between two samples.
+
+**Channel order needs a coloured scene, and most of glmark2's are not.** `shading` is a grey horse
+and `texture` a near-neutral wood crate: measured over the client's window they come out
+144/144/144 and 55/55/55, so a swapped red and blue is invisible on them and a frame that shows
+them says nothing about it. `build` is the one that carries it -- a saturated blue cat, 0/0/182 on
+the C reference -- so a sample that lands on `build` and reads blue is the observation, and any
+other scene is a frame that gates compositing and geometry only.
 
 Unlike the Vulkan client corpora below, the C **can** replay this one: the GL client's contexts
 are classic and are skipped, so nothing is recorded out of execution order.
