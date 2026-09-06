@@ -38,9 +38,10 @@ use super::proto::types::{
     VkPipelineStageFlags, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
     VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
     VkRenderPassBeginInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo, VkSubpassContents,
-    VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
+    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo,
+    VkSubpassContents, VkSubresourceLayout, VkViewport, VkWriteDescriptorSet,
 };
 use std::sync::Arc;
 
@@ -327,6 +328,19 @@ pub struct Driver {
     /// way: the record dies at both places the pool does, so a recycled handle finds no record
     /// from a previous life.
     query_pools: BTreeMap<VkQueryPool, QueryFacts>,
+    /// Whether each live semaphore is binary or timeline.
+    ///
+    /// Vulkan fixes this at create and offers no way to ask afterwards, and three entry points are
+    /// valid on a timeline and undefined on a binary. Undefined here is not "an error comes back":
+    /// mesa's `vk_sync_get_value` guards the type with an *assert* and then calls
+    /// `sync->type->get_value`, which KosmicKrisp's binary sync (a `vk_sync_binary` over the
+    /// timeline type) does not define -- so a release build jumps through a null pointer. That is
+    /// a guest taking the host down, so the kind is recorded here and the three calls are checked
+    /// against it at the boundary. See [`Context::timeline`](super::context::Context).
+    ///
+    /// Keyed by host handle for the reason `images` and `query_pools` are, and kept honest the
+    /// same way: the record dies at both places the semaphore does.
+    semaphores: BTreeMap<VkSemaphore, SemaphoreKind>,
     /// Live command and descriptor pools, and what was allocated from each. See [`Pools`].
     pools: Pools,
     /// The device each queue belongs to, by host handle.
@@ -463,6 +477,7 @@ impl Driver {
             memory: BTreeMap::new(),
             images: BTreeMap::new(),
             query_pools: BTreeMap::new(),
+            semaphores: BTreeMap::new(),
             pools: Pools::default(),
             queues: BTreeMap::new(),
         }
@@ -1028,6 +1043,105 @@ impl Driver {
         Ok((n, r))
     }
 
+    // ---------------------------------------------------------------------- semaphores
+    //
+    // Only the kind, because that is the one thing about a semaphore Vulkan will not tell us
+    // later and three entry points are undefined without.
+
+    /// `vkCreateSemaphore`, and the record of which kind the guest asked for.
+    ///
+    /// The kind is the guest's `VkSemaphoreTypeCreateInfo`, or binary when it chained none --
+    /// which is what Vulkan says the absent chain means, not a default this code chose.
+    pub fn create_semaphore(
+        &mut self,
+        device: VkDevice,
+        info: &VkSemaphoreCreateInfo,
+        alloc: Option<&VkAllocationCallbacks>,
+    ) -> Result<VkSemaphore, VkResult> {
+        let kind = match chained::<VkSemaphoreTypeCreateInfo>(&info.pNext) {
+            Some(t) if t.semaphoreType == VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE => {
+                SemaphoreKind::Timeline
+            }
+            _ => SemaphoreKind::Binary,
+        };
+        let sem = self.create_object(device, |d| d.vkCreateSemaphore(), info, alloc)?;
+        self.semaphores.insert(sem, kind);
+        Ok(sem)
+    }
+
+    /// Which kind `sem` is, or `None` for a handle no create here recorded.
+    pub fn semaphore_kind(&self, sem: VkSemaphore) -> Option<SemaphoreKind> {
+        self.semaphores.get(&sem).copied()
+    }
+
+    /// Drop a semaphore's record, at both places Vulkan destroys one: the guest's own
+    /// `vkDestroySemaphore`, and the teardown that empties a device the guest left full.
+    pub fn forget_semaphore(&mut self, sem: VkSemaphore) {
+        self.semaphores.remove(&sem);
+    }
+
+    /// Whether `sem` is a timeline, checked only where the call would actually be made.
+    ///
+    /// The order is deliberate: a device this table does not have is an ordinary error the guest
+    /// can act on, and it keeps its own answer. The undefined call this guards against cannot
+    /// happen without a device to make it on, so the guard stands exactly there and nowhere
+    /// earlier.
+    fn as_timeline(&self, device: VkDevice, sem: VkSemaphore) -> Result<(), NotATimeline> {
+        if !self.devices.contains_key(&device) {
+            return Ok(());
+        }
+        match self.semaphores.get(&sem) {
+            Some(SemaphoreKind::Timeline) => Ok(()),
+            Some(SemaphoreKind::Binary) => Err(NotATimeline::Binary),
+            None => Err(NotATimeline::Unrecorded),
+        }
+    }
+
+    /// `vkGetSemaphoreCounterValue`, on a semaphore that has a counter.
+    pub fn semaphore_counter(
+        &self,
+        device: VkDevice,
+        sem: VkSemaphore,
+        out: &mut u64,
+    ) -> Result<Result<VkResult, VkResult>, NotATimeline> {
+        self.as_timeline(device, sem)?;
+        Ok(self.dev_query_arg(device, sem, out, |d| d.try_vkGetSemaphoreCounterValue()))
+    }
+
+    /// `vkSignalSemaphore`, on a semaphore that has a counter to raise.
+    pub fn signal_semaphore(
+        &self,
+        device: VkDevice,
+        info: &VkSemaphoreSignalInfo,
+    ) -> Result<VkResult, NotATimeline> {
+        self.as_timeline(device, info.semaphore)?;
+        Ok(self.dev_op_info(device, info, |d| d.try_vkSignalSemaphore()))
+    }
+
+    /// `vkWaitSemaphores`, on semaphores that all have counters.
+    ///
+    /// Every one of them, not the first: a wait naming one binary among timelines is the same
+    /// undefined call, and a check that stopped early would be one the guest could walk around.
+    pub fn wait_semaphores(
+        &self,
+        device: VkDevice,
+        info: &VkSemaphoreWaitInfo,
+        timeout: u64,
+    ) -> Result<VkResult, NotATimeline> {
+        // SAFETY: the decoder allocated `pSemaphores` from the batch arena sized to
+        // `semaphoreCount`, and the borrow of `info` this call holds is shorter than that arena.
+        // Read here rather than in the handler because the generator emits a safe slice accessor
+        // for a command's own arrays and not for one nested in a struct, and `context.rs` does not
+        // dereference. `wire_array` is the same reconciliation those accessors use.
+        let named: Option<&[VkSemaphore]> =
+            unsafe { crate::venus::cs::wire_array(info.semaphoreCount as usize, info.pSemaphores) };
+        let named = named.ok_or(NotATimeline::Malformed)?;
+        for sem in named {
+            self.as_timeline(device, *sem)?;
+        }
+        Ok(self.dev_op_info_timeout(device, info, timeout, |d| d.try_vkWaitSemaphores()))
+    }
+
     // ---------------------------------------------------------------------- query pools
     //
     // A pool of GPU-side counters the guest reads back through `vkGetQueryPoolResults`, into a
@@ -1501,6 +1615,9 @@ impl Driver {
                 VkObjectType::VK_OBJECT_TYPE_QUERY_POOL => {
                     self.forget_query_pool(VkQueryPool::from_host(handle));
                 }
+                VkObjectType::VK_OBJECT_TYPE_SEMAPHORE => {
+                    self.forget_semaphore(VkSemaphore::from_host(handle));
+                }
                 _ => {}
             }
         }
@@ -1871,6 +1988,7 @@ impl Driver {
         self.physical_device_exts.clear();
         self.images.clear();
         self.query_pools.clear();
+        self.semaphores.clear();
     }
 
     /// Stand a pool up with contents already in it, as a run of allocations would have left it.
@@ -1906,6 +2024,13 @@ impl Driver {
     pub(super) fn pool_child_id<P: PoolOf>(&self, pool: P, child: P::Child) -> Option<ObjectId> {
         let p = self.pools.open.get(&TypedHandle::of(pool))?;
         p.children.get(&TypedHandle::of(child)).copied()
+    }
+
+    /// Record a semaphore's kind without a create having run, so a planted table can reach the
+    /// three entry points that check it.
+    #[cfg(test)]
+    pub(super) fn plant_semaphore(&mut self, sem: VkSemaphore, kind: SemaphoreKind) {
+        self.semaphores.insert(sem, kind);
     }
 
     /// Point a queue at a device, as `device_queue` would have.
@@ -3933,6 +4058,42 @@ pub fn chained<T: InStruct>(head: &*const core::ffi::c_void) -> Option<&T> {
         node = base.pNext;
     }
     None
+}
+
+/// Why a timeline entry point was refused without being forwarded.
+///
+/// Not a `VkResult`: Vulkan has no error for this, because it is not an error the driver reports
+/// -- it is undefined behaviour the guest was required not to reach. What the caller does with it
+/// is poison the context that asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotATimeline {
+    /// The semaphore is binary, and has no counter to read, raise or wait on.
+    Binary,
+    /// No record of the semaphore's kind. Unreachable through the wire -- the decoder resolved the
+    /// handle through this context's object table, and the record dies exactly where the object
+    /// does -- and refused rather than asserted anyway, because the cost of being wrong about that
+    /// is one poisoned guest against a host abort.
+    Unrecorded,
+    /// A count with no array behind it, in a wait. Also unreachable -- the decoder refuses that
+    /// pair -- and refused here rather than treated as an empty wait, which would report a wait
+    /// that never happened.
+    Malformed,
+}
+
+/// Which kind of semaphore a handle is, which Vulkan fixes at create and never answers again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SemaphoreKind {
+    /// Signalled and waited inside a submit, and nowhere else. It has no counter, and the three
+    /// timeline entry points are undefined on it.
+    Binary,
+    /// A counter the guest can read, raise and block on from outside a submit.
+    Timeline,
+}
+
+// SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the
+// same vk.xml with Vulkan's `sType`/`pNext` header first.
+unsafe impl InStruct for VkSemaphoreTypeCreateInfo {
+    const TYPE: VkStructureType = VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
 }
 
 // SAFETY: this is the struct venus-protocol decodes for that tag, generated `repr(C)` from the

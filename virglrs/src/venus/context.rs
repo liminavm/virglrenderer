@@ -20,7 +20,7 @@ use super::budget::{Account, Budget};
 use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
-use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
+use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd, NotATimeline};
 use super::journal::{self, Journal, Seq};
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
@@ -1971,14 +1971,27 @@ impl Commands for Handlers<'_> {
     simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence_mut);
     simple_destroy!(vkDestroyFence, vn_command_vkDestroyFence, fence);
 
-    simple_create!(
-        vkCreateSemaphore,
-        vn_command_vkCreateSemaphore,
-        pCreateInfo,
-        pSemaphore,
-        handle_pSemaphore_mut
-    );
-    simple_destroy!(vkDestroySemaphore, vn_command_vkDestroySemaphore, semaphore);
+    /// A semaphore, and the one thing about it Vulkan will not answer later.
+    ///
+    /// Not a [`simple_create`]: whether the guest asked for a binary or a timeline semaphore is
+    /// fixed here and can never be queried again, and three entry points below are undefined
+    /// without it. See [`Driver::semaphores`](super::driver::Driver).
+    fn vkCreateSemaphore(&mut self, args: &mut vn_command_vkCreateSemaphore<'_>) {
+        let Some(info) = self.names(args.pCreateInfo) else { return };
+        let host = self.driver.create_semaphore(args.device, info, args.pAllocator);
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        self.plant("vkCreateSemaphore", args.pSemaphore(), args.handle_pSemaphore_mut(), host);
+    }
+
+    fn vkDestroySemaphore(&mut self, args: &mut vn_command_vkDestroySemaphore<'_>) {
+        self.driver.destroy_object(
+            args.device,
+            |d| d.vkDestroySemaphore(),
+            args.semaphore,
+            args.pAllocator,
+        );
+        self.driver.forget_semaphore(args.semaphore);
+    }
 
     pool_create!(
         vkCreateCommandPool,
@@ -4057,7 +4070,9 @@ impl Commands for Handlers<'_> {
     // this side. A timeline semaphore has a counter the guest can read, raise and block on
     // directly, and these three are how it does that.
     //
-    // All three are forwarded with nothing added. The handles inside `VkSemaphoreWaitInfo` and
+    // Each checks that the semaphore it was handed really is a timeline, which is the one thing
+    // the decoder cannot check for them -- see [`Context::timeline`]. Everything else about the
+    // arguments it does check. The handles inside `VkSemaphoreWaitInfo` and
     // `VkSemaphoreSignalInfo` are already host handles: the generated decoder resolves each one
     // through the object table as it reads it, so a guest naming a semaphore it does not own stops
     // its own ring before any handler is reached. `pSemaphores` and `pValues` are likewise already
@@ -4071,11 +4086,15 @@ impl Commands for Handlers<'_> {
     fn vkGetSemaphoreCounterValue(&mut self, args: &mut vn_command_vkGetSemaphoreCounterValue<'_>) {
         let (device, semaphore) = (args.device, args.semaphore);
         let Some(out) = self.fills(args.pValue_mut()) else { return };
-        let r = self
-            .driver
-            .dev_query_arg(device, semaphore, out, |d| d.try_vkGetSemaphoreCounterValue());
-        if let Some(ret) = self.asked(r) {
-            args.ret = ret;
+        let r = self.driver.semaphore_counter(device, semaphore, out);
+        match r {
+            Err(NotATimeline::Binary) => self.reject = Some("read a binary semaphore's counter"),
+            Err(_) => self.reject = Some("named an unrecorded semaphore"),
+            Ok(r) => {
+                if let Some(ret) = self.asked(r) {
+                    args.ret = ret;
+                }
+            }
         }
     }
 
@@ -4085,7 +4104,11 @@ impl Commands for Handlers<'_> {
             self.reject = Some("signalled a semaphore it did not name");
             return;
         };
-        args.ret = self.driver.dev_op_info(args.device, info, |d| d.try_vkSignalSemaphore());
+        match self.driver.signal_semaphore(args.device, info) {
+            Err(NotATimeline::Binary) => self.reject = Some("signalled a binary semaphore"),
+            Err(_) => self.reject = Some("named an unrecorded semaphore"),
+            Ok(ret) => args.ret = ret,
+        }
     }
 
     /// Block until a set of timeline semaphores reaches the values the guest named.
@@ -4098,9 +4121,14 @@ impl Commands for Handlers<'_> {
             self.reject = Some("waited on semaphores it did not name");
             return;
         };
-        args.ret = self
-            .driver
-            .dev_op_info_timeout(args.device, info, args.timeout, |d| d.try_vkWaitSemaphores());
+        match self.driver.wait_semaphores(args.device, info, args.timeout) {
+            Err(NotATimeline::Binary) => self.reject = Some("waited on a binary semaphore"),
+            Err(NotATimeline::Unrecorded) => self.reject = Some("named an unrecorded semaphore"),
+            Err(NotATimeline::Malformed) => {
+                self.reject = Some("waited on semaphores it did not send")
+            }
+            Ok(ret) => args.ret = ret,
+        }
     }
 
     /// Recycle everything a command pool handed out, without destroying the pool or the buffers.
@@ -5468,6 +5496,11 @@ mod tests {
                 table.add(ObjectId(id), ty, HostHandle(host), None).expect("a fresh id");
             }
         }
+        // These three commands are undefined on a binary semaphore and are refused for it, so the
+        // pair has to be what a create would have recorded -- see `Driver::as_timeline`.
+        for sem in [HOST_SEM_A, HOST_SEM_B] {
+            ctx.driver.plant_semaphore(VkSemaphore(sem), driver::SemaphoreKind::Timeline);
+        }
 
         // The counter query goes first so its reply -- the only one carrying a value the driver
         // wrote -- sits at the front of the window, where no other reply's size can move it.
@@ -5619,6 +5652,219 @@ mod tests {
         ));
         assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "no device to ask");
         assert!(ctx.fatal());
+    }
+
+    /// A binary semaphore in a timeline command costs the guest its context and nothing else.
+    ///
+    /// Not a validation nicety. mesa guards the semaphore's type with an `assert` and then calls
+    /// `sync->type->get_value` (`vk_sync.c:218`); KosmicKrisp's binary semaphore is a
+    /// `vk_sync_binary`, whose type table defines `signal`, `wait_many`, `reset` and the two
+    /// sync-file entry points and *not* `get_value` (`vk_sync_binary.c:145`). A release build
+    /// therefore calls through a null pointer, which is a guest ending the host process -- and
+    /// this renderer forwarded all three of these unconditionally. So the kind is recorded at
+    /// create and the call stops here.
+    ///
+    /// All three, one context each: the guard belongs to each entry point's own lookup, and one
+    /// that forgot it would be invisible in another's test. Each must poison rather than answer,
+    /// because there is no result code that means "the call you made is undefined".
+    #[test]
+    fn a_binary_semaphore_in_a_timeline_command_is_refused() {
+        use super::super::proto::serialize as ser;
+        use super::super::proto::types as ty;
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkSemaphore, VkSemaphoreSignalInfo, VkSemaphoreWaitInfo,
+            VkStructureType,
+        };
+
+        const DEVICE: u64 = 3;
+        const WINDOW: usize = 0x21000;
+        const GUEST_DEV: u64 = 0x5001;
+        const GUEST_SEM: u64 = 0x5002;
+        const HOST_SEM: u64 = 0x901;
+
+        /// The create the kind is recorded at, so this test runs the real path rather than a
+        /// planted record: the guest asks for a semaphore with no `VkSemaphoreTypeCreateInfo`,
+        /// which is Vulkan saying binary.
+        unsafe extern "C" fn create(
+            _d: VkDevice,
+            info: *const ty::VkSemaphoreCreateInfo,
+            _a: *const VkAllocationCallbacks,
+            out: *mut VkSemaphore,
+        ) -> VkResult {
+            assert!(!info.is_null() && !out.is_null());
+            // SAFETY: the single arena slot the decoder allocated for this out-parameter.
+            unsafe { *out = VkSemaphore(HOST_SEM) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_semaphore(
+            _d: VkDevice,
+            _s: VkSemaphore,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        /// The rest answer nothing: reaching any of them is the failure under test, and a planted
+        /// table aborts on an entry point it was never given.
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+        /// The three under test, for the timeline leg where they are reached for real.
+        unsafe extern "C" fn counter(_d: VkDevice, _s: VkSemaphore, out: *mut u64) -> VkResult {
+            assert!(!out.is_null());
+            // SAFETY: the single arena slot the decoder allocated for this out-parameter.
+            unsafe { *out = 0 };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn wait_sems(
+            _d: VkDevice,
+            _i: *const VkSemaphoreWaitInfo,
+            _t: u64,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn signal_sem(
+            _d: VkDevice,
+            _i: *const VkSemaphoreSignalInfo,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+
+        let sems = [VkSemaphore(GUEST_SEM)];
+        let vals = [0x77u64];
+        let wait = VkSemaphoreWaitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            semaphoreCount: 1,
+            pSemaphores: sems.as_ptr(),
+            pValues: vals.as_ptr(),
+            ..Default::default()
+        };
+        let signal = VkSemaphoreSignalInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            semaphore: VkSemaphore(GUEST_SEM),
+            value: 0xabcd,
+            ..Default::default()
+        };
+
+        let mut value = 0u64;
+        let mut cv = ty::vn_command_vkGetSemaphoreCounterValue::default();
+        cv.device = VkDevice(GUEST_DEV);
+        cv.semaphore = VkSemaphore(GUEST_SEM);
+        cv.plant_pValue(&mut value);
+
+        let commands: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "vkGetSemaphoreCounterValue",
+                wire!(
+                    ser::vn_sizeof_vkGetSemaphoreCounterValue_args,
+                    ser::vn_encode_vkGetSemaphoreCounterValue_args,
+                    cv,
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkWaitSemaphores",
+                wire!(
+                    ser::vn_sizeof_vkWaitSemaphores_args,
+                    ser::vn_encode_vkWaitSemaphores_args,
+                    ty::vn_command_vkWaitSemaphores {
+                        device: VkDevice(GUEST_DEV),
+                        pWaitInfo: Some(&wait),
+                        timeout: u64::MAX,
+                        ..Default::default()
+                    },
+                    GENERATE_REPLY
+                ),
+            ),
+            (
+                "vkSignalSemaphore",
+                wire!(
+                    ser::vn_sizeof_vkSignalSemaphore_args,
+                    ser::vn_encode_vkSignalSemaphore_args,
+                    ty::vn_command_vkSignalSemaphore {
+                        device: VkDevice(GUEST_DEV),
+                        pSignalInfo: Some(&signal),
+                        ..Default::default()
+                    },
+                    GENERATE_REPLY
+                ),
+            ),
+        ];
+
+        for (name, cmd) in commands {
+            for timeline in [false, true] {
+                let t = ring_table();
+                let g = crate::vulkan::global();
+                let mut todo = Unimplemented::default();
+                let mut ctx = Context::new(
+                    ContextKey::for_test(ContextId::new(1).unwrap()),
+                    &Budget::with_cap(None, false),
+                );
+                let mut fns = crate::vulkan::Device::default();
+                fns.plant_vkDeviceWaitIdle(idle);
+                fns.plant_vkDestroyDevice(destroy_device);
+                fns.plant_vkCreateSemaphore(create);
+                fns.plant_vkDestroySemaphore(destroy_semaphore);
+                fns.plant_vkGetSemaphoreCounterValue(counter);
+                fns.plant_vkWaitSemaphores(wait_sems);
+                fns.plant_vkSignalSemaphore(signal_sem);
+                ctx.driver.plant_device(VkDevice(DEVICE), fns);
+                {
+                    let mut table = ctx.objects.borrow_mut();
+                    table
+                        .add(
+                            ObjectId(GUEST_DEV),
+                            VkObjectType::VK_OBJECT_TYPE_DEVICE,
+                            HostHandle(DEVICE),
+                            None,
+                        )
+                        .expect("a fresh id");
+                }
+
+                // The semaphore comes from a create, not from a planted record: what this test is
+                // really asking is whether the create wrote the kind down. Both kinds, from the same
+                // command bytes -- a create that recorded nothing would refuse the timeline too, and
+                // a test that only ever sent a binary could not tell that apart from working.
+                let ty_info = ty::VkSemaphoreTypeCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                    semaphoreType: ty::VkSemaphoreType::VK_SEMAPHORE_TYPE_TIMELINE,
+                    ..Default::default()
+                };
+                let info = ty::VkSemaphoreCreateInfo {
+                    sType: VkStructureType::VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                    pNext: if timeline {
+                        core::ptr::addr_of!(ty_info).cast()
+                    } else {
+                        core::ptr::null()
+                    },
+                    ..Default::default()
+                };
+                let mut id = VkSemaphore(GUEST_SEM);
+                let mut made = ty::vn_command_vkCreateSemaphore::default();
+                made.device = VkDevice(GUEST_DEV);
+                made.pCreateInfo = Some(&info);
+                made.plant_pSemaphore(&mut id);
+
+                let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+                batch.extend_from_slice(&wire!(
+                    ser::vn_sizeof_vkCreateSemaphore_args,
+                    ser::vn_encode_vkCreateSemaphore_args,
+                    made,
+                    GENERATE_REPLY
+                ));
+                assert!(ctx.submit(&batch, &mut todo, &g, &t).ran(), "the create itself is served");
+
+                let mut batch = wire_set_reply(&reply_at(WINDOW, 0x100));
+                batch.extend_from_slice(&cmd);
+                let ran = ctx.submit(&batch, &mut todo, &g, &t).ran();
+                if timeline {
+                    assert!(ran, "{name} on a timeline is served");
+                    assert!(!ctx.fatal(), "{name} on a timeline poisons nothing");
+                } else {
+                    assert!(!ran, "{name} on a binary is refused");
+                    assert!(ctx.fatal(), "{name} poisons the context that sent it");
+                }
+            }
+        }
     }
 
     /// What one command's reply looks like when the answer is the one given, built by the
