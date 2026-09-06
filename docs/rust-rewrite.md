@@ -893,10 +893,6 @@ it survives the session it was found in.
   The keys elsewhere are generational; this one is not, and the fix is to make it so rather than
   to purge at the reuse site.
 
-- **Two ids still travel as bare integers where a newtype belongs.** `venus_memory_read` takes a
-  `u64` for what is an object id, and the `BlobId`-means-`ObjectId` decision is made in three
-  places instead of once. `venus_memory_export` already resolves it once and is the pattern.
-
 - **The libkrun opaque-journal branch is parked and ready.** `limina-p5-opaque-journal` merges into
   `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks
   it now.
