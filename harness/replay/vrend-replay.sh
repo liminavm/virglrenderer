@@ -34,6 +34,11 @@ shift
 # Resolve --score/--expect against the caller's directory: everything below runs from the script's.
 ARGS=()
 RENDERER=""
+# The snapshot-journal gate runs by default on the Rust tree, where it passes on every classic
+# fixture with no drops. A gate that has to be remembered is a gate that stops being run, and
+# this one costs milliseconds. --no-rebuild opts out; the C tree has no journal ABI to gate.
+REBUILD=1
+ASKED=0     # whether the caller named --rebuild, which decides refuse-vs-skip for the C tree
 while [ $# -gt 0 ]; do
   case "$1" in
     --renderer)
@@ -49,9 +54,21 @@ while [ $# -gt 0 ]; do
         *)  ARGS+=("$1" "$PWD/$2") ;;
       esac
       shift 2 ;;
+    --rebuild)    REBUILD=1; ASKED=1; shift ;;
+    --no-rebuild) REBUILD=0; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
+# The C reference answers -ENOTSUP for the journal entry points, so asking it to rebuild scores
+# nothing and reports a failure about the ABI rather than about the corpus. Refuse rather than
+# quietly skip: a gate that silently does not run is worse than one that is not asked for.
+if [ "$RENDERER" = c ]; then
+  if [ "$ASKED" = 1 ]; then
+    echo "--rebuild needs --renderer rs (the C tree has no journal ABI)" >&2; exit 2
+  fi
+  REBUILD=0
+fi
+[ "$REBUILD" = 1 ] && ARGS+=(--rebuild)
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 cd "$(dirname "$0")"

@@ -44,11 +44,20 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   `REPLAY_DUMP_DIR` (narrowed by `REPLAY_DUMP_W`) writes every scored readback and surface as raw
   BGRA, for `rgba2png.py` and a pixel diff.
 
-  `--rebuild` gates the snapshot journal: it exports what each context retained, replays it into a
-  context that never saw the stream, and requires the two journals to describe the same steps in
-  the same order (positions are renumbered by the rebuild, so they are not compared). It is the
-  floor, not the ceiling — a durable command the recorder never learned to keep is missing from
-  both journals and they agree about it anyway. Only pixels answer that.
+  The snapshot-journal gate runs by default under `--renderer rs`; `--no-rebuild` opts out, and
+  asking for it under `--renderer c` is refused (the C answers `-ENOTSUP` for the journal ABI, so
+  it would report about the ABI rather than the corpus). It exports what each context retained,
+  replays it into a context that never saw the stream, and requires the two journals to describe
+  the same steps in the same order (positions are renumbered by the rebuild, so they are not
+  compared).
+
+  It is a fixed-point test — replaying a journal must yield a world whose journal is that same
+  journal — and so it is the floor, not the ceiling. It catches an entry that fails to replay, an
+  order that binds before it creates, a serializer that loses a shader's later chunks. It cannot
+  catch a durable command the recorder never learned to keep: that is absent from both journals
+  and they agree about it anyway. It also rebuilds only the end-of-stream world, and feeds the
+  whole journal at once — so it never exercises the fence, the interleave where the VMM creates a
+  blob partway through the replay. Only a real suspend/resume scores that.
 
   Every classic fixture passes it, with no drops. A drop is therefore a finding, never noise:
   each one names the command and the fault, and is either a create the recorder failed to keep or
