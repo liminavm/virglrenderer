@@ -39,6 +39,7 @@ use super::resource::{self, Limits, Resource, Storage, Texture, ViewKey};
 use super::transfer::{self, Info};
 use super::{debug, shader, tgsi, video};
 use crate::guest_mem::{HostSpan, Iov, PixelSource};
+use crate::ids::BlobId;
 use crate::ids::{ContextId, ResourceHandle};
 use crate::videotoolbox;
 use std::cell::Cell;
@@ -320,6 +321,16 @@ pub enum Fault {
         cmd: Cmd,
         what: &'static str,
     },
+    /// A `PIPE_RESOURCE_CREATE` the host could not build.
+    ///
+    /// Distinct from [`Fault::RefusedResource`] because there is no handle: a described resource
+    /// is named by the blob id a later claim will look it up under, and by nothing else until
+    /// that claim gives it one.
+    DescribedResource {
+        cmd: Cmd,
+        blob: BlobId,
+        why: resource::Refusal,
+    },
     /// A video command the guest had no business sending: an unserved profile, a handle it never
     /// created, a frame out of sequence. A host that merely fails to decode a frame is not here
     /// -- that is logged and the stream continues.
@@ -338,6 +349,9 @@ impl fmt::Display for Fault {
             }
             Fault::IllegalResource { cmd, handle } => {
                 write!(f, "{}: no such resource {handle}", cmd.name())
+            }
+            Fault::DescribedResource { cmd, blob, why } => {
+                write!(f, "{}: blob {blob}: {why}", cmd.name())
             }
             Fault::RefusedResource { cmd, handle, why } => {
                 write!(f, "{}: resource {handle} cannot be made: {why:?}", cmd.name())
@@ -1052,6 +1066,18 @@ pub struct Context {
     /// How far this context's journal has got. One counter, because the order a rebuild replays
     /// in, the create-before-use guarantee and the VMM's fence watermark are one order.
     seq: Seq,
+    /// Resources this context's command stream described and nothing has claimed yet.
+    ///
+    /// `PIPE_RESOURCE_CREATE` builds a resource and gives it a blob id instead of a handle; the
+    /// `RESOURCE_CREATE_BLOB` that follows on the control queue names that id and gives it one.
+    /// Between the two there is a real host allocation that no handle reaches, so it is held
+    /// here -- keyed by the only name it has, and owned by the context the name means something
+    /// in. A blob id is per-context on the wire, and two contexts using the same number are
+    /// naming two different things.
+    ///
+    /// Owned rather than registered, so an id the guest describes and never claims dies with the
+    /// context and no destroy path has to remember it exists.
+    described: BTreeMap<BlobId, (Resource, Vec<u32>)>,
 }
 
 impl Context {
@@ -1065,6 +1091,7 @@ impl Context {
             owed: Vec::new(),
             replay: None,
             seq: Seq::default(),
+            described: BTreeMap::new(),
         };
         ctx.create_sub(host, SubContextId(0))?;
         Ok(ctx)
@@ -1100,6 +1127,13 @@ impl Context {
 
     /// `vrend_destroy_context`: unbind what the C unbinds, then every sub-context.
     pub fn destroy(mut self, host: &mut Host<'_>) {
+        // The described-but-unclaimed first, while a GL context of this share group is still
+        // current: their storage is real allocations that no handle reaches, so nothing else
+        // will ever come back for them.
+        self.make_current(host);
+        for (_, (res, _)) in std::mem::take(&mut self.described) {
+            res.destroy(host.gl);
+        }
         let ids: Vec<SubContextId> = self.subs.keys().rev().copied().collect();
         for id in ids {
             let sub = self.subs.remove(&id).expect("listed");
@@ -1315,6 +1349,50 @@ impl Context {
         order(subs.chain(types))
     }
 
+    /// `vrend_renderer_pipe_resource_create`: build a resource the command stream describes and
+    /// park it under the blob id it named, for a `RESOURCE_CREATE_BLOB` to claim.
+    ///
+    /// This is the classic half of what a nonzero `blob_id` means at `RESOURCE_CREATE_BLOB`. A
+    /// venus context's id names device memory it allocated; a classic context's names a resource
+    /// it described here, and there is nothing in the number itself to tell the two apart -- the
+    /// context is what says which. See [`Renderer::resource_create_blob`].
+    ///
+    /// Zero is not an id: it is the wire's way of saying "no blob", so `CREATE_BLOB` can never
+    /// come back for it. Nor is one the context is already holding: the C's list quietly keeps
+    /// both and hands out the older, which is a guest reading an allocation it thought it had
+    /// replaced. Both are the guest's error and neither can be repaired here.
+    fn describe_resource(
+        &mut self,
+        host: &mut Host<'_>,
+        blob_id: BlobId,
+        args: resource::Args,
+        wire: &[u32],
+    ) -> Result<(), Fault> {
+        let cmd = Cmd::PipeResourceCreate;
+        if blob_id.0 == 0 {
+            return Err(Fault::OutOfRange { cmd, what: "a blob id of zero names nothing" });
+        }
+        if self.described.contains_key(&blob_id) {
+            return Err(Fault::OutOfRange { cmd, what: "that blob id is already described" });
+        }
+        self.make_current(host);
+        let res =
+            Resource::create(host.gl, host.winsys, host.features, host.formats, host.limits, args)
+                .map_err(|why| Fault::DescribedResource { cmd, blob: blob_id, why })?;
+        self.described.insert(blob_id, (res, wire.to_vec()));
+        Ok(())
+    }
+
+    /// Hand over the resource described under `blob_id`, and the command that described it.
+    ///
+    /// Taking, not lending: the claim gives the resource a handle and the resource table takes
+    /// it over from here, so the id stops naming anything the moment it is answered. That is the
+    /// C's `vrend_get_blob_pipe` zeroing `res->blob_id`, except that here there is no field left
+    /// to go stale.
+    pub fn claim_described(&mut self, blob_id: BlobId) -> Option<(Resource, Vec<u32>)> {
+        self.described.remove(&blob_id)
+    }
+
     fn poison(&mut self, f: Fault) -> Result<(), Fault> {
         eprintln!("[virglrs] vrend: context poisoned: {f}");
         self.fault = Some(f.clone());
@@ -1526,9 +1604,36 @@ impl Context {
                 let plane = planes.first().copied().unwrap_or(Plane { stride: 0, offset: 0 });
                 self.set_resource_type(host, resource, format, bind, width, height, plane, wire)
             }
-            Command::PipeResourceCreate { .. }
-            | Command::GetMemoryInfo(_)
-            | Command::GetPipeResourceLayout { .. } => {
+            Command::PipeResourceCreate {
+                target,
+                format,
+                bind,
+                width,
+                height,
+                depth,
+                array_size,
+                last_level,
+                nr_samples,
+                flags,
+                blob_id,
+            } => self.describe_resource(
+                host,
+                blob_id,
+                resource::Args {
+                    target,
+                    format,
+                    bind: resource::Bind(bind),
+                    width,
+                    height,
+                    depth,
+                    array_size,
+                    last_level,
+                    nr_samples,
+                    flags: resource::ResourceFlags(flags),
+                },
+                wire,
+            ),
+            Command::GetMemoryInfo(_) | Command::GetPipeResourceLayout { .. } => {
                 host.todo.note(kind.name());
                 Err(Fault::Unimplemented { cmd: kind, what: "blob resources" })
             }

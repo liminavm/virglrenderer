@@ -526,7 +526,14 @@ impl Untyped {
                 zero_texture(gl, formats, &args, &storage);
             }
         }
-        Ok(Resource { args, storage, guest_pixels, typed_by: None })
+        Ok(Resource {
+            args,
+            storage,
+            guest_pixels,
+            typed_by: None,
+            described_by: None,
+            mapped: None,
+        })
     }
 
     /// A share of the surface these bytes are, if they are one.
@@ -617,6 +624,11 @@ pub enum Storage {
         name: BufferName,
         /// The binding target the buffer is created and mapped through, from its bind.
         target: GLenum,
+        /// The `glBufferStorage` flags the store was made with; zero for a `glBufferData` store,
+        /// which has none. Kept because `glMapBufferRange` on an immutable store must be asked
+        /// with the same bits, and re-deriving them from the args at the map is how the two come
+        /// to disagree.
+        storage_flags: GLbitfield,
         /// The buffer texture a sampler view of this buffer samples through, made at the first
         /// such view (`tbo_tex_id`).
         tbo: Option<TextureName>,
@@ -1006,6 +1018,27 @@ pub struct Resource {
     /// no position to keep: it must precede everything that views the resource and has no order
     /// against another resource's, so the export emits it ahead of everything instead.
     pub typed_by: Option<Vec<u32>>,
+    /// The `PIPE_RESOURCE_CREATE` that described this resource, for a rebuild to send again.
+    ///
+    /// `Some` only for a resource a classic command stream described and a `CREATE_BLOB` then
+    /// claimed -- see [`Context::describe_resource`](super::context::Context::describe_resource).
+    /// Such a resource has no other way back: the VMM's journal holds the claim, and the claim
+    /// finds nothing to claim unless the describe ran first.
+    ///
+    /// Dwords and no position, for the same reason as `typed_by`, and replayed the same way --
+    /// ahead of everything. The only order it owes is describe-before-claim, and the VMM advances
+    /// a context's journal to the claim's watermark before replaying the claim, so anything at
+    /// seq zero is already there when the claim arrives.
+    pub described_by: Option<Vec<u32>>,
+    /// Where the driver put this buffer's persistent mapping, once something asked for one.
+    ///
+    /// Only the address: how far it runs is `args.width`, the size the store was created at, and
+    /// a second copy of that here is a number that can come to disagree with the buffer it
+    /// measures -- which is a guest mapping past the end of an allocation.
+    ///
+    /// It lives exactly as long as the buffer: deleting a mapped buffer unmaps it, and nothing
+    /// can reach this address once the resource holding it is gone.
+    pub mapped: Option<usize>,
 }
 
 /// Which resources copy guest pages, as of one batch.
@@ -1074,7 +1107,8 @@ impl Resource {
         batch: u64,
         src: &PixelSource<'_>,
     ) {
-        let Resource { args, storage, guest_pixels, typed_by: _ } = self;
+        let Resource { args, storage, guest_pixels, typed_by: _, described_by: _, mapped: _ } =
+            self;
         let Some(gp) = guest_pixels else {
             return;
         };
@@ -1237,7 +1271,14 @@ impl Resource {
                 alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
             }
         };
-        Ok(Resource { args, storage, guest_pixels: None, typed_by: None })
+        Ok(Resource {
+            args,
+            storage,
+            guest_pixels: None,
+            typed_by: None,
+            described_by: None,
+            mapped: None,
+        })
     }
 
     /// The texture storage, for the operations only a texture has.
@@ -1251,6 +1292,40 @@ impl Resource {
     /// Delete what only this resource holds. Texture storage a framebuffer is still attached to
     /// is handed back instead: the caller keeps it until the last attachment lets go.
     #[must_use = "texture storage still attached somewhere has to be kept, not dropped"]
+    /// Take the persistent mapping of this resource's buffer, so the guest may be given the
+    /// pages themselves rather than a copy of them.
+    ///
+    /// `false` for anything that is not an immutable buffer store: a texture has no host address,
+    /// and a mutable `glBufferData` store may be moved by the driver under any call, so a pointer
+    /// into one is good until the next command and no longer. That is the C's check
+    /// (`VREND_STORAGE_GL_BUFFER | VREND_STORAGE_GL_IMMUTABLE`), and it is what makes the address
+    /// this returns safe to hand to a VMM.
+    ///
+    /// Idempotent: a resource already mapped answers with the mapping it has. Mapping a buffer
+    /// twice is a GL error, and two addresses for one allocation is the bug this whole path
+    /// exists to avoid.
+    pub fn map_persistent(&mut self, gl: &Gl) -> bool {
+        if self.mapped.is_some() {
+            return true;
+        }
+        let Storage::Buffer { name, target, storage_flags, .. } = self.storage else {
+            return false;
+        };
+        if storage_flags == 0 {
+            return false;
+        }
+        gl.bind_buffer(target, Some(name));
+        gl.drain_errors();
+        let addr = gl.map_buffer_persistent(target, self.args.width as usize, storage_flags);
+        let err = gl.drain_errors();
+        gl.bind_buffer(target, None);
+        if err != GL_NO_ERROR {
+            return false;
+        }
+        self.mapped = addr;
+        addr.is_some()
+    }
+
     pub fn destroy(self, gl: &Gl) -> Option<Arc<Texture>> {
         match self.storage {
             Storage::Guest | Storage::Host(_) => None,
@@ -1604,7 +1679,7 @@ fn alloc_buffer(
         gl.delete_buffer(name);
         return Err(Refusal::GlError(err));
     }
-    Ok(Storage::Buffer { name, target, tbo: None })
+    Ok(Storage::Buffer { name, target, storage_flags, tbo: None })
 }
 
 /// `tgsitargettogltarget`, with the GLES rewrites `vrend_resource_alloc_texture` applies after
