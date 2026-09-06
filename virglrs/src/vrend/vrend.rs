@@ -249,6 +249,15 @@ impl Vrend {
         (host, contexts)
     }
 
+    /// What every live context has retained for a rebuild.
+    pub fn journal_census(&self) -> crate::vrend::journal::Census {
+        let mut c = crate::vrend::journal::Census::default();
+        for ctx in self.contexts.values() {
+            c += ctx.journal_census();
+        }
+        c
+    }
+
     // ---- contexts ----
 
     pub fn context_create(&mut self, id: ContextId, guest: &dyn Guest) -> Result<(), EglError> {

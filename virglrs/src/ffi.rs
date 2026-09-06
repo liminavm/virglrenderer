@@ -1304,6 +1304,7 @@ pub extern "C" fn virgl_renderer_limina_dump_state() {
     with((), |r| {
         let (res, ctx) = r.counts();
         eprintln!("[virglrs] {res} resources, {ctx} contexts, {:?}", r.config);
+        eprintln!("[virglrs] vrend journal: {}", r.journal_census());
         let todo = r.venus_todo();
         if !todo.is_empty() {
             let total: u64 = todo.iter().map(|(_, n)| n).sum();
