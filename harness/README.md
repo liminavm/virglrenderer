@@ -702,8 +702,9 @@ It is also the only read that survives the allocation. A host-visible venus allo
 pages the blob holds a *share* of, so `vkFreeMemory` retires the record and leaves the mapping
 good — and every venus corpus reaches that state: measured 2026-09-06, `venus` frees all 26 of its
 exported allocations and still has five blobs alive to read at scoring, `synoik-lifecycle` frees
-nine. A resource that kept the published address without the share would fault or read rubbish on
-exactly those lines.
+nine. The minted pages are an `mmap` whose last holder `munmap`s them (`GuestMap::drop`), so a
+resource that kept the published address without the share would take the replayer down with a
+fault on exactly those lines rather than quietly reading stale heap.
 
 Each score is sampled four times, 200 ms apart after a 500 ms lead, and stability is decided per
 allocation — see "The census decides stability per allocation" below. The replay skips every ring
