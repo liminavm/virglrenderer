@@ -59,15 +59,27 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   whole journal at once — so it never exercises the fence, the interleave where the VMM creates a
   blob partway through the replay. Only a real suspend/resume scores that.
 
-  Every classic fixture passes it, with no drops. A drop is therefore a finding, never noise:
-  each one names the command and the fault, and is either a create the recorder failed to keep or
-  a state the corpus reached that a guest cannot. Never file one under "benign stale reference"
-  the way the C's `drops_by_klass` does — the two are indistinguishable from the histogram.
+  A drop is a finding, never noise: each one names the command and the fault, and is either a
+  create the recorder failed to keep or a state the corpus reached. Never file one under "benign
+  stale reference" the way the C's `drops_by_klass` does — the two are indistinguishable from the
+  histogram. So a drop fails the run, and the only way to accept one is to pin it:
+  `--rebuild-score F` writes the report — entries in and out per context, and for each lost entry
+  its kind, sub-context, size and leading dwords, which is where the object handle and the
+  resource it names live — and `--rebuild-expect F` requires that exact report. A corpus with no
+  pin must lose nothing, which is where every corpus but `vrend-webgl` stands. The pin is a
+  subsequence check, not a licence: a rebuild may lose an entry, never invent or reorder one, and
+  a rebuilt journal carrying an entry the source does not have fails whatever is pinned.
+
+  What earns a pin is a drop the guest caused. A guest that destroys a resource under an object of
+  its own leaves a create no rebuild can replay, and the object is already unusable — binding it
+  faults on the resource lookup whether or not a rebuild ever happened — so dropping it changes
+  nothing the guest can observe. Two guest processes sharing a buffer reach that and one cannot,
+  which is why the browser corpus is the only pinned one.
 
   The synthetic corpora score a resource by unref'ing it, so they retire their surfaces and
-  sampler views first. That is not the gate being appeased: a view holds a reference to the
-  resource it names, so a guest cannot free one underneath it, and a corpus that did would be
-  scoring a world no guest reaches.
+  sampler views first. That is not the gate being appeased: within one process a view holds a
+  reference to the resource it names, so a guest cannot free one underneath it, and a corpus that
+  did would be scoring a world no single-process guest reaches.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `corpus.py` — the synthetic-corpus writer: the trace container and the virgl commands, shared
   by the `make-*-corpus.py` scripts.
@@ -353,11 +365,18 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the compositor. The page must not ask for MSAA; `../vm/README.md` says why, and it is not a
   renderer problem.
 
-  **It is the one corpus that fails the rebuild gate, and only at that `--ctx`.** The score is
-  bit-identical either way; with ctx 9 replayed as well, ctx 2 keeps five `CreateObject` entries
-  on a resource the browser unrefs, and the rebuild is 131 entries in and 126 out. Run it at the
-  default single context and the gate is green on a world where the browser never ran, which is
-  not the world the corpus is about. `docs/rust-rewrite.md` carries the decision that is owed.
+  **It is the one corpus whose rebuild loses anything, so it is the one with a pin.** Replay it as
+
+  ```sh
+  ./vrend-replay.sh ../vm/captures/vrend-webgl.bin --renderer rs --ctx 2,9 \
+      --expect fixtures/vrend-webgl.score --rebuild-expect fixtures/vrend-webgl.rebuild
+  ```
+
+  The five entries in that pin are sampler views ctx 2 holds over window buffers ctx 9 destroys —
+  the compositor and the browser are two guest processes, and one's unref does not consult the
+  other's views. Run it at the default single context and the score is still bit-identical but
+  the rebuild is green on a world where the browser never ran, which is not the world the corpus
+  is about.
 
   **Every readback asks at the format's own bytes per texel.** It used to ask at four, everywhere,
   under a belief written into the comment: four "is what every format this scores actually is".

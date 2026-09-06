@@ -873,19 +873,6 @@ waiting on a call rather than on work.
   conversion is unreachable and unscoreable, and refusing it by name is the resting state; the
   decision is whether to keep hunting for one.
 
-- **A real capture keeps a classic object on a resource the guest destroyed.** `vrend-webgl` at
-  the `--ctx 2,9` it is documented to replay at scores bit-identically to its pinned fixture and
-  then fails the rebuild gate: ctx 2 retains five `CreateObject` entries naming resource 1484,
-  which the stream unrefs, so 131 entries go in and 126 come out. The state was believed not to
-  occur, because mesa refcounts a `pipe_resource` under a live sampler view — and that holds
-  inside one guest process. It does not hold across two: ctx 2 is the shell and ctx 9 the browser,
-  sharing buffers through the compositor, and one process's unref does not consult the other's
-  views. This is not the replayer's own liveness view being wrong either — attaching every backing
-  it knows, live or not, drops the same five, because the resource is gone from the renderer and
-  not merely absent from the fresh context. The decision is what a fixed-point gate should say
-  about a drop the guest itself caused: dropping and naming it is the trust-boundary behaviour we
-  want, and a gate demanding an identical journal cannot also accept one.
-
 ## Owed, and waiting on work
 
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
@@ -901,6 +888,17 @@ it survives the session it was found in.
   it now.
 
 ## Consequences to accept
+
+- **A classic object can outlive the resource it names, and a snapshot loses it.** Two guest
+  processes sharing a buffer reach this — a compositor's sampler view over a window surface the
+  client then destroys — and neither renderer keeps the resource alive for it, because a context
+  attachment is not a reference here or in the C. The object survives as a handle that resolves to
+  nothing, which costs nothing: binding it faults on the resource lookup and poisons the guest's
+  own context, which is what binding an object over a destroyed resource is owed. What it does
+  cost is the rebuild, which cannot replay a create over a resource that is gone, so the entry is
+  dropped and named. The fix that would avoid this is destroying objects at their resource's
+  destroy — a purge at a destroy site, the shape this tree does not add — so the drop stands and
+  the harness pins which drops a corpus makes.
 
 - **Upstream gets the fixes made up to the switch, and nothing after.** The delta
   this fork carries against upstream virglrenderer is still worth contributing, and

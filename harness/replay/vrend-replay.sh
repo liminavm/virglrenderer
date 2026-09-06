@@ -47,7 +47,7 @@ while [ $# -gt 0 ]; do
         *) echo "--renderer wants rs or c" >&2; exit 2 ;;
       esac
       shift 2 ;;
-    --score|--expect)
+    --score|--expect|--rebuild-score|--rebuild-expect)
       case "${2:-}" in
         /*) ARGS+=("$1" "$2") ;;
         "") echo "$1 wants a path" >&2; exit 2 ;;

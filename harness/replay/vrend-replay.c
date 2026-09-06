@@ -41,6 +41,10 @@
 //   --sweep-w W   restrict --sweep to targets of this width
 //   --score F     write the score to F
 //   --expect F    compare the score against F and exit non-zero on any difference
+//   --rebuild-score F   write the rebuild report -- entries in and out per context, and every
+//                 entry the rebuild could not use -- to F
+//   --rebuild-expect F  compare that report against F. Without it, a rebuild that loses an entry
+//                 fails; with it, the pinned losses are the ones this corpus is known to make
 //   --caps F      write the classic capsets (VIRGL and VIRGL2) the renderer fills, one field a
 //                 line, to F and exit. Record it from the C, diff it against virglrs: the guest's
 //                 driver configures itself from nothing else.
@@ -245,6 +249,7 @@ static bool ctx_wanted(uint16_t id)
    return false;
 }
 static const char *score_path, *expect_path, *caps_path;
+static const char *rb_score_path, *rb_expect_path;
 static bool zero_new = true;
 
 /* The score, accumulated in stream order. Two implementations that render the same pixels in a
@@ -286,6 +291,22 @@ static void count_addf(const char *fmt, ...)
    va_list ap;
    va_start(ap, fmt);
    buf_addf(&count_buf, &count_len, &count_cap, fmt, ap);
+   va_end(ap);
+}
+
+/* The rebuild report: what each context's journal rebuilt into, and every entry the rebuild could
+ * not use. Its own buffer and not the score's, because the two answer different questions -- the
+ * score is about the pixels this stream drew and the report is about whether they could be drawn
+ * again after a resume -- and a corpus that legitimately loses an entry must not have to rewrite
+ * its pixels to say so. */
+static char *rb_buf;
+static size_t rb_len, rb_cap;
+
+static void rb_addf(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   buf_addf(&rb_buf, &rb_len, &rb_cap, fmt, ap);
    va_end(ap);
 }
 
@@ -764,57 +785,117 @@ static uint32_t vrj_u32(struct vrj *c)
    return v;
 }
 
-/* Whether two journals describe the same rebuild.
- *
- * Positions are deliberately not compared: the rebuilt context re-records as it replays, so it
- * numbers from 1 while the original numbers from wherever its guest got to. What must agree is
- * the number of steps, their order, and each step's sub-context and dwords. */
-static bool journals_agree(const void *a, uint64_t a_len, const void *b, uint64_t b_len,
-                           uint32_t ctx)
+/* One entry of a journal, pointing into the journal it was parsed from: the bytes from its kind
+ * dword to the end of its last chunk, which is everything two journals have to agree on. The seq
+ * pair in front of it is left out because the rebuild renumbers it -- the rebuilt context records
+ * from 1 while the original numbers from wherever its guest got to. */
+struct vrj_ent {
+   const uint8_t *raw;
+   size_t len;
+};
+
+/* Split a journal into its entries, or NULL if it is not one. */
+static struct vrj_ent *vrj_entries(const void *j, uint64_t len, uint32_t *n_out, uint32_t *ver)
 {
-   struct vrj ca = { a, (size_t)a_len, false }, cb = { b, (size_t)b_len, false };
-   uint32_t magic_a = vrj_u32(&ca), ver_a = vrj_u32(&ca), n_a = vrj_u32(&ca);
-   uint32_t magic_b = vrj_u32(&cb), ver_b = vrj_u32(&cb), n_b = vrj_u32(&cb);
-   (void)vrj_u32(&ca); (void)vrj_u32(&cb);            /* reserved */
-   if (magic_a != 0x314a5256u || magic_b != 0x314a5256u || ver_a != ver_b) {
+   struct vrj c = { j, (size_t)len, false };
+   uint32_t magic = vrj_u32(&c);
+   *ver = vrj_u32(&c);
+   uint32_t n = vrj_u32(&c);
+   (void)vrj_u32(&c);                                 /* reserved */
+   if (magic != 0x314a5256u || c.bad)
+      return NULL;
+   struct vrj_ent *e = calloc(n ? n : 1, sizeof *e);
+   if (!e) { perror("rebuild"); exit(2); }
+   for (uint32_t i = 0; i < n; i++) {
+      (void)vrj_u32(&c); (void)vrj_u32(&c);           /* seq, renumbered by the rebuild */
+      const uint8_t *start = c.p;
+      (void)vrj_u32(&c); (void)vrj_u32(&c);           /* kind, sub */
+      uint32_t nc = vrj_u32(&c);
+      for (uint32_t k = 0; k < nc; k++) {
+         uint32_t dwords = vrj_u32(&c);
+         for (uint32_t d = 0; d < dwords; d++) (void)vrj_u32(&c);
+      }
+      if (c.bad) { free(e); return NULL; }
+      e[i].raw = start;
+      e[i].len = (size_t)(c.p - start);
+   }
+   *n_out = n;
+   return e;
+}
+
+/* Name a dropped entry in the report: its kind, its sub-context, its size, and its leading
+ * dwords, which is where the object handle and the resource it names live. The prefix and not
+ * the whole entry, because a shader create runs to hundreds of dwords and the pin has to fit on
+ * a line -- the size guards what the prefix does not reach. */
+static void rb_drop_line(const struct vrj_ent *e)
+{
+   struct vrj c = { e->raw, e->len, false };
+   uint32_t kind = vrj_u32(&c), sub = vrj_u32(&c), nc = vrj_u32(&c);
+   uint32_t total = 0;
+   for (uint32_t k = 0; k < nc; k++) {
+      uint32_t dwords = vrj_u32(&c);
+      total += dwords;
+      for (uint32_t d = 0; d < dwords; d++) (void)vrj_u32(&c);
+   }
+   rb_addf("  drop kind=%u sub=%u chunks=%u dwords=%u:", kind, sub, nc, total);
+   struct vrj w = { e->raw, e->len, false };
+   (void)vrj_u32(&w); (void)vrj_u32(&w); (void)vrj_u32(&w);
+   uint32_t first = nc ? vrj_u32(&w) : 0;
+   uint32_t show = first < 8 ? first : 8;
+   for (uint32_t d = 0; d < show && !w.bad; d++)
+      rb_addf(" %08x", vrj_u32(&w));
+   rb_addf("\n");
+}
+
+/* Whether the rebuilt journal describes the same world, and what it lost on the way.
+ *
+ * The rebuilt journal must be a SUBSEQUENCE of the source. A rebuild is allowed to lose an entry
+ * -- a create over a resource the guest has since destroyed is the case a real capture reaches,
+ * and dropping it is what the renderer owes a guest that did that -- but never to invent one or
+ * to reorder what it kept. So the walk is greedy: on a match both advance, on a mismatch the
+ * source entry is recorded as dropped and only the source advances. An entry whose CONTENT
+ * changed reads as a drop and takes every later entry with it, ending with the rebuilt journal
+ * outrunning the source, which fails here and is not something a pin can accept.
+ *
+ * Whether the drops themselves are acceptable is not decided here: they go into the report, and
+ * the pin in `--rebuild-expect` is what says which ones this corpus is known to make. With no
+ * pin, a drop is a failure. */
+static bool journals_agree(const void *a, uint64_t a_len, const void *b, uint64_t b_len,
+                           uint32_t ctx, uint32_t *dropped)
+{
+   uint32_t n_a = 0, n_b = 0, ver_a = 0, ver_b = 0;
+   struct vrj_ent *ea = vrj_entries(a, a_len, &n_a, &ver_a);
+   struct vrj_ent *eb = vrj_entries(b, b_len, &n_b, &ver_b);
+   if (!ea || !eb || ver_a != ver_b) {
       fprintf(stderr, "rebuild: ctx %u: not a pair of journals\n", ctx);
+      free(ea); free(eb);
       return false;
    }
-   if (n_a != n_b) {
-      fprintf(stderr, "rebuild: ctx %u: %u entries in, %u out\n", ctx, n_a, n_b);
-      return false;
+
+   rb_addf("ctx %u: %u in, %u out\n", ctx, n_a, n_b);
+   bool ok = true;
+   uint32_t i = 0, j = 0;
+   while (i < n_a && j < n_b) {
+      if (ea[i].len == eb[j].len && !memcmp(ea[i].raw, eb[j].raw, ea[i].len)) {
+         i++; j++;
+         continue;
+      }
+      rb_drop_line(&ea[i]);
+      (*dropped)++;
+      i++;
    }
-   for (uint32_t i = 0; i < n_a; i++) {
-      (void)vrj_u32(&ca); (void)vrj_u32(&ca);          /* seq, renumbered by the rebuild */
-      (void)vrj_u32(&cb); (void)vrj_u32(&cb);
-      uint32_t kind_a = vrj_u32(&ca), sub_a = vrj_u32(&ca), nc_a = vrj_u32(&ca);
-      uint32_t kind_b = vrj_u32(&cb), sub_b = vrj_u32(&cb), nc_b = vrj_u32(&cb);
-      if (kind_a != kind_b || sub_a != sub_b || nc_a != nc_b) {
-         fprintf(stderr,
-                 "rebuild: ctx %u entry %u: kind/sub/chunks %u/%u/%u became %u/%u/%u\n",
-                 ctx, i, kind_a, sub_a, nc_a, kind_b, sub_b, nc_b);
-         return false;
-      }
-      for (uint32_t c = 0; c < nc_a; c++) {
-         uint32_t la = vrj_u32(&ca), lb = vrj_u32(&cb);
-         if (la != lb) {
-            fprintf(stderr, "rebuild: ctx %u entry %u chunk %u: %u dwords became %u\n",
-                    ctx, i, c, la, lb);
-            return false;
-         }
-         for (uint32_t d = 0; d < la; d++)
-            if (vrj_u32(&ca) != vrj_u32(&cb)) {
-               fprintf(stderr, "rebuild: ctx %u entry %u chunk %u dword %u differs\n",
-                       ctx, i, c, d);
-               return false;
-            }
-      }
-      if (ca.bad || cb.bad) {
-         fprintf(stderr, "rebuild: ctx %u: a journal ran out at entry %u\n", ctx, i);
-         return false;
-      }
+   if (j < n_b) {
+      fprintf(stderr, "rebuild: ctx %u: the rebuild kept %u entries the journal does not have\n",
+              ctx, n_b - j);
+      ok = false;
    }
-   return true;
+   for (; i < n_a; i++) {
+      rb_drop_line(&ea[i]);
+      (*dropped)++;
+   }
+
+   free(ea); free(eb);
+   return ok;
 }
 
 int main(int argc, char **argv)
@@ -832,6 +913,7 @@ int main(int argc, char **argv)
     * corpus never asked for, and every pinned score was recorded without it. */
    bool rebuild = false;
    unsigned rebuild_failed = 0;
+   uint32_t rebuild_dropped = 0;
    bool sweep = false;
    uint64_t draws_from = 0;
    /* --until stops the stream after a sequence number and scores what is on the surfaces THEN.
@@ -869,6 +951,8 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--readback") && i + 1 < argc) readback_res = (uint32_t)atoi(argv[++i]);
       else if (!strcmp(argv[i], "--no-zero-new")) zero_new = false;
       else if (!strcmp(argv[i], "--rebuild")) rebuild = true;
+      else if (!strcmp(argv[i], "--rebuild-score") && i + 1 < argc) rb_score_path = argv[++i];
+      else if (!strcmp(argv[i], "--rebuild-expect") && i + 1 < argc) rb_expect_path = argv[++i];
       else if (!strcmp(argv[i], "--score") && i + 1 < argc) score_path = argv[++i];
       else if (!strcmp(argv[i], "--expect") && i + 1 < argc) expect_path = argv[++i];
       else if (!strcmp(argv[i], "--caps") && i + 1 < argc) caps_path = argv[++i];
@@ -1397,11 +1481,16 @@ int main(int argc, char **argv)
             free(a);
             continue;
          }
-         if (!journals_agree(a, a_len, b, b_len, src))
+         uint32_t dropped = 0;
+         if (!journals_agree(a, a_len, b, b_len, src, &dropped))
             rebuild_failed++;
+         else if (dropped)
+            fprintf(stderr, "rebuild: ctx %u -> %u rebuilt without %u entr%s the report names\n",
+                    src, dst, dropped, dropped == 1 ? "y" : "ies");
          else
             fprintf(stderr, "rebuild: ctx %u -> %u rebuilt identically (%llu bytes)\n",
                     src, dst, (unsigned long long)a_len);
+         rebuild_dropped += dropped;
          free(a);
          free(b);
       }
@@ -1507,6 +1596,60 @@ int main(int argc, char **argv)
       fprintf(stderr, "REBUILD FAILED for %u context(s)\n", rebuild_failed);
       ok = 0;
    }
+
+   if (rb_score_path && rebuild) {
+      FILE *rf = fopen(rb_score_path, "wb");
+      if (!rf || fwrite(rb_buf ? rb_buf : "", 1, rb_len, rf) != rb_len) {
+         fprintf(stderr, "writing %s: %s\n", rb_score_path, strerror(errno));
+         ok = 0;
+      } else {
+         fprintf(stderr, "rebuild report written to %s\n", rb_score_path);
+      }
+      if (rf) fclose(rf);
+   }
+
+   /* What a corpus is known to lose, and why a lost entry is not automatically a fault. A guest
+    * that destroys a resource under an object of its own leaves a create the rebuild cannot
+    * replay; the object is already unusable, because binding it faults on the resource lookup
+    * whether or not a rebuild happened. So the drop is the right behaviour and the pin is what
+    * says WHICH drops this corpus makes -- a different entry going missing is still a diff.
+    *
+    * With no pin, a drop is a failure. That is the resting state, and every corpus but the one
+    * with two guest processes sharing buffers stays in it. */
+   if (rebuild && rb_expect_path) {
+      FILE *ef = fopen(rb_expect_path, "rb");
+      if (!ef) {
+         fprintf(stderr, "reading %s: %s\n", rb_expect_path, strerror(errno));
+         ok = 0;
+      } else {
+         fseek(ef, 0, SEEK_END);
+         long elen = ftell(ef);
+         fseek(ef, 0, SEEK_SET);
+         char *want = malloc((size_t)elen + 1);
+         if (!want || fread(want, 1, (size_t)elen, ef) != (size_t)elen) {
+            fprintf(stderr, "short read of %s\n", rb_expect_path);
+            ok = 0;
+         } else {
+            want[elen] = 0;
+            if ((size_t)elen == rb_len && !memcmp(want, rb_buf ? rb_buf : "", rb_len)) {
+               fprintf(stderr, "rebuild matches %s\n", rb_expect_path);
+            } else {
+               fprintf(stderr, "REBUILD DIFFERS from %s:\n", rb_expect_path);
+               diff_lines(want, rb_buf ? rb_buf : "");
+               ok = 0;
+            }
+         }
+         free(want);
+         fclose(ef);
+      }
+   } else if (rebuild_dropped) {
+      fprintf(stderr,
+              "REBUILD DROPPED %u entr%s and nothing pins them (see --rebuild-expect)\n",
+              rebuild_dropped, rebuild_dropped == 1 ? "y" : "ies");
+      ok = 0;
+   }
+
+   free(rb_buf);
 
    free(text);
    return ok ? 0 : 1;
