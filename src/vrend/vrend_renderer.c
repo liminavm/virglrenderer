@@ -14381,6 +14381,28 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
    if (has_feature(feat_storage_multisample))
       caps->v1.max_samples = vrend_renderer_query_multisample_caps(caps->v1.max_samples, &caps->v2);
 
+   /* limina: a ceiling on the sample counts we advertise. A guest cannot ask for multisampling it
+    * has not been told exists, so clamping here is how a host whose multisample path is unsafe
+    * degrades instead of dying -- the guest's GL reports a lower GL_MAX_SAMPLES, and a WebGL
+    * context created with {antialias:true} simply comes back reporting antialias:false, which is
+    * what the specification says should happen and what every browser already handles.
+    *
+    * Mechanism only: the value is policy and belongs to whoever embeds us. */
+   {
+      const char *env = getenv("VREND_MAX_SAMPLES");
+      if (env != NULL) {
+         unsigned ceiling = (unsigned)atoi(env);
+         if (caps->v1.max_samples > ceiling) {
+            virgl_warn("limina: clamping advertised max_samples %u -> %u (VREND_MAX_SAMPLES)\n",
+                         caps->v1.max_samples, ceiling);
+            caps->v1.max_samples = ceiling;
+            /* Sample positions describe counts we no longer offer; leaving them populated would
+             * advertise a layout for a mode the guest can never select. */
+            memset(caps->v2.sample_locations, 0, sizeof(caps->v2.sample_locations));
+         }
+      }
+   }
+
    caps->v2.capability_bits |= VIRGL_CAP_TGSI_INVARIANT | VIRGL_CAP_SET_MIN_SAMPLES |
                                VIRGL_CAP_TGSI_PRECISE | VIRGL_CAP_APP_TWEAK_SUPPORT;
 
