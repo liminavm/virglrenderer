@@ -542,6 +542,12 @@ impl CapsV2 {
                 getu(GL_MAX_FRAGMENT_IMAGE_UNIFORMS).min(PIPE_MAX_SHADER_IMAGES);
             // GLES has no multisample images: `max_image_samples` stays zero.
         }
+        // Before the probe and not after it, so the counts we advertise and the positions we
+        // publish for them come out of one pass: the probe skips every count above what it is
+        // handed, so it writes positions for exactly the counts that survive. Clamping
+        // afterwards would need the positions blanked to match, which also blanks the counts
+        // still under the ceiling -- advertising a mode with no layout for it.
+        c.v1.max_samples = capped_samples(c.v1.max_samples, sample_ceiling());
         if has(Feature::storage_multisample) {
             c.v1.max_samples =
                 query_multisample_caps(gl, c.v1.max_samples, &mut c.sample_locations);
@@ -770,6 +776,49 @@ fn mixed_color_attachments_work(gl: &Gl) -> bool {
     complete
 }
 
+/// The name limina's worker sets, and so the only name that can be read here. A different one
+/// would leave the mitigation below silently absent with nothing to say so.
+const MAX_SAMPLES_ENV: &str = "VREND_MAX_SAMPLES";
+
+/// A ceiling on the sample counts we are willing to advertise, or none.
+///
+/// Mechanism only: the value is policy and belongs to whoever embeds us. It exists because a host
+/// whose multisample path is unsafe needs a way to degrade instead of dying, and a guest cannot
+/// ask for multisampling it has not been told exists -- a WebGL context created with
+/// `{antialias:true}` comes back reporting `antialias:false`, which is what the specification says
+/// should happen and what every browser already handles.
+fn sample_ceiling() -> Option<u32> {
+    parse_ceiling(std::env::var(MAX_SAMPLES_ENV).ok().as_deref()?)
+}
+
+/// What a setting of the variable means, split from reading it so it can be tested without
+/// touching an environment the rest of the process shares.
+fn parse_ceiling(setting: &str) -> Option<u32> {
+    match setting.trim().parse::<u32>() {
+        // Zero is not a sample count, and single-sampled is how "no multisampling" is spelled in
+        // this field. Reading it as "no ceiling" would take the value an operator is most likely
+        // to write for "none" and turn it into the opposite.
+        Ok(n) => Some(n.max(1)),
+        Err(_) => {
+            eprintln!("[virglrs] {MAX_SAMPLES_ENV}={setting:?} is not a sample count; no ceiling");
+            None
+        }
+    }
+}
+
+/// The advertised maximum after the ceiling, saying so when it bites.
+fn capped_samples(max_samples: u32, ceiling: Option<u32>) -> u32 {
+    match ceiling {
+        Some(c) if max_samples > c => {
+            eprintln!(
+                "[virglrs] {MAX_SAMPLES_ENV}: advertising max_samples {c}, not {max_samples}"
+            );
+            c
+        }
+        _ => max_samples,
+    }
+}
+
 /// `vrend_renderer_query_multisample_caps`: the sample counts a multisample RGBA32F texture
 /// can be made and rendered to at, from the driver's maximum down, and where each count's
 /// samples sit -- packed four positions to a word, each as a 4-bit x and y in sixteenths.
@@ -930,6 +979,28 @@ mod tests {
         assert_eq!(one.glsl_level, 310);
         assert_eq!(one.as_bytes().len(), size_of::<CapsV1>());
         assert_eq!(&two.as_bytes()[4..size_of::<CapsV1>()], &one.as_bytes()[4..]);
+    }
+
+    /// The ceiling is a mitigation, so every way of getting it wrong has to fail towards
+    /// advertising less rather than more -- except the absent variable, which is the only case
+    /// where the host has said nothing at all.
+    #[test]
+    fn a_sample_ceiling_never_raises_what_we_advertise() {
+        assert_eq!(capped_samples(8, None), 8, "no ceiling advertises what the host has");
+        assert_eq!(capped_samples(8, Some(4)), 4);
+        assert_eq!(capped_samples(8, Some(1)), 1, "which is how multisampling is switched off");
+        assert_eq!(
+            capped_samples(2, Some(8)),
+            2,
+            "a ceiling above the host does not invent counts"
+        );
+        assert_eq!(capped_samples(0, Some(4)), 0, "nor does it invent them for a host with none");
+
+        assert_eq!(parse_ceiling("1"), Some(1));
+        assert_eq!(parse_ceiling(" 4 "), Some(4));
+        assert_eq!(parse_ceiling("0"), Some(1), "zero means none, and none is single-sampled");
+        assert_eq!(parse_ceiling("all"), None, "garbage caps nothing, and says so");
+        assert_eq!(parse_ceiling(""), None);
     }
 
     #[test]

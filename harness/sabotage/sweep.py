@@ -865,6 +865,20 @@ SABOTAGES = [
         "Command::ResourceInlineWrite { transfer: w.transfer()?, data: w.tail(11) }",
         'vrend',
     ),
+    (
+        'the sample-count ceiling is ignored and the host maximum advertised anyway',
+        'virglrs/src/vrend/caps.rs',
+        'Some(c) if max_samples > c => {',
+        'Some(c) if max_samples > c && false => {',
+        'sample_ceiling',
+    ),
+    (
+        'a ceiling of zero is read as no ceiling, which is what it least means',
+        'virglrs/src/vrend/caps.rs',
+        'Ok(n) => Some(n.max(1)),',
+        'Ok(0) => None,\n        Ok(n) => Some(n),',
+        'sample_ceiling',
+    ),
 ]
 
 # Not here, and deliberately: "a ring-seqno wake is never sent". Deleting any single
