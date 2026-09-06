@@ -525,7 +525,7 @@ class RustGen:
         return out
 
     def funcpointer(self, ty):
-        params = ', '.join(self.field_type(v) for v in ty.variables)
+        params = ', '.join(self.proc_param(v) for v in ty.variables)
         ret = ''
         if ty.ret and not (self.base_name(ty.ret.ty) == 'core::ffi::c_void'
                            and not ty.ret.ty.is_pointer()):
@@ -1768,9 +1768,27 @@ class RustGen:
         proc table transcribed by hand can disagree with the decoder about a parameter, and the
         disagreement is a stack smash rather than a compile error.
         """
-        params = ', '.join(self.field_type(v) for v in ty.variables)
+        params = ', '.join(self.proc_param(v) for v in ty.variables)
         ret = ' -> %s' % self.field_type(ty.ret) if ty.ret else ''
         return 'unsafe extern "C" fn(%s)%s' % (params, ret)
+
+    def proc_param(self, var):
+        """A C *parameter*'s type, which is not always its member type.
+
+        C adjusts an array parameter to a pointer: `const float blendConstants[4]` is passed as an
+        address, never as four floats. `field_type` is right for a struct member, where the array
+        really is inline, and wrong here -- an aggregate passed by value goes in different
+        registers than a pointer does, so transcribing the member type into a call signature is a
+        corrupt call rather than a type error. Only the outermost dimension decays.
+        """
+        ty = var.ty
+        if not ty.is_static_array():
+            return self.field_type(var)
+        quals = ty.decor.ref_quals or [ty.decor.qual]
+        inner = self.base_name(ty)
+        for dim in reversed(ty.static_array_size().split('][')[1:]):
+            inner = '[%s; %s]' % (inner, self.dimension(dim))
+        return '*%s %s' % ('const' if 'const' in (quals[0] or '') else 'mut', inner)
 
     def render_proc_table(self):
         """The driver's entry points, in three tables loaded the way Vulkan says to load them.
