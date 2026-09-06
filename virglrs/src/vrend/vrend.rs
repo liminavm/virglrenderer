@@ -479,13 +479,19 @@ impl Vrend {
         // there, and using it means the answer does not depend on which sub-context the guest
         // happened to leave current.
         self.switch_ctx0();
-        if let Err(why) = publishable(size, args.width) {
-            res.destroy(&self.gl);
+        let refused = publishable(size, args.width)
+            .err()
+            .or_else(|| (!res.map_persistent(&self.gl)).then_some(ClaimRefused::Unmappable));
+        if let Some(why) = refused {
+            // Nothing can be attached to it: it has had no handle, so no view, framebuffer or
+            // transfer has ever been able to name it. `destroy` handing storage back here would
+            // mean a described resource had been reachable, which is the thing this path exists
+            // to prevent.
+            assert!(
+                res.destroy(&self.gl).is_none(),
+                "a resource with no handle is attached to nothing"
+            );
             return Err(why);
-        }
-        if !res.map_persistent(&self.gl) {
-            res.destroy(&self.gl);
-            return Err(ClaimRefused::Unmappable);
         }
         res.described_by = Some(wire);
         self.resources.insert(handle, resource::Slot::Resource(res));

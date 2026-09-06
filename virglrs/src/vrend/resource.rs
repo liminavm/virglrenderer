@@ -1289,9 +1289,6 @@ impl Resource {
         }
     }
 
-    /// Delete what only this resource holds. Texture storage a framebuffer is still attached to
-    /// is handed back instead: the caller keeps it until the last attachment lets go.
-    #[must_use = "texture storage still attached somewhere has to be kept, not dropped"]
     /// Take the persistent mapping of this resource's buffer, so the guest may be given the
     /// pages themselves rather than a copy of them.
     ///
@@ -1326,6 +1323,9 @@ impl Resource {
         addr.is_some()
     }
 
+    /// Delete what only this resource holds. Texture storage a framebuffer is still attached to
+    /// is handed back instead: the caller keeps it until the last attachment lets go.
+    #[must_use = "texture storage still attached somewhere has to be kept, not dropped"]
     pub fn destroy(self, gl: &Gl) -> Option<Arc<Texture>> {
         match self.storage {
             Storage::Guest | Storage::Host(_) => None,

@@ -1132,7 +1132,12 @@ impl Context {
         // will ever come back for them.
         self.make_current(host);
         for (_, (res, _)) in std::mem::take(&mut self.described) {
-            res.destroy(host.gl);
+            // Attached to nothing, and asserted rather than parked: a described resource has no
+            // handle, so no view or framebuffer of this context has ever been able to name it.
+            assert!(
+                res.destroy(host.gl).is_none(),
+                "a resource with no handle is attached to nothing"
+            );
         }
         let ids: Vec<SubContextId> = self.subs.keys().rev().copied().collect();
         for id in ids {
