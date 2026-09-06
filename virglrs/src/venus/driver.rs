@@ -1658,8 +1658,10 @@ impl Driver {
         use VkObjectType as T;
         let h = o.handle;
         let n = core::ptr::null();
-        // SAFETY (all arms): `h` is a handle this context created on `device`, taken out of the
-        // object table by this call so it is destroyed exactly once, and the entry point comes
+        // SAFETY (all arms): `h` came from a `vkCreateX` on `device` -- `Doomed` is made only out
+        // of the object table's arena, which holds driver handles and nothing else, so an id no
+        // handler decided cannot arrive here wearing a handle's clothes. It was taken out of that
+        // table to build this list, so it is destroyed exactly once, and the entry point comes
         // from that device's own proc table.
         unsafe {
             match o.ty {
@@ -2420,6 +2422,13 @@ impl Driver {
         let d = self.recorder(cb)?;
         // SAFETY: as above.
         unsafe { (d.vkCmdDraw())(cb, vertices, instances, first_vertex, first_instance) };
+        Some(())
+    }
+
+    pub fn cmd_dispatch(&self, cb: VkCommandBuffer, x: u32, y: u32, z: u32) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdDispatch())(cb, x, y, z) };
         Some(())
     }
 

@@ -216,18 +216,39 @@ enum Slot {
     /// the create fails. Remembering the id turns each of them into one lost command instead of a
     /// poisoned ring -- the guest's own error handling then unwinds, as it would on real hardware.
     Ghost,
+    /// No handler ran, so there is no host object -- only the guest's id, which stands in for a
+    /// handle so that the rest of the stream still decodes. See `context`'s `object_created`.
+    ///
+    /// It is a slot and never an arena entry, which is the whole point: **the arena holds host
+    /// handles and nothing else**, so a number the guest invented cannot reach a driver entry
+    /// point by any path. It reached one before this existed -- the fiction went in as an ordinary
+    /// object, and a context teardown handed it to `vkDestroyPipeline` as if the driver had
+    /// produced it, which segfaults the host on a guest's say-so.
+    ///
+    /// `under` is what keeps it from outliving its world: it resolves only while the object it was
+    /// created beneath is still there, so a device's destroy invalidates every fiction below it
+    /// the same way it invalidates every real key, with nothing to remember to purge.
+    Fiction {
+        ty: VkObjectType,
+        under: Option<Key>,
+    },
 }
 
 impl Slot {
     fn key(&self) -> Option<Key> {
         match self {
             Slot::Live(k) => Some(*k),
-            Slot::Ghost => None,
+            Slot::Ghost | Slot::Fiction { .. } => None,
         }
     }
 }
 
 /// One object on its way out, and the device whose entry points can destroy it.
+///
+/// **Every handle here came from the driver.** These are made only out of arena entries, and the
+/// arena is only ever written with what a `vkCreateX` returned -- so an id no handler decided (see
+/// [`Slot::Fiction`]) cannot appear, and the destroy that consumes this cannot be handed a number
+/// the guest invented.
 ///
 /// Not an [`Object`]: an object in the table knows its parent, which for anything below a device
 /// is not the device itself. What a destroy needs is the `VkDevice` to call *on*, and that is
@@ -316,6 +337,28 @@ impl Table {
         self.slots.insert(id, Slot::Ghost);
     }
 
+    /// Record an id no handler decided: the unserved command's fiction. See [`Slot::Fiction`].
+    ///
+    /// An id that already names something keeps it, for [`Table::add_ghost`]'s reason -- a
+    /// decision already made is not overwritten by the absence of one.
+    pub fn add_fiction(&mut self, id: ObjectId, ty: VkObjectType, owner: Option<ObjectId>) {
+        if id.0 == 0 || self.get(id).is_some() || self.is_ghost(id) {
+            return;
+        }
+        let under = owner.and_then(|o| self.slots.get(&o)).and_then(Slot::key);
+        self.slots.insert(id, Slot::Fiction { ty, under });
+    }
+
+    /// Whether this id is a fiction that still stands -- one whose parent is still here.
+    pub fn is_fiction(&self, id: ObjectId) -> bool {
+        matches!(self.slots.get(&id), Some(Slot::Fiction { under, .. }) if self.fiction_stands(*under))
+    }
+
+    /// A fiction under a parent the arena has dropped names nothing, exactly as a stale key does.
+    fn fiction_stands(&self, under: Option<Key>) -> bool {
+        under.is_none_or(|k| self.arena.get(k).is_some())
+    }
+
     /// Take an object and everything under it, root first, and hand back every one.
     ///
     /// [`Table::remove`] is the same cascade with the descendants dropped, which is right for a
@@ -325,6 +368,11 @@ impl Table {
     #[must_use = "these host handles are still alive, and this is the only place that names them"]
     pub fn take_tree(&mut self, id: ObjectId) -> Vec<Doomed> {
         let Some(key) = self.slots.get(&id).and_then(Slot::key) else {
+            // A fiction is destroyed by forgetting it: there is no host handle to hand back, and
+            // leaving the slot would have the id go on answering a create the guest makes next.
+            if self.is_fiction(id) {
+                self.slots.remove(&id);
+            }
             return Vec::new();
         };
         let doomed = self.arena.take_tree(key);
@@ -338,7 +386,13 @@ impl Table {
     /// pipelined that destroy behind the create that failed, and every command in between is still
     /// in flight behind it.
     pub fn remove(&mut self, id: ObjectId) -> Option<Object> {
-        let key = self.slots.get(&id)?.key()?;
+        let Some(key) = self.slots.get(&id).and_then(Slot::key) else {
+            // See `take_tree`: a fiction goes out of the table and hands nothing back.
+            if self.is_fiction(id) {
+                self.slots.remove(&id);
+            }
+            return None;
+        };
         // Everything created under it goes at the same moment, because Vulkan has just destroyed
         // it all without naming any of it. Their ids stay in `slots` and stop resolving, which is
         // the cheap half of the trade: nothing has to walk back here and delete them.
@@ -492,6 +546,13 @@ impl Objects for Table {
                 None => Lookup::Missing,
             },
             Some(Slot::Ghost) => Lookup::Ghost,
+            // The fiction, answered as the id itself. Whether the type matches is checked exactly
+            // as it is for a real object: an unserved create does not buy the guest the right to
+            // name its id as something else.
+            Some(Slot::Fiction { ty: t, under }) if t.0 == ty && self.fiction_stands(*under) => {
+                Lookup::Found(HostHandle(id.0))
+            }
+            Some(Slot::Fiction { .. }) => Lookup::Missing,
             None => Lookup::Missing,
         }
     }

@@ -348,6 +348,40 @@ SABOTAGES = [
         """        let size = size.min(blob.len() - at);""",
         'a_blob_that_is_not_one_is_refused',
     ),
+    # The unserved command's fiction. It is a decode convenience with no host object behind it,
+    # and the crash it caused was a guest sending one unserved create and then exiting.
+    (
+        "an unserved create's invented handle goes into the table as an object",
+        'virglrs/src/venus/context.rs',
+        """            self.objects.borrow_mut().add_fiction(id, ty, owner);
+            return;""",
+        """            let _ = self.objects.borrow_mut().add(id, ty, HostHandle(id.0), owner);
+            return;""",
+        'an_unserved_creates_invented_handle_never_reaches_the_driver',
+    ),
+    (
+        "a compute pipeline run is compiled without the guest's pipeline cache",
+        'virglrs/src/venus/context.rs',
+        """        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let out = args.handle_pPipelines_mut();
+        let host = self.driver.create_pipelines(
+            device,
+            |d| d.vkCreateComputePipelines(),""",
+        """        let (device, _cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let cache = Default::default();
+        let out = args.handle_pPipelines_mut();
+        let host = self.driver.create_pipelines(
+            device,
+            |d| d.vkCreateComputePipelines(),""",
+        'the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it',
+    ),
+    (
+        "a dispatch's group counts are passed in whatever order",
+        'virglrs/src/venus/driver.rs',
+        '        unsafe { (d.vkCmdDispatch())(cb, x, y, z) };',
+        '        unsafe { (d.vkCmdDispatch())(cb, z, y, x) };',
+        'the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it',
+    ),
     (
         "a scanout's restore goes through vkMapMemory like any other allocation",
         'virglrs/src/venus/driver.rs',
