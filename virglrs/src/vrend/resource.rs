@@ -899,6 +899,11 @@ impl Planes {
         self.luma.surface()
     }
 
+    /// A share of it, for the same reason and from the same image.
+    pub fn held(&self) -> Arc<dyn Held> {
+        self.luma.held()
+    }
+
     /// How many planes there are. A biplanar surface, so always two -- named rather than
     /// written as a literal at each call site.
     pub fn count(&self) -> u32 {
@@ -1138,6 +1143,20 @@ impl Resource {
         match &self.storage {
             Storage::Texture(t) => {
                 t.image.as_ref().map(|i| i.surface()).or_else(|| Some(t.planes.as_ref()?.surface()))
+            }
+            _ => None,
+        }
+    }
+
+    /// A share of that surface, for a holder outside the classic side.
+    ///
+    /// Answers wherever [`Resource::surface`] does, and for the same storage: a venus context
+    /// importing this resource must hold the surface, not name it, so that the import stays good
+    /// after this resource and the context that made it are both gone.
+    pub fn surface_share(&self) -> Option<Arc<dyn Held>> {
+        match &self.storage {
+            Storage::Texture(t) => {
+                t.image.as_ref().map(Image::held).or_else(|| Some(t.planes.as_ref()?.held()))
             }
             _ => None,
         }

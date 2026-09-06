@@ -286,7 +286,13 @@ pub struct HostMapping {
 pub enum Backing {
     /// Created from `virgl_renderer_resource_create` -- a classic texture or buffer. Its host
     /// side, when this build serves vrend, is vrend's under the same handle.
-    Classic(ClassicArgs),
+    ///
+    /// `surface` is a share of the IOSurface that host side's storage is, when it is one, taken
+    /// at the create because that is when the surface is minted and there is no later moment one
+    /// appears. It is what a venus context imports the resource by: a share held here resolves
+    /// without asking vrend's table, which is what lets a compositor keep a client's last frame
+    /// after the client's context is gone.
+    Classic { args: ClassicArgs, surface: Option<Arc<dyn crate::metal::Held>> },
     /// Created from `virgl_renderer_resource_create_blob`. `desc` is what the guest asked for;
     /// `storage` is what it got, settled once at the create -- see [`BlobStorage`].
     Blob { desc: BlobDesc, storage: BlobStorage },
@@ -366,7 +372,23 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
                     None
                 }
             },
-            Backing::Classic(_) | Backing::Imported { .. } => {
+            // A classic resource whose storage is an IOSurface lends a share of it, which is how
+            // a GL client's window buffer reaches the Vulkan compositor importing it. The share
+            // travels, never the surface's id: an id names whatever the system last minted under
+            // it, so an import holding one would resolve to a stranger's surface the moment this
+            // resource died. Anything else classic is a GL object with no host address at all.
+            Backing::Classic { surface, .. } => match surface {
+                Some(held) => Some(ResourceBytes::Shared(Storage::lent(Arc::clone(held)))),
+                None => {
+                    eprintln!(
+                        "[virglrs] ctx {}: resource {handle:?} is a classic resource with no \
+                         IOSurface storage, so there is nothing to import",
+                        ctx.get(),
+                    );
+                    None
+                }
+            },
+            Backing::Imported { .. } => {
                 eprintln!(
                     "[virglrs] ctx {}: resource {handle:?} is not host-addressable",
                     ctx.get(),
@@ -427,7 +449,7 @@ impl Resource {
         match &self.backing {
             Backing::Imported { map, .. } => map.as_ref(),
             Backing::Blob { storage: BlobStorage::Minted(h), .. } => Some(&h.map),
-            Backing::Blob { .. } | Backing::Classic(_) => None,
+            Backing::Blob { .. } | Backing::Classic { .. } => None,
         }
     }
 }
@@ -557,10 +579,16 @@ impl Renderer {
         self.free_handle(handle)?;
         // vrend's half first, because it is the half that can refuse; without vrend the resource
         // is a table entry and nothing more, which is all a venus-only build owes it.
-        if let Some(v) = self.vrend.as_mut() {
-            v.resource_create(handle, args).map_err(Error::ClassicRefused)?;
-        }
-        self.insert(handle, Backing::Classic(args), iov);
+        // The share is taken here and not looked up later: the surface is minted inside the
+        // create, and a resource that got one has it from this moment to its last.
+        let surface = match self.vrend.as_mut() {
+            Some(v) => {
+                v.resource_create(handle, args).map_err(Error::ClassicRefused)?;
+                v.resource_surface_share(handle)
+            }
+            None => None,
+        };
+        self.insert(handle, Backing::Classic { args, surface }, iov);
         Ok(())
     }
 
@@ -886,7 +914,7 @@ impl Renderer {
                     Some(storage.held())
                 }
                 Backing::Blob { .. } => Some(None),
-                Backing::Classic(_) | Backing::Imported { .. } => None,
+                Backing::Classic { .. } | Backing::Imported { .. } => None,
             })
             .flatten();
         if let Some(held) = blob
@@ -1229,7 +1257,7 @@ impl Renderer {
             Backing::Blob { storage: BlobStorage::Shared { storage, .. }, .. } => {
                 Some(storage.clone())
             }
-            Backing::Blob { .. } | Backing::Classic(_) | Backing::Imported { .. } => None,
+            Backing::Blob { .. } | Backing::Classic { .. } | Backing::Imported { .. } => None,
         })?
     }
 
@@ -1291,7 +1319,7 @@ impl Renderer {
                 }
                 BlobStorage::Guest => None,
             },
-            Backing::Classic(_) | Backing::Imported { .. } => None,
+            Backing::Classic { .. } | Backing::Imported { .. } => None,
         })
         .ok_or(Error::NoResource)?
         .ok_or(Error::NotMappable)
@@ -1563,6 +1591,75 @@ mod tests {
         assert!(
             table.bytes(one, minted).is_none(),
             "a blob with no host storage resolves to nothing"
+        );
+    }
+
+    /// A classic resource whose storage is an IOSurface lends a share of it to a venus context,
+    /// and one whose storage is an ordinary GL texture lends nothing.
+    ///
+    /// This is the classic-into-venus import: a GL client's window buffer reaching the Vulkan
+    /// compositor that composites it. What it must lend is the surface itself and not its id --
+    /// the system recycles ids, so an importer holding one would resolve to a stranger's surface
+    /// the moment this resource died -- and the span it lends must be the surface's own, because
+    /// that is what the driver is handed as a host pointer.
+    #[test]
+    fn a_classic_resource_lends_the_surface_its_storage_is() {
+        use crate::metal::{Held, PixelFormat, Surface};
+        use crate::venus::driver::Storage;
+        use crate::venus::ring::ShmResources;
+
+        let one = ContextId::new(1).unwrap();
+        let two = ContextId::new(2).unwrap();
+        let window = ResourceHandle::new(1).unwrap();
+        let plain = ResourceHandle::new(2).unwrap();
+
+        let surface = Surface::plain(800, 600, PixelFormat::Bgra).expect("the system minted");
+        let (addr, extent) = (surface.host_addr(), surface.alloc_size());
+        // A share of a real surface, which is what vrend's EGL image holds. No EGL here: the
+        // image is how the classic side comes by the share, not what makes it one.
+        let held: Arc<dyn Held> = Arc::new(surface);
+
+        let args = ClassicArgs {
+            target: crate::vrend::pipe::TextureTarget::Texture2d,
+            format: crate::vrend::proto::Format::from_wire(1).expect("a format"),
+            bind: crate::vrend::resource::Bind::SHARED,
+            width: 800,
+            height: 600,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: crate::vrend::resource::ResourceFlags::default(),
+        };
+        let classic = |handle, surface, attached| Resource {
+            handle,
+            backing: Backing::Classic { args, surface },
+            iov: Vec::new(),
+            priv_: VmmPtr(core::ptr::null_mut()),
+            attached,
+        };
+
+        let mut table = BTreeMap::new();
+        table.insert(window, classic(window, Some(Arc::clone(&held)), vec![one, two]));
+        table.insert(plain, classic(plain, None, vec![one, two]));
+
+        let Some(ResourceBytes::Shared(lent)) = table.bytes(two, window) else {
+            panic!("the compositor's context imports the client's window buffer");
+        };
+        assert_eq!(lent.span(), (addr, extent), "and it is the surface's own pages it imports");
+        assert_eq!(
+            lent,
+            Storage::lent(Arc::clone(&held)),
+            "the same storage, not a second one describing the same surface"
+        );
+        assert!(
+            lent.held().is_some(),
+            "a share, so the surface outlives the classic context that made it"
+        );
+
+        assert!(
+            table.bytes(two, plain).is_none(),
+            "a classic resource with GL storage has no host address to import"
         );
     }
 
