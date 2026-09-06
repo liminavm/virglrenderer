@@ -828,6 +828,12 @@ waiting on a call rather than on work.
   occurrences across all six venus corpora — so this is a gap with no workload behind it yet, and
   the decision is whether to serve them before one appears or wait for one to.
 
+- **The gpu memory budget counts venus's surfaces and not vrend's.** A venus allocation is charged
+  and can be refused; a classic resource's IOSurface is neither, so the ledger under-reports the
+  host memory the renderer holds, by exactly the compositor's client windows. Charging vrend too
+  would make `resource_create` refusable over budget, which is a behaviour classic has never had —
+  hence a decision rather than a fix.
+
 - **`MultisampleArrayUnsupported` is latent.** `vrend/resource.rs` refuses a multisampled array
   texture. Nothing on this host asks for one, so no corpus scores it and no boot has hit it. It is
   a known refusal waiting for either a workload that needs it or a decision that it never will be.
@@ -871,14 +877,6 @@ waiting on a call rather than on work.
 
 These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
 it survives the session it was found in.
-
-- **A classic resource does not import into a venus context.** The Vulkan compositor answers
-  `create_immed failed and produced an invalid wl_buffer` and kills a classic-virgl GL client
-  after one benchmark; the C serves the same client on the same guest. It is the mirror of the
-  venus-to-venus import, which works. Attributed in time as well as between the legs — the build
-  before host-visible allocations became minted pages fails identically, so it is neither that
-  change nor the force-LINEAR rule. `harness/vm/client-gl-synoik.sh` is the reproducer, and
-  `synoik-glclient.vkrc` was recorded from the C, which is why replaying it green said nothing.
 
 - **`Exporter.ctx` names a context id, not a generation of one.** A `Shared` blob left by an
   earlier life of a reused context id is counted against the new one, inflating `journal_held`.
