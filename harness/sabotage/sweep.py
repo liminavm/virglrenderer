@@ -14,7 +14,8 @@ alone, so one sabotage never masks another.
 
 The edits are exact string replacements and every one asserts it matched, so an entry whose target
 has been refactored away fails loudly instead of quietly testing nothing -- a sweep that reports
-`RED` for an edit it never made is worse than no sweep.
+`RED` for an edit it never made is worse than no sweep. Every target is checked up front, before
+anything is built, so a refactor costs one message naming all of them.
 """
 
 import os
@@ -175,8 +176,8 @@ SABOTAGES = [
                     );
                     break;
                 }
-                continue;""",
-        '                continue;',
+""",
+        '',
         'a_ghost_absorbs_a_command',
     ),
     (
@@ -531,16 +532,6 @@ SABOTAGES = [
                 return;
             }""",
         """""",
-        '',
-    ),
-    (
-        'the property query resolves a resource the allocation would not',
-        'virglrs/src/venus/context.rs',
-        """        let Some(span) = self.driver.span(&bytes) else {
-            args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
-            return;
-        };""",
-        """        let span = self.driver.span(&bytes).unwrap_or((0, 0));""",
         '',
     ),
     (
@@ -924,6 +915,16 @@ def main():
     dirty = run(['git', 'status', '--porcelain'], cwd=ROOT).stdout.strip()
     if dirty:
         sys.exit('the tree has uncommitted changes; sweep would restore over them:\n' + dirty)
+
+    # Every target, before any building. The per-entry assert below is the guarantee that an edit
+    # was made; this is what makes a refactor cost one message naming all of them rather than a
+    # build's wait followed by an abort on the first, and another on the next.
+    stale = [(n, r) for n, r, old, _, _ in SABOTAGES if old not in (ROOT / r).read_text()]
+    if stale:
+        sys.exit(
+            'sabotage targets no longer in the tree -- fix or retire each:\n'
+            + '\n'.join('  %s\n    %s' % (n, r) for n, r in stale)
+        )
 
     started = time.monotonic()
     baseline = run(['cargo', 'test'])
