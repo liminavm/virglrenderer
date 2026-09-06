@@ -62,6 +62,13 @@ struct Args {
     /// no commands, no scoring. This is P1's gate -- a renderer that gets through it has a working
     /// ABI, resource table and context table, which is all a skeleton claims.
     smoke: bool,
+    /// Export each venus context's snapshot journal, rebuild a fresh context from it, and require
+    /// the rebuilt context's own journal to be the same one. See `rebuild_gate`.
+    rebuild: bool,
+    /// Run the gate after this many commands have been replayed, instead of only at teardown.
+    /// A real suspend happens mid-workload; a capture of a workload that exits ends with the
+    /// guest's own teardown, where there is nothing left to rebuild.
+    rebuild_at: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -72,6 +79,8 @@ fn parse_args() -> Result<Args, String> {
     let mut score = None;
     let mut expect = None;
     let mut smoke = false;
+    let mut rebuild = false;
+    let mut rebuild_at = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -87,6 +96,12 @@ fn parse_args() -> Result<Args, String> {
             "--score" => score = Some(it.next().ok_or("--score wants a path")?),
             "--expect" => expect = Some(it.next().ok_or("--expect wants a path")?),
             "--smoke" => smoke = true,
+            "--rebuild" => rebuild = true,
+            "--rebuild-at" => {
+                let v = it.next().ok_or("--rebuild-at wants a command count")?;
+                rebuild_at = Some(v.parse().map_err(|_| format!("--rebuild-at {v}: not a number"))?);
+                rebuild = true;
+            }
             _ if corpus.is_none() => corpus = Some(a),
             _ => return Err(format!("unexpected argument {a}")),
         }
@@ -96,6 +111,9 @@ fn parse_args() -> Result<Args, String> {
         // A smoke score is a strict subset of a real one. Pinning it would replace a golden with
         // a weaker one that still passes, which is the failure a fixture exists to prevent.
         return Err("--smoke scores nothing; drop --score/--expect".into());
+    }
+    if smoke && rebuild {
+        return Err("--smoke replays nothing, so there is no journal to rebuild from".into());
     }
     Ok(Args {
         corpus: corpus.ok_or("no corpus given")?,
@@ -107,6 +125,8 @@ fn parse_args() -> Result<Args, String> {
         score,
         expect,
         smoke,
+        rebuild,
+        rebuild_at,
     })
 }
 
@@ -119,6 +139,9 @@ struct Tally {
     smoke_skipped_exports: u64,
     prologue_ok: u64,
     prologue_fail: u64,
+    /// Contexts whose journal rebuilt into the same journal, and those that did not.
+    rebuild_ok: u64,
+    rebuild_fail: u64,
     cmd_ok: u64,
     cmd_fail: u64,
     ctl_ok: u64,
@@ -139,8 +162,12 @@ struct Tally {
 }
 
 impl Tally {
+    /// What makes the run fail. `rebuild_fail` is here and deliberately not in the score text: the
+    /// gate is a claim about the renderer, not about the corpus, so a tree that passes it must
+    /// produce the same score file as one that was never asked to run it -- otherwise turning the
+    /// gate on would force every pinned fixture to be re-recorded.
     fn failed(&self) -> u64 {
-        self.prologue_fail + self.cmd_fail + self.ctl_fail
+        self.prologue_fail + self.cmd_fail + self.ctl_fail + self.rebuild_fail
     }
 }
 
@@ -166,6 +193,12 @@ struct Replay<'a> {
     score: Vec<String>,
     /// Contexts already scored at their destroy, so the final sweep does not score them twice.
     scored: BTreeSet<u32>,
+    /// Whether to run the snapshot fixed-point gate, and which contexts it has already run on.
+    rebuild: bool,
+    rebuilt: BTreeSet<u32>,
+    /// Gate after this many replayed commands, and how many have gone by.
+    rebuild_at: Option<u64>,
+    replayed: u64,
     /// DIAGNOSTIC, not the shipped semantics. A create_blob that exports a VkDeviceMemory
     /// (blob_id != 0) can be recorded ahead of the vkAllocateMemory that made it: the recorder
     /// orders events by when each thread reached its lock, and that is not the order they
@@ -288,6 +321,10 @@ impl<'a> Replay<'a> {
                 // zero too -- carrying the dead generation's count forward would report a port
                 // that backs nothing as backing everything the previous one did.
                 self.iosurf.remove(ctx_id);
+                // A reused id is a different context, so it owes the gate its own answer. Without
+                // this the second life of an id is silently taken as already gated -- and this
+                // corpus reuses ctx 8 three times.
+                self.rebuilt.remove(ctx_id);
                 (rc, format!("context_create {ctx_id} flags={context_init:#x} {name:?}"))
             }
             Ctl::CtxDestroy { ctx_id } => {
@@ -300,6 +337,14 @@ impl<'a> Replay<'a> {
                     let lines = score_context(&self.r, *ctx_id);
                     self.score.extend(lines);
                     self.score.push(iosurf_line(&self.iosurf, *ctx_id));
+                    // And rebuild it here for the same reason it is scored here. A capture of a
+                    // workload that exits carries the guest's own teardown, so by end of stream
+                    // this context is gone and its journal with it -- a gate that waited would be
+                    // asking a context that no longer exists and calling the silence a pass.
+                    if self.rebuild {
+                        rebuild_gate(&self.r, *ctx_id, &mut self.tally);
+                        self.rebuilt.insert(*ctx_id);
+                    }
                 }
                 self.scored.insert(*ctx_id);
                 self.r.context_destroy(*ctx_id);
@@ -462,6 +507,10 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         deferred: Vec::new(),
         smoke: args.smoke,
         iosurf: BTreeMap::new(),
+        rebuild: args.rebuild,
+        rebuilt: BTreeSet::new(),
+        rebuild_at: args.rebuild_at,
+        replayed: 0,
     };
 
     // 1-2. Contexts already alive when the recorder armed: they have a prologue and no CtxCreate
@@ -554,6 +603,20 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
                     eprintln!("FAIL cmd: {ctx} ring={ring_id:#x} type={cmd_type} -> {rc}");
                 }
                 rp.drain_deferred();
+
+                // Mid-stream, which is the only shape a real suspend has: the guest is still
+                // running and its world is at its richest. Gating only at teardown asks a context
+                // that has already destroyed everything it built, and calls the empty answer a
+                // pass.
+                rp.replayed += 1;
+                if rp.rebuild_at == Some(rp.replayed) {
+                    for ctx_id in rp.open.clone() {
+                        if rp.classic.contains(&ctx_id) || !rp.rebuilt.insert(ctx_id) {
+                            continue;
+                        }
+                        rebuild_gate(&rp.r, ctx_id, &mut rp.tally);
+                    }
+                }
             }
         }
     }
@@ -567,6 +630,20 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
     // ring thread running earlier would race the replayed commands into an order that never ran.
     for ctx_id in rp.open.clone() {
         rp.end(ctx_id);
+    }
+
+    // The snapshot gate, before the score is taken: it creates and destroys contexts of its own,
+    // and running it after scoring would score a world it had already added to.
+    // Contexts the stream never destroyed -- the shape a real suspend has, where the guest is
+    // still running. Those the stream did destroy were gated at that point, where they still
+    // existed.
+    if args.rebuild && !rp.smoke {
+        for ctx_id in rp.open.clone().into_iter().chain(rp.scored.clone()) {
+            if rp.classic.contains(&ctx_id) || !rp.rebuilt.insert(ctx_id) {
+                continue;
+            }
+            rebuild_gate(&rp.r, ctx_id, &mut rp.tally);
+        }
     }
 
     // The oracle. Counts say the commands were accepted; the census says something was built, and
@@ -589,6 +666,119 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
     let tally = std::mem::take(&mut rp.tally);
     r.cleanup();
     Ok((tally, score))
+}
+
+/// Where a rebuilt context is stood up, added to the id of the context it was built from.
+///
+/// Far enough above any id a corpus uses that the two cannot collide, and deliberately derived
+/// from the original rather than allocated: a failure names `1008` and the reader knows it was
+/// ctx 8 that could not be rebuilt.
+const REBUILT_BASE: u32 = 1000;
+
+/// Require that replaying a context's journal yields a context whose journal is that same journal.
+///
+/// This is a fixed point, and so it is the floor rather than the ceiling. It cannot see what the
+/// recorder never learned to keep -- a command dropped on the way in is equally absent from both
+/// exports, and the two agree about a world that is missing it. What it does catch is everything
+/// the recorder keeps and the replay cannot use: an entry whose objects are rebuilt in the wrong
+/// order, one that names something the closure did not drag in, and any retention rule that is not
+/// stable under being applied twice.
+///
+/// It also rebuilds only the end-of-stream world and feeds the whole journal at once, so it never
+/// exercises the fence -- the interleave where the VMM creates a blob partway through the replay.
+/// Only a real suspend and resume scores that.
+///
+/// `seq` is deliberately not compared. A rebuilt context numbers its own journal from one, so the
+/// sequence numbers differ by construction; what has to match is which commands were retained, in
+/// which order, with which bytes, on which ring.
+fn rebuild_gate(r: &abi::Renderer, ctx_id: u32, tally: &mut Tally) {
+    let before = match r.journal_export(ctx_id) {
+        Ok(b) => b,
+        // Nothing retained is a real answer, not a failure: a context whose every command was
+        // transient has nothing to rebuild and nothing to disagree about.
+        Err(_) => {
+            // Two very different answers, and an absent journal cannot tell them apart: a
+            // recorder that saw nothing is a broken tee, and one that saw commands and kept none
+            // of them is a context the guest tore down before the capture ended.
+            println!(
+                "rebuild ctx={ctx_id} nothing retained ({} commands recorded)",
+                r.journal_seq(ctx_id)
+            );
+            return;
+        }
+    };
+
+    let fresh = ctx_id + REBUILT_BASE;
+    let mut fail = |why: String| {
+        tally.rebuild_fail += 1;
+        eprintln!("FAIL rebuild: ctx {ctx_id}: {why}");
+    };
+
+    let rc = r.context_create(fresh, CAPSET_VENUS, "vkr-rebuild");
+    if rc != 0 {
+        return fail(format!("context_create {fresh} -> {rc}"));
+    }
+    let rc = r.replay_begin(fresh);
+    if rc != 0 {
+        r.context_destroy(fresh);
+        return fail(format!("replay_begin {fresh} -> {rc}"));
+    }
+    let rc = r.journal_restore(fresh, &before);
+    if rc != 0 {
+        r.replay_end(fresh);
+        r.context_destroy(fresh);
+        return fail(format!("journal_restore {fresh} ({} bytes) -> {rc}", before.len()));
+    }
+    // Everything, in one go. A real restore paces this against its own rebuilding; here there is
+    // nothing on the other side to pace against, which is exactly why this cannot score the fence.
+    let rc = r.journal_replay_upto(fresh, u64::MAX);
+    if rc != 0 {
+        r.replay_end(fresh);
+        r.context_destroy(fresh);
+        return fail(format!("journal_replay_upto {fresh} -> {rc}"));
+    }
+    let rc = r.replay_end(fresh);
+    if rc != 0 {
+        r.context_destroy(fresh);
+        return fail(format!("replay_end {fresh} -> {rc}"));
+    }
+
+    let after = r.journal_export(fresh).unwrap_or_default();
+    r.context_destroy(fresh);
+
+    let key = |id| corpus::CtxKey { id, generation: 0 };
+    let (a, b) = match (
+        corpus::parse_journal(&before, key(ctx_id)),
+        corpus::parse_journal(&after, key(fresh)),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return fail(format!("journal does not parse: {e}")),
+    };
+
+    if a.len() != b.len() {
+        return fail(format!(
+            "rebuilt journal has {} entries, the original {} -- a replayed command retained \
+             something the guest's did not, or the reverse",
+            b.len(),
+            a.len()
+        ));
+    }
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        if x.cmd_type != y.cmd_type || x.ring_key != y.ring_key || x.wire != y.wire {
+            return fail(format!(
+                "entry {i} differs: original cmd_type={} ring={:#x} {} bytes, \
+                 rebuilt cmd_type={} ring={:#x} {} bytes",
+                x.cmd_type,
+                x.ring_key,
+                x.wire.len(),
+                y.cmd_type,
+                y.ring_key,
+                y.wire.len()
+            ));
+        }
+    }
+    tally.rebuild_ok += 1;
+    println!("rebuild ctx={ctx_id} {} entries, {} bytes, identical", a.len(), before.len());
 }
 
 /// FNV-1a, 64-bit. Inline because a content hash needs to be reproducible and comparable by hand,
@@ -750,7 +940,7 @@ fn main() -> ExitCode {
             eprintln!("vkr-replay: {e}");
             eprintln!(
                 "usage: vkr-replay <corpus.vkrc> --renderer <lib> [--flags N] [--verbose]\n\
-                 \x20               [--score <file>] [--expect <file>] [--smoke]"
+                 \x20               [--score <file>] [--expect <file>] [--smoke] [--rebuild]"
             );
             return ExitCode::FAILURE;
         }

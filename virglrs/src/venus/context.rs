@@ -4137,6 +4137,33 @@ mod tests {
         assert_eq!(ctx.unhandled, 0);
     }
 
+    /// The tee runs, and a command that built nothing durable is still counted.
+    ///
+    /// The narrowest possible check on the wiring: `seq` advances once per dispatched command
+    /// whatever the classification, so a zero here means the recorder was never reached at all --
+    /// which is a thing that can be true while every command succeeds and every score matches.
+    #[test]
+    fn a_dispatched_command_reaches_the_recorder() {
+        let cmd = VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT;
+        let g = crate::vulkan::global();
+        let mut todo = Unimplemented::default();
+        let mut ctx = Context::new(ContextId::new(1).unwrap(), &Budget::with_cap(None, false));
+        ctx.replay_begin();
+
+        assert_eq!(ctx.journal_seq(), Seq(0), "nothing has gone by yet");
+
+        let mut w = header(cmd, 0);
+        w.extend_from_slice(&0u64.to_le_bytes()); // a null instance: legal, and destroys nothing
+        w.extend_from_slice(&0u64.to_le_bytes()); // no allocator
+        assert!(ctx.submit(&w, &mut todo, &g, &NO_RESOURCES).ran());
+
+        assert_eq!(ctx.dispatched, 1);
+        assert_eq!(ctx.journal_seq(), Seq(1), "the recorder saw the command the dispatcher did");
+        // It created nothing, so it is retained as nothing -- and named, not merely counted.
+        assert_eq!(ctx.journal_transient(), vec![("vkDestroyInstance", 1)]);
+        assert!(ctx.journal_export().is_none(), "a journal of nothing exports nothing");
+    }
+
     /// A window in the ring resource, for the reply-stream tests.
     fn reply_at(
         offset: usize,

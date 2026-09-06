@@ -131,10 +131,10 @@ fn round_trip(rec: &Recorded, tally: &mut Tally) -> usize {
         seen += 1;
         let header = Header::parse(rec.words[from]);
         match next {
-            Ok(cmd) => {
+            Ok(framed) => {
                 let want = &rec.words[from..batch.position()];
                 let mut got = Vec::with_capacity(want.len());
-                encode(&cmd, &mut got);
+                encode(&framed.cmd, &mut got);
                 if got == want {
                     tally.note(header.cmd, Outcome::Ok, String::new);
                 } else {
