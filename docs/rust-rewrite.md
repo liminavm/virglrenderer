@@ -880,14 +880,6 @@ it survives the session it was found in.
   change nor the force-LINEAR rule. `harness/vm/client-gl-synoik.sh` is the reproducer, and
   `synoik-glclient.vkrc` was recorded from the C, which is why replaying it green said nothing.
 
-- **The classic half of P5 must drop and name, never poison.** virglrs refuses one journal entry
-  by poisoning the context, which loses everything after it; a restore has to keep going and
-  account for what it left behind. The C's shape is the trap to avoid, not the model: it buckets
-  drops by class and calls the low ones "the benign stale-reference kind", which is
-  indistinguishable from a recorder that never wrote the entry. Name every drop individually. It
-  lands *with* the classic recorder and never after — libkrun fails the whole restore if
-  `replay_begin` fails, so a restorer that reads a journal nothing writes is worse than none.
-
 - **`Exporter.ctx` names a context id, not a generation of one.** A `Shared` blob left by an
   earlier life of a reused context id is counted against the new one, inflating `journal_held`.
   The keys elsewhere are generational; this one is not, and the fix is to make it so rather than
