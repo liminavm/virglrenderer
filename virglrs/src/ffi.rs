@@ -1379,6 +1379,12 @@ fn malloc_bytes(bytes: &[u8]) -> Option<*mut c_void> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_journal_seq(_ctx_id: u32) -> u64 {
+    // Not implemented, and 0 is not an answer -- it is the absence of one, which the VMM cannot
+    // tell apart. It reads this to rebase a blob's fence into the new journal's epoch on a
+    // re-suspend, so a 0 says "everything recorded so far", and the next restore feeds nothing
+    // before each blob and everything at the drain. Harmless only because of what is true today:
+    // classic reaches no PIPE_RESOURCE_CREATE in a real session, and venus has no journal at all
+    // yet. Whichever of those changes first, this has to answer before it does.
     0
 }
 
