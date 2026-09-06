@@ -17,7 +17,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::cs::ObjectId;
 use super::driver::Storage;
 use super::proto::types::{VkCommandStreamDescriptionMESA, VkRingCreateInfoMESA};
 use crate::guest_mem::GuestMap;
@@ -257,8 +256,12 @@ pub trait ShmResources {
 
 /// Where a resource's bytes are, in the two shapes a resource can hold them.
 ///
-/// The pair a caller ultimately wants -- an address and a length -- is deliberately not here: an
-/// allocation's address is the driver's to know, and reconstituting it needs the memory table.
+/// Both are things the holder *keeps alive*, never names it has to resolve. A resource that held
+/// an allocation's id would go on naming it after the guest freed it, and the table it had to be
+/// resolved through would answer for whoever allocated next; a mapping and a share both stop
+/// existing when the last holder lets go, which is the same rule said once.
+///
+/// The pair a caller ultimately wants -- an address and a length -- is deliberately not here.
 /// See [`Driver::span`](crate::venus::driver::Driver::span), which is the one place that turns
 /// either of these into that pair.
 pub enum ResourceBytes {
@@ -268,19 +271,6 @@ pub enum ResourceBytes {
     /// alive for as long as it holds it. Resolvable by any context the guest attached it to,
     /// because a share is not a name in anybody's table.
     Shared(Storage),
-    /// Device memory a context allocated and then published as a resource.
-    Allocation(Published),
-}
-
-/// An allocation a resource publishes, and the size the resource was given.
-///
-/// The size is the guest's figure for the resource, never the extent of the storage behind it:
-/// what backs an allocation may be page-rounded by whatever minted it, and a guest asking about
-/// its resource did not ask about that rounding.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Published {
-    pub memory: ObjectId,
-    pub size: u64,
 }
 
 /// The words of a ring that more than one thread has a reason to touch, and the mapping they are

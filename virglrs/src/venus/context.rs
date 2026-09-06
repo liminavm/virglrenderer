@@ -693,21 +693,20 @@ impl Context {
         &mut self,
         id: ObjectId,
         blob_size: u64,
-    ) -> Result<(Exported, Option<driver::Storage>, ObjectKey), ExportError> {
-        let (handle, device, key) = {
+    ) -> Result<(Exported, driver::Storage, ObjectKey), ExportError> {
+        // The key, and only the key. The export itself no longer reaches Vulkan, so the device
+        // and the handle the table could resolve are not its business; what it still owes the
+        // caller is the generational name of the object it published, which is what a journal
+        // entry and a blob resource both hold on to.
+        let key = {
             let objects = self.objects.borrow();
-            let handle = objects
+            objects
                 .get(id)
                 .filter(|o| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY)
-                .map(|o| VkDeviceMemory::from_host(o.handle))
                 .ok_or(ExportError::NoSuchAllocation)?;
-            (
-                handle,
-                objects.device_of(id).ok_or(ExportError::NoSuchAllocation)?,
-                objects.key_of(id).ok_or(ExportError::NoSuchAllocation)?,
-            )
+            objects.key_of(id).ok_or(ExportError::NoSuchAllocation)?
         };
-        let (exported, share) = self.driver.memory_export(device, handle, id, blob_size)?;
+        let (exported, share) = self.driver.memory_export(id, blob_size)?;
         Ok((exported, share, key))
     }
 
@@ -3276,10 +3275,7 @@ impl Commands for Handlers<'_> {
             args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
             return;
         };
-        let Some(span) = self.driver.span(&bytes) else {
-            args.ret = VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE;
-            return;
-        };
+        let span = self.driver.span(&bytes);
 
         // A device this renderer has no table for is the other kind of failure: not the guest's
         // state, ours. It goes back through the query family's own refusal rather than a second
@@ -3300,7 +3296,6 @@ impl Commands for Handlers<'_> {
                 // over it -- literally the same number, so the query cannot promise an extent
                 // the allocation then clamps away.
                 ResourceBytes::Shared(_) => span.1,
-                ResourceBytes::Allocation(published) => published.size,
             };
         }
         args.ret = VkResult::VK_SUCCESS;
@@ -5912,82 +5907,6 @@ mod tests {
         args.resourceId = RING_RES.get();
         args.plant_pMemoryResourceProperties(&mut props);
         assert!(run!(&mut args).is_some(), "a device with no table behind it is refused");
-        assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
-    }
-
-    /// A resource the property query can resolve and the allocation could not alias.
-    ///
-    /// The two commands read one resolution now, so the only way they can still disagree is for
-    /// the resolution to name an allocation the driver has no record of -- a memory freed between
-    /// the query and its answer, say. That is a resource the guest must be told is not importable,
-    /// because the import that follows would fall through to ordinary memory and hand it a buffer
-    /// nobody presents.
-    ///
-    /// It is the guest's own state and not ours, so it is answered rather than refused: the ring
-    /// stays alive, exactly as it does for a resource id that names nothing.
-    #[test]
-    fn an_allocation_the_import_could_not_alias_is_not_called_importable() {
-        use super::super::proto::types::{
-            VkMemoryResourcePropertiesMESA, vn_command_vkGetMemoryResourcePropertiesMESA as Cmd,
-        };
-        use super::super::ring::Published;
-
-        /// A table whose one resource publishes an allocation that is not in any driver.
-        struct GhostExport;
-        impl ShmResources for GhostExport {
-            fn shm(
-                &self,
-                _: crate::ids::ResourceHandle,
-            ) -> Option<std::sync::Arc<crate::guest_mem::GuestMap>> {
-                None
-            }
-            fn bytes(&self, _: ContextId, _: crate::ids::ResourceHandle) -> Option<ResourceBytes> {
-                Some(ResourceBytes::Allocation(Published { memory: ObjectId(0x9999), size: 4096 }))
-            }
-        }
-
-        let objects = Shared::new();
-        let mut driver = Driver::new(Account::for_test(None));
-        let mut todo = Unimplemented::default();
-        let global = crate::vulkan::global();
-        let t = GhostExport;
-
-        let mut props = VkMemoryResourcePropertiesMESA::default();
-        let mut args = Cmd::default();
-        args.device = VkDevice(0x5001);
-        args.resourceId = 7;
-        args.plant_pMemoryResourceProperties(&mut props);
-
-        let mut rings = BTreeMap::new();
-        let mut ctx_reply = None;
-        let mut monitor = None;
-        let mut jrnl = Journal::new();
-        let mut h = Handlers {
-            objects: &objects,
-            todo: &mut todo,
-            driver: &mut driver,
-            global: &global,
-            ctx: ContextId::new(1).expect("1 is not zero"),
-            reject: None,
-            resources: &t,
-            rings: &mut rings,
-            monitor: &mut monitor,
-            wait: None,
-            execute: None,
-            replaying: false,
-            current_ring: None,
-            reply: &mut ctx_reply,
-            note: None,
-            journal: &mut jrnl,
-        };
-        h.vkGetMemoryResourcePropertiesMESA(&mut args);
-
-        assert!(h.reject.is_none(), "the guest's own state does not poison the ring");
-        assert_eq!(
-            args.ret,
-            VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE,
-            "a resource the import cannot alias is not importable",
-        );
         assert_eq!(props.memoryTypeBits, 0, "and nothing was written");
     }
 
