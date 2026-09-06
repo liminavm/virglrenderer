@@ -13,6 +13,7 @@ use super::features::{Feature, Features};
 use super::formats::{Entry, Table};
 use super::gl::gles::*;
 use super::gl::{BufferName, GLbitfield, GLenum, GLint, GLsizei, GLuint, Gl, TextureName};
+use super::journal::Retained;
 use super::pipe::TextureTarget;
 use super::proto::{Format, Plane};
 use super::video;
@@ -526,7 +527,7 @@ impl Untyped {
                 zero_texture(gl, formats, &args, &storage);
             }
         }
-        Ok(Resource { args, storage, guest_pixels })
+        Ok(Resource { args, storage, guest_pixels, typed_by: None })
     }
 
     /// A share of the surface these bytes are, if they are one.
@@ -983,6 +984,17 @@ pub struct Resource {
     /// Set only for a blob filled from pages this renderer may read; `None` for everything else,
     /// which is every classic resource and every blob that adopted a surface.
     pub guest_pixels: Option<GuestPixels>,
+    /// The `PIPE_RESOURCE_SET_TYPE` that gave this blob its type, for a rebuild to send again.
+    ///
+    /// `None` for a resource the control queue created, which is most of them: those are rebuilt
+    /// by the VMM replaying its own journal and were never described on the wire at all. The
+    /// record lives here because this is what it describes -- so it goes when the resource goes,
+    /// at the global unref, which is exactly where the C calls `journal_unpin`. That is why
+    /// nothing in this tree has to implement unpin.
+    ///
+    /// Typing is first-wins: `set_resource_type` returns early for a resource that already has a
+    /// type, so this is written once and never contradicted.
+    pub typed_by: Option<Retained>,
 }
 
 /// Which resources copy guest pages, as of one batch.
@@ -1051,7 +1063,7 @@ impl Resource {
         batch: u64,
         src: &PixelSource<'_>,
     ) {
-        let Resource { args, storage, guest_pixels } = self;
+        let Resource { args, storage, guest_pixels, typed_by: _ } = self;
         let Some(gp) = guest_pixels else {
             return;
         };
@@ -1200,7 +1212,7 @@ impl Resource {
                 alloc_texture(gl, features, formats, &args, gl_target, image, planes)?
             }
         };
-        Ok(Resource { args, storage, guest_pixels: None })
+        Ok(Resource { args, storage, guest_pixels: None, typed_by: None })
     }
 
     /// The texture storage, for the operations only a texture has.

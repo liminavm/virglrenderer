@@ -249,11 +249,20 @@ impl Vrend {
         (host, contexts)
     }
 
-    /// What every live context has retained for a rebuild.
+    /// What has been retained for a rebuild: every live context's objects and current state,
+    /// plus the type each live blob was given.
+    ///
+    /// The resources are counted here and not in `Context` because that is where they live -- one
+    /// table shared by every context, so no single context can answer for it.
     pub fn journal_census(&self) -> crate::vrend::journal::Census {
         let mut c = crate::vrend::journal::Census::default();
         for ctx in self.contexts.values() {
             c += ctx.journal_census();
+        }
+        for slot in self.resources.values() {
+            if let Some(at) = slot.resource().and_then(|r| r.typed_by.as_ref()) {
+                c.add(at, true);
+            }
         }
         c
     }

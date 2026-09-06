@@ -1052,7 +1052,7 @@ impl Renderer {
         self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
     }
 
-    /// What the classic renderer has retained for a rebuild, over every live context.
+    /// What the classic renderer has retained for a rebuild.
     pub fn journal_census(&self) -> crate::vrend::journal::Census {
         self.vrend.as_ref().map(|v| v.journal_census()).unwrap_or_default()
     }
