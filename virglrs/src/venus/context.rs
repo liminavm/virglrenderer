@@ -700,6 +700,22 @@ impl Context {
         self.driver.memory_read(device, handle, id, buf)
     }
 
+    /// Copy bytes back into one allocation, returning how many landed.
+    ///
+    /// Here for the reason [`Self::memory_read`] gives -- the table owns the handle and the
+    /// device, the driver owns the size and the mapping, and neither keeps a copy of the other's
+    /// answer.
+    pub fn memory_write(&self, id: ObjectId, src: &[u8]) -> Result<usize, MemoryError> {
+        let objects = self.objects.borrow();
+        let handle = objects
+            .get(id)
+            .filter(|o| o.ty == VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY)
+            .map(|o| VkDeviceMemory::from_host(o.handle))
+            .ok_or(MemoryError::NoSuchAllocation)?;
+        let device = objects.device_of(id).ok_or(MemoryError::NoSuchAllocation)?;
+        self.driver.memory_write(device, handle, id, src)
+    }
+
     /// Export one allocation as a blob, handing back the host address the VMM will publish.
     ///
     /// Here for the reason [`Self::memory_read`] gives: the table owns the handle and the device,

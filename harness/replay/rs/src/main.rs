@@ -881,6 +881,13 @@ fn rebuild_gate(
         return fail(why);
     }
 
+    // Before `replay_end`, because that is where the VMM writes them: a restore puts the contents
+    // in while the rings are still idle, and starting a ring over an allocation whose bytes have
+    // not landed is the interleave the whole two-call shape exists to avoid. Held, not reported,
+    // until the journals have been compared -- a held mismatch is the cause and a write refused
+    // for an allocation the rebuild did not make is its symptom.
+    let content = content_gate(r, ctx_id, fresh);
+
     let rc = r.replay_end(fresh);
     if rc != 0 {
         for h in &remade {
@@ -939,6 +946,10 @@ fn rebuild_gate(
             ));
         }
     }
+    match content {
+        Ok(n) => println!("rebuild ctx={ctx_id} contents restored into {n} allocation(s)"),
+        Err(why) => return fail(why),
+    }
     tally.rebuild_ok += 1;
     println!("rebuild ctx={ctx_id} {} entries, {} bytes, identical", a.len(), before.len());
 }
@@ -981,6 +992,57 @@ const READ_CAP: usize = 1 << 20;
 /// buffer twice -- so without this the whole exported half of a context is unscored. It is also
 /// the only read that survives the guest freeing the allocation: the resource holds a share of the
 /// storage, so `vkFreeMemory` retires the record and leaves these bytes standing. Every venus
+/// Put the original context's allocation contents into the rebuilt one, and require them to read
+/// back as themselves.
+///
+/// The other half of what a snapshot is. `rebuild_gate` proves a journal rebuilds the *world* --
+/// the objects, and the commands that would make them again -- and says nothing about the bytes
+/// in it: a rebuilt allocation is freshly allocated and blank, so a resume that stopped there
+/// would come back to a desktop of empty windows. This is `memory_read` and `memory_write` closing
+/// on each other over a live pair of contexts, which is the only place the pair can be scored --
+/// at end of stream there is no rebuilt context to write into, and comparing a dead world to a
+/// dead world compares nothing.
+///
+/// A prefix, capped the same way the census is: what the VMM keeps is what it can put back, and
+/// the cap is the harness's, not the mechanism's.
+///
+/// Run where the VMM runs it -- after the journal has been fed and before `replay_end` starts the
+/// rings -- so what this scores is the order a resume actually uses.
+fn content_gate(r: &abi::Renderer, ctx_id: u32, fresh: u32) -> Result<usize, String> {
+    let pairs = r
+        .memory_census(ctx_id)
+        .map_err(|rc| format!("memory_census {ctx_id} for the content gate -> {rc}"))?;
+    let mut n = 0;
+    for (mem_id, size) in pairs {
+        let want = size.min(READ_CAP as u64) as usize;
+        let mut src = vec![0u8; want];
+        let rc = r.memory_read(ctx_id, mem_id, &mut src);
+        if rc != 0 {
+            return Err(format!("memory_read {ctx_id} mem {mem_id} ({want} bytes) -> {rc}"));
+        }
+        let rc = r.memory_write(fresh, mem_id, &src);
+        if rc != 0 {
+            return Err(format!(
+                "memory_write {fresh} mem {mem_id} ({want} bytes) -> {rc} -- the rebuilt context                  has no allocation of that size under the id the original was read from"
+            ));
+        }
+        let mut back = vec![0u8; want];
+        let rc = r.memory_read(fresh, mem_id, &mut back);
+        if rc != 0 {
+            return Err(format!("memory_read {fresh} mem {mem_id} ({want} bytes) -> {rc}"));
+        }
+        if back != src {
+            return Err(format!(
+                "mem {mem_id} reads back as {:016x} in the rebuilt context, {:016x} in the                  original -- the write landed somewhere the read does not look",
+                fnv1a(&back),
+                fnv1a(&src)
+            ));
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// corpus we hold reaches that state.
 fn census_pass(
     r: &abi::Renderer,

@@ -3277,6 +3277,69 @@ impl Driver {
         unsafe { (d.fns.vkUnmapMemory())(device, handle) };
         Ok(n)
     }
+
+    /// Copy bytes back into an allocation, returning how many landed.
+    ///
+    /// [`Self::memory_read`] backwards, arm for arm, because a restore has to reach the bytes by
+    /// whichever route the capture read them by: a scanout through its surface, minted pages
+    /// through the mapping this renderer owns, and anything else through `vkMapMemory`. A route
+    /// the two sides disagreed about would put a capture back somewhere nothing samples.
+    ///
+    /// Length is the one place the two are not mirrors. A short read is ordinary -- the VMM caps
+    /// what it keeps -- so a short write puts that prefix back and says so. A write *longer* than
+    /// the allocation is not a caller being economical: it means the allocation this id names now
+    /// is not the one the bytes were read from, and the refusal is the point.
+    ///
+    /// No flush after the mapped write, and none of this host's business: KosmicKrisp advertises
+    /// exactly one memory type and it is `HOST_COHERENT`. A host with a non-coherent host-visible
+    /// type would owe `vkFlushMappedMemoryRanges` here and `vkInvalidateMappedMemoryRanges` in
+    /// the read above -- both, or the pair is worth nothing.
+    pub fn memory_write(
+        &self,
+        device: VkDevice,
+        handle: VkDeviceMemory,
+        id: ObjectId,
+        src: &[u8],
+    ) -> Result<usize, MemoryError> {
+        let Some(record) = self.memory.get(&id) else {
+            return Err(MemoryError::NoSuchAllocation);
+        };
+        if src.len() as u64 > record.size {
+            return Err(MemoryError::LargerThanAllocation);
+        }
+        if let Some(surface) = record.surface() {
+            return Ok(surface.write_from(src));
+        }
+        if let Backing::Owned { storage: Storage::Linear(p), .. } = &record.backing {
+            assert!(p.it.map.copy_in(0, src), "a write within pages this renderer minted");
+            return Ok(src.len());
+        }
+        let Some(d) = self.devices.get(&device) else {
+            return Err(MemoryError::NoSuchAllocation);
+        };
+        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: a device and an allocation this context made, and `ptr` is a local.
+        let r = unsafe {
+            (d.fns.vkMapMemory())(
+                device,
+                handle,
+                VkDeviceSize(0),
+                VK_WHOLE_SIZE,
+                VkMemoryMapFlags(0),
+                &mut ptr,
+            )
+        };
+        if r != VkResult::VK_SUCCESS || ptr.is_null() {
+            return Err(MemoryError::NotMappable);
+        }
+        // SAFETY: the driver mapped at least `record.size` bytes at `ptr`, and `src` is no longer
+        // than that -- checked above, which is what that check is for. The two cannot overlap:
+        // one is the driver's mapping and the other the caller's.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.cast::<u8>(), src.len()) };
+        // SAFETY: the mapping this call just made, unmapped once.
+        unsafe { (d.fns.vkUnmapMemory())(device, handle) };
+        Ok(src.len())
+    }
 }
 
 /// One live allocation, as this driver holds it.
@@ -3764,6 +3827,11 @@ pub enum MemoryError {
     /// driver's to hand out, and a scanout backed by an IOSurface lives in the surface rather
     /// than in the allocation -- in both cases the bytes are reachable, but by the blob path.
     NotMappable,
+    /// A write carries more bytes than the allocation holds. Only a restore writes, and a capture
+    /// bigger than what it is being put back into means the journal rebuilt a different
+    /// allocation than the one the bytes came from -- the world disagreeing, which is refused
+    /// rather than clamped to whatever happens to fit.
+    LargerThanAllocation,
 }
 
 /// How many bytes to mint for an allocation of `size`, as the host counts them.
@@ -4225,6 +4293,92 @@ mod tests {
 
         drop(share);
         assert_eq!(budget.live(), 0, "and the last share going is what credits it");
+    }
+
+    /// A capture goes back in by the route it came out of, whichever backing that is.
+    ///
+    /// The three arms are three different pieces of memory -- a surface's pages, pages this
+    /// renderer minted, and whatever the driver hands back from `vkMapMemory` -- and a restore
+    /// that knew one route and not another would put a snapshot back somewhere nothing reads. So
+    /// the property under test is the round trip and not the write: write, then read, for each.
+    ///
+    /// The refusal is the other half. A capture larger than the allocation it is going back into
+    /// means the id names a different allocation than the one it was read from, and a write that
+    /// clamped would report success for a restore it did not do.
+    #[test]
+    fn a_capture_goes_back_in_by_the_route_it_came_out_of() {
+        use std::cell::RefCell;
+
+        const DEVICE: VkDevice = VkDevice(3);
+        const HANDLE: VkDeviceMemory = VkDeviceMemory(0x9000);
+
+        thread_local! {
+            /// What the driver would have allocated: the bytes `vkMapMemory` hands out.
+            static DRIVER_MEMORY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn map(
+            _d: VkDevice,
+            _m: VkDeviceMemory,
+            _o: VkDeviceSize,
+            _s: VkDeviceSize,
+            _f: VkMemoryMapFlags,
+            out: *mut *mut core::ffi::c_void,
+        ) -> VkResult {
+            let at = DRIVER_MEMORY.with(|b| b.borrow_mut().as_mut_ptr());
+            // SAFETY: the driver's out parameter, written once. The buffer behind `at` is a
+            // thread-local that outlives every call in this test and is never resized after the
+            // planting below, so the pointer stays good until it unmaps.
+            unsafe { *out = at.cast() };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn unmap(_d: VkDevice, _m: VkDeviceMemory) {}
+
+        let mut d = Driver::new(Account::for_test(None));
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkMapMemory(map);
+        fns.plant_vkUnmapMemory(unmap);
+        d.plant_device(DEVICE, fns);
+
+        let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
+        let extent = surface.alloc_size() as usize;
+        d.plant_scanout_allocation(ObjectId(66), surface);
+        d.plant_allocation(ObjectId(70), 4096);
+        DRIVER_MEMORY.with(|b| *b.borrow_mut() = vec![0u8; 4096]);
+        d.plant_device_local_allocation(ObjectId(72), 4096);
+
+        let round_trip = |d: &Driver, id: u64, len: usize| {
+            let src: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            assert_eq!(
+                d.memory_write(DEVICE, HANDLE, ObjectId(id), &src),
+                Ok(len),
+                "the whole capture goes back into {id}"
+            );
+            let mut back = vec![0u8; len];
+            assert_eq!(d.memory_read(DEVICE, HANDLE, ObjectId(id), &mut back), Ok(len));
+            assert_eq!(back, src, "and reads back as what went in, for {id}");
+        };
+        round_trip(&d, 66, extent);
+        round_trip(&d, 70, 4096);
+        round_trip(&d, 72, 4096);
+
+        // A prefix is ordinary -- the VMM caps what it keeps -- and lands at the front.
+        assert_eq!(d.memory_write(DEVICE, HANDLE, ObjectId(70), &[0xab; 8]), Ok(8));
+        let mut head = [0u8; 8];
+        assert_eq!(d.memory_read(DEVICE, HANDLE, ObjectId(70), &mut head), Ok(8));
+        assert_eq!(head, [0xab; 8], "a short write is a prefix, not a failure");
+
+        assert_eq!(
+            d.memory_write(DEVICE, HANDLE, ObjectId(70), &vec![0u8; 4096 * 4]),
+            Err(MemoryError::LargerThanAllocation),
+            "more bytes than the allocation holds is a different allocation, and is refused"
+        );
+        assert_eq!(
+            d.memory_write(DEVICE, HANDLE, ObjectId(999), &[0u8; 4]),
+            Err(MemoryError::NoSuchAllocation),
+            "and an id nothing is allocated under is refused before any of that"
+        );
+
+        d.abandon_planted();
     }
 
     /// What each backing lends, now that every allocation the host can address owns its bytes.

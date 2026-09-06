@@ -279,6 +279,25 @@ SABOTAGES = [
         '',
     ),
     (
+        'a capture larger than the allocation is clamped to fit instead of refused',
+        'virglrs/src/venus/driver.rs',
+        """        if src.len() as u64 > record.size {
+            return Err(MemoryError::LargerThanAllocation);
+        }""",
+        """        let src = &src[..src.len().min(record.size as usize)];""",
+        'a_capture_goes_back_in_by_the_route_it_came_out_of',
+    ),
+    (
+        "a scanout's restore goes through vkMapMemory like any other allocation",
+        'virglrs/src/venus/driver.rs',
+        """        if let Some(surface) = record.surface() {
+            return Ok(surface.write_from(src));
+        }
+""",
+        """""",
+        'a_capture_goes_back_in_by_the_route_it_came_out_of',
+    ),
+    (
         'a blob is attributed to whichever context holds its id now',
         'virglrs/src/renderer.rs',
         '                    if from.ctx == key =>',

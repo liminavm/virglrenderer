@@ -58,6 +58,9 @@ pub enum Error {
     NoAllocation,
     /// The allocation exists but the driver would not map it; see [`MemoryError::NotMappable`].
     NotMappable,
+    /// A restore carries more bytes than the allocation it is being put back into holds; see
+    /// [`MemoryError::LargerThanAllocation`].
+    ContentLargerThanAllocation,
     /// The allocation is already published as some other resource's blob. A memory backs one
     /// blob: two resources over one storage is a state neither of them could detect.
     AlreadyExported,
@@ -76,6 +79,16 @@ pub enum Error {
     ClassicRefused(Refusal),
     /// A classic transfer did not happen, for the reason given.
     Transfer(transfer::Error),
+}
+
+/// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
+/// both, because a route one of them refuses is a route the other refuses for the same reason.
+fn memory_error(e: MemoryError) -> Error {
+    match e {
+        MemoryError::NoSuchAllocation => Error::NoAllocation,
+        MemoryError::NotMappable => Error::NotMappable,
+        MemoryError::LargerThanAllocation => Error::ContentLargerThanAllocation,
+    }
 }
 
 /// An export's refusals in the renderer's vocabulary, for the reason [`venus_error`] gives.
@@ -116,6 +129,9 @@ impl std::fmt::Display for Error {
             Error::AlreadyExported => "that allocation is already published as a blob",
             Error::NotHostVisible => "that allocation is not addressable by the host",
             Error::BlobLargerThanAllocation => "the blob is larger than the allocation behind it",
+            Error::ContentLargerThanAllocation => {
+                "the restored contents are larger than the allocation they go back into"
+            }
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
@@ -1358,10 +1374,21 @@ impl Renderer {
         mem: ObjectId,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        self.venus_context(ctx_id, |ctx| ctx.memory_read(mem, buf))?.map_err(|e| match e {
-            MemoryError::NoSuchAllocation => Error::NoAllocation,
-            MemoryError::NotMappable => Error::NotMappable,
-        })
+        self.venus_context(ctx_id, |ctx| ctx.memory_read(mem, buf))?.map_err(memory_error)
+    }
+
+    /// Copy one allocation's contents back in, returning how many bytes landed.
+    ///
+    /// The restore half of [`Self::venus_memory_read`], and the only writer of an allocation's
+    /// bytes that is not the guest. What it puts back is what that read handed out, so the two
+    /// reach the memory by the same routes and neither knows a route the other does not.
+    pub fn venus_memory_write(
+        &self,
+        ctx_id: ContextId,
+        mem: ObjectId,
+        src: &[u8],
+    ) -> Result<usize, Error> {
+        self.venus_context(ctx_id, |ctx| ctx.memory_write(mem, src))?.map_err(memory_error)
     }
 
     /// The venus context under an id, distinguishing "no venus in this build" from "no such

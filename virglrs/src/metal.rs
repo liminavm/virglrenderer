@@ -816,6 +816,42 @@ impl Surface {
         n
     }
 
+    /// Copy bytes into the surface, returning how many landed in it.
+    ///
+    /// [`Self::read_into`] backwards, for the restore that puts a captured scanout back: the
+    /// storage *is* the surface, so there is nothing for `vkMapMemory` to write through. A source
+    /// shorter than the surface writes a prefix and says so, which is the same contract the read
+    /// side has and for the same reason -- the caller decides how much of an allocation it kept.
+    ///
+    /// Locked for write, not read-only: the read-only lock promises the kernel this process will
+    /// not dirty the pages, and writing through it is how a restore lands nowhere.
+    pub fn write_from(&self, src: &[u8]) -> usize {
+        let n = src.len().min(self.alloc_size() as usize);
+        if n == 0 {
+            return 0;
+        }
+        // SAFETY: `IOSurfaceLock` takes the surface we hold a reference to; a null seed is
+        // documented as "do not report the seed" rather than as an out parameter we must supply.
+        // A failed lock leaves nothing locked, so there is nothing to unlock and nothing to write.
+        if unsafe { IOSurfaceLock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut()) } != 0 {
+            return 0;
+        }
+        // SAFETY: the lock is held, so the base address addresses `alloc_size` writable bytes
+        // that no one else is reading through the CPU's view; `n` is bounded by that above and by
+        // `src`'s own length. The regions cannot overlap -- `src` is the caller's memory and this
+        // is the surface's.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                IOSurfaceGetBaseAddress(self.as_ref()).cast::<u8>(),
+                n,
+            );
+            // Balanced against the lock above, with the same options, as IOSurface requires.
+            IOSurfaceUnlock(self.as_ref(), LOCK_READ_WRITE, core::ptr::null_mut());
+        }
+        n
+    }
+
     /// Copy the surface's rows into a buffer whose own rows are `stride` bytes apart.
     ///
     /// Two pitches, and they are not the same number: a surface lays its rows out however
@@ -1048,6 +1084,31 @@ mod tests {
         // Were the alignment ever 1, this would still pass while measuring nothing, and every
         // caller reading a pitch back would look like dead caution.
         assert!(wider_than_tight > 0, "no plane was aligned past its tight row");
+    }
+
+    /// A surface's bytes go out and come back the same, which is the whole of what a restore
+    /// needs of it: the scanout's storage *is* the surface, so this pair is the only route a
+    /// captured frame has back in.
+    #[test]
+    fn a_surface_reads_back_what_was_written_into_it() {
+        let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
+        let extent = surface.alloc_size() as usize;
+        let src: Vec<u8> = (0..extent).map(|i| (i % 251) as u8).collect();
+        assert_eq!(surface.write_from(&src), extent, "all of it lands");
+
+        let mut back = vec![0u8; extent];
+        assert_eq!(surface.read_into(&mut back), extent);
+        assert_eq!(back, src, "and reads back as itself");
+
+        // A source shorter than the surface writes a prefix and says how much, the same contract
+        // the read side has: the caller decides how much of a frame it kept.
+        assert_eq!(surface.write_from(&[0xcd; 16]), 16);
+        let mut head = [0u8; 16];
+        assert_eq!(surface.read_into(&mut head), 16);
+        assert_eq!(head, [0xcd; 16]);
+
+        // And a source longer than it stops at the surface's own allocation rather than past it.
+        assert_eq!(surface.write_from(&vec![0u8; extent * 2]), extent);
     }
 
     /// Chroma rounds up, so an odd picture keeps a sample for its last row and column. A plane

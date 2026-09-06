@@ -114,6 +114,8 @@ syms! {
         = "virgl_renderer_limina_memory_census",
     memory_read: extern "C" fn(u32, u64, *mut c_void, u64) -> c_int
         = "virgl_renderer_limina_memory_read",
+    memory_write: extern "C" fn(u32, u64, *const c_void, u64) -> c_int
+        = "virgl_renderer_limina_memory_write",
     resource_map: extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int
         = "virgl_renderer_resource_map",
     resource_get_iosurface_id: extern "C" fn(u32, *mut u32) -> c_int
@@ -311,6 +313,13 @@ impl Renderer {
     /// allocation size the census reported; the renderer copies min(size, allocation).
     pub fn memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> c_int {
         (self.syms.memory_read)(ctx_id, mem_id, buf.as_mut_ptr().cast(), buf.len() as u64)
+    }
+
+    /// Put a capturable memory's contents back, which is what a restore does with what
+    /// [`Self::memory_read`] handed out. A buffer shorter than the allocation writes that prefix;
+    /// one longer than it is refused, because it means the id names a different allocation now.
+    pub fn memory_write(&self, ctx_id: u32, mem_id: u64, buf: &[u8]) -> c_int {
+        (self.syms.memory_write)(ctx_id, mem_id, buf.as_ptr().cast(), buf.len() as u64)
     }
 
     /// Read a blob resource through the host address the VMM publishes to the guest, returning
