@@ -544,19 +544,6 @@ SABOTAGES = [
         '',
     ),
     (
-        'a published allocation travels without the size of the resource that published it',
-        'virglrs/src/renderer.rs',
-        """                    Some(ResourceBytes::Allocation(Published {
-                        memory: ObjectId(mem.0),
-                        size: desc.size,
-                    }))""",
-        """                    Some(ResourceBytes::Allocation(Published {
-                        memory: ObjectId(mem.0),
-                        size: 0,
-                    }))""",
-        '',
-    ),
-    (
         "a ring's shared memory is reachable by any context that guesses its handle",
         'virglrs/src/renderer.rs',
         """        if !res.attached.contains(&ctx) {
@@ -582,17 +569,6 @@ SABOTAGES = [
         'a_context_reaches_the_resources_the_guest_attached_to_it',
     ),
     (
-        'an import keeps the address it resolved and drops the share that kept it good',
-        'virglrs/src/venus/driver.rs',
-        """            (Some(bytes), _, _) => Backing::Imported(bytes),""",
-        """            (Some(bytes), _, _) => {
-                let name = crate::venus::ring::Published { memory: id, size };
-                drop(bytes);
-                Backing::Imported(ResourceBytes::Allocation(name))
-            }""",
-        'an_import_holds_the_storage_it_resolved',
-    ),
-    (
         'the gate on what the guest attached to a context is dropped',
         'virglrs/src/renderer.rs',
         """        if !res.attached.contains(&ctx) {""",
@@ -602,9 +578,11 @@ SABOTAGES = [
     (
         'a scanout export lends no share, so its storage stays trapped in one context',
         'virglrs/src/venus/driver.rs',
-        """            Backing::Owned { storage, .. } => Some(storage.clone()),""",
-        """            Backing::Owned { storage: Storage::Linear(s), .. } => Some(Storage::Linear(Arc::clone(s))),
-            Backing::Owned { storage: Storage::Texture(_), .. } => None,""",
+        """        let share = storage.clone();""",
+        """        let share = match storage {
+            Storage::Linear(s) => Storage::Linear(Arc::clone(s)),
+            Storage::Texture(_) => return Err(ExportError::NotMappable),
+        };""",
         '',
     ),
     (
@@ -649,55 +627,36 @@ SABOTAGES = [
         '',
     ),
     (
-        'memory the guest asked to export is the driver\'s own again, lent by a mapping',
+        'host-visible memory is left to the driver again, so a blob over it has nothing to hold',
         'virglrs/src/venus/driver.rs',
-        """            && exports_memory(info.pNext)
-            && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)""",
+        """            && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)""",
         """            && false""",
-        '',
+        'host_addressable_memory_is_backed_by_pages_this_renderer_minted',
+    ),
+    (
+        'an allocation is published twice, and neither resource can learn of the other',
+        'virglrs/src/venus/driver.rs',
+        """        *published = true;""",
+        """        *published = false;""",
+        'memory_is_published_once_and_leaves_the_census_when_it_is',
+    ),
+    (
+        'a blob is published larger than the storage it was minted from',
+        'virglrs/src/venus/driver.rs',
+        """        if blob_size > len {
+            return Err(ExportError::LargerThanAllocation);
+        }""",
+        """""",
+        'every_allocation_the_host_can_address_owns_the_bytes_it_lends',
     ),
     (
         'minted pages lend no share, so the buffer stays trapped in one context',
         'virglrs/src/venus/driver.rs',
-        """            Backing::Owned { storage, .. } => Some(storage.clone()),""",
-        """            Backing::Owned { storage: Storage::Texture(s), .. } => Some(Storage::Texture(Arc::clone(s))),
-            Backing::Owned { storage: Storage::Linear(_), .. } => None,""",
-        '',
-    ),
-    (
-        'a borrowed mapping is answered for as long as the resource lives, as the C answers it',
-        'virglrs/src/renderer.rs',
-        """        if !self.venus_context(ctx, |c| c.holds(key))? {
-            return Err(Error::NoAllocation);
-        }
-        Ok(mapping)""",
-        """        let _ = (ctx, key);
-        Ok(mapping)""",
-        'a_borrowed_mapping_dies_with_the_object',
-    ),
-    (
-        'a borrowed mapping is answered for whatever the guest names by the id now',
-        'virglrs/src/renderer.rs',
-        """        if !self.venus_context(ctx, |c| c.holds(key))? {
-            return Err(Error::NoAllocation);
-        }
-        Ok(mapping)""",
-        """        let _ = key;
-        let mem = self.with_resource(handle, |r| match &r.backing {
-            Backing::Blob { storage: BlobStorage::Borrowed { mem, .. }, .. } => Some(*mem),
-            _ => None,
-        }).flatten().ok_or(Error::NoResource)?;
-        if self.venus_context(ctx, |c| c.objects().borrow().get(ObjectId(mem.0)).is_none())? {
-            return Err(Error::NoAllocation);
-        }
-        Ok(mapping)""",
-        'a_borrowed_mapping_dies_with_the_object',
-    ),
-    (
-        'a resource id resolves to whatever another context filed under the same number',
-        'virglrs/src/renderer.rs',
-        """                BlobStorage::Borrowed { ctx: owner, mem, .. } if *owner == ctx => {""",
-        """                BlobStorage::Borrowed { mem, .. } => {""",
+        """        let share = storage.clone();""",
+        """        let share = match storage {
+            Storage::Texture(s) => Storage::Texture(Arc::clone(s)),
+            Storage::Linear(_) => return Err(ExportError::NotMappable),
+        };""",
         '',
     ),
     (
