@@ -32,6 +32,7 @@ use crate::fence;
 use crate::ids::{BlobId, ClientFenceId, ContextId, FenceId, ResourceHandle, RingId, RingIdx};
 use crate::renderer::{self, BlobMem, FdType, ImportDesc, Renderer};
 use crate::venus::context::{Submitted, Wait};
+use crate::venus::cs::ObjectId;
 use crate::vrend::pipe::TextureTarget;
 use crate::vrend::proto::{self, Format};
 use crate::vrend::resource::{Args as ClassicArgs, Bind, ResourceFlags};
@@ -1670,7 +1671,7 @@ pub extern "C" fn virgl_renderer_limina_memory_read(
         };
         // The ABI answers success or a code, never a count -- a caller that wants fewer bytes
         // than the census reported passes a shorter buffer and knows what it asked for.
-        match r.venus_memory_read(ctx, mem_id, out) {
+        match r.venus_memory_read(ctx, ObjectId(mem_id), out) {
             Ok(_) => 0,
             Err(e) => errno(e),
         }

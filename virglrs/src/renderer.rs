@@ -1298,17 +1298,18 @@ impl Renderer {
     }
 
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
+    ///
+    /// Named by the same [`ObjectId`] the census reported it under, and not by a bare integer:
+    /// the two are one value, and the shim is where it is spelled as a number.
     pub fn venus_memory_read(
         &self,
         ctx_id: ContextId,
-        mem_id: u64,
+        mem: ObjectId,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        self.venus_context(ctx_id, |ctx| ctx.memory_read(ObjectId(mem_id), buf))?.map_err(|e| {
-            match e {
-                MemoryError::NoSuchAllocation => Error::NoAllocation,
-                MemoryError::NotMappable => Error::NotMappable,
-            }
+        self.venus_context(ctx_id, |ctx| ctx.memory_read(mem, buf))?.map_err(|e| match e {
+            MemoryError::NoSuchAllocation => Error::NoAllocation,
+            MemoryError::NotMappable => Error::NotMappable,
         })
     }
 
