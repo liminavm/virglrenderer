@@ -5,9 +5,14 @@ skipped flow-control 72172
 skipped classic [2, 4, 5, 6, 7]
 unreplayable imports []
 parked 0
+blob ctx=8 res=465 size=1015808 read=1015808 hash=84793f592e256b65
+blob ctx=8 res=466 size=1015808 read=1015808 hash=84793f592e256b65
+blob ctx=8 res=467 size=1015808 read=1015808 hash=84793f592e256b65
 census ctx=8 allocations=0
 iosurface ctx=8 backed=3
 census ctx=8 allocations=0
 iosurface ctx=8 backed=0
+blob ctx=8 res=554 size=1933312 read=1048576 hash=dbc20b4b18c22325
+blob ctx=8 res=557 size=1933312 read=1048576 hash=dbc20b4b18c22325
 census ctx=8 allocations=0
 iosurface ctx=8 backed=4

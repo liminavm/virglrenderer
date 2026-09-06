@@ -114,6 +114,8 @@ syms! {
         = "virgl_renderer_limina_memory_census",
     memory_read: extern "C" fn(u32, u64, *mut c_void, u64) -> c_int
         = "virgl_renderer_limina_memory_read",
+    resource_map: extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int
+        = "virgl_renderer_resource_map",
     resource_get_iosurface_id: extern "C" fn(u32, *mut u32) -> c_int
         = "virgl_renderer_resource_get_iosurface_id",
     resource_read_iosurface: extern "C" fn(u32, *mut c_void, u32, u32) -> c_int
@@ -309,6 +311,37 @@ impl Renderer {
     /// allocation size the census reported; the renderer copies min(size, allocation).
     pub fn memory_read(&self, ctx_id: u32, mem_id: u64, buf: &mut [u8]) -> c_int {
         (self.syms.memory_read)(ctx_id, mem_id, buf.as_mut_ptr().cast(), buf.len() as u64)
+    }
+
+    /// Read a blob resource through the host address the VMM publishes to the guest, returning
+    /// the mapped extent and up to `cap` bytes of it.
+    ///
+    /// The mapped size comes back with the bytes because they are one fact: the extent decides
+    /// what may be read, and a caller that asked for the size in a separate call could be told
+    /// about a different state of the same resource. Nothing is unmapped afterwards -- the
+    /// address belongs to whatever minted the storage, and `virgl_renderer_resource_unmap` is a
+    /// no-op on both trees for exactly that reason.
+    ///
+    /// This is the only read that goes the way the guest's own load does. `memory_read` asks the
+    /// venus context about an allocation it still holds; this asks the resource, which holds a
+    /// share of the storage and answers after the guest has freed the allocation.
+    pub fn blob_read(&self, res_handle: u32, cap: usize) -> Result<(u64, Vec<u8>), c_int> {
+        let mut addr: *mut c_void = ptr::null_mut();
+        let mut size: u64 = 0;
+        let rc = (self.syms.resource_map)(res_handle, &mut addr, &mut size);
+        if rc != 0 {
+            return Err(rc);
+        }
+        if addr.is_null() {
+            return Err(-1);
+        }
+        let n = cap.min(size as usize);
+        let mut buf = vec![0u8; n];
+        // SAFETY: the renderer answered 0, which is its promise that `addr` points at `size`
+        // readable bytes; `n` is clamped to that, and `buf` is a fresh allocation of `n` that
+        // cannot overlap the renderer's storage.
+        unsafe { ptr::copy_nonoverlapping(addr.cast::<u8>(), buf.as_mut_ptr(), n) };
+        Ok((size, buf))
     }
 
     /// Whether a resource is IOSurface-backed. `Some(id)` for backed, `None` otherwise.
