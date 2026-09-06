@@ -1776,17 +1776,28 @@ impl Driver {
     /// Plant a live allocation from a memory type with the given properties.
     #[cfg(test)]
     pub(super) fn plant_allocation_of(&mut self, id: ObjectId, size: u64, props: u32) {
-        // Charged like a real one, so a test's ledger says what a guest's would.
-        let charge =
-            self.account.try_charge("device memory", size).expect("a test ledger has no cap");
-        self.memory.insert(
-            id,
-            Allocated {
-                size,
-                backing: Backing::Driver { charge, mapped: None },
-                props: VkMemoryPropertyFlags(props as _),
-            },
-        );
+        // The same fork the real allocate takes, so a planted allocation is the shape a guest's
+        // would be: memory the host can address is minted pages this renderer owns, and only
+        // memory it cannot is left to the driver. Charged like a real one either way, so a test's
+        // ledger says what a guest's would.
+        let backing = if props & HOST_VISIBLE_BIT != 0 {
+            let len = size_for_pages(size).expect("a test size fits");
+            let map = GuestMap::anonymous(len).expect("the host has pages");
+            let charge = self
+                .account
+                .try_charge("exported pages", len as u64)
+                .expect("a test ledger has no cap");
+            Backing::Owned {
+                storage: Storage::pages(map, charge, NoSurface::NotExported),
+                published: false,
+            }
+        } else {
+            let charge =
+                self.account.try_charge("device memory", size).expect("a test ledger has no cap");
+            Backing::Driver { charge }
+        };
+        self.memory
+            .insert(id, Allocated { size, backing, props: VkMemoryPropertyFlags(props as _) });
     }
 
     /// Plant an allocation that aliases storage it resolved elsewhere -- host-visible like any
@@ -2856,7 +2867,7 @@ impl Driver {
         if import.is_some() && alias.is_none() {
             return Err(NoMemory::Driver(VkResult::VK_ERROR_INVALID_EXTERNAL_HANDLE));
         }
-        let alias_span = alias.as_ref().and_then(|b| self.span(b));
+        let alias_span = alias.as_ref().map(|b| self.span(b));
         let surface = if import.is_some() {
             Err(NoSurface::NotExported)
         } else {
@@ -2866,12 +2877,21 @@ impl Driver {
         // buffer. The driver would allocate it and later lend a mapping -- a pointer with the
         // device's lifetime, which no other context could be handed. So the pages are minted here
         // and the driver imports them, and the pages are what a resource can hold a share of.
-        // Only for memory the host can address: exporting a type it cannot is refused later,
-        // and minting pages for it would be storage nobody reaches. Plain host-visible memory
-        // the guest never asked to export keeps the driver's own allocation, unchanged.
+        // Every allocation the host can address is minted here and imported, whether or not the
+        // guest said it meant to export it. Waiting for the guest to say so was the bug: a guest
+        // may export at any later moment, and an allocation that was not minted has only the
+        // driver's own `vkMapMemory` pointer to publish -- an address the VMM maps into guest
+        // physical memory and that `vkFreeMemory` then unmaps underneath it. Minting up front is
+        // what makes the storage outlive the allocation: a blob holds a share, so the guest's
+        // free retires the record and not the pages.
+        //
+        // There is deliberately no fallback to a driver allocation when the mint or the import
+        // fails. A fallback is the borrowed-pointer lifetime coming back under another name, and
+        // it would come back exactly on the hosts where it is least testable. Refusing is loud
+        // and the guest's allocation fails; the alternative is quiet and the hypervisor's mapping
+        // dangles.
         let pages = if import.is_none()
             && surface.is_err()
-            && exports_memory(info.pNext)
             && props.is_some_and(|p| p.0 & HOST_VISIBLE_BIT != 0)
         {
             Some(size_for_pages(info.allocationSize.0)?)
@@ -2911,9 +2931,7 @@ impl Driver {
                 };
                 Backing::Owned { storage: Storage::pages(map, charge, why), published: false }
             }
-            (None, Err(_), None) => {
-                Backing::Driver { charge: self.admit("device memory", size)?, mapped: None }
-            }
+            (None, Err(_), None) => Backing::Driver { charge: self.admit("device memory", size)? },
         };
 
         // Whichever it is, it comes out as one host address the driver is handed instead of
@@ -2999,33 +3017,19 @@ impl Driver {
     ///
     /// The only place either shape of [`ResourceBytes`] becomes an address and a length, so the
     /// property query that says a resource is importable and the allocation that imports it get
-    /// the same answer or no answer at all -- they cannot get two.
-    pub fn span(&self, bytes: &ResourceBytes) -> Option<(usize, u64)> {
+    /// the same answer -- they cannot get two.
+    ///
+    /// Total, and no longer a lookup. Both shapes are things the resource *holds*, so an address
+    /// exists by construction; there is no id left to resolve through a table that could have
+    /// emptied, and so no "importable" answer the import can go on to contradict. It stays a
+    /// method rather than becoming a free function because the driver is what the caller has,
+    /// and moving it would only relocate the call.
+    pub fn span(&self, bytes: &ResourceBytes) -> (usize, u64) {
         match bytes {
-            ResourceBytes::Host(map) => Some((map.host_addr(), map.len() as u64)),
+            ResourceBytes::Host(map) => (map.host_addr(), map.len() as u64),
             // Resolved from the share itself. No table is consulted, so it answers the same for
             // the context that made the storage and for any other the guest attached it to.
-            ResourceBytes::Shared(storage) => Some(storage.span()),
-            ResourceBytes::Allocation(published) => self.aliased_span(published.memory),
-        }
-    }
-
-    /// Where an allocation this context already owns lives, for a second allocation that names
-    /// it: the host address and how far it runs.
-    ///
-    /// One value, because an address and the length it is good for are only meaningful together
-    /// -- the caller clamps the guest's figure to the second before handing the driver the first.
-    ///
-    /// `None` for storage there is no address for: an allocation the driver keeps to itself, or
-    /// one that is itself an alias. Only a scanout has an address before anyone asks; ordinary
-    /// memory has one once it has been published, and the guest publishes before it imports,
-    /// because the resource it names is the blob that publishing made.
-    fn aliased_span(&self, id: ObjectId) -> Option<(usize, u64)> {
-        let record = self.memory.get(&id)?;
-        match &record.backing {
-            Backing::Driver { mapped, .. } => Some(((*mapped)?, record.size)),
-            Backing::Owned { storage, .. } => Some(storage.span()),
-            Backing::Imported(_) => None,
+            ResourceBytes::Shared(storage) => storage.span(),
         }
     }
 
@@ -3130,26 +3134,15 @@ impl Driver {
     /// table like every other input handle -- not from a record of this driver's own. The id is
     /// only the census entry to retire.
     pub fn free_memory(&mut self, device: VkDevice, memory: VkDeviceMemory, id: ObjectId) {
-        let was = self.memory.remove(&id);
+        self.memory.remove(&id);
+        // Dropping the record is the whole retirement. Nothing here holds a mapping the VMM was
+        // handed: an exported allocation's bytes are storage this renderer minted, and a blob
+        // over it holds a share, so the pages stand until the last holder goes. Freeing the
+        // allocation retires the record and the charge with it, and leaves the guest's blob
+        // working -- which is the arrangement the C reaches on Linux by keeping a dup'd fd.
         let Some(d) = self.devices.get(&device) else {
             return;
         };
-        // An exported allocation is still mapped -- the export handed the VMM that address and
-        // left the mapping standing. `vkFreeMemory` would drop it implicitly, but the record that
-        // owns the mapping is being retired here, so releasing it here is what keeps the two the
-        // same act: nothing is left holding an address after the thing it named is gone.
-        //
-        // Only a driver mapping. A published scanout's address is its surface's, which the
-        // surface owns and this record's drop releases; unmapping it would be undoing something
-        // `vkMapMemory` never did.
-        if was
-            .as_ref()
-            .is_some_and(|a| matches!(a.backing, Backing::Driver { mapped: Some(_), .. }))
-        {
-            // SAFETY: the mapping this driver made in `memory_export` and has not released, on the
-            // device that owns it. The record is out of the map, so it cannot be unmapped twice.
-            unsafe { (d.fns.vkUnmapMemory())(device, memory) };
-        }
         // SAFETY: a device and an allocation this context made; the object table took the id out
         // before this call, so the same handle cannot arrive twice.
         unsafe { (d.fns.vkFreeMemory())(device, memory, core::ptr::null()) };
@@ -3171,90 +3164,59 @@ impl Driver {
             .collect()
     }
 
-    /// Map an allocation for the VMM to publish into the guest, and mark it exported.
+    /// Publish an allocation as a blob: a share of the storage behind it, and the address the
+    /// VMM maps into the guest.
     ///
-    /// The address outlives this call, which is the whole point: the VMM maps it into the guest
-    /// and reads and writes it for as long as the resource lives. It is *not* handed out again --
-    /// exporting twice would give two resources one storage, and the second holder would have no
-    /// way to know. The mapping is released when the allocation is freed, by the record that owns
-    /// it, so an address for freed memory cannot be produced.
+    /// It touches Vulkan not at all, which is the change: every allocation the host can address
+    /// is storage this renderer minted and the driver imported, so publishing hands out what
+    /// already exists rather than asking the driver to map something. The share is what makes the
+    /// bytes outlive the allocation, the context and this call -- the VMM reads and writes them
+    /// for as long as the resource lives, and the guest is free to `vkFreeMemory` in the meantime.
+    ///
+    /// It is *not* handed out again: exporting twice would give two resources one storage, and
+    /// the second holder would have no way to know.
     ///
     /// Every refusal here is the guest's error, not ours: it names memory it never allocated,
-    /// exports the same memory twice, asks for a blob larger than the allocation behind it, or
-    /// asks to map memory the host was never able to address. None of them may stop the worker.
-    ///
-    /// The device and the handle are the caller's to resolve through the object table, exactly as
-    /// [`Self::memory_read`] takes them, and for the same reason: this map does not keep a second
-    /// copy of what the table already knows.
+    /// exports the same memory twice, asks for a blob larger than the storage behind it, or asks
+    /// to publish memory that has no host address to give. None of them may stop the worker.
     pub fn memory_export(
         &mut self,
-        device: VkDevice,
-        handle: VkDeviceMemory,
         id: ObjectId,
         blob_size: u64,
-    ) -> Result<(Exported, Option<Storage>), ExportError> {
+    ) -> Result<(Exported, Storage), ExportError> {
         let Some(record) = self.memory.get(&id) else {
             return Err(ExportError::NoSuchAllocation);
         };
         if record.exported() {
             return Err(ExportError::AlreadyExported);
         }
-        if let Backing::Owned { storage, .. } = &record.backing {
-            // Storage this renderer minted -- a surface or pages -- is published as what it
-            // already is. There is nothing to map: the driver imported these pages, and the
-            // address is the one every other holder of the share reads the same bytes through.
-            let (addr, len) = storage.span();
-            if blob_size > len {
-                return Err(ExportError::LargerThanAllocation);
-            }
-            let write_back = record.write_back();
-            let share = record.shared();
-            let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
-            let Backing::Owned { published, .. } = &mut record.backing else {
-                unreachable!("the backing was owned a moment ago");
-            };
-            *published = true;
-            return Ok((Exported { addr, write_back }, share));
-        }
-        if !record.host_visible() {
-            return Err(ExportError::NotHostVisible);
-        }
-        // The VMM publishes the *blob's* size from this address, not the allocation's, so a blob
-        // larger than what was reserved would put host memory past the end of the allocation into
-        // the guest. `pad_for_blob` sizes an allocation up so this does not normally happen;
-        // refuse rather than over-map on the guest's say-so if it ever does.
-        if blob_size > record.size {
+        let storage = match &record.backing {
+            Backing::Owned { storage, .. } => storage,
+            // Memory the host cannot address. There is no pointer to publish and never was: the
+            // mint at allocate is gated on host-visibility, so this arm is exactly the memory
+            // that was left to the driver.
+            Backing::Driver { .. } => return Err(ExportError::NotHostVisible),
+            // Bytes another allocation owns. The exporter publishes them, once; a second export
+            // through the alias would be two resources over one storage with no way for either
+            // holder to learn of the other.
+            Backing::Imported(_) => return Err(ExportError::NotMappable),
+        };
+        // The VMM publishes the *blob's* size from this address, not the storage's, so a blob
+        // larger than what was minted would put host memory past the end of it into the guest.
+        // `pad_for_blob` sizes an allocation up so this does not normally happen; refuse rather
+        // than over-map on the guest's say-so if it ever does.
+        let (addr, len) = storage.span();
+        if blob_size > len {
             return Err(ExportError::LargerThanAllocation);
         }
-        let Some(d) = self.devices.get(&device) else {
-            return Err(ExportError::NoSuchAllocation);
-        };
-        let mut ptr: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: a device and an allocation this context made, and `ptr` is a local. The mapping
-        // is deliberately left standing -- see this function's contract.
-        let r = unsafe {
-            (d.fns.vkMapMemory())(
-                device,
-                handle,
-                VkDeviceSize(0),
-                VK_WHOLE_SIZE,
-                VkMemoryMapFlags(0),
-                &mut ptr,
-            )
-        };
-        if r != VkResult::VK_SUCCESS || ptr.is_null() {
-            return Err(ExportError::NotMappable);
-        }
-        let addr = ptr as usize;
-        // Written back only now: until the map succeeds there is nothing to mark, and the mark
-        // *is* the address, so there is no mark without one.
+        let write_back = record.write_back();
+        let share = storage.clone();
         let record = self.memory.get_mut(&id).expect("the record was here a moment ago");
-        let Backing::Driver { mapped, .. } = &mut record.backing else {
-            unreachable!("an owned or imported backing was answered above");
+        let Backing::Owned { published, .. } = &mut record.backing else {
+            unreachable!("the backing was owned a moment ago");
         };
-        *mapped = Some(addr);
-        // Ordinary device memory has no share to give: see [`Allocated::shared`].
-        Ok((Exported { addr, write_back: record.write_back() }, None))
+        *published = true;
+        Ok((Exported { addr, write_back }, share))
     }
 
     /// Copy an allocation's contents out through a host mapping, returning how many bytes landed.
@@ -3345,11 +3307,11 @@ struct Allocated {
 enum Backing {
     /// Memory the driver allocated for this guest, and what it cost the host.
     ///
-    /// Publishing it maps it, and `mapped` is where: `Some` *is* the export mark, one value
-    /// rather than a flag beside an address that could disagree with it, and it is what says
-    /// freeing owes an unmap. The record owns the mapping, so retiring it on
-    /// [`Driver::free_memory`] is the same act as making the address unreachable: nothing can
-    /// hand the VMM a pointer into memory the guest has freed.
+    /// Only memory the host cannot address reaches this arm: everything host-visible is minted
+    /// and imported instead, so the renderer owns the pages. There is therefore no address to
+    /// publish and nothing to unmap -- which is the point. An allocation whose bytes exist only
+    /// where the driver put them cannot be handed to the VMM, and so cannot be handed to the VMM
+    /// and then freed underneath it.
     ///
     /// The charge is never read, and that is the design: it is a value whose only job is to be
     /// dropped with the record, so there is no release call for a future destroy path to forget.
@@ -3359,7 +3321,6 @@ enum Backing {
             reason = "held for its Drop -- crediting the ledger is this going away"
         )]
         charge: Charge,
-        mapped: Option<usize>,
     },
     /// Storage this renderer minted -- an IOSurface, or pages -- that the allocation is a
     /// host-pointer import of, so the memory *is* the storage. The storage carries its own
@@ -3471,34 +3432,27 @@ struct ImageFacts {
 impl Allocated {
     /// The surface behind it, for the one backing that has one.
     fn surface(&self) -> Option<&Surface> {
-        match &self.backing {
-            Backing::Owned { storage, .. } => storage.surface().ok(),
-            Backing::Driver { .. } | Backing::Imported(_) => None,
-        }
+        self.storage()?.surface().ok()
     }
 
     /// Whether it has been published to the VMM -- which a second export must refuse, because
     /// two resources over one storage is a state neither holder could detect afterwards.
     fn exported(&self) -> bool {
         match &self.backing {
-            Backing::Driver { mapped, .. } => mapped.is_some(),
+            Backing::Driver { .. } | Backing::Imported(_) => false,
             Backing::Owned { published, .. } => *published,
-            Backing::Imported(_) => false,
         }
     }
 
-    /// A share of the storage behind it, for a resource that must go on naming these bytes after
-    /// the context that allocated them is gone.
+    /// The storage behind it, for the backings that own theirs.
     ///
-    /// Storage this renderer minted can be shared: a surface, or pages. Driver memory cannot --
-    /// it is published as a borrowed `vkMapMemory` pointer whose lifetime is the device's, and
-    /// handing that to another context would be exactly the dangling the share exists to prevent
-    /// -- so it answers `None`, and the caller refuses rather than sharing what it cannot keep
-    /// alive. That is only ever memory the guest exported without having asked, at allocation,
-    /// for memory it could export.
-    fn shared(&self) -> Option<Storage> {
+    /// A resource that must go on naming these bytes after the allocation, and after the context
+    /// that made it, holds a clone of this. `None` is not a gap: an import's bytes are the
+    /// exporter's to lend, and driver memory is memory the host cannot address, which has no
+    /// address to lend in the first place.
+    fn storage(&self) -> Option<&Storage> {
         match &self.backing {
-            Backing::Owned { storage, .. } => Some(storage.clone()),
+            Backing::Owned { storage, .. } => Some(storage),
             Backing::Driver { .. } | Backing::Imported(_) => None,
         }
     }
@@ -3512,16 +3466,11 @@ impl Allocated {
     /// take that lock.
     fn censused(&self) -> bool {
         match &self.backing {
-            Backing::Driver { mapped, .. } => mapped.is_none(),
+            Backing::Driver { .. } => true,
             Backing::Owned { storage: Storage::Linear(_), published } => !published,
             Backing::Owned { storage: Storage::Texture(_), .. } => true,
             Backing::Imported(_) => false,
         }
-    }
-
-    /// Whether the host can address it -- what an export needs before it may map anything.
-    fn host_visible(&self) -> bool {
-        self.props.0 & HOST_VISIBLE_BIT != 0
     }
 
     /// Whether the host reads and writes it through a write-back cache that stays coherent
@@ -4198,11 +4147,8 @@ mod tests {
 
         let mut driver = Driver::new(Account::for_test(None));
         driver.plant_allocation(OWNED, SIZE);
-        driver.plant_imported_allocation(
-            BORROWED,
-            SIZE,
-            ResourceBytes::Allocation(crate::venus::ring::Published { memory: OWNED, size: SIZE }),
-        );
+        let lent = driver.memory.get(&OWNED).expect("planted").storage().expect("pages").clone();
+        driver.plant_imported_allocation(BORROWED, SIZE, ResourceBytes::Shared(lent));
 
         let census = driver.memory_census();
         assert_eq!(census.len(), 1, "the borrowed one is the exporter's to report");
@@ -4233,8 +4179,13 @@ mod tests {
         assert_eq!(budget.live(), extent, "minted, and charged to the context that minted it");
         assert_eq!(budget.live_for(one), extent);
 
-        let share =
-            d.memory.get(&ObjectId(66)).expect("planted").shared().expect("a scanout lends");
+        let share = d
+            .memory
+            .get(&ObjectId(66))
+            .expect("planted")
+            .storage()
+            .expect("a scanout lends")
+            .clone();
         assert_eq!(budget.live_for(one), extent, "shared, and still the minting context's");
 
         // The allocation goes -- a free, or the context's whole memory table at its destroy.
@@ -4256,61 +4207,44 @@ mod tests {
         assert_eq!(budget.live(), 0, "and the last share going is what credits it");
     }
 
-    /// Three backings, three answers: a scanout has an address from the moment it is minted, a
-    /// driver allocation has one only once it has been published, and an import has none of its
-    /// own to lend.
+    /// What each backing lends, now that every allocation the host can address owns its bytes.
+    ///
+    /// A scanout lends the surface. Ordinary host-visible memory lends its minted pages, from the
+    /// moment it is allocated and not from the moment it is published -- which is the change, and
+    /// the reason a blob can outlive the `vkFreeMemory` that retires the allocation. Memory the
+    /// host cannot address lends nothing, because there is nothing of it to lend. And an import
+    /// lends nothing *of its own*: the storage is the exporter's, offered once.
     #[test]
-    fn an_import_resolves_to_storage_that_already_exists() {
+    fn every_allocation_the_host_can_address_owns_the_bytes_it_lends() {
         let mut d = Driver::new(Account::for_test(None));
 
         let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
         let addr = surface.host_addr();
         let extent = surface.alloc_size();
         d.plant_scanout_allocation(ObjectId(66), surface);
-        assert_eq!(
-            d.aliased_span(ObjectId(66)),
-            Some((addr, extent)),
-            "a scanout lends the surface's own pages, and how far they run"
-        );
 
         d.plant_allocation(ObjectId(70), 4096);
-        assert_eq!(
-            d.aliased_span(ObjectId(70)),
-            None,
-            "an allocation nobody has published has no address to lend"
-        );
+        d.plant_device_local_allocation(ObjectId(72), 4096);
 
-        d.plant_imported_allocation(
-            ObjectId(71),
-            4096,
-            ResourceBytes::Allocation(crate::venus::ring::Published {
-                memory: ObjectId(70),
-                size: 4096,
-            }),
-        );
-        assert_eq!(
-            d.aliased_span(ObjectId(71)),
-            None,
-            "and an import lends nothing: the storage is not its to offer twice"
-        );
+        let lent =
+            |d: &Driver, id: u64| d.memory.get(&ObjectId(id)).expect("planted").storage().cloned();
 
-        // The same three backings, asked for the *share* a resource keeps rather than the span
-        // this driver resolves. Only the scanout has one: a surface outlives the device, the
-        // instance and the context, so it is the only storage that can be lent to a resource
-        // that will still be standing after the context which made it is gone.
-        let shared = |id| d.memory.get(&ObjectId(id)).expect("planted").shared();
         assert_eq!(
-            shared(66).map(|s| s.span()),
+            lent(&d, 66).map(|s| s.span()),
             Some((addr, extent)),
-            "a scanout's share resolves to the surface's own pages, consulting no table at all"
+            "a scanout lends the surface's own pages, consulting no table at all"
         );
-        assert!(
-            shared(70).is_none(),
-            "ordinary device memory is published as a borrowed mapping, and lends no share"
-        );
-        assert!(shared(71).is_none(), "and an import has nothing of its own to share");
+        let pages = lent(&d, 70).expect("host-visible memory is minted pages");
+        assert!(matches!(pages, Storage::Linear(_)));
+        assert!(pages.span().1 >= 4096, "and they cover what the guest asked for");
+        assert!(lent(&d, 72).is_none(), "memory the host cannot address has no bytes here to lend");
 
-        assert_eq!(d.aliased_span(ObjectId(999)), None, "nor does an id that names nothing");
+        let borrowed = ResourceBytes::Shared(pages.clone());
+        d.plant_imported_allocation(ObjectId(71), 4096, borrowed);
+        assert!(
+            lent(&d, 71).is_none(),
+            "and an import lends nothing of its own: the storage is not its to offer twice"
+        );
 
         d.abandon_planted();
     }
@@ -4656,16 +4590,19 @@ mod tests {
         );
     }
 
-    /// Memory the guest asks to be able to export is backed by pages this renderer minted, handed
-    /// to the driver by host-pointer import -- so that the pages, and not a mapping the driver
-    /// lends, are what a resource can hold a share of.
+    /// Every allocation the host can address is backed by pages this renderer minted, handed to
+    /// the driver by host-pointer import -- so that the pages, and not a mapping the driver
+    /// lends, are what a resource holds a share of.
     ///
-    /// Three things have to be true of it at once. The driver was handed our pages and nothing
+    /// Four things have to be true of it at once. The driver was handed our pages and nothing
     /// else. Publishing it maps nothing: the address is the pages', so `vkMapMemory` is never
-    /// asked. And the share carries the charge, so the pages stay counted for as long as any
-    /// holder has them, whatever happened to the allocation.
+    /// asked. The share carries the charge, so the pages stay counted for as long as any holder
+    /// has them, whatever happened to the allocation. And it does not wait for the guest to say
+    /// it means to export: an allocation with no `VkExportMemoryAllocateInfo` is minted the same
+    /// way, because the guest may export it at any later moment and an allocation that was not
+    /// minted has only the driver's mapping to publish.
     #[test]
-    fn exportable_memory_is_backed_by_pages_this_renderer_minted() {
+    fn host_addressable_memory_is_backed_by_pages_this_renderer_minted() {
         use super::super::budget::Budget;
         use super::super::proto::types::{
             VkExportMemoryAllocateInfo, VkExternalMemoryHandleTypeFlags,
@@ -4756,18 +4693,21 @@ mod tests {
         assert_eq!(ptr % page, 0, "pages start on a page, which every import alignment divides");
         let padded = pad_for_blob(ASKED, Some(VkMemoryPropertyFlags(HOST_VISIBLE_BIT)), false);
         assert_eq!(told, padded, "and told the guest's padded figure, which the pages cover");
-        let span = d.aliased_span(ObjectId(1)).expect("minted pages have an address");
+        let Backing::Owned { storage, .. } =
+            &d.memory.get(&ObjectId(1)).expect("allocated").backing
+        else {
+            panic!("host-addressable memory is minted pages");
+        };
+        let span = storage.span();
         assert_eq!(span.0, ptr, "the address a later import aliases is the one the driver got");
         assert!(span.1 >= padded, "the pages cover everything the driver was told it has");
         assert_eq!(budget.live(), span.1, "charged for the pages, as 'exported pages'");
 
         // Publishing is a matter of saying where the pages are. Nothing is mapped.
-        let (published, share) =
-            d.memory_export(DEVICE, VkDeviceMemory(0x9000), ObjectId(1), ASKED).expect("exports");
+        let (published, share) = d.memory_export(ObjectId(1), ASKED).expect("exports");
         assert_eq!(published.addr, ptr);
         assert!(published.write_back, "coherent and cached, as the type says");
         assert!(!MAPPED.with(Cell::get), "the driver was never asked to map what it imported");
-        let share = share.expect("pages lend a share");
         assert!(matches!(share, Storage::Linear(_)), "and the share is the pages");
         assert_eq!(
             share.surface().err(),
@@ -4788,18 +4728,22 @@ mod tests {
         drop(share);
         assert_eq!(budget.live(), 0, "and the last share going is what credits them");
 
-        // Plain host-visible memory the guest never asked to export is the driver's own, as it
-        // always was: the two paths are not unified, because their coherency has not been measured
-        // to be the same.
+        // And plain host-visible memory, with no export info at all, takes the same path. This
+        // is the whole change: the gate used to be the guest's `VkExportMemoryAllocateInfo`, and
+        // an allocation that had not asked was published as the driver's own `vkMapMemory`
+        // pointer -- an address the VMM maps into guest physical memory and `vkFreeMemory` then
+        // unmaps underneath it.
         let plain = VkMemoryAllocateInfo { pNext: core::ptr::null(), ..info };
         GIVEN.with(|g| g.set((0, 0)));
         d.allocate_memory(DEVICE, ObjectId(2), &plain, None, &|_| None).expect("no cap");
-        assert_eq!(GIVEN.with(Cell::get).0, 0, "no pages were handed over for it");
-        assert!(
-            d.memory.get(&ObjectId(2)).expect("here").shared().is_none(),
-            "and it lends no share"
-        );
+        assert_ne!(GIVEN.with(Cell::get).0, 0, "it was handed pages too");
+        let (_, plain_share) = d.memory_export(ObjectId(2), ASKED).expect("it exports");
         d.free_memory(DEVICE, VkDeviceMemory(0x9000), ObjectId(2));
+        assert!(
+            matches!(plain_share, Storage::Linear(_)),
+            "and its share outlives the free, which is what the hypervisor's mapping needs"
+        );
+        drop(plain_share);
 
         d.abandon_planted();
     }
@@ -5004,36 +4948,11 @@ mod tests {
     /// could detect afterwards.
     #[test]
     fn memory_is_published_once_and_leaves_the_census_when_it_is() {
-        use std::cell::RefCell;
-
         const DEVICE: VkDevice = VkDevice(3);
         const MEM: ObjectId = ObjectId(12);
         const LOCAL: ObjectId = ObjectId(13);
         const SIZE: u64 = 128 * 1024;
-        /// Any address will do; nothing dereferences it. Page-aligned so it reads like one.
-        const ADDR: usize = 0x7000_0000;
 
-        thread_local! {
-            static MAPS: RefCell<u32> = const { RefCell::new(0) };
-            static UNMAPS: RefCell<u32> = const { RefCell::new(0) };
-        }
-
-        unsafe extern "C" fn map(
-            _d: VkDevice,
-            _m: VkDeviceMemory,
-            _o: VkDeviceSize,
-            _s: VkDeviceSize,
-            _f: VkMemoryMapFlags,
-            out: *mut *mut core::ffi::c_void,
-        ) -> VkResult {
-            MAPS.with_borrow_mut(|n| *n += 1);
-            // SAFETY: the caller passes a local of its own.
-            unsafe { *out = ADDR as *mut core::ffi::c_void };
-            VkResult::VK_SUCCESS
-        }
-        unsafe extern "C" fn unmap(_d: VkDevice, _m: VkDeviceMemory) {
-            UNMAPS.with_borrow_mut(|n| *n += 1);
-        }
         unsafe extern "C" fn free(
             _d: VkDevice,
             _m: VkDeviceMemory,
@@ -5042,8 +4961,6 @@ mod tests {
         }
 
         let mut fns = crate::vulkan::Device::default();
-        fns.plant_vkMapMemory(map);
-        fns.plant_vkUnmapMemory(unmap);
         fns.plant_vkFreeMemory(free);
 
         let mut driver = Driver::new(Account::for_test(None));
@@ -5054,76 +4971,51 @@ mod tests {
 
         assert_eq!(driver.memory_census().len(), 2, "both are live and unexported");
 
-        // Memory nobody allocated, refused before anything is mapped.
-        assert_eq!(
-            driver.memory_export(DEVICE, handle, ObjectId(999), SIZE),
-            Err(ExportError::NoSuchAllocation)
-        );
-        // A blob bigger than the allocation would publish whatever follows it in this process.
-        assert_eq!(
-            driver.memory_export(DEVICE, handle, MEM, SIZE + 1),
-            Err(ExportError::LargerThanAllocation)
-        );
-        // Memory the host cannot address has nothing to publish.
-        assert_eq!(
-            driver.memory_export(DEVICE, handle, LOCAL, SIZE),
-            Err(ExportError::NotHostVisible)
-        );
-        MAPS.with_borrow(|n| assert_eq!(*n, 0, "not one of those reached the driver"));
+        // Memory nobody allocated.
+        assert_eq!(driver.memory_export(ObjectId(999), SIZE), Err(ExportError::NoSuchAllocation));
+        // A blob bigger than the storage would publish whatever follows it in this process.
+        assert_eq!(driver.memory_export(MEM, SIZE + 1), Err(ExportError::LargerThanAllocation));
+        // Memory the host cannot address has nothing to publish. It is the one kind still left
+        // to the driver, precisely because there is no address to hand out.
+        assert_eq!(driver.memory_export(LOCAL, SIZE), Err(ExportError::NotHostVisible));
 
         // The export itself. Coherent and cached on the host, so the guest may map it cached.
-        let published = Exported { addr: ADDR, write_back: true };
-        assert_eq!(driver.memory_export(DEVICE, handle, MEM, SIZE), Ok((published, None)));
-        MAPS.with_borrow(|n| assert_eq!(*n, 1));
-        UNMAPS.with_borrow(|n| assert_eq!(*n, 0, "the mapping is the VMM's now and stays up"));
+        let (published, share) = driver.memory_export(MEM, SIZE).expect("it publishes");
+        assert!(published.write_back, "coherent and cached, as the type says");
+        assert_eq!(share.span().0, published.addr, "the address is the share's own");
         assert_eq!(
-            driver.memory_export(DEVICE, handle, MEM, SIZE),
-            Err(ExportError::AlreadyExported),
-            "the mapping is the mark: exporting twice would give two resources one storage"
+            driver.memory_export(MEM, SIZE).err(),
+            Some(ExportError::AlreadyExported),
+            "the mark is the storage's: exporting twice would give two resources one storage"
         );
-        MAPS.with_borrow(|n| assert_eq!(*n, 1, "and the refusal mapped nothing"));
 
         // Memory the host reaches through a cache it has to flush is memory the guest must not
         // map cached, and the answer comes from the type it was allocated from -- not from a
         // default that happens to be right for the driver we run on today.
         const UNCACHED: ObjectId = ObjectId(14);
         driver.plant_allocation_of(UNCACHED, SIZE, HOST_VISIBLE_BIT | HOST_COHERENT_BIT);
-        assert_eq!(
-            driver.memory_export(DEVICE, handle, UNCACHED, SIZE),
-            Ok((Exported { addr: ADDR, write_back: false }, None))
-        );
+        let (uncached, _) = driver.memory_export(UNCACHED, SIZE).expect("it publishes");
+        assert!(!uncached.write_back);
         driver.free_memory(DEVICE, handle, UNCACHED);
-        MAPS.with_borrow(|n| assert_eq!(*n, 2));
-        UNMAPS.with_borrow(|n| assert_eq!(*n, 1));
-        MAPS.with_borrow_mut(|n| *n = 1);
-        UNMAPS.with_borrow_mut(|n| *n = 0);
 
         // The census stops reporting it: its bytes are the blob's, captured where they live.
         let census = driver.memory_census();
         assert_eq!(census.len(), 1, "the exported allocation is no longer the census's to read");
         assert_eq!(census[0].id, LOCAL);
 
-        // And it cannot be published a second time.
-        assert_eq!(
-            driver.memory_export(DEVICE, handle, MEM, SIZE),
-            Err(ExportError::AlreadyExported)
-        );
-        MAPS.with_borrow(|n| assert_eq!(*n, 1, "a refused export maps nothing"));
-
-        // Freeing it releases the mapping the export left standing -- the record that owned the
-        // address is gone, so this is the last moment it could be unmapped at all.
+        // Freeing it retires the record and nothing else. The share is what the VMM's mapping
+        // stands on, and it stands: this is the sequence -- allocate, export as a blob, map into
+        // the guest, free -- that used to leave the hypervisor pointing at unmapped host memory.
         driver.free_memory(DEVICE, handle, MEM);
-        UNMAPS.with_borrow(|n| assert_eq!(*n, 1, "the export's mapping went with the allocation"));
         assert_eq!(
-            driver.memory_export(DEVICE, handle, MEM, SIZE),
+            driver.memory_export(MEM, SIZE),
             Err(ExportError::NoSuchAllocation),
             "and there is no allocation left to export"
         );
+        assert_eq!(share.span().1, SIZE, "while the pages the guest is mapped over are still here");
+        drop(share);
 
-        // The unexported one was never mapped, so freeing it must not unmap anything.
         driver.free_memory(DEVICE, handle, LOCAL);
-        UNMAPS.with_borrow(|n| assert_eq!(*n, 1, "nothing unmaps memory that was never mapped"));
-
         driver.abandon_planted();
     }
 

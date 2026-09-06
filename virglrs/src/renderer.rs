@@ -19,7 +19,7 @@ use crate::venus::context::Submitted;
 use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
 use crate::venus::objects::ObjectKey;
-use crate::venus::ring::{Published, ResourceBytes};
+use crate::venus::ring::ResourceBytes;
 use crate::vrend;
 use crate::vrend::context::Guest;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
@@ -245,10 +245,6 @@ pub enum BlobStorage {
     /// including after the context that minted them is gone. `caching` is how the exporter's
     /// memory type said the host reaches them, decided at the export.
     Shared { storage: Storage, caching: Caching, from: Exporter },
-    /// The exporting allocation's own `vkMapMemory` pointer, resolved once at the export and
-    /// kept -- what the C keeps too. Good only in the context that mapped it, and only while that
-    /// allocation stands, which `from` is what says.
-    Borrowed { from: Exporter, mem: BlobId, mapping: HostMapping },
 }
 
 /// The allocation a blob was exported from: whose it is, and which object it was.
@@ -358,31 +354,9 @@ impl venus::ring::ShmResources for BTreeMap<ResourceHandle, Resource> {
             return Some(ResourceBytes::Host(Arc::clone(map)));
         }
         match &res.backing {
-            Backing::Blob { desc, storage } => match storage {
+            Backing::Blob { storage, .. } => match storage {
                 // A share resolves for anyone holding it: no table is asked.
                 BlobStorage::Shared { storage, .. } => Some(ResourceBytes::Shared(storage.clone())),
-                BlobStorage::Borrowed { from, mem, .. } if from.ctx == ctx => {
-                    Some(ResourceBytes::Allocation(Published {
-                        memory: ObjectId(mem.0),
-                        size: desc.size,
-                    }))
-                }
-                // Named by the wrong context. Not a mistake the guest made in this command: it is
-                // one context reaching for another's export, which the ids cannot express.
-                // Attached, so the guest is entitled to it -- but its storage is a borrowed
-                // `vkMapMemory` pointer into ctx `owner`'s device, and this renderer cannot keep
-                // that alive for anyone else. Refused loudly rather than shared: handing it over
-                // would dangle the moment `owner` freed the memory or went away.
-                BlobStorage::Borrowed { from, .. } => {
-                    eprintln!(
-                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, and ordinary \
-                         device memory is published as a borrowed mapping this renderer cannot \
-                         share across contexts",
-                        ctx.get(),
-                        from.ctx.get(),
-                    );
-                    None
-                }
                 BlobStorage::Minted(_) => unreachable!("answered as shared memory above"),
                 BlobStorage::Guest => {
                     eprintln!(
@@ -439,21 +413,6 @@ impl Guest for BTreeMap<ResourceHandle, Resource> {
             // and the texture's storage becomes it, so reading its bytes here would mint exactly
             // the copy the adopt exists to avoid.
             BlobStorage::Shared { storage, .. } => storage.mapping().map(PixelSource::Mapped),
-            // Ordinary device memory published as a borrowed `vkMapMemory` pointer. Good only in
-            // the context that mapped it and only while that allocation stands, so it is not
-            // this renderer's to hand anyone else -- the same refusal `bytes()` gives, and for
-            // the same lifetime reason.
-            BlobStorage::Borrowed { from, .. } => {
-                if from.ctx != ctx {
-                    eprintln!(
-                        "[virglrs] ctx {}: resource {handle:?} is ctx {}'s export, published as a \
-                         borrowed mapping this renderer cannot share across contexts",
-                        ctx.get(),
-                        from.ctx.get(),
-                    );
-                }
-                None
-            }
         }
     }
 }
@@ -626,31 +585,15 @@ impl Renderer {
             },
             BlobSource::Exported { ctx, mem } => {
                 match self.venus_memory_export(ctx, mem, desc.size) {
-                    Ok((exported, share, key)) => {
-                        let caching = if exported.write_back {
+                    Ok((exported, storage, key)) => BlobStorage::Shared {
+                        storage,
+                        caching: if exported.write_back {
                             Caching::Cached
                         } else {
                             Caching::WriteCombining
-                        };
-                        match share {
-                            Some(storage) => BlobStorage::Shared {
-                                storage,
-                                caching,
-                                from: Exporter { ctx, key },
-                            },
-                            // The VMM publishes the *blob's* size from this address, which the
-                            // export held to the allocation's.
-                            None => BlobStorage::Borrowed {
-                                from: Exporter { ctx, key },
-                                mem,
-                                mapping: HostMapping {
-                                    addr: exported.addr,
-                                    size: desc.size,
-                                    caching,
-                                },
-                            },
-                        }
-                    }
+                        },
+                        from: Exporter { ctx, key },
+                    },
                     Err(e) => {
                         // Two failures, one errno at the ABI, and they want opposite
                         // investigations. The memory not being there says the command that would
@@ -1228,7 +1171,7 @@ impl Renderer {
         ctx_id: ContextId,
         mem: BlobId,
         blob_size: u64,
-    ) -> Result<(Exported, Option<Storage>, ObjectKey), Error> {
+    ) -> Result<(Exported, Storage, ObjectKey), Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
         v.with_context_mut(ctx_id, |ctx| ctx.memory_export(ObjectId(mem.0), blob_size))
             .ok_or(Error::NoContext)?
@@ -1323,48 +1266,33 @@ impl Renderer {
     /// to publish memory, and a size or a caching mode fetched separately is a second lookup that
     /// can land on a different resource -- or on one that has since been freed.
     ///
-    /// Answered from what the resource holds. A share keeps its storage alive, so its address is
-    /// good by construction. A borrowed mapping is good only while the allocation that lent it
-    /// stands, which is asked of the exporting context every time -- of the object, by its key,
-    /// so a fresh allocation the guest has since named by the same id does not answer for it.
+    /// Answered from what the resource holds, and from nothing else. Both shapes are things the
+    /// resource keeps alive -- its own pages, or a share of an allocation's storage -- so the
+    /// address is good for as long as the resource is, whatever the guest has since done to the
+    /// allocation it was published from. There is no longer a case that has to be re-checked
+    /// against the exporting context, because there is no longer an address this renderer
+    /// hands out without owning.
     pub fn resource_host_mapping(&self, handle: ResourceHandle) -> Result<HostMapping, Error> {
-        // What is needed is copied out and the resource lock released before venus is asked
-        // anything. Holding a read lock across a call into a context is how a ring thread on the
-        // other side of it ends up waiting on us while we wait on it.
-        let answer = self
-            .with_resource(handle, |r| match &r.backing {
-                Backing::Blob { desc, storage } => match storage {
-                    // The mapping answers for its own extent: `desc.size` is what was asked for,
-                    // this is what was mapped, and it is what bounds what may be read. The host
-                    // maps its own shm write-back and coherent, like any anonymous page.
-                    BlobStorage::Minted(h) => Some(Ok(HostMapping {
-                        addr: h.map.host_addr(),
-                        size: h.map.len() as u64,
-                        caching: Caching::Cached,
-                    })),
-                    // The blob's size, not the storage's: the export held the one to the other.
-                    BlobStorage::Shared { storage, caching, .. } => Some(Ok(HostMapping {
-                        addr: storage.span().0,
-                        size: desc.size,
-                        caching: *caching,
-                    })),
-                    BlobStorage::Borrowed { from, mapping, .. } => {
-                        Some(Err((from.ctx, from.key, *mapping)))
-                    }
-                    BlobStorage::Guest => None,
-                },
-                Backing::Classic(_) | Backing::Imported { .. } => None,
-            })
-            .ok_or(Error::NoResource)?
-            .ok_or(Error::NotMappable)?;
-        let (ctx, key, mapping) = match answer {
-            Ok(held) => return Ok(held),
-            Err(borrowed) => borrowed,
-        };
-        if !self.venus_context(ctx, |c| c.holds(key))? {
-            return Err(Error::NoAllocation);
-        }
-        Ok(mapping)
+        self.with_resource(handle, |r| match &r.backing {
+            Backing::Blob { desc, storage } => match storage {
+                // The mapping answers for its own extent: `desc.size` is what was asked for,
+                // this is what was mapped, and it is what bounds what may be read. The host
+                // maps its own shm write-back and coherent, like any anonymous page.
+                BlobStorage::Minted(h) => Some(HostMapping {
+                    addr: h.map.host_addr(),
+                    size: h.map.len() as u64,
+                    caching: Caching::Cached,
+                }),
+                // The blob's size, not the storage's: the export held the one to the other.
+                BlobStorage::Shared { storage, caching, .. } => {
+                    Some(HostMapping { addr: storage.span().0, size: desc.size, caching: *caching })
+                }
+                BlobStorage::Guest => None,
+            },
+            Backing::Classic(_) | Backing::Imported { .. } => None,
+        })
+        .ok_or(Error::NoResource)?
+        .ok_or(Error::NotMappable)
     }
 
     /// Copy one allocation's contents out, returning how many bytes landed in `buf`.
@@ -1510,6 +1438,7 @@ mod tests {
     /// No corpus can reach this: the captures are one guest, replayed one context at a time.
     #[test]
     fn a_context_reaches_the_resources_the_guest_attached_to_it() {
+        use crate::venus::budget::Account;
         use crate::venus::ring::ShmResources;
 
         let one = ContextId::new(1).unwrap();
@@ -1528,21 +1457,20 @@ mod tests {
             )
             .unwrap();
         let key = objects.key_of(ObjectId(66)).unwrap();
-        let borrowed = |attached: Vec<ContextId>| Resource {
+        let pages = Storage::pages_for_test(4096, &Account::for_test(None));
+        let exported = |attached: Vec<ContextId>| Resource {
             handle: blob,
             backing: Backing::Blob {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
                     source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
-                    size: 4128768,
+                    size: 4096,
                 },
-                // Ordinary device memory: published as a borrowed `vkMapMemory` pointer, which
-                // is storage this renderer cannot keep alive on anyone else's behalf.
-                storage: BlobStorage::Borrowed {
+                storage: BlobStorage::Shared {
+                    storage: pages.clone(),
+                    caching: Caching::Cached,
                     from: Exporter { ctx: one, key },
-                    mem: BlobId(66),
-                    mapping: HostMapping { addr: 0x1000, size: 4128768, caching: Caching::Cached },
                 },
             },
             iov: Vec::new(),
@@ -1551,27 +1479,22 @@ mod tests {
         };
 
         let mut table = BTreeMap::new();
-        table.insert(blob, borrowed(vec![one]));
-        assert_eq!(
-            match table.bytes(one, blob) {
-                Some(ResourceBytes::Allocation(published)) => Some(published),
-                _ => None,
-            },
-            Some(Published { memory: ObjectId(66), size: 4128768 }),
-            "the context it is attached to finds the allocation, at the size the resource has"
+        table.insert(blob, exported(vec![one]));
+        assert!(
+            matches!(table.bytes(one, blob), Some(ResourceBytes::Shared(s)) if s == pages),
+            "the context it is attached to finds the storage the resource holds"
         );
         assert!(
             table.bytes(two, blob).is_none(),
             "a context the guest never attached it to reaches nothing, whoever exported it"
         );
 
-        // Attached to both, and still refused for the second -- but for a reason about the
-        // storage rather than about who owns the name. A borrowed mapping into ctx one's device
-        // would dangle for ctx two the moment ctx one freed it or went away.
-        table.insert(blob, borrowed(vec![one, two]));
+        // Attached to both, and reached by both. Attachment is the whole gate: the storage is a
+        // share, so it is not the exporting context's to be the only one that can resolve it.
+        table.insert(blob, exported(vec![one, two]));
         assert!(
-            table.bytes(two, blob).is_none(),
-            "attached is not enough when the storage behind it cannot be shared"
+            matches!(table.bytes(two, blob), Some(ResourceBytes::Shared(s)) if s == pages),
+            "and once the guest attaches it, the other context reaches the same bytes"
         );
 
         assert!(
@@ -1849,41 +1772,32 @@ mod tests {
     /// They were two: the size a VMM sizes its buffer from asked whether the venus renderer
     /// existed, and the fill asked whether the config had venus set. They agree today only
     /// because one is built from the other at construction -- and the day they stopped agreeing,
-    /// A borrowed mapping is good while the allocation that lent it stands, and not a moment
-    /// longer -- and "stands" is asked of the object, not the id.
+    /// A blob's mapping outlives the `vkFreeMemory` that retires the allocation it was published
+    /// from -- which is the fix, and the thing the guest can otherwise weaponise.
     ///
-    /// The C caches the exporter's pointer on the resource and answers it for as long as the
-    /// resource lives, which is a use after the guest frees the memory. Resolving the *name*
-    /// each time instead was worse in a different way: the guest reuses ids, so after a free and
-    /// a fresh allocation under the same id the name resolves to somebody else's bytes. The key
-    /// answers "is it still that object", which is the only question with a safe answer.
+    /// The sequence is legal and unremarkable: allocate host-visible memory, `CREATE_BLOB` over
+    /// it, `RESOURCE_MAP_BLOB` so the VMM `hv_vm_map`s that host address into guest physical
+    /// memory, then `vkFreeMemory`. When the address was the driver's own `vkMapMemory` pointer,
+    /// the free unmapped and released it and the hypervisor's mapping was left pointing at host
+    /// memory this process had given back. The C has the same hole, guarded by a comment.
+    ///
+    /// It is a lifetime bug, so the fix is structural rather than another purge: the storage is
+    /// pages this renderer minted, the resource holds a share of them, and the free retires the
+    /// record while the pages stand. There is no destroy site left that could get this wrong,
+    /// because there is no longer an address handed out that this renderer does not own.
     #[test]
-    fn a_borrowed_mapping_dies_with_the_object_that_lent_it_and_not_with_its_id() {
-        use crate::venus::cs::HostHandle;
-        use crate::venus::proto::types::VkObjectType;
+    fn a_blobs_mapping_survives_the_guest_freeing_the_allocation() {
+        use crate::venus::budget::Account;
 
         const MEM: ObjectId = ObjectId(66);
         let mut r = renderer(Config { venus: true, ..Config::default() });
         let one = ContextId::new(1).unwrap();
         r.context_create(one, CapsetId::Venus, "exporter".into()).expect("a fresh id");
 
-        // The allocation the blob borrows, as the context's table holds it.
-        let add = |r: &Renderer, handle: u64| {
-            r.venus_context(one, |c| {
-                c.objects()
-                    .borrow_mut()
-                    .add(MEM, VkObjectType::VK_OBJECT_TYPE_DEVICE_MEMORY, HostHandle(handle), None)
-                    .expect("added")
-            })
-            .expect("the context is here")
-        };
-        add(&r, 0x9000);
-        let key = r
-            .venus_context(one, |c| c.objects().borrow().key_of(MEM))
-            .expect("the context is here")
-            .expect("just added");
+        let account = Account::for_test(None);
+        let pages = Storage::pages_for_test(4096, &account);
+        let addr = pages.span().0;
 
-        let mapping = HostMapping { addr: 0x1000, size: 4096, caching: Caching::Cached };
         let blob = ResourceHandle::new(5).unwrap();
         r.insert(
             blob,
@@ -1894,28 +1808,24 @@ mod tests {
                     source: BlobSource::Exported { ctx: one, mem: BlobId(MEM.0) },
                     size: 4096,
                 },
-                storage: BlobStorage::Borrowed {
-                    from: Exporter { ctx: one, key },
-                    mem: BlobId(MEM.0),
-                    mapping,
+                storage: BlobStorage::Shared {
+                    storage: pages,
+                    caching: Caching::Cached,
+                    from: Exporter { ctx: one, key: any_key() },
                 },
             },
             Vec::new(),
         );
-        assert_eq!(r.resource_host_mapping(blob), Ok(mapping), "the allocation stands");
+        let mapping = r.resource_host_mapping(blob).expect("the blob publishes its pages");
+        assert_eq!(mapping.addr, addr);
 
-        // The guest frees the memory, and allocates again under the same id.
-        r.venus_context(one, |c| c.objects().borrow_mut().remove(MEM)).unwrap().expect("removed");
+        // The whole context goes -- more than a `vkFreeMemory`, and the strictest version of the
+        // question: the arena, the driver and the device are all gone.
+        r.context_destroy(one);
         assert_eq!(
             r.resource_host_mapping(blob),
-            Err(Error::NoAllocation),
-            "the mapping went with the allocation"
-        );
-        add(&r, 0x9100);
-        assert_eq!(
-            r.resource_host_mapping(blob),
-            Err(Error::NoAllocation),
-            "and a fresh allocation under the same id does not answer for it"
+            Ok(mapping),
+            "the address the hypervisor is mapped over is still the resource's own"
         );
     }
 

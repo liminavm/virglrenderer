@@ -646,6 +646,17 @@ and memory bindings wrong long before it gets a colour space wrong. The census d
 excludes map_ptr-exported blobs — those are the VMM's mapped-blob capture and are already
 host-mapped — so what gets hashed is GPU-produced state plus allocations nothing has written.
 
+**A zero hash is a fact about the driver, not a failed read.** Every host-visible allocation this
+renderer makes is pages it minted and handed the driver as a host-pointer import, so that a blob
+over one can outlive the guest's `vkFreeMemory`. KosmicKrisp honours such an import for a buffer
+and for a LINEAR image, but keeps an OPTIMAL image's texels in a private texture -- the image
+renders correctly and the imported pages stay blank, and `vkMapMemory` does not reach the texels
+either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here, and
+the entries that still discriminate are the ones sharing their allocation with a buffer. On
+`synoik` and `synoik-glclient` that is two entries of twenty-two. Reaching the rest needs a census
+that copies out of the `VkImage` rather than out of the memory; until it exists, the venus score is
+a weak oracle for these two corpora and the pixel gate is the one that matters.
+
 Each context is scored when it is destroyed, and once more at the end if it is still alive. A
 workload that exits cleanly frees everything, so scoring only at the end would score nothing.
 
@@ -657,9 +668,12 @@ the renderer is perfectly deterministic.
 ### Scoring the port against the C
 
 A fixture is recorded from the C, so the gate ladder compares Rust to Rust and a fixture mismatch
-means a regression. Reading a Rust score against the *C's* score is a different question, and on
-all three corpora the answer is currently agreement: every census id, size and hash, and every
-`iosurface backed` count, matches byte-for-byte.
+means a regression. Reading a Rust score against the *C's* score is a different question, and the
+answer is agreement on every census id and size, on every `iosurface backed` count, and on the
+hash of everything the paragraph above does not cover. The C leaves host-visible memory to the
+driver and publishes the driver's own pointer, so where this tree reads zeros for an OPTIMAL
+image the C reads the driver's linear backing. Comparing those entries across the two trees
+compares two different allocation models, not two ports.
 
 Equal totals are not agreement. These two censuses once read 22 against 22 while sharing only
 twenty entries, because a missing export and a missing import cancelled. Compare the ids, never
