@@ -172,13 +172,14 @@ and the socket here is `wayland-1`, not `wayland-0`; and `glxgears` is not a rou
 GLX on a guest with no X server. `glmark2-wayland` is, and it prints the renderer it actually
 got -- check for `GL_RENDERER: virgl` before trusting a capture.
 
-**This leg does not work on virglrs, and the failure is attributed.** The compositor rejects the
-client's buffer with `create_immed failed and produced an invalid wl_buffer` and kills it after
-one benchmark; the C renders the same client into the same desktop on the same guest. It is not
-the tiling rule and not the minting change -- the pre-minting build fails identically -- so it is
-a standing gap in importing a classic resource into a venus context, and this script is what
-reproduces it. `synoik-glclient.vkrc` was recorded from the C, which is why the corpus has traffic
-this tree cannot yet produce live.
+**This leg is the gate on classic-into-venus import, and nothing else gates it.** The venus
+replayer skips classic contexts, so `synoik-glclient.vkrc` replays green whether or not the import
+works -- it did, for as long as it did not. Booting is the only thing that scores it: run this
+script, then read the frame while glmark2 is still running. `glmark2 pids:` in its output is the
+first signal (a rejected buffer kills the client after one benchmark), and the frame is the
+verdict -- the client's window carries the scene, the scene changes between two samples, and the
+wood texture in `texture` reads brown rather than blue, which is what says the channels did not
+swap on the way through the surface.
 
 Unlike the Vulkan client corpora below, the C **can** replay this one: the GL client's contexts
 are classic and are skipped, so nothing is recorded out of execution order.
