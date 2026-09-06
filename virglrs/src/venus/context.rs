@@ -40,8 +40,9 @@ use super::proto::types::{
     vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdEndQuery,
     vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
     vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetScissor,
-    vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp, vn_command_vkCreateBuffer,
-    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
+    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
+    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
     vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
     vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
     vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
@@ -101,8 +102,8 @@ use super::proto::types::{
     vn_command_vkResetDescriptorPool, vn_command_vkResetEvent, vn_command_vkResetFences,
     vn_command_vkResetQueryPool, vn_command_vkSeekReplyCommandStreamMESA, vn_command_vkSetEvent,
     vn_command_vkSetReplyCommandStreamMESA, vn_command_vkSignalSemaphore,
-    vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkUpdateDescriptorSets,
-    vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
+    vn_command_vkSubmitVirtqueueSeqnoMESA, vn_command_vkTransitionImageLayout,
+    vn_command_vkUpdateDescriptorSets, vn_command_vkWaitForFences, vn_command_vkWaitRingSeqnoMESA,
     vn_command_vkWaitSemaphoreResourceMESA, vn_command_vkWaitSemaphores,
     vn_command_vkWaitVirtqueueSeqnoMESA, vn_command_vkWriteRingExtraMESA,
 };
@@ -4067,6 +4068,61 @@ impl Commands for Handlers<'_> {
             regions,
         );
         self.recorded(done);
+    }
+
+    // ---- VK_EXT_host_image_copy ----
+    //
+    // The guest reaches an image without a queue: no command buffer, no submit, no fence. That is
+    // the point of the extension, and it is why these four sit here beside the recording commands
+    // rather than among them.
+    //
+    // Two of them arrive reshaped. `VkImageToMemoryCopy` and `VkMemoryToImageCopy` each carry a
+    // host address, which cannot cross a guest boundary, so venus defines `...MESA` forms
+    // carrying the bytes instead. Putting a real address back is `driver`'s -- see
+    // `Driver::copy_image_to_memory`.
+
+    fn vkTransitionImageLayout(&mut self, args: &mut vn_command_vkTransitionImageLayout<'_>) {
+        let transitions = args.pTransitions();
+        let Some(ret) = self.driver.transition_image_layout(args.device, transitions) else {
+            self.reject = Some("transitioned an image layout on a device it does not have");
+            return;
+        };
+        args.ret = ret;
+    }
+
+    fn vkCopyImageToImage(&mut self, args: &mut vn_command_vkCopyImageToImage<'_>) {
+        let Some(info) = self.names(args.pCopyImageToImageInfo) else { return };
+        let Some(ret) = self.driver.copy_image_to_image(args.device, info) else {
+            self.reject = Some("copied between images on a device it does not have");
+            return;
+        };
+        args.ret = ret;
+    }
+
+    fn vkCopyImageToMemoryMESA(&mut self, args: &mut vn_command_vkCopyImageToMemoryMESA<'_>) {
+        // Read before the reply blob is borrowed: see `vkEnumeratePhysicalDevices`.
+        let device = args.device;
+        let Some(info) = self.names(args.pCopyImageToMemoryInfo) else { return };
+        // No blob to read into is not an empty read: the guest asked for the image's bytes and
+        // gave nowhere to put them, and answering success would report a copy that never ran.
+        let Some(out) = args.pData_mut() else {
+            self.reject = Some("read an image out without room for the bytes");
+            return;
+        };
+        let Some(ret) = self.driver.copy_image_to_memory(device, info, out) else {
+            self.reject = Some("read an image out on a device it does not have");
+            return;
+        };
+        args.ret = ret;
+    }
+
+    fn vkCopyMemoryToImageMESA(&mut self, args: &mut vn_command_vkCopyMemoryToImageMESA<'_>) {
+        let Some(info) = self.names(args.pCopyMemoryToImageInfo) else { return };
+        let Some(ret) = self.driver.copy_memory_to_image(args.device, info) else {
+            self.reject = Some("wrote into an image on a device it does not have");
+            return;
+        };
+        args.ret = ret;
     }
 
     fn vkCmdBlitImage(&mut self, args: &mut vn_command_vkCmdBlitImage<'_>) {
