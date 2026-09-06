@@ -287,6 +287,27 @@ SABOTAGES = [
         """        let src = &src[..src.len().min(record.size as usize)];""",
         'a_capture_goes_back_in_by_the_route_it_came_out_of',
     ),
+    (
+        'a binary semaphore reaches the timeline entry points unchecked',
+        'virglrs/src/venus/driver.rs',
+        """        match self.semaphores.get(&sem) {
+            Some(SemaphoreKind::Timeline) => Ok(()),
+            Some(SemaphoreKind::Binary) => Err(NotATimeline::Binary),
+            None => Err(NotATimeline::Unrecorded),
+        }""",
+        """        let _ = sem;
+        Ok(())""",
+        'a_binary_semaphore_in_a_timeline_command_is_refused',
+    ),
+    (
+        "a semaphore's kind is forgotten while the semaphore is still live",
+        'virglrs/src/venus/driver.rs',
+        """        self.semaphores.insert(sem, kind);
+        Ok(sem)""",
+        """        let _ = kind;
+        Ok(sem)""",
+        'a_binary_semaphore_in_a_timeline_command_is_refused',
+    ),
     # The classic contents blob. Only the codec is reachable from a unit test: a no-op restore is
     # caught by the replay gate's scrub, and "a level that could not be read back is written as
     # zeros" is caught by the composite corpora, whose planar decode targets a texture transfer
