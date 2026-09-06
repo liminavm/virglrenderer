@@ -50,12 +50,15 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   floor, not the ceiling — a durable command the recorder never learned to keep is missing from
   both journals and they agree about it anyway. Only pixels answer that.
 
-  **`--rebuild` fails on `sampled` and `surface`, and the failure is honest.** Those corpora score
-  a resource by unref'ing it, so by the end the stream has destroyed the very resources its live
-  sampler views and surfaces name, and a create that cannot be satisfied is dropped. That is not a
-  journal defect: it is an object outliving the resource it views, which the guest can still bind.
-  Restoring drops it, so a resume loses an object the guest believes in — the reason this class of
-  drop is worth reporting rather than filing under "benign stale reference" as the C does.
+  Every classic fixture passes it, with no drops. A drop is therefore a finding, never noise:
+  each one names the command and the fault, and is either a create the recorder failed to keep or
+  a state the corpus reached that a guest cannot. Never file one under "benign stale reference"
+  the way the C's `drops_by_klass` does — the two are indistinguishable from the histogram.
+
+  The synthetic corpora score a resource by unref'ing it, so they retire their surfaces and
+  sampler views first. That is not the gate being appeased: a view holds a reference to the
+  resource it names, so a guest cannot free one underneath it, and a corpus that did would be
+  scoring a world no guest reaches.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `corpus.py` — the synthetic-corpus writer: the trace container and the virgl commands, shared
   by the `make-*-corpus.py` scripts.

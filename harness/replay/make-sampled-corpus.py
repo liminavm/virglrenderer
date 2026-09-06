@@ -25,7 +25,8 @@ from corpus import (Corpus, cmd0, f32, BIND_DEPTH_STENCIL, BIND_RENDER_TARGET, B
                     BIND_VERTEX_BUFFER, PIPE_MASK_Z,
                     B8G8R8A8_UNORM, B8G8R8X8_UNORM, R32G32B32A32_FLOAT,
                     Z32_FLOAT, Z24X8_UNORM,
-                    OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_VERTEX_ELEMENTS,
+                    OBJ_BLEND, OBJ_DSA, OBJ_RASTERIZER, OBJ_SAMPLER_VIEW, OBJ_SURFACE,
+                    OBJ_VERTEX_ELEMENTS,
                     STAGE_VERTEX, STAGE_FRAGMENT,
                     SWIZZLE_X, SWIZZLE_Y, SWIZZLE_Z, SWIZZLE_W,
                     TARGET_2D, TARGET_3D, TARGET_2D_ARRAY)
@@ -95,6 +96,7 @@ class Rig:
     def __init__(self, c):
         self.c = c
         self.next = Rig.NEXT_TRANSIENT
+        self.transient = []     # (kind, handle) for every per-draw object, to retire below
         c.shader(Rig.VS_H, STAGE_VERTEX, VS)
         c.shader(Rig.FS_ARRAY_H, STAGE_FRAGMENT, fs("2D_ARRAY"))
         c.shader(Rig.FS_3D_H, STAGE_FRAGMENT, fs("3D"))
@@ -133,7 +135,22 @@ class Rig:
         self.c.sampler_view(h, src, src_fmt, src_target, first_layer=first_layer,
                             last_layer=last_layer, first_level=first_level,
                             last_level=last_level, swizzle=swizzle)
+        self.transient.append((OBJ_SAMPLER_VIEW, h))
         return h
+
+    def retire(self):
+        """Unbind and destroy the per-draw objects, the way a guest releases them.
+
+        A sampler view or surface holds a reference to the resource it names, which is what stops
+        a guest from freeing that resource underneath one. Dropping them here is what makes the
+        unref sweep below a state a guest can actually reach.
+        """
+        c = self.c
+        c.set_framebuffer([])
+        c.set_sampler_views(STAGE_FRAGMENT, [])
+        for kind, h in self.transient:
+            c.destroy_object(kind, h)
+        self.transient = []
 
     def sample(self, view, src_target, layer_coord, dst, dst_fmt, side):
         """Draw what `view` samples into `dst`, which the sweep will read back."""
@@ -141,6 +158,7 @@ class Rig:
         surf = self.handle()
         vbo = self.vertex_buffer(layer_coord)
         c.surface(surf, dst, dst_fmt)
+        self.transient.append((OBJ_SURFACE, surf))
         c.bind_shader(Rig.FS_FOR[src_target], STAGE_FRAGMENT)
         c.set_framebuffer([surf])
         c.set_viewport(side, side)
@@ -276,6 +294,7 @@ def build():
                DEPTH_READ_SRC, B8G8R8A8_UNORM, SIDE)
     rig.sample(rig.view(DEPTH_DST, Z32_FLOAT, TARGET_2D), TARGET_2D, 0,
                DEPTH_READ_DST, B8G8R8A8_UNORM, SIDE)
+    rig.retire()
     c.submit()
 
     # The sweep reads each scored offscreen AT its unref, so everything it scores is unref'd.

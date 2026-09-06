@@ -98,6 +98,12 @@ def build():
 
     # Drop the framebuffer before the unrefs, so the readbacks are not racing an attachment.
     c.set_framebuffer([])
+    # And retire the surfaces themselves. The orderings this corpus exists to score all happen
+    # above; leaving the objects live past the end would only add a state no guest reaches, where
+    # the end-of-stream world holds a surface naming a resource that is gone.
+    c.destroy_object(OBJ_SURFACE, REBIND_SURF)
+    c.destroy_object(OBJ_SURFACE, UNREF_SURF)
+    c.destroy_object(OBJ_SURFACE, SURVIVE_SURF)
     c.submit()
 
     c.unref(DESTROY_RES)
