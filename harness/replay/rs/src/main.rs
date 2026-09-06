@@ -196,6 +196,12 @@ struct Replay<'a> {
     /// Whether to run the snapshot fixed-point gate, and which contexts it has already run on.
     rebuild: bool,
     rebuilt: BTreeSet<u32>,
+    /// The resources each context currently has attached.
+    ///
+    /// A rebuilt context needs the same ones: a journal's `vkAllocateMemory` may import from a
+    /// resource, and a context that cannot reach it fails that create -- which then reads as the
+    /// journal having lost the allocation, when what it lost was the attachment.
+    attached: BTreeMap<u32, BTreeSet<u32>>,
     /// Gate after this many replayed commands, and how many have gone by.
     rebuild_at: Option<u64>,
     replayed: u64,
@@ -325,6 +331,7 @@ impl<'a> Replay<'a> {
                 // this the second life of an id is silently taken as already gated -- and this
                 // corpus reuses ctx 8 three times.
                 self.rebuilt.remove(ctx_id);
+                self.attached.remove(ctx_id);
                 (rc, format!("context_create {ctx_id} flags={context_init:#x} {name:?}"))
             }
             Ctl::CtxDestroy { ctx_id } => {
@@ -342,7 +349,8 @@ impl<'a> Replay<'a> {
                     // this context is gone and its journal with it -- a gate that waited would be
                     // asking a context that no longer exists and calling the silence a pass.
                     if self.rebuild {
-                        rebuild_gate(&self.r, *ctx_id, &mut self.tally);
+                        let res = self.attached.get(ctx_id).cloned().unwrap_or_default();
+                        rebuild_gate(&self.r, *ctx_id, &res, &mut self.tally);
                         self.rebuilt.insert(*ctx_id);
                     }
                 }
@@ -412,10 +420,12 @@ impl<'a> Replay<'a> {
             }
             Ctl::AttachResource { ctx_id, res_handle } => {
                 self.r.attach_resource(*ctx_id, *res_handle);
+                self.attached.entry(*ctx_id).or_default().insert(*res_handle);
                 (0, format!("attach_resource ctx={ctx_id} res={res_handle}"))
             }
             Ctl::DetachResource { ctx_id, res_handle } => {
                 self.r.detach_resource(*ctx_id, *res_handle);
+                self.attached.entry(*ctx_id).or_default().remove(res_handle);
                 (0, format!("detach_resource ctx={ctx_id} res={res_handle}"))
             }
             Ctl::ResourceUnref { res_handle } => {
@@ -509,6 +519,7 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
         iosurf: BTreeMap::new(),
         rebuild: args.rebuild,
         rebuilt: BTreeSet::new(),
+        attached: BTreeMap::new(),
         rebuild_at: args.rebuild_at,
         replayed: 0,
     };
@@ -614,7 +625,8 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
                         if rp.classic.contains(&ctx_id) || !rp.rebuilt.insert(ctx_id) {
                             continue;
                         }
-                        rebuild_gate(&rp.r, ctx_id, &mut rp.tally);
+                        let res = rp.attached.get(&ctx_id).cloned().unwrap_or_default();
+                        rebuild_gate(&rp.r, ctx_id, &res, &mut rp.tally);
                     }
                 }
             }
@@ -628,6 +640,9 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
 
     // 4. replay_end last, for everything still open: it starts the deferred ring threads, and a
     // ring thread running earlier would race the replayed commands into an order that never ran.
+    // Read before `end` empties it: these are the contexts the stream never destroyed, and they
+    // are exactly the ones the gate below still owes an answer for.
+    let still_open: BTreeSet<u32> = rp.open.clone();
     for ctx_id in rp.open.clone() {
         rp.end(ctx_id);
     }
@@ -638,11 +653,12 @@ fn run(args: &Args) -> Result<(Tally, Vec<String>), String> {
     // still running. Those the stream did destroy were gated at that point, where they still
     // existed.
     if args.rebuild && !rp.smoke {
-        for ctx_id in rp.open.clone().into_iter().chain(rp.scored.clone()) {
+        for ctx_id in still_open {
             if rp.classic.contains(&ctx_id) || !rp.rebuilt.insert(ctx_id) {
                 continue;
             }
-            rebuild_gate(&rp.r, ctx_id, &mut rp.tally);
+            let res = rp.attached.get(&ctx_id).cloned().unwrap_or_default();
+            rebuild_gate(&rp.r, ctx_id, &res, &mut rp.tally);
         }
     }
 
@@ -691,7 +707,12 @@ const REBUILT_BASE: u32 = 1000;
 /// `seq` is deliberately not compared. A rebuilt context numbers its own journal from one, so the
 /// sequence numbers differ by construction; what has to match is which commands were retained, in
 /// which order, with which bytes, on which ring.
-fn rebuild_gate(r: &abi::Renderer, ctx_id: u32, tally: &mut Tally) {
+fn rebuild_gate(
+    r: &abi::Renderer,
+    ctx_id: u32,
+    resources: &BTreeSet<u32>,
+    tally: &mut Tally,
+) {
     let before = match r.journal_export(ctx_id) {
         Ok(b) => b,
         // Nothing retained is a real answer, not a failure: a context whose every command was
@@ -717,6 +738,12 @@ fn rebuild_gate(r: &abi::Renderer, ctx_id: u32, tally: &mut Tally) {
     let rc = r.context_create(fresh, CAPSET_VENUS, "vkr-rebuild");
     if rc != 0 {
         return fail(format!("context_create {fresh} -> {rc}"));
+    }
+    // The same resources the original can reach. A journal's `vkAllocateMemory` may import from
+    // one, and without this the create fails and reads as a journal that lost the allocation --
+    // which is how this gate first reported a renderer bug that was its own.
+    for res in resources {
+        r.attach_resource(fresh, *res);
     }
     let rc = r.replay_begin(fresh);
     if rc != 0 {
