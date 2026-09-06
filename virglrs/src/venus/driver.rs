@@ -21,20 +21,23 @@ use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
     VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkClearAttachment, VkClearColorValue,
     VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCopyDescriptorSet, VkDependencyFlags, VkDescriptorPool, VkDescriptorSet,
-    VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo,
-    VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo,
-    VkExtensionProperties, VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer, VkImage,
-    VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags,
-    VkImageCreateInfo, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
-    VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageType, VkImageUsageFlagBits,
-    VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
-    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo,
-    VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags,
-    VkMemoryPropertyFlagBits, VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA,
-    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline,
-    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
+    VkCommandPool, VkCopyDescriptorSet, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
+    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
+    VkDependencyFlags, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
+    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
+    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
+    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
+    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer,
+    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits, VkImageAspectFlags,
+    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
+    VkImageLayout, VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange,
+    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits, VkImageUsageFlags,
+    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
+    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
+    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
+    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
+    VkMemoryToImageCopyMESA, VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties,
+    VkPipeline, VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
     VkPipelineStageFlags, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
     VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
     VkRenderPassBeginInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler,
@@ -1405,6 +1408,139 @@ impl Driver {
                 flags,
             )
         })
+    }
+
+    // ---- VK_EXT_host_image_copy ----
+    //
+    // Four entry points, and the wire reshapes two of them. `VkImageToMemoryCopy` and
+    // `VkMemoryToImageCopy` each carry a `pHostPointer` -- an address in the caller's process,
+    // which is meaningless across a guest boundary and which the generator lists in `gaps.txt`
+    // as not serializable. So venus defines `...MESA` forms that carry the bytes on the wire
+    // instead, and the renderer is what puts a real host pointer back. That reshaping is the
+    // reason these four live here rather than being plain forwards in a handler: building a
+    // `VkImageToMemoryCopy` means writing a host address into a Vulkan struct, and this module
+    // is where an address is allowed to be.
+
+    /// `vkTransitionImageLayout`: put images into the layouts the guest named, on the host.
+    pub fn transition_image_layout(
+        &self,
+        device: VkDevice,
+        transitions: &[VkHostImageLayoutTransitionInfo],
+    ) -> Option<VkResult> {
+        let d = &self.devices.get(&device)?.fns;
+        // SAFETY: a device in this table; the slice was decoded into the batch arena and is live
+        // for the call, and the driver is told its own length rather than the guest's count.
+        Some(unsafe {
+            (d.vkTransitionImageLayout())(device, transitions.len() as u32, transitions.as_ptr())
+        })
+    }
+
+    /// `vkCopyImageToImage`: copy between two images on the host, with no queue involved.
+    pub fn copy_image_to_image(
+        &self,
+        device: VkDevice,
+        info: &VkCopyImageToImageInfo,
+    ) -> Option<VkResult> {
+        let d = &self.devices.get(&device)?.fns;
+        // SAFETY: a device in this table, and `info` is an arena allocation live for the call --
+        // its own `pRegions` included, which the decoder sized and allocated beside it.
+        Some(unsafe { (d.vkCopyImageToImage())(device, info) })
+    }
+
+    /// `vkCopyImageToMemoryMESA`: read one region of an image out into `out`.
+    ///
+    /// One region, because that is what the MESA form carries: the wire's reply is one blob, and
+    /// a multi-region copy would need the guest to say how the regions divide it. `out` is the
+    /// reply's own storage, and its length -- not a number the guest sent beside it -- is what
+    /// bounds what the driver writes.
+    pub fn copy_image_to_memory(
+        &self,
+        device: VkDevice,
+        info: &VkCopyImageToMemoryInfoMESA,
+        out: &mut [u8],
+    ) -> Option<VkResult> {
+        let d = &self.devices.get(&device)?.fns;
+        let region = VkImageToMemoryCopy {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY,
+            pNext: core::ptr::null(),
+            pHostPointer: out.as_mut_ptr().cast(),
+            memoryRowLength: info.memoryRowLength,
+            memoryImageHeight: info.memoryImageHeight,
+            imageSubresource: info.imageSubresource,
+            imageOffset: info.imageOffset,
+            imageExtent: info.imageExtent,
+        };
+        let local = VkCopyImageToMemoryInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO,
+            pNext: core::ptr::null(),
+            flags: info.flags,
+            srcImage: info.srcImage,
+            srcImageLayout: info.srcImageLayout,
+            regionCount: 1,
+            pRegions: &region,
+        };
+        // SAFETY: a device in this table; `region` and `local` live to the end of this call, and
+        // `pHostPointer` addresses `out`, which the caller owns for the same span. The extent the
+        // driver writes is the guest's, and it is the guest's own reply blob it writes into --
+        // an extent larger than the blob is the guest overrunning its own buffer, which the
+        // driver rejects against the image rather than us guessing at a byte count.
+        Some(unsafe { (d.vkCopyImageToMemory())(device, &local) })
+    }
+
+    /// `vkCopyMemoryToImageMESA`: write the regions the guest sent into an image.
+    ///
+    /// Many regions here where the read has one, and for the same reason: the bytes travel
+    /// *with* each region rather than in one reply, so nothing has to say how a single blob
+    /// divides between them.
+    ///
+    /// The whole MESA info comes in rather than a slice of regions, because the regions are
+    /// behind a `pRegions` this struct carries as a raw pointer -- there is no accessor over a
+    /// *struct* member, only over a command's. Walking it here keeps the handler free of the
+    /// pointer, which is the rule; the decoder is what reconciled `regionCount` with it, and it
+    /// is the only thing that could.
+    pub fn copy_memory_to_image(
+        &self,
+        device: VkDevice,
+        info: &VkCopyMemoryToImageInfoMESA,
+    ) -> Option<VkResult> {
+        let d = &self.devices.get(&device)?.fns;
+        // SAFETY: the decoder allocated `regionCount` regions from the batch arena and wrote
+        // `pRegions` from that allocation, so the pair agrees by construction and the arena
+        // outlives this call. A null pointer with a nonzero count cannot reach here -- the
+        // decode fails the batch first.
+        let regions: &[VkMemoryToImageCopyMESA] = if info.pRegions.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(info.pRegions, info.regionCount as usize) }
+        };
+        let local: Vec<VkMemoryToImageCopy> = regions
+            .iter()
+            .map(|r| VkMemoryToImageCopy {
+                sType: VkStructureType::VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY,
+                pNext: core::ptr::null(),
+                // The bytes the region carried on the wire, at the address the decoder put them.
+                // `dataSize` is the decoder's own count for that allocation, not a second number
+                // the guest sent, so there is nothing here for the two to disagree about.
+                pHostPointer: r.pData,
+                memoryRowLength: r.memoryRowLength,
+                memoryImageHeight: r.memoryImageHeight,
+                imageSubresource: r.imageSubresource,
+                imageOffset: r.imageOffset,
+                imageExtent: r.imageExtent,
+            })
+            .collect();
+        let local_info = VkCopyMemoryToImageInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO,
+            pNext: core::ptr::null(),
+            flags: info.flags,
+            dstImage: info.dstImage,
+            dstImageLayout: info.dstImageLayout,
+            regionCount: local.len() as u32,
+            pRegions: local.as_ptr(),
+        };
+        // SAFETY: a device in this table; `local` and every arena allocation it points into
+        // outlive the call, and the count the driver is told is `local`'s own length.
+        Some(unsafe { (d.vkCopyMemoryToImage())(device, &local_info) })
     }
 
     /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
@@ -4502,6 +4638,174 @@ mod tests {
     /// concludes there is no external memory at all -- and a compositor then exports no scanout
     /// and presents nothing, with every process still reporting itself healthy. Measured against
     /// KosmicKrisp: with neither advertised the synoik guest never leaves the boot console.
+    /// The host-copy reshape: what the guest sent on the wire and what the driver is handed are
+    /// the same copy, and the wire's `...MESA` forms are the only reason they are not the same
+    /// struct.
+    ///
+    /// Every field the reshape copies across by hand is a field it can drop or transpose, and a
+    /// dropped `memoryRowLength` is a picture skewed by a few pixels a frame -- visible, and
+    /// attributable to nothing. So they are read back here from the struct the driver actually
+    /// received, not from the one that was sent.
+    #[test]
+    fn the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent() {
+        use std::cell::RefCell;
+
+        use crate::venus::proto::types::VkExtent3D;
+
+        const DEVICE: VkDevice = VkDevice(0x11);
+        const IMAGE: VkImage = VkImage(0x22);
+
+        thread_local! {
+            /// (row length, image height, host pointer, extent width) per region the driver saw.
+            static SAW: RefCell<Vec<(u32, u32, usize, u32)>> = const { RefCell::new(Vec::new()) };
+            static LAYOUTS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "C" fn to_memory(
+            _d: VkDevice,
+            info: *const VkCopyImageToMemoryInfo,
+        ) -> VkResult {
+            // SAFETY: the call under test builds this and keeps it alive across the call.
+            let info = unsafe { &*info };
+            let regions =
+                unsafe { core::slice::from_raw_parts(info.pRegions, info.regionCount as usize) };
+            SAW.with_borrow_mut(|v| {
+                v.extend(regions.iter().map(|r| {
+                    (
+                        r.memoryRowLength,
+                        r.memoryImageHeight,
+                        r.pHostPointer as usize,
+                        r.imageExtent.width,
+                    )
+                }))
+            });
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn to_image(
+            _d: VkDevice,
+            info: *const VkCopyMemoryToImageInfo,
+        ) -> VkResult {
+            // SAFETY: as above.
+            let info = unsafe { &*info };
+            let regions =
+                unsafe { core::slice::from_raw_parts(info.pRegions, info.regionCount as usize) };
+            SAW.with_borrow_mut(|v| {
+                v.extend(regions.iter().map(|r| {
+                    (
+                        r.memoryRowLength,
+                        r.memoryImageHeight,
+                        r.pHostPointer as usize,
+                        r.imageExtent.width,
+                    )
+                }))
+            });
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn transition(
+            _d: VkDevice,
+            count: u32,
+            p: *const VkHostImageLayoutTransitionInfo,
+        ) -> VkResult {
+            // SAFETY: the caller passes the slice's own pointer and length.
+            let t = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            LAYOUTS.with_borrow_mut(|v| v.extend(t.iter().map(|t| t.newLayout.0 as u32)));
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCopyImageToMemory(to_memory);
+        fns.plant_vkCopyMemoryToImage(to_image);
+        fns.plant_vkTransitionImageLayout(transition);
+        unsafe extern "C" fn wait_idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+        fns.plant_vkDeviceWaitIdle(wait_idle);
+        fns.plant_vkDestroyDevice(destroy_device);
+        let mut d = Driver::new(Account::for_test(None));
+        d.plant_device(DEVICE, fns);
+
+        // Reading an image out: one region, and its bytes go where the reply's blob is -- not to
+        // a copy this renderer would then have to move again.
+        let mut out = [0u8; 64];
+        let want = out.as_mut_ptr() as usize;
+        let read = VkCopyImageToMemoryInfoMESA {
+            srcImage: IMAGE,
+            memoryRowLength: 37,
+            memoryImageHeight: 11,
+            imageExtent: VkExtent3D { width: 5, height: 6, depth: 1 },
+            ..Default::default()
+        };
+        assert_eq!(d.copy_image_to_memory(DEVICE, &read, &mut out), Some(VkResult::VK_SUCCESS));
+        assert_eq!(
+            SAW.with_borrow(|v| v.clone()),
+            vec![(37, 11, want, 5)],
+            "the read reaches the driver with the guest's layout, addressing the reply's own blob"
+        );
+        SAW.with_borrow_mut(|v| v.clear());
+
+        // Writing into one: many regions, each carrying its own bytes, and each keeping the
+        // layout it was sent with. Transposing two here writes one region's pixels with the
+        // other's stride.
+        let a = [1u8; 8];
+        let b = [2u8; 8];
+        let regions = [
+            VkMemoryToImageCopyMESA {
+                dataSize: a.len(),
+                pData: a.as_ptr().cast(),
+                memoryRowLength: 3,
+                memoryImageHeight: 4,
+                imageExtent: VkExtent3D { width: 9, height: 1, depth: 1 },
+                ..Default::default()
+            },
+            VkMemoryToImageCopyMESA {
+                dataSize: b.len(),
+                pData: b.as_ptr().cast(),
+                memoryRowLength: 5,
+                memoryImageHeight: 6,
+                imageExtent: VkExtent3D { width: 8, height: 1, depth: 1 },
+                ..Default::default()
+            },
+        ];
+        let write = VkCopyMemoryToImageInfoMESA {
+            dstImage: IMAGE,
+            regionCount: regions.len() as u32,
+            pRegions: regions.as_ptr(),
+            ..Default::default()
+        };
+        assert_eq!(d.copy_memory_to_image(DEVICE, &write), Some(VkResult::VK_SUCCESS));
+        assert_eq!(
+            SAW.with_borrow(|v| v.clone()),
+            vec![(3, 4, a.as_ptr() as usize, 9), (5, 6, b.as_ptr() as usize, 8)],
+            "each region keeps its own bytes and its own layout, in the order it was sent"
+        );
+
+        // A transition is a plain forward, and the count the driver is told is the slice's own.
+        let t = [
+            VkHostImageLayoutTransitionInfo {
+                image: IMAGE,
+                newLayout: VkImageLayout(7),
+                ..Default::default()
+            },
+            VkHostImageLayoutTransitionInfo {
+                image: IMAGE,
+                newLayout: VkImageLayout(2),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(d.transition_image_layout(DEVICE, &t), Some(VkResult::VK_SUCCESS));
+        assert_eq!(LAYOUTS.with_borrow(|v| v.clone()), vec![7, 2]);
+
+        // A device this renderer does not have is a refusal, not a copy reported as done.
+        assert!(d.copy_image_to_memory(VkDevice(0x99), &read, &mut out).is_none());
+        assert!(d.copy_memory_to_image(VkDevice(0x99), &write).is_none());
+        assert!(d.transition_image_layout(VkDevice(0x99), &t).is_none());
+
+        d.destroy_device(DEVICE, &[]);
+    }
+
     #[test]
     fn the_extensions_the_metal_path_emulates_are_advertised_in_pairs() {
         const METAL: VkPhysicalDevice = VkPhysicalDevice(1);

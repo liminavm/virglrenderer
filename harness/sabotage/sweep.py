@@ -412,6 +412,35 @@ SABOTAGES = [
         '        self.described.remove(&blob_id).map(|(r, _)| (r, Vec::new()))',
         'a_described_blob_is_claimed_once_and_by_the_context_that_described_it',
     ),
+    # VK_EXT_host_image_copy. The wire's `...MESA` forms carry the bytes where Vulkan carries a
+    # host address, so the renderer rebuilds each region by hand -- and every field copied across
+    # by hand is one that can be dropped or transposed into a skewed picture with no error
+    # anywhere.
+    (
+        "an image read out lands somewhere other than the reply's own blob",
+        'virglrs/src/venus/driver.rs',
+        '            pHostPointer: out.as_mut_ptr().cast(),',
+        '            pHostPointer: core::ptr::null_mut(),',
+        'the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent',
+    ),
+    (
+        "a host copy's row length is dropped on the way to the driver",
+        'virglrs/src/venus/driver.rs',
+        """                memoryRowLength: r.memoryRowLength,
+                memoryImageHeight: r.memoryImageHeight,
+                imageSubresource: r.imageSubresource,""",
+        """                memoryRowLength: 0,
+                memoryImageHeight: r.memoryImageHeight,
+                imageSubresource: r.imageSubresource,""",
+        'the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent',
+    ),
+    (
+        'a layout transition is passed the guest\'s count instead of the array it got',
+        'virglrs/src/venus/driver.rs',
+        '            (d.vkTransitionImageLayout())(device, transitions.len() as u32, transitions.as_ptr())',
+        '            (d.vkTransitionImageLayout())(device, 1, transitions.as_ptr())',
+        'the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent',
+    ),
     (
         "a scanout's restore goes through vkMapMemory like any other allocation",
         'virglrs/src/venus/driver.rs',
