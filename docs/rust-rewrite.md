@@ -859,6 +859,46 @@ waiting on a call rather than on work.
   conversion is unreachable and unscoreable, and refusing it by name is the resting state; the
   decision is whether to keep hunting for one.
 
+## Owed, and waiting on work
+
+These are not decisions. Each is settled in shape and unwritten in code, and each is here so that
+it survives the session it was found in.
+
+- **virglrs advertises every sample count the host has.** The C fork carries a `VREND_MAX_SAMPLES`
+  ceiling on the multisample caps, and limina sets it to 1: a WebGL context asking for
+  `{antialias:true}` faults the GPU and kills the VM, and a guest cannot ask for multisampling it
+  has not been told exists. virglrs must read that exact variable name, or swapping the dylib in
+  silently removes the mitigation with nothing to say so.
+
+- **A classic resource does not import into a venus context.** The Vulkan compositor answers
+  `create_immed failed and produced an invalid wl_buffer` and kills a classic-virgl GL client
+  after one benchmark; the C serves the same client on the same guest. It is the mirror of the
+  venus-to-venus import, which works. Attributed in time as well as between the legs — the build
+  before host-visible allocations became minted pages fails identically, so it is neither that
+  change nor the force-LINEAR rule. `harness/vm/client-gl-synoik.sh` is the reproducer, and
+  `synoik-glclient.vkrc` was recorded from the C, which is why replaying it green said nothing.
+
+- **The classic half of P5 must drop and name, never poison.** virglrs refuses one journal entry
+  by poisoning the context, which loses everything after it; a restore has to keep going and
+  account for what it left behind. The C's shape is the trap to avoid, not the model: it buckets
+  drops by class and calls the low ones "the benign stale-reference kind", which is
+  indistinguishable from a recorder that never wrote the entry. Name every drop individually. It
+  lands *with* the classic recorder and never after — libkrun fails the whole restore if
+  `replay_begin` fails, so a restorer that reads a journal nothing writes is worse than none.
+
+- **`Exporter.ctx` names a context id, not a generation of one.** A `Shared` blob left by an
+  earlier life of a reused context id is counted against the new one, inflating `journal_held`.
+  The keys elsewhere are generational; this one is not, and the fix is to make it so rather than
+  to purge at the reuse site.
+
+- **Two ids still travel as bare integers where a newtype belongs.** `venus_memory_read` takes a
+  `u64` for what is an object id, and the `BlobId`-means-`ObjectId` decision is made in three
+  places instead of once. `venus_memory_export` already resolves it once and is the pattern.
+
+- **The libkrun opaque-journal branch is parked and ready.** `limina-p5-opaque-journal` merges into
+  `third_party/libkrun`'s `limina` branch with a `third_party/manifest.toml` bump. Nothing blocks
+  it now.
+
 ## Consequences to accept
 
 - **Upstream gets the fixes made up to the switch, and nothing after.** The delta
