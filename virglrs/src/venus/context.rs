@@ -39,7 +39,8 @@ use super::proto::types::{
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
     vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdEndQuery,
     vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
-    vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool,
+    vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetScissor,
     vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
     vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
     vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
@@ -3988,6 +3989,16 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
         let viewports = args.pViewports();
         let done = self.driver.cmd_set_viewport(args.commandBuffer, args.firstViewport, viewports);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetAttachmentFeedbackLoopEnableEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_attachment_feedback_loop_enable(args.commandBuffer, args.aspectMask);
         self.recorded(done);
     }
 
@@ -12580,6 +12591,131 @@ mod tests {
         assert!(h.reject.is_some(), "there is no device to record into");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
+    }
+
+    /// An extension recording command reaches the driver when the device exports it, and is
+    /// rejected -- not aborted on -- when it does not.
+    ///
+    /// The capset advertises what this build can *serialize*, which is every extension the
+    /// pinned vk.xml defines. What a device exports is narrower and is the guest's own choice at
+    /// `vkCreateDevice`. So a guest can always send an extension command the device behind it
+    /// has no entry point for, and the panicking accessor would turn that into a process abort
+    /// on guest input. Reaching for the fallible accessor is what keeps it a poisoned context.
+    #[test]
+    fn an_extension_recording_command_the_device_does_not_export_is_refused_and_not_aborted_on() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkImageAspectFlags,
+            vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
+        };
+        use std::cell::Cell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        const ASPECTS: u32 = 0x2 | 0x4;
+
+        thread_local! {
+            static SAW: Cell<u32> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn set_feedback_loop(_cb: VkCommandBuffer, aspects: VkImageAspectFlags) {
+            SAW.with(|s| s.set(aspects.0));
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn handlers<'a>(
+            objects: &'a Shared,
+            driver: &'a mut Driver,
+            todo: &'a mut Unimplemented,
+            global: &'a crate::vulkan::Global,
+            rings: &'a mut BTreeMap<RingId, RingSlot>,
+            monitor: &'a mut Option<Monitor>,
+            reply: &'a mut Option<ReplyStream>,
+            journal: &'a mut Journal,
+        ) -> Handlers<'a> {
+            Handlers {
+                objects,
+                todo,
+                driver,
+                global,
+                ctx: ContextId::new(1).expect("1 is not zero"),
+                reject: None,
+                resources: &NO_RESOURCES,
+                rings,
+                monitor,
+                wait: None,
+                execute: None,
+                replaying: false,
+                current_ring: None,
+                reply,
+                note: None,
+                journal,
+            }
+        }
+
+        fn driver_with(fns: crate::vulkan::Device) -> Driver {
+            let mut driver = Driver::new(Account::for_test(None));
+            driver.plant_device(VkDevice(DEVICE), fns);
+            driver.plant_pool(
+                VkDevice(DEVICE),
+                VkCommandPool(POOL),
+                &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+            );
+            driver
+        }
+
+        fn call(h: &mut Handlers<'_>) {
+            let mut args = vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT {
+                commandBuffer: VkCommandBuffer(CB.0),
+                aspectMask: VkImageAspectFlags(ASPECTS),
+                ..Default::default()
+            };
+            h.vkCmdSetAttachmentFeedbackLoopEnableEXT(&mut args);
+        }
+
+        let objects = Shared::new();
+        let global = crate::vulkan::global();
+
+        // The device exports it: the mask the guest sent is the mask the driver is called with,
+        // unchanged -- a handler passing a constant, or the command buffer, would not be visible
+        // anywhere else.
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetAttachmentFeedbackLoopEnableEXT(set_feedback_loop);
+        let mut driver = driver_with(fns);
+        let (mut todo, mut rings, mut monitor, mut reply, mut jrnl) =
+            (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
+        let mut h = handlers(
+            &objects,
+            &mut driver,
+            &mut todo,
+            &global,
+            &mut rings,
+            &mut monitor,
+            &mut reply,
+            &mut jrnl,
+        );
+        call(&mut h);
+        assert!(h.reject.is_none());
+        assert_eq!(SAW.with(|s| s.get()), ASPECTS, "the guest's aspect mask, and nothing else");
+        h.driver.abandon_planted();
+
+        // The device does not: the context dies and the process does not.
+        let mut driver = driver_with(crate::vulkan::Device::default());
+        let (mut todo, mut rings, mut monitor, mut reply, mut jrnl) =
+            (Unimplemented::default(), BTreeMap::new(), None, None, Journal::new());
+        let mut h = handlers(
+            &objects,
+            &mut driver,
+            &mut todo,
+            &global,
+            &mut rings,
+            &mut monitor,
+            &mut reply,
+            &mut jrnl,
+        );
+        call(&mut h);
+        assert!(h.reject.is_some(), "an entry point the device has not got is a rejection");
         h.driver.abandon_planted();
     }
 

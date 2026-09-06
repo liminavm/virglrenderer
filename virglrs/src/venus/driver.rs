@@ -1430,9 +1430,8 @@ impl Driver {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: a device in this table; the slice was decoded into the batch arena and is live
         // for the call, and the driver is told its own length rather than the guest's count.
-        Some(unsafe {
-            (d.vkTransitionImageLayout())(device, transitions.len() as u32, transitions.as_ptr())
-        })
+        let f = d.try_vkTransitionImageLayout()?;
+        Some(unsafe { f(device, transitions.len() as u32, transitions.as_ptr()) })
     }
 
     /// `vkCopyImageToImage`: copy between two images on the host, with no queue involved.
@@ -1444,7 +1443,8 @@ impl Driver {
         let d = &self.devices.get(&device)?.fns;
         // SAFETY: a device in this table, and `info` is an arena allocation live for the call --
         // its own `pRegions` included, which the decoder sized and allocated beside it.
-        Some(unsafe { (d.vkCopyImageToImage())(device, info) })
+        let f = d.try_vkCopyImageToImage()?;
+        Some(unsafe { f(device, info) })
     }
 
     /// `vkCopyImageToMemoryMESA`: read one region of an image out into `out`.
@@ -1484,7 +1484,8 @@ impl Driver {
         // driver writes is the guest's, and it is the guest's own reply blob it writes into --
         // an extent larger than the blob is the guest overrunning its own buffer, which the
         // driver rejects against the image rather than us guessing at a byte count.
-        Some(unsafe { (d.vkCopyImageToMemory())(device, &local) })
+        let f = d.try_vkCopyImageToMemory()?;
+        Some(unsafe { f(device, &local) })
     }
 
     /// `vkCopyMemoryToImageMESA`: write the regions the guest sent into an image.
@@ -1540,7 +1541,8 @@ impl Driver {
         };
         // SAFETY: a device in this table; `local` and every arena allocation it points into
         // outlive the call, and the count the driver is told is `local`'s own length.
-        Some(unsafe { (d.vkCopyMemoryToImage())(device, &local_info) })
+        let f = d.try_vkCopyMemoryToImage()?;
+        Some(unsafe { f(device, &local_info) })
     }
 
     /// Fold `srcs` into `dst`. The handles are the guest's names already resolved to the
@@ -2589,6 +2591,24 @@ impl Driver {
         let d = self.recorder(cb)?;
         // SAFETY: as above; the count is the slice's own length.
         unsafe { (d.vkCmdSetScissor())(cb, first, scissors.len() as u32, scissors.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdSetAttachmentFeedbackLoopEnableEXT`: say which aspects the next draws may sample
+    /// from while rendering to them.
+    ///
+    /// `try_` and not the panicking accessor, as every extension recording command must be: the
+    /// capset advertises what this build can *serialize*, which is a wider set than what a
+    /// device the guest built happens to export. A guest that sends this without having enabled
+    /// the extension is a guest to reject, not a driver table to abort on.
+    pub fn cmd_set_attachment_feedback_loop_enable(
+        &self,
+        cb: VkCommandBuffer,
+        aspects: VkImageAspectFlags,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetAttachmentFeedbackLoopEnableEXT()?;
+        // SAFETY: as above; both arguments are scalars the decoder read off the wire.
+        unsafe { f(cb, aspects) };
         Some(())
     }
 

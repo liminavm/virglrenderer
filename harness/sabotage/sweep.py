@@ -437,9 +437,26 @@ SABOTAGES = [
     (
         'a layout transition is passed the guest\'s count instead of the array it got',
         'virglrs/src/venus/driver.rs',
-        '            (d.vkTransitionImageLayout())(device, transitions.len() as u32, transitions.as_ptr())',
-        '            (d.vkTransitionImageLayout())(device, 1, transitions.as_ptr())',
+        '        Some(unsafe { f(device, transitions.len() as u32, transitions.as_ptr()) })',
+        '        Some(unsafe { f(device, 1, transitions.as_ptr()) })',
         'the_host_copy_reshape_hands_the_driver_the_copy_the_guest_sent',
+    ),
+    # An extension command's entry point is the guest's choice at `vkCreateDevice`, not ours: the
+    # capset advertises everything the pinned vk.xml can serialize. So the fallible accessor is
+    # what stands between a guest sending a command its own device never enabled and an abort.
+    (
+        'an extension recording command aborts when the device has no entry point for it',
+        'virglrs/src/venus/driver.rs',
+        '        let f = self.recorder(cb)?.try_vkCmdSetAttachmentFeedbackLoopEnableEXT()?;',
+        '        let f = self.recorder(cb)?.vkCmdSetAttachmentFeedbackLoopEnableEXT();',
+        'an_extension_recording_command_the_device_does_not_export_is_refused_and_not_aborted_on',
+    ),
+    (
+        'a feedback-loop enable reaches the driver with an aspect mask the guest never sent',
+        'virglrs/src/venus/driver.rs',
+        '        unsafe { f(cb, aspects) };',
+        '        unsafe { f(cb, VkImageAspectFlags(0)) };',
+        'an_extension_recording_command_the_device_does_not_export_is_refused_and_not_aborted_on',
     ),
     (
         "a scanout's restore goes through vkMapMemory like any other allocation",
