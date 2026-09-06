@@ -1160,12 +1160,14 @@ impl Renderer {
         self.venus_context(ctx_id, |ctx| ctx.driver().memory_census())
     }
 
-    /// Publish one venus allocation to the VMM, handing back the host address it lives at.
+    /// Publish one venus allocation to the VMM: the host address, the storage behind it, and the
+    /// generational name of the object that lent it.
     ///
-    /// The address is not kept here. A resource holding it would outlive the memory it points
-    /// into the first time a guest freed the memory while the resource stood -- so the resource
-    /// keeps the names, and [`Self::venus_memory_map_ptr`] resolves them again each time. Memory
-    /// that is gone then has no address to give, instead of having a stale one.
+    /// All three, because a blob resource needs all three and none of them can be derived from
+    /// another later. The address is what the VMM maps; the storage is a share of the pages
+    /// themselves, so the mapping stays good after the guest's `vkFreeMemory` retires the
+    /// allocation; and the key is what a journal entry and a held-allocation census name the
+    /// object by, which an id alone cannot do once the guest reuses it.
     pub fn venus_memory_export(
         &mut self,
         ctx_id: ContextId,

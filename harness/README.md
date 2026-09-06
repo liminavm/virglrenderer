@@ -651,9 +651,9 @@ renderer makes is pages it minted and handed the driver as a host-pointer import
 over one can outlive the guest's `vkFreeMemory`. KosmicKrisp honours such an import for a buffer
 and for a LINEAR image, but keeps an OPTIMAL image's texels in a private texture -- the image
 renders correctly and the imported pages stay blank, and `vkMapMemory` does not reach the texels
-either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here, and
-the entries that still discriminate are the ones sharing their allocation with a buffer. On
-`synoik` and `synoik-glclient` that is two entries of twenty-two. Reaching the rest needs a census
+either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here. On
+`synoik` and `synoik-glclient` two entries of twenty-two still discriminate, and both are the
+4 MiB allocations the census reads 1 MiB deep -- why those two and not the rest is unmeasured. Reaching the rest needs a census
 that copies out of the `VkImage` rather than out of the memory; until it exists, the venus score is
 a weak oracle for these two corpora and the pixel gate is the one that matters.
 
