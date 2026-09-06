@@ -1090,8 +1090,31 @@ fn record(
         return;
     }
 
-    if mutates(cmd) {
-        h.journal.mutated(cmd_type, &wire, key_of(&named), Vec::new());
+    if let Some(targets) = mutates(cmd) {
+        // What the command *wrote into* is what it is about; everything else it named is a
+        // reference. Told apart by object type rather than by argument position -- the wire order
+        // is the generator's business and a positional rule would be a second parse of it.
+        let (about, refs) = {
+            let t = h.objects.borrow();
+            let mut about = Vec::new();
+            let mut refs = Vec::new();
+            for id in &named {
+                let Some(key) = t.key_of(*id) else { continue };
+                match t.get(*id) {
+                    Some(o) if targets.contains(&o.ty) => about.push(key),
+                    _ => refs.push(key),
+                }
+            }
+            (about, refs)
+        };
+        // Nothing of the target type at all means the command wrote into something this build
+        // does not track. Keeping it as a mutation of nothing would make it immortal, since an
+        // empty "all of these live" is vacuously true.
+        if about.is_empty() {
+            h.journal.skip(cmd_type);
+            return;
+        }
+        h.journal.mutated(cmd_type, &wire, about, refs);
         return;
     }
 
@@ -1148,22 +1171,34 @@ fn recording_class(cmd: VkCommandTypeEXT) -> Option<Recording> {
     }
 }
 
-/// Commands that write into objects they do not own, and so are true only while every object they
-/// named is still there.
+/// Commands that write into objects they do not own, and the types of the objects they write into.
 ///
 /// A short explicit list, unlike the recordings: there is no naming rule that picks these out, and
 /// a wrong guess here is not a missing entry but a stale one -- an entry claiming to describe a
 /// descriptor set that has been freed and reallocated.
-fn mutates(cmd: VkCommandTypeEXT) -> bool {
-    matches!(
-        cmd,
+///
+/// The types are what separate the two halves of what such a command names. A bind names a buffer
+/// and the memory it is bound to; a descriptor write names the set and every buffer, view and
+/// sampler it points at. Only the first of each pair is what the entry is *about* -- the entry
+/// stops being true when the thing it wrote into is gone, not when something it merely pointed at
+/// is. Keying on all of them together is why a `vkBindBufferMemory2` over two buffers used to be
+/// lost entirely when one of them was destroyed, taking the other buffer's binding with it -- and
+/// a binding, unlike a descriptor write, is never sent again.
+fn mutates(cmd: VkCommandTypeEXT) -> Option<&'static [VkObjectType]> {
+    const SET: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_SET;
+    const BUFFER: VkObjectType = VkObjectType::VK_OBJECT_TYPE_BUFFER;
+    const IMAGE: VkObjectType = VkObjectType::VK_OBJECT_TYPE_IMAGE;
+    match cmd {
+        // Both the written set and a copy's source set: a copy from a set that is gone describes
+        // nothing, so it is right for that to end the entry too.
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkUpdateDescriptorSets_EXT
-            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplate_EXT
-            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory_EXT
-            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory2_EXT
-            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory_EXT
-            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory2_EXT
-    )
+        | VkCommandTypeEXT::VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplate_EXT => Some(&[SET]),
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory_EXT
+        | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory2_EXT => Some(&[BUFFER]),
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory_EXT
+        | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory2_EXT => Some(&[IMAGE]),
+        _ => None,
+    }
 }
 
 /// Run the streams one `vkExecuteCommandStreamsMESA` named, seeking the reply stream per stream.
@@ -12273,7 +12308,7 @@ mod tests {
             for raw in 0..2000i32 {
                 let cmd = VkCommandTypeEXT(raw);
                 assert!(
-                    !(recording_class(cmd).is_some() && mutates(cmd)),
+                    !(recording_class(cmd).is_some() && mutates(cmd).is_some()),
                     "{cmd:?} is classified twice"
                 );
             }
