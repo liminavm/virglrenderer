@@ -600,9 +600,8 @@ SABOTAGES = [
     (
         'a late credit lands on whichever context holds the id now',
         'virglrs/src/venus/budget.rs',
-        """        self.ctxs.get_mut(&ctx).filter(|s| s.epoch == epoch).map(|s| &mut s.live)""",
-        """        let _ = epoch;
-        self.ctxs.get_mut(&ctx).map(|s| &mut s.live)""",
+        """        self.ctxs.get_mut(&ctx.id()).filter(|s| s.ctx == ctx).map(|s| &mut s.live)""",
+        """        self.ctxs.get_mut(&ctx.id()).map(|s| &mut s.live)""",
         'a_late_credit_never_lands_on_the_next_context_with_the_same_id',
     ),
     (
