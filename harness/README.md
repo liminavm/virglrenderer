@@ -676,11 +676,16 @@ renderer makes is pages it minted and handed the driver as a host-pointer import
 over one can outlive the guest's `vkFreeMemory`. KosmicKrisp honours such an import for a buffer
 and for a LINEAR image, but keeps an OPTIMAL image's texels in a private texture -- the image
 renders correctly and the imported pages stay blank, and `vkMapMemory` does not reach the texels
-either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here. On
-`synoik` and `synoik-glclient` two entries of twenty-two still discriminate, and both are the
-4 MiB allocations the census reads 1 MiB deep -- why those two and not the rest is unmeasured. Reaching the rest needs a census
-that copies out of the `VkImage` rather than out of the memory; until it exists, the venus score is
-a weak oracle for these two corpora and the pixel gate is the one that matters.
+either. So an allocation whose only content is an OPTIMAL image hashes as N zero bytes here.
+
+Measured 2026-09-06, joining every censused id to the object bound to its memory: `synoik` scores
+20 of 22 entries as zeros and `synoik-glclient` 21 of 23, and **every one of the 41 is an OPTIMAL
+image**. No buffer and no LINEAR image is among them -- those the census reads correctly. The four
+that carry data are the 4 MiB scanouts, and they discriminate because they are not read through the
+pages at all: their backing is an IOSurface and `Surface::read_into` copies from the surface.
+Reaching the rest needs a census that copies out of the `VkImage` rather than out of the memory;
+until it exists, the venus score is a weak oracle for these two corpora and the pixel gate is the
+one that matters.
 
 Each context is scored when it is destroyed, and once more at the end if it is still alive. A
 workload that exits cleanly frees everything, so scoring only at the end would score nothing.
@@ -836,12 +841,20 @@ be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
 **The census reads the memory, so an image's texels can escape it.** It hashes the allocation's
 pages, which is the whole of the truth for a buffer and for a LINEAR image, and none of it for an
 OPTIMAL image on KosmicKrisp — the driver keeps those texels in a private texture and the pages
-stay zero. Nine entries across `synoik` and `synoik-glclient` are pinned at all-zeros for that
-reason, and a real divergence in any of them would not move the score. Recovering them needs a
-census that copies out of the `VkImage` — a transfer to a host-visible staging buffer on a
-transient command buffer, hashed from there — rather than out of the memory the image was bound
-to. Until it exists the venus score is a weak oracle on those two corpora, and the pixel gate is
-the one that carries them.
+stay zero. Forty-one entries across `synoik` and `synoik-glclient` are pinned at all-zeros for that
+reason — every censused allocation on either corpus that is not one of the four IOSurface-backed
+scanouts — and a real divergence in any of them would not move the score.
+
+Recovering them means copying out of the `VkImage` — a transfer to a host-visible staging buffer on
+a transient command buffer — and two things stand in the way of writing that. The copy needs the
+image's current layout, which this renderer does not track: layouts are the guest's, moved by every
+barrier, render-pass `finalLayout` and implicit transition, so tracking them is a shadow of
+Vulkan's state machine and `UNDEFINED` would discard the texels the census came for. And the gap is
+symmetric — `memory_write` restores *pages*, so texels the census cannot see are texels a restore
+cannot put back either. A census that read through the image alone would report content the restore
+cannot reproduce, which is a stricter gate than the mechanism it gates. Either both sides go
+through the image, or neither does and the hole is documented. Until that is settled the venus
+score is a weak oracle on those two corpora, and the pixel gate is the one that carries them.
 
 **No case makes a shared blob outlive the allocation it came from.** Every host-visible venus
 allocation is minted pages the blob holds a share of, so the guest's `vkFreeMemory` retires the
