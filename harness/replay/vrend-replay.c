@@ -41,8 +41,10 @@
 //   --sweep-w W   restrict --sweep to targets of this width
 //   --score F     write the score to F
 //   --expect F    compare the score against F and exit non-zero on any difference
-//   --rebuild-score F   write the rebuild report -- entries in and out per context, and every
-//                 entry the rebuild could not use -- to F
+//   --rebuild-score F   write the rebuild report -- entries in and out per context, every
+//                 entry the rebuild could not use, and the contents account (how many levels
+//                 were captured, how many were all zeros, and every resource that did not come
+//                 back byte for byte) -- to F
 //   --rebuild-expect F  compare that report against F. Without it, a rebuild that loses an entry
 //                 fails; with it, the pinned losses are the ones this corpus is known to make
 //   --caps F      write the classic capsets (VIRGL and VIRGL2) the renderer fills, one field a
@@ -847,6 +849,194 @@ static void rb_drop_line(const struct vrj_ent *e)
    rb_addf("\n");
 }
 
+/* -------- the classic contents fixed point -------- *
+ *
+ * The journal gate above proves the rebuilt context has the same OBJECTS. It says nothing about
+ * what is in them: a rebuilt world is structurally sound and blank, which is the gray-blocks
+ * state a restore is supposed to avoid. This is the other half -- export a context's resource
+ * contents, put them into the rebuilt context, export that one, and require the two blobs to
+ * agree entry for entry.
+ *
+ * Blob layout (`VRCC`): u32 magic, u32 version, then per entry u32 res_id, level, w, h, d, size,
+ * followed by `size` bytes.
+ */
+
+struct vrcc_ent {
+   uint32_t res_id, level, w, h, d, size;
+   const uint8_t *bytes;
+};
+
+/* Split a content blob into its entries, or NULL if it is not one. */
+static struct vrcc_ent *vrcc_entries(const void *b, uint64_t len, uint32_t *n_out)
+{
+   const uint8_t *p = b, *end = p + len;
+   uint32_t magic, version;
+   if (len < 8)
+      return NULL;
+   memcpy(&magic, p, 4);
+   memcpy(&version, p + 4, 4);
+   if (magic != 0x43435256u || version != 1u)
+      return NULL;
+   p += 8;
+   uint32_t cap = 16, n = 0;
+   struct vrcc_ent *e = calloc(cap, sizeof *e);
+   if (!e) { perror("content"); exit(2); }
+   while (p + 24 <= end) {
+      uint32_t h[6];
+      memcpy(h, p, 24);
+      p += 24;
+      if ((uint64_t)(end - p) < h[5]) { free(e); return NULL; }
+      if (n == cap) {
+         cap *= 2;
+         struct vrcc_ent *ne = realloc(e, cap * sizeof *e);
+         if (!ne) { perror("content"); exit(2); }
+         e = ne;
+      }
+      e[n].res_id = h[0];
+      e[n].level = h[1];
+      e[n].w = h[2];
+      e[n].h = h[3];
+      e[n].d = h[4];
+      e[n].size = h[5];
+      e[n].bytes = p;
+      n++;
+      p += h[5];
+   }
+   if (p != end) { free(e); return NULL; }
+   *n_out = n;
+   return e;
+}
+
+static bool vrcc_all_zero(const struct vrcc_ent *e)
+{
+   for (uint32_t i = 0; i < e->size; i++)
+      if (e->bytes[i])
+         return false;
+   return true;
+}
+
+/* A copy of a content blob with every entry's bytes inverted: same resources, same layout,
+ * content nothing could have produced.
+ *
+ * Without it the fixed point is vacuous. A classic resource is global and the rebuilt context is
+ * attached to the same ones, so exporting from the rebuilt context re-reads the very storage the
+ * source read -- and a restore that wrote nothing at all would still compare equal. Scrubbing
+ * first means the bytes that come back can only have come from the restore. */
+static void *vrcc_scrub(const void *b, uint64_t len)
+{
+   uint8_t *c = malloc((size_t)len);
+   if (!c) { perror("content"); exit(2); }
+   memcpy(c, b, (size_t)len);
+   const uint8_t *end = c + len;
+   uint8_t *p = c + 8;
+   while (p + 24 <= end) {
+      uint32_t sz;
+      memcpy(&sz, p + 20, 4);
+      p += 24;
+      if ((uint64_t)(end - p) < sz) break;
+      for (uint32_t i = 0; i < sz; i++)
+         p[i] = (uint8_t)~p[i];
+      p += sz;
+   }
+   return c;
+}
+
+/* Whether two content blobs hold the same bytes for the entries they share.
+ *
+ * `scored` says whether anything was actually compared: a blob with no entries, or none with any
+ * bytes, shares nothing with anything and reads as "the same" -- which is the answer that would
+ * make the scrub check below accuse an empty capture of writing nothing. */
+static bool vrcc_same(const void *a, uint64_t a_len, const void *b, uint64_t b_len, bool *scored)
+{
+   uint32_t n_a = 0, n_b = 0;
+   struct vrcc_ent *ea = vrcc_entries(a, a_len, &n_a);
+   struct vrcc_ent *eb = vrcc_entries(b, b_len, &n_b);
+   bool same = ea && eb;
+   *scored = false;
+   for (uint32_t i = 0; ea && i < n_a; i++)
+      if (ea[i].size)
+         *scored = true;
+   for (uint32_t i = 0; same && i < n_a; i++)
+      for (uint32_t j = 0; j < n_b; j++)
+         if (eb[j].res_id == ea[i].res_id && eb[j].level == ea[i].level) {
+            if (eb[j].size != ea[i].size || memcmp(eb[j].bytes, ea[i].bytes, ea[i].size))
+               same = false;
+            break;
+         }
+   free(ea); free(eb);
+   return same;
+}
+
+/* The fixed point itself. Every entry the source exported must come back from the rebuilt
+ * context, at the same res_id and level, byte for byte. An entry that did not come back is a
+ * resource the restore did not reach -- reported, and the caller decides against the pin. */
+static bool contents_agree(const void *a, uint64_t a_len, const void *b, uint64_t b_len,
+                           uint32_t src, uint32_t dst, uint32_t *missing, uint32_t *deviations,
+                           const struct res_ev *res, uint32_t n_res)
+{
+   uint32_t n_a = 0, n_b = 0;
+   struct vrcc_ent *ea = vrcc_entries(a, a_len, &n_a);
+   struct vrcc_ent *eb = vrcc_entries(b, b_len, &n_b);
+   if (!ea || !eb) {
+      fprintf(stderr, "content: ctx %u: not a pair of content blobs\n", src);
+      free(ea); free(eb);
+      return false;
+   }
+
+   /* How many entries carry nothing but zeros. Not a failure -- a scratch buffer the guest never
+    * wrote is legitimately zero -- but a run where EVERY entry is zero is a gate comparing
+    * nothing to nothing, and that is worth saying out loud rather than reading as a pass. */
+   uint32_t zeros = 0, bytes = 0;
+   for (uint32_t i = 0; i < n_a; i++) {
+      zeros += vrcc_all_zero(&ea[i]) ? 1 : 0;
+      bytes += ea[i].size;
+   }
+
+   bool ok = true;
+   uint32_t differ = 0;
+   for (uint32_t i = 0; i < n_a; i++) {
+      const struct vrcc_ent *m = NULL;
+      for (uint32_t j = 0; j < n_b; j++)
+         if (eb[j].res_id == ea[i].res_id && eb[j].level == ea[i].level) { m = &eb[j]; break; }
+      if (!m) {
+         (*missing)++;
+         continue;
+      }
+      if (m->size != ea[i].size || memcmp(m->bytes, ea[i].bytes, ea[i].size)) {
+         /* Where and how much, not just that: a whole-buffer difference, a tail, and a
+          * channel-order swap are three different bugs and the line has to tell them apart. */
+         uint32_t first = 0, differing = 0;
+         if (m->size == ea[i].size) {
+            while (first < ea[i].size && m->bytes[first] == ea[i].bytes[first])
+               first++;
+            for (uint32_t k = 0; k < ea[i].size; k++)
+               differing += m->bytes[k] != ea[i].bytes[k];
+         }
+         const struct res_ev *born = NULL;
+         for (uint32_t k = 0; k < n_res; k++)
+            if (res[k].handle == ea[i].res_id && res[k].kind != RES_UNREF)
+               born = &res[k];
+         rb_addf("  content res=%u level=%u %ux%ux%u fmt=%u bind=%#x target=%u differs "
+                 "(%u vs %u bytes, %u from offset %u)\n", ea[i].res_id, ea[i].level, ea[i].w,
+                 ea[i].h, ea[i].d, born ? born->format : 0u, born ? born->bind : 0u,
+                 born ? born->target : 0u, ea[i].size, m->size, differing, first);
+         differ++;
+      }
+   }
+   /* The line goes into the pinned report, not just onto stderr: a resource that does not
+    * survive the round trip is a fact about this corpus on this host -- a depth buffer whose
+    * low byte does not come back is one -- and a fact that is only true of some resources is
+    * pinned, the way a dropped journal entry is, rather than being argued about per run. */
+   rb_addf("ctx %u: content %u entries, %u all-zero, %u missing, %u differ\n", src, n_a, zeros,
+           *missing, differ);
+   fprintf(stderr, "content: ctx %u -> %u: %u entries (%u bytes, %u all-zero), %u missing, "
+           "%u different\n", src, dst, n_a, bytes, zeros, *missing, differ);
+   *deviations += *missing + differ;
+
+   free(ea); free(eb);
+   return ok;
+}
+
 /* Whether the rebuilt journal describes the same world, and what it lost on the way.
  *
  * The rebuilt journal must be a SUBSEQUENCE of the source. A rebuild is allowed to lose an entry
@@ -914,6 +1104,8 @@ int main(int argc, char **argv)
    bool rebuild = false;
    unsigned rebuild_failed = 0;
    uint32_t rebuild_dropped = 0;
+   unsigned content_failed = 0;
+   uint32_t content_deviations = 0;
    bool sweep = false;
    uint64_t draws_from = 0;
    /* --until stops the stream after a sequence number and scores what is on the surfaces THEN.
@@ -1474,6 +1666,47 @@ int main(int argc, char **argv)
          virgl_renderer_limina_journal_replay_upto(dst, UINT64_MAX);
          virgl_renderer_limina_replay_end(dst);
 
+         /* The contents half, in the VMM's own order: the classic pixels go in after the wire
+          * replay has re-created the objects to hold them (virtio_gpu's restore does the same,
+          * after the per-context replay loop and before the scanout flips). */
+         void *ca = NULL; uint64_t ca_len = 0;
+         int crc = virgl_renderer_limina_classic_content_export(src, &ca, &ca_len);
+         if (crc) {
+            fprintf(stderr, "content: ctx %u exported nothing (%d)\n", src, crc);
+            content_failed++;
+         } else {
+            /* Scrub, then restore, then read back: the bytes that come back can only have come
+             * from the restore. A scrub that reads back unchanged says the restore wrote
+             * nothing, which is the way this gate would otherwise pass while doing nothing. */
+            void *scrub = vrcc_scrub(ca, ca_len);
+            int cw = virgl_renderer_limina_classic_content_restore(dst, scrub, ca_len);
+            void *cs = NULL; uint64_t cs_len = 0;
+            int cy = cw ? cw : virgl_renderer_limina_classic_content_export(dst, &cs, &cs_len);
+            bool scored = false;
+            if (!cy && vrcc_same(ca, ca_len, cs, cs_len, &scored) && scored) {
+               fprintf(stderr, "content: ctx %u -> %u: the scrub read back unchanged -- "
+                       "the restore wrote nothing\n", src, dst);
+               content_failed++;
+            }
+            free(cs);
+            free(scrub);
+
+            int cr = cw ? cw : virgl_renderer_limina_classic_content_restore(dst, ca, ca_len);
+            void *cb = NULL; uint64_t cb_len = 0;
+            int cx = cr ? cr : virgl_renderer_limina_classic_content_export(dst, &cb, &cb_len);
+            if (cx) {
+               fprintf(stderr, "content: ctx %u -> %u restore/export failed (%d)\n", src, dst, cx);
+               content_failed++;
+            } else {
+               uint32_t missing = 0;
+               if (!contents_agree(ca, ca_len, cb, cb_len, src, dst, &missing, &content_deviations,
+                                   res, res_n))
+                  content_failed++;
+            }
+            free(cb);
+            free(ca);
+         }
+
          void *b = NULL; uint64_t b_len = 0;
          if (virgl_renderer_limina_journal_export(dst, &b, &b_len)) {
             fprintf(stderr, "rebuild: ctx %u rebuilt into nothing\n", src);
@@ -1592,8 +1825,26 @@ int main(int argc, char **argv)
    /* A rebuild that did not describe the same world fails the run, whatever the score said: the
     * score is about the pixels this stream drew, and the rebuild is about whether they could be
     * drawn again after a resume. */
+   /* A content mismatch fails the run for the same reason a rebuild failure does, and is
+    * reported after it: a journal that did not rebuild the objects is the cause, and contents
+    * that could not be put into objects that are not there is its symptom. */
    if (rebuild_failed) {
       fprintf(stderr, "REBUILD FAILED for %u context(s)\n", rebuild_failed);
+      ok = 0;
+   }
+   if (content_failed) {
+      fprintf(stderr, "CONTENT FAILED for %u context(s)\n", content_failed);
+      ok = 0;
+   }
+   /* A resource the rebuild dropped has nowhere for its content to go, so a missing entry is the
+    * journal drop's shadow and is pinned by the same report. Without a pin it is a failure, the
+    * same way an unpinned journal drop is. */
+   /* A resource that did not come back, or came back different, is in the rebuild report and is
+    * a failure unless that report is pinned -- the same rule the journal's dropped entries
+    * follow, for the same reason: what is acceptable is a property of the corpus, not of a run. */
+   if (content_deviations && !rb_expect_path) {
+      fprintf(stderr, "CONTENT DEVIATED for %u resource(s) and nothing pins them "
+              "(see --rebuild-expect)\n", content_deviations);
       ok = 0;
    }
 

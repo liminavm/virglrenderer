@@ -22,7 +22,9 @@ use crate::venus::objects::ObjectKey;
 use crate::venus::ring::ResourceBytes;
 use crate::venus::vkr::ContextKey;
 use crate::vrend;
+use crate::vrend::content;
 use crate::vrend::context::Guest;
+use crate::vrend::proto::Box3;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
 use std::collections::{BTreeMap, BTreeSet};
@@ -79,6 +81,8 @@ pub enum Error {
     ClassicRefused(Refusal),
     /// A classic transfer did not happen, for the reason given.
     Transfer(transfer::Error),
+    /// A restore was handed something that is not a classic content blob.
+    MalformedContent(content::Malformed),
 }
 
 /// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
@@ -136,6 +140,7 @@ impl std::fmt::Display for Error {
             Error::Unmappable => "that shm descriptor could not be mapped",
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
+            Error::MalformedContent(m) => return write!(f, "the contents were refused: {m}"),
         };
         f.write_str(s)
     }
@@ -1075,6 +1080,147 @@ impl Renderer {
     /// One classic context's journal, for the VMM to store beside its own.
     pub fn vrend_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
         self.vrend.as_ref()?.journal_export(id)
+    }
+
+    /// One classic context's resource contents, for the VMM to store beside its journal.
+    ///
+    /// `None` for a context this renderer does not serve as a classic one; an empty world is a
+    /// blob with no entries, which is a different answer and says so.
+    ///
+    /// The walk is over the resources attached to the context, which is the classic analogue of
+    /// the C's `ctx->res_hash` -- and attachment lives here rather than in vrend, so the loop does
+    /// too. What it costs is a full readback of every level of every attached resource; that is
+    /// the price of the textures whose only copy is on the host, and a snapshot is not a hot path.
+    pub fn vrend_content_export(&mut self, ctx: ContextId) -> Option<(Vec<u8>, content::Account)> {
+        if !self.is_classic(ctx) {
+            return None;
+        }
+        let handles: Vec<ResourceHandle> = self
+            .resources
+            .read()
+            .expect("the resource lock is never poisoned")
+            .iter()
+            .filter(|(_, r)| r.attached.contains(&ctx))
+            .map(|(h, _)| *h)
+            .collect();
+
+        let mut capture = content::Capture::new();
+        for handle in handles {
+            let Some(plan) = self.content_plan(handle) else {
+                capture.excluded();
+                continue;
+            };
+            let own = self.with_resource(handle, |r| r.iov.clone()).unwrap_or_default();
+            let own = Iov::new(&own);
+            for (level, region, size) in plan {
+                let mut bytes = vec![0u8; size];
+                let span = crate::guest_mem::HostSpanMut::new(&mut bytes);
+                let info = transfer::Info {
+                    level,
+                    stride: 0,
+                    layer_stride: 0,
+                    offset: 0,
+                    region,
+                    synchronized: true,
+                };
+                let v = self.vrend.as_mut().expect("a classic context needs vrend");
+                match v.transfer(Some(ctx), handle, false, Some(&own), &span.iov(), &info) {
+                    // Counted, and nothing written: a level that could not be read back has no
+                    // bytes, and zeros in its place would restore over whatever the guest still
+                    // holds. The C writes them, having called `calloc` so at least they are
+                    // deterministic zeros rather than heap garbage -- which is the tell that the
+                    // entry should not have been there at all.
+                    Err(_) => capture.skipped(),
+                    Ok(()) => capture.push(handle, level, region, &bytes),
+                }
+            }
+        }
+        let account = capture.account();
+        Some((capture.into_bytes(), account))
+    }
+
+    /// Which levels of a resource a capture reads, and how many bytes each needs. `None` for a
+    /// resource deliberately left out.
+    fn content_plan(&self, handle: ResourceHandle) -> Option<Vec<(u32, Box3, usize)>> {
+        let res = self.vrend.as_ref()?.resource(handle)?;
+        // A multisample surface cannot be read back at all, and is a render target the compositor
+        // draws again anyway. A resource whose only storage is the guest's pages holds nothing
+        // this renderer could restore -- the VMM's RAM dump carries those bytes.
+        //
+        // The C excludes one more: an immutable buffer created without `GL_MAP_READ_BIT`, which
+        // its readback path would log and then capture uninitialised. This tree cannot make one
+        // -- `alloc_buffer` sets `GL_MAP_READ_BIT` whenever it sets any storage flag at all -- so
+        // porting the exclusion would carry a rule that guards nothing.
+        if res.args.nr_samples > 0 || matches!(res.storage, vrend::resource::Storage::Guest) {
+            return None;
+        }
+        let last = if res.args.target == crate::vrend::pipe::TextureTarget::Buffer {
+            0
+        } else {
+            res.args.last_level
+        };
+        let mut plan = Vec::new();
+        for level in 0..=last {
+            let region = transfer::level_region(res, level);
+            // A format this tree cannot describe is a resource sized by guessing, which is worse
+            // than one left out.
+            let size = transfer::level_span(res, level)?;
+            // The blob's header field is a dword, so a level that does not fit one cannot be
+            // written down. Refused rather than truncated: a length that wrapped would name a
+            // fraction of the bytes that follow it and every entry after would parse as garbage.
+            let Ok(size) = usize::try_from(size)
+                .map_err(|_| ())
+                .and_then(|n| if n > u32::MAX as usize { Err(()) } else { Ok(n) })
+            else {
+                return None;
+            };
+            plan.push((level, region, size));
+        }
+        Some(plan)
+    }
+
+    /// Put a captured blob back into a classic context, after its journal has rebuilt the world
+    /// the resources hang in.
+    ///
+    /// An entry naming a resource this context cannot reach is `dropped`, not an error: the
+    /// journal is allowed to lose a create whose resource died around the snapshot, and this is
+    /// that loss seen from the other side. What is an error is a blob that is not one.
+    pub fn vrend_content_restore(
+        &mut self,
+        ctx: ContextId,
+        blob: &[u8],
+    ) -> Result<content::Account, Error> {
+        if !self.is_classic(ctx) {
+            return Err(Error::NoContext);
+        }
+        let entries = content::entries(blob).map_err(Error::MalformedContent)?;
+        let mut account = content::Account::default();
+        for e in entries {
+            let own =
+                match self.with_resource(e.res, |r| (r.iov.clone(), r.attached.contains(&ctx))) {
+                    Some((own, true)) => own,
+                    _ => {
+                        account.dropped += 1;
+                        continue;
+                    }
+                };
+            let own = Iov::new(&own);
+            let span = crate::guest_mem::HostSpan::new(e.bytes);
+            let info = transfer::Info {
+                level: e.level,
+                stride: 0,
+                layer_stride: 0,
+                offset: 0,
+                region: e.region,
+                synchronized: true,
+            };
+            let v = self.vrend.as_mut().expect("a classic context needs vrend");
+            match v.transfer(Some(ctx), e.res, true, Some(&own), &span.iov(), &info) {
+                Ok(()) => account.entries += 1,
+                Err(_) => account.skipped += 1,
+            }
+        }
+        Ok(account)
     }
 
     /// One venus context's journal.

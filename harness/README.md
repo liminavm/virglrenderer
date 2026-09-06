@@ -63,10 +63,11 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   create the recorder failed to keep or a state the corpus reached. Never file one under "benign
   stale reference" the way the C's `drops_by_klass` does — the two are indistinguishable from the
   histogram. So a drop fails the run, and the only way to accept one is to pin it:
-  `--rebuild-score F` writes the report — entries in and out per context, and for each lost entry
-  its kind, sub-context, size and leading dwords, which is where the object handle and the
-  resource it names live — and `--rebuild-expect F` requires that exact report. A corpus with no
-  pin must lose nothing, which is where every corpus but `vrend-webgl` stands. The pin is a
+  `--rebuild-score F` writes the report — entries in and out per context, for each lost entry its
+  kind, sub-context, size and leading dwords, which is where the object handle and the resource it
+  names live, and the contents account beside it — and `--rebuild-expect F` requires that exact
+  report. A corpus with no pin must lose nothing and must restore every resource's contents
+  unchanged, which is where every corpus but `vrend-webgl` and `sampled` stands. The pin is a
   subsequence check, not a licence: a rebuild may lose an entry, never invent or reorder one, and
   a rebuilt journal carrying an entry the source does not have fails whatever is pinned.
 
@@ -125,6 +126,35 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   compares nothing to nothing. What it can see is bounded by what the census can see — the pages,
   never an OPTIMAL image's private texels (below) — so on the synoik corpora the two IOSurface
   scanouts are the entries carrying real bytes and the rest agree at all-zeros.
+
+  **The classic side does the same, and its blob is the C's.** A classic context's contents are
+  every level of every resource attached to it, read back through the transfer path the guest
+  uses; the gate exports them from the original context, scrubs the rebuilt one with the same
+  bytes inverted, restores the capture and requires it to read back byte for byte. The scrub is
+  the load-bearing half: classic resources are global and the rebuilt context is attached to the
+  same ones, so a restore that wrote nothing at all would still compare equal. The blob layout is
+  the C's entry for entry so that one parser scores both, and this was pinned against the C first
+  — virglrs then reproduced it byte for byte on every corpus measured, deviations included.
+
+  **A capture whose count is zero passes anything, and the pinned count is what stops it.** The
+  scrub can only speak for a capture with bytes in it, so an export that returned an empty blob
+  would sail through an unpinned corpus. What catches it is the `content N entries` line in the
+  rebuild report, which a pin fixes; that is the lever, not an environment variable, and there is
+  deliberately no `VREND_CONTENT=0` here.
+
+  **`Z24X8_UNORM` does not survive the round trip on this stack.** Read back, written and read
+  again, such a resource differs by one byte per texel — the same resources,
+  the same offsets and the same counts under the C as under virglrs, so it is the GL path and not
+  either renderer. It is pinned per corpus rather than excluded from the capture, because
+  excluding it would be a behaviour change against the reference for a buffer every frame clears
+  anyway. Its stencil-carrying twin `S8_UINT_Z24_UNORM` is in the same corpus and does not
+  deviate, so this is that format and not depth as a class.
+
+  **A planar level is skipped, and the composite corpora are where that shows.** A texture
+  transfer moves one GL triple, so a decode target with its planes chained behind it has no
+  readback -- 41 levels on `--ctx 10,11`, 6 on `--ctx 8,9`, the same in both renderers. Skipped is
+  not the same as captured-empty: the entry is absent rather than present and zero, which is why
+  the report prints both counts.
 
   **The venus gate crosses the fence**, unlike the classic one. Part of what a journal retains is
   retained because a *blob*, not the guest, still holds what an entry made, so a rebuilt context
@@ -375,12 +405,17 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   the compositor. The page must not ask for MSAA; `../vm/README.md` says why, and it is not a
   renderer problem.
 
-  **It is the one corpus whose rebuild loses anything, so it is the one with a pin.** Replay it as
+  **It is the one corpus whose rebuild loses entries, so it is the one with a journal pin.**
+  Replay it as
 
   ```sh
   ./vrend-replay.sh ../vm/captures/vrend-webgl.bin --renderer rs --ctx 2,9 \
       --expect fixtures/vrend-webgl.score --rebuild-expect fixtures/vrend-webgl.rebuild
   ```
+
+  That pin also carries a depth deviation, which `sampled` carries alone — replay that one as
+  `./vrend-replay.sh ../vm/captures/sampled.bin --renderer rs --expect fixtures/sampled.score
+  --rebuild-expect fixtures/sampled.rebuild`.
 
   The five entries in that pin are sampler views ctx 2 holds over window buffers ctx 9 destroys —
   the compositor and the browser are two guest processes, and one's unref does not consult the

@@ -287,6 +287,20 @@ SABOTAGES = [
         """        let src = &src[..src.len().min(record.size as usize)];""",
         'a_capture_goes_back_in_by_the_route_it_came_out_of',
     ),
+    # The classic contents blob. Only the codec is reachable from a unit test: a no-op restore is
+    # caught by the replay gate's scrub, and "a level that could not be read back is written as
+    # zeros" is caught by the composite corpora, whose planar decode targets a texture transfer
+    # cannot move -- 41 skipped levels on --ctx 10,11 and 6 on --ctx 8,9. Zeros in their place
+    # would change the entry count and the all-zero count, both of which the gate prints.
+    (
+        'a truncated content blob is parsed as far as it goes instead of refused',
+        'virglrs/src/vrend/content.rs',
+        """        if blob.len() - at < size {
+            return Err(Malformed::Truncated);
+        }""",
+        """        let size = size.min(blob.len() - at);""",
+        'a_blob_that_is_not_one_is_refused',
+    ),
     (
         "a scanout's restore goes through vkMapMemory like any other allocation",
         'virglrs/src/venus/driver.rs',

@@ -1,7 +1,11 @@
+  content res=1500 level=0 1024x512x1 fmt=21 bind=0x9 target=2 differs (2097152 vs 2097152 bytes, 524288 from offset 1)
+ctx 2: content 250 entries, 31 all-zero, 0 missing, 1 differ
 ctx 2: 131 in, 126 out
   drop kind=1 sub=3 chunks=1 dwords=7: 00060601 000001f3 000005cc 02000043 00000000 00000000 00000688
   drop kind=1 sub=3 chunks=1 dwords=7: 00060601 0000020c 00000638 02000001 00000000 00000000 00000688
   drop kind=1 sub=3 chunks=1 dwords=7: 00060601 0000020e 00000617 02000001 00000000 00000000 00000688
   drop kind=1 sub=3 chunks=1 dwords=7: 00060601 000002da 00000666 02000043 00000000 00000000 00000688
   drop kind=1 sub=3 chunks=1 dwords=7: 00060601 000002db 00000664 02000043 00000000 00000000 00000688
+  content res=1500 level=0 1024x512x1 fmt=21 bind=0x9 target=2 differs (2097152 vs 2097152 bytes, 524288 from offset 1)
+ctx 9: content 250 entries, 31 all-zero, 0 missing, 1 differ
 ctx 9: 139 in, 139 out
