@@ -20,6 +20,9 @@
 //! a sub-context's latest-wins state goes with the sub-context, and a blob-defining resource
 //! create goes with the resource.
 
+use super::pipe::ShaderStage;
+use super::proto::{Cmd, Command};
+
 /// A position in one context's journal.
 ///
 /// Deliberately three things at once, because they are the same thing: the order a rebuild must
@@ -73,5 +76,125 @@ impl Retained {
     /// Dwords retained, for the census.
     pub fn dwords(&self) -> usize {
         self.chunks.iter().map(Vec::len).sum()
+    }
+}
+
+/// Which slot of a sub-context's current state a command sets.
+///
+/// Creates alone rebuild nothing usable. Gallium re-emits a bind or a set only when it *changes*,
+/// so a client that bound its shader once and has drawn ever since never sends that bind again --
+/// replaying only the creates would leave a world of objects with nothing bound. What has to be
+/// kept is the last command per slot, and the slot is what stops two commands of the same kind
+/// overwriting each other: a stage, a start slot, an index, an object type.
+///
+/// Taken from the decoded command rather than from dword offsets, so the discriminator is the
+/// field the protocol names -- not a position that has to be kept in step with the encoder by
+/// hand.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct StateKey {
+    cmd: Cmd,
+    slot: (u32, u32),
+}
+
+/// The state slot this command sets, or `None` if it leaves nothing that has to be rebuilt.
+///
+/// `None` covers three kinds of command, and they are all deliberate. The transient ones --
+/// draws, clears, blits, barriers, queries, transfers -- describe work, not state, and the client
+/// re-issues them every frame. The structural ones -- creates, destroys, sub-context lifecycle --
+/// are retained somewhere that owns them instead. And `LINK_SHADER` is neither: it assembles a
+/// program early that a draw would otherwise assemble on demand, restoring the previous binds
+/// when it is done, so a rebuild that omits it is slower for one frame and identical after. The C
+/// design retains it; there is nothing in it to retain.
+pub fn state_key(cmd: &Command<'_>) -> Option<StateKey> {
+    let stage_slot = |s: &ShaderStage, n: &u32| (s.index() as u32, *n);
+    let (cmd, slot) = match cmd {
+        // Per object type: one bind of each kind is current at a time.
+        Command::BindObject { kind, .. } => (Cmd::BindObject, (kind.wire(), 0)),
+        // Per stage.
+        Command::BindShader { stage, .. } => (Cmd::BindShader, (stage.index() as u32, 0)),
+        // Per stage and the first slot the set writes.
+        Command::BindSamplerStates { stage, start_slot, .. } => {
+            (Cmd::BindSamplerStates, stage_slot(stage, start_slot))
+        }
+        Command::SetSamplerViews { stage, start_slot, .. } => {
+            (Cmd::SetSamplerViews, stage_slot(stage, start_slot))
+        }
+        Command::SetConstantBuffer { stage, index, .. } => {
+            (Cmd::SetConstantBuffer, stage_slot(stage, index))
+        }
+        Command::SetUniformBuffer { stage, index, .. } => {
+            (Cmd::SetUniformBuffer, stage_slot(stage, index))
+        }
+        Command::SetShaderBuffers { stage, start_slot, .. } => {
+            (Cmd::SetShaderBuffers, stage_slot(stage, start_slot))
+        }
+        Command::SetShaderImages { stage, start_slot, .. } => {
+            (Cmd::SetShaderImages, stage_slot(stage, start_slot))
+        }
+        // Per first slot.
+        Command::SetAtomicBuffers { start_slot, .. } => (Cmd::SetAtomicBuffers, (*start_slot, 0)),
+        Command::SetViewportState { start_slot, .. } => (Cmd::SetViewportState, (*start_slot, 0)),
+        Command::SetScissorState { start_slot, .. } => (Cmd::SetScissorState, (*start_slot, 0)),
+        // Per tweak.
+        Command::SetTweaks { id, .. } => (Cmd::SetTweaks, (*id, 0)),
+        // One of each per sub-context.
+        Command::SetFramebufferState { .. } => (Cmd::SetFramebufferState, (0, 0)),
+        Command::SetFramebufferStateNoAttach { .. } => (Cmd::SetFramebufferStateNoAttach, (0, 0)),
+        Command::SetVertexBuffers(_) => (Cmd::SetVertexBuffers, (0, 0)),
+        Command::SetIndexBuffer(_) => (Cmd::SetIndexBuffer, (0, 0)),
+        Command::SetStencilRef { .. } => (Cmd::SetStencilRef, (0, 0)),
+        Command::SetBlendColor(_) => (Cmd::SetBlendColor, (0, 0)),
+        Command::SetClipState(_) => (Cmd::SetClipState, (0, 0)),
+        Command::SetSampleMask(_) => (Cmd::SetSampleMask, (0, 0)),
+        Command::SetMinSamples(_) => (Cmd::SetMinSamples, (0, 0)),
+        Command::SetPolygonStipple(_) => (Cmd::SetPolygonStipple, (0, 0)),
+        Command::SetStreamoutTargets { .. } => (Cmd::SetStreamoutTargets, (0, 0)),
+        Command::SetTessState(_) => (Cmd::SetTessState, (0, 0)),
+        Command::SetRenderCondition { .. } => (Cmd::SetRenderCondition, (0, 0)),
+        _ => return None,
+    };
+    Some(StateKey { cmd, slot })
+}
+
+/// What one context has retained: creates, current-state slots, and the dwords behind them.
+///
+/// The point of counting is that the answer must be bounded by the world that is *live*, not by
+/// how long the guest has been running: destroys prune by dropping, and state overwrites in
+/// place, so a desktop left alone for a day must not have a larger journal than one just seated.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Census {
+    pub creates: usize,
+    pub slots: usize,
+    pub dwords: usize,
+}
+
+impl Census {
+    pub fn add(&mut self, at: &Retained, create: bool) {
+        if create {
+            self.creates += 1;
+        } else {
+            self.slots += 1;
+        }
+        self.dwords += at.dwords();
+    }
+}
+
+impl std::ops::AddAssign for Census {
+    fn add_assign(&mut self, o: Census) {
+        self.creates += o.creates;
+        self.slots += o.slots;
+        self.dwords += o.dwords;
+    }
+}
+
+impl std::fmt::Display for Census {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} creates + {} state slots, {} KiB of wire",
+            self.creates,
+            self.slots,
+            self.dwords * 4 / 1024
+        )
     }
 }

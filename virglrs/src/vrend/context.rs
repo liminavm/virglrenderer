@@ -28,7 +28,7 @@ use super::gl::{
     ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
     TransformFeedbackName, UniformLocation, VertexArrayName,
 };
-use super::journal::{Retained, Seq};
+use super::journal::{Census, Retained, Seq, StateKey, state_key};
 use super::pipe::slots::{
     MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
     MAX_VIEWPORTS,
@@ -671,6 +671,12 @@ pub struct SubContext {
     blit_fbs: [FramebufferName; 2],
     vao: VertexArrayName,
     objects: Objects,
+    /// The last command that set each slot of this sub-context's current state.
+    ///
+    /// Latest-wins per slot, and it lives here rather than in a per-context log so that
+    /// `DESTROY_SUB_CTX` takes it away with everything else the sub-context owned. Only what the
+    /// current state *is* survives; how it got there is not worth keeping.
+    state: BTreeMap<StateKey, Retained>,
     long_shader: [Option<ObjectHandle>; ShaderStage::COUNT],
 
     blend: Option<BlendState>,
@@ -764,6 +770,7 @@ impl SubContext {
             blit_fbs,
             vao,
             objects: Objects::default(),
+            state: BTreeMap::new(),
             long_shader: [None; ShaderStage::COUNT],
             blend: None,
             hw_blend: HwBlend::default(),
@@ -1102,8 +1109,16 @@ impl Context {
                 Err(r) => return self.poison(Fault::Wire(r)),
             };
             let kind = framed.cmd.kind();
-            if let Err(f) = self.run(host, framed.cmd, framed.wire) {
+            // Read before the command is consumed, recorded only if it ran: the journal holds
+            // what this context accepted, never what it refused.
+            let slot = state_key(&framed.cmd);
+            let wire = framed.wire;
+            if let Err(f) = self.run(host, framed.cmd, wire) {
                 return self.poison(f);
+            }
+            if let Some(slot) = slot {
+                let at = Retained::new(self.seq.advance(), wire);
+                self.sub_mut().state.insert(slot, at);
             }
             self.fill_composites(host);
             // `vrend_check_no_error`: any GL error a command left is the context's error.
@@ -1113,6 +1128,20 @@ impl Context {
             }
         }
         Ok(())
+    }
+
+    /// What this context has retained, over every sub-context it owns.
+    pub fn journal_census(&self) -> Census {
+        let mut c = Census::default();
+        for sub in self.subs.values() {
+            for at in sub.objects.retained() {
+                c.add(at, true);
+            }
+            for at in sub.state.values() {
+                c.add(at, false);
+            }
+        }
+        c
     }
 
     fn poison(&mut self, f: Fault) -> Result<(), Fault> {

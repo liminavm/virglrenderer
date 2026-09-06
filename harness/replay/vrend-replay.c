@@ -1269,6 +1269,11 @@ int main(int argc, char **argv)
          score_resource(born);
    }
 
+   /* The journal census, on stderr and never in the score: it is a fact about what the recorder
+    * retained, not about the pixels, and a number that moves whenever the recorder changes must
+    * not be able to rewrite every pinned score in the tree. */
+   virgl_renderer_limina_dump_state();
+
    /* A blob nothing typed is a real result -- it says the stream never described storage the
     * guest went on to use -- so it is counted rather than passed over in silence. Emitted only
     * for a corpus that HAS blobs: an unconditional line would rewrite every pinned score in the
