@@ -20,6 +20,7 @@ use crate::venus::cs::ObjectId;
 use crate::venus::driver::{Allocation, Exported, MemoryError, Storage};
 use crate::venus::objects::ObjectKey;
 use crate::venus::ring::ResourceBytes;
+use crate::venus::vkr::ContextKey;
 use crate::vrend;
 use crate::vrend::context::Guest;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
@@ -253,9 +254,15 @@ pub enum BlobStorage {
 /// an [`ObjectKey`] indexes one context's arena, so the same key names a different object in every
 /// other context. Passing them separately would let a caller ask one context's table about another
 /// context's key and get a confident wrong answer.
+///
+/// Both halves are generational, and for one reason: a blob outlives what it was exported from.
+/// The object goes when the guest frees it, and the context goes when the guest destroys it -- and
+/// the VMM is free to stand a new context up under the same id straight afterwards. A bare
+/// [`ContextId`] here would let that new context find this blob among its own and be told about an
+/// allocation belonging to a guest that is gone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Exporter {
-    pub ctx: ContextId,
+    pub ctx: ContextKey,
     pub key: ObjectKey,
 }
 
@@ -613,14 +620,14 @@ impl Renderer {
             },
             BlobSource::Exported { ctx, mem } => {
                 match self.venus_memory_export(ctx, mem, desc.size) {
-                    Ok((exported, storage, key)) => BlobStorage::Shared {
+                    Ok((exported, storage, from)) => BlobStorage::Shared {
                         storage,
                         caching: if exported.write_back {
                             Caching::Cached
                         } else {
                             Caching::WriteCombining
                         },
-                        from: Exporter { ctx, key },
+                        from,
                     },
                     Err(e) => {
                         // Two failures, one errno at the ABI, and they want opposite
@@ -1080,17 +1087,26 @@ impl Renderer {
 
     /// The allocations of `ctx` that a resource still holds a share of.
     ///
-    /// Only `Shared`. A `Borrowed` blob keeps no share -- it holds the allocation's own
-    /// `vkMapMemory` pointer, which the free takes away -- so such a resource genuinely stops
-    /// working when the guest frees, and retaining its allocation would rebuild a world *better*
-    /// than the one snapshotted. When that arm gains a real share, it belongs here too.
+    /// Only `BlobStorage::Shared` holds one; a blob over the guest's own pages or over memory this
+    /// renderer minted for it borrows nothing from a venus context and has no allocation to name.
+    ///
+    /// The context is resolved to its key first, and everything is matched on that. A resource
+    /// outlives the context it was exported from, so the table can hold blobs of a context that is
+    /// gone -- and if the VMM has since made a new context under the same id, matching on the id
+    /// would hand the newcomer a set of keys into a dead guest's arena. An unknown id answers with
+    /// the empty set, which is the truth: no live context, no allocations of one.
     fn exported_allocations(&self, ctx: ContextId) -> BTreeSet<ObjectKey> {
+        // Its own scope: the context lock and the resource lock are taken one after the other and
+        // never nested, which is the order the ring threads take them in too.
+        let Some(key) = self.venus.as_ref().and_then(|v| v.with_context(ctx, |c| c.key())) else {
+            return BTreeSet::new();
+        };
         let table = self.resources.read().expect("the resource lock is never poisoned");
         table
             .values()
             .filter_map(|res| match &res.backing {
                 Backing::Blob { storage: BlobStorage::Shared { from, .. }, .. }
-                    if from.ctx == ctx =>
+                    if from.ctx == key =>
                 {
                     Some(from.key)
                 }
@@ -1201,11 +1217,18 @@ impl Renderer {
         ctx_id: ContextId,
         mem: BlobId,
         blob_size: u64,
-    ) -> Result<(Exported, Storage, ObjectKey), Error> {
+    ) -> Result<(Exported, Storage, Exporter), Error> {
         let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
-        v.with_context_mut(ctx_id, |ctx| ctx.memory_export(ObjectId(mem.0), blob_size))
-            .ok_or(Error::NoContext)?
-            .map_err(export_error)
+        // The exporter is named here and not by the caller, because this is where the live
+        // context is in hand: an id the caller passed says which context it *meant*, and the key
+        // says which one it got.
+        v.with_context_mut(ctx_id, |ctx| {
+            let ctx_key = ctx.key();
+            ctx.memory_export(ObjectId(mem.0), blob_size)
+                .map(|(exported, storage, key)| (exported, storage, Exporter { ctx: ctx_key, key }))
+        })
+        .ok_or(Error::NoContext)?
+        .map_err(export_error)
     }
 
     /// The IOSurface a resource is presented from, or `None` when it is not presented from one.
@@ -1501,7 +1524,7 @@ mod tests {
                 storage: BlobStorage::Shared {
                     storage: pages.clone(),
                     caching: Caching::Cached,
-                    from: Exporter { ctx: one, key },
+                    from: Exporter { ctx: ContextKey::for_test(one), key },
                 },
             },
             iov: Vec::new(),
@@ -1700,7 +1723,7 @@ mod tests {
                     storage: BlobStorage::Shared {
                         storage: share.clone(),
                         caching: Caching::Cached,
-                        from: Exporter { ctx: one, key: any_key() },
+                        from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                     },
                 },
                 iov: Vec::new(),
@@ -1747,7 +1770,7 @@ mod tests {
                     storage: BlobStorage::Shared {
                         storage: pages.clone(),
                         caching: Caching::Cached,
-                        from: Exporter { ctx: one, key: any_key() },
+                        from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                     },
                 },
                 iov: Vec::new(),
@@ -1911,7 +1934,7 @@ mod tests {
                 storage: BlobStorage::Shared {
                     storage: pages,
                     caching: Caching::Cached,
-                    from: Exporter { ctx: one, key: any_key() },
+                    from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                 },
             },
             Vec::new(),
@@ -1926,6 +1949,65 @@ mod tests {
             r.resource_host_mapping(blob),
             Ok(mapping),
             "the address the hypervisor is mapped over is still the resource's own"
+        );
+    }
+
+    /// A context id the VMM reuses does not inherit the last occupant's blobs.
+    ///
+    /// The state is ordinary: a guest destroys a context and the VMM stands another up under the
+    /// same id, while a blob exported from the first is still a live resource -- resources are
+    /// device-wide and outlive the context that exported them, which is the whole reason the
+    /// share exists. Held allocations decide what a snapshot's journal retains, so attributing
+    /// the old context's allocations to the new one would export a journal keeping entries for
+    /// objects in a dead guest's arena.
+    ///
+    /// The key is what makes it impossible, rather than a purge at `context_destroy` that a
+    /// future path could skip: the record names the occupant, and the next occupant of that id is
+    /// simply not it.
+    #[test]
+    fn a_reused_context_id_does_not_inherit_the_previous_contexts_blobs() {
+        use crate::venus::budget::Account;
+
+        let mut r = renderer(Config { venus: true, ..Config::default() });
+        let two = ContextId::new(2).unwrap();
+        r.context_create(two, CapsetId::Venus, "first".into()).expect("a fresh id");
+        let first = r
+            .venus
+            .as_ref()
+            .and_then(|v| v.with_context(two, |c| c.key()))
+            .expect("the context was just created");
+
+        let blob = ResourceHandle::new(5).unwrap();
+        let pages = Storage::pages_for_test(4096, &Account::for_test(None));
+        r.insert(
+            blob,
+            Backing::Blob {
+                desc: BlobDesc {
+                    blob_mem: crate::abi::BLOB_MEM_HOST3D,
+                    blob_flags: 1,
+                    source: BlobSource::Exported { ctx: two, mem: BlobId(66) },
+                    size: 4096,
+                },
+                storage: BlobStorage::Shared {
+                    storage: pages,
+                    caching: Caching::Cached,
+                    from: Exporter { ctx: first, key: any_key() },
+                },
+            },
+            Vec::new(),
+        );
+        assert_eq!(r.venus_held_allocations(two), 1, "its own context holds it");
+
+        r.context_destroy(two);
+        r.context_create(two, CapsetId::Venus, "second".into()).expect("the id is free again");
+        assert_eq!(
+            r.venus_held_allocations(two),
+            0,
+            "the new occupant of the id holds nothing the old one exported"
+        );
+        assert!(
+            r.resource_host_mapping(blob).is_ok(),
+            "and the blob still publishes its pages, which is what it holds the share for"
         );
     }
 
@@ -1958,7 +2040,7 @@ mod tests {
                 storage: BlobStorage::Shared {
                     storage: pages.clone(),
                     caching: Caching::Cached,
-                    from: Exporter { ctx: one, key: any_key() },
+                    from: Exporter { ctx: ContextKey::for_test(one), key: any_key() },
                 },
             },
             Vec::new(),

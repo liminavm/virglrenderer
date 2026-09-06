@@ -61,6 +61,9 @@ pub struct Vkr {
     /// needs exclusively, so two guests' rings dispatch at the same time. The `Arc` is what lets a
     /// ring thread hold a claim on its own context without holding the renderer.
     contexts: BTreeMap<ContextId, Arc<Mutex<Context>>>,
+    /// The next context's generation. See [`ContextKey`]: it counts occupants of context ids, so
+    /// that a key made for one occupant cannot name the next one to arrive under the same id.
+    generations: u64,
     /// The commands this build does not serve yet, counted across every context. Kept on the root
     /// because it answers a question about the build, not about a guest.
     pub todo: Arc<Mutex<Unimplemented>>,
@@ -76,6 +79,38 @@ pub struct Vkr {
     /// the host kills the *process* for the total -- see [`crate::venus::budget`]. Each context
     /// gets a key to it and can reach nothing else, which is what makes billing structural.
     budget: Arc<Budget>,
+}
+
+/// One context, as something outside this module may hold it: which id, and which occupant of
+/// that id.
+///
+/// A context id is the VMM's, reused the moment the guest destroys a context and makes another --
+/// so a record that kept the bare id would find the next occupant sitting under it and answer
+/// about the wrong guest. The generation is what makes that impossible: a key made for one
+/// context stops matching anything once that context is gone, and nothing has to be purged at the
+/// destroy for it to stop matching. It is the same mechanism [`super::objects::ObjectKey`] uses
+/// for one context's objects, one level up.
+///
+/// Minted only by [`Vkr::context_create`], which is the one place a context is stood up.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ContextKey {
+    id: ContextId,
+    generation: u64,
+}
+
+impl ContextKey {
+    /// Which id this occupant holds. The id alone is what the ABI, the logs and the guest speak,
+    /// and every one of them is free to see the next occupant under it.
+    pub fn id(self) -> ContextId {
+        self.id
+    }
+
+    /// A key for a context no table stood up. Tests build a `Context` directly, and one that
+    /// never shares an id with another needs no generation to tell them apart.
+    #[cfg(test)]
+    pub fn for_test(id: ContextId) -> ContextKey {
+        ContextKey { id, generation: 0 }
+    }
 }
 
 /// The resource table as everything outside the renderer sees it: shared, read-mostly, and known
@@ -136,6 +171,7 @@ impl Vkr {
         Vkr {
             config,
             contexts: BTreeMap::new(),
+            generations: 0,
             todo: Arc::new(Mutex::new(Unimplemented::default())),
             global: Arc::new(crate::vulkan::global()),
             resources,
@@ -153,7 +189,9 @@ impl Vkr {
         // Checked before the new context is built: building it opens the id's budget account,
         // which is one per live id too.
         assert!(!self.contexts.contains_key(&id), "{id:?} already had a venus context");
-        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(id, &self.budget))));
+        let key = ContextKey { id, generation: self.generations };
+        self.generations += 1;
+        self.contexts.insert(id, Arc::new(Mutex::new(Context::new(key, &self.budget))));
     }
 
     /// Tear a context down. Every host handle it still holds dies with it -- a guest that leaks is
