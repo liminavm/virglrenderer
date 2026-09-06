@@ -1,0 +1,3 @@
+  content res=60 level=0 64x64x1 fmt=21 bind=0x9 target=2 differs (16384 vs 16384 bytes, 4097 from offset 5)
+ctx 1: content 11 entries, 0 all-zero, 0 missing, 1 differ
+ctx 1: 21 in, 21 out

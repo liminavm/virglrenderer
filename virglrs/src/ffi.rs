@@ -117,6 +117,7 @@ fn errno(e: renderer::Error) -> c_int {
         | NotHostVisible
         | BlobLargerThanAllocation
         | ContentLargerThanAllocation
+        | MalformedContent(_)
         | ClassicRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
@@ -1711,22 +1712,83 @@ pub extern "C" fn virgl_renderer_limina_memory_write(
     .unwrap_or(EINVAL)
 }
 
+/// A classic context's resource contents, as one blob the caller frees.
+///
+/// `ENOENT` for a context this renderer does not serve as a classic one, the way the journal
+/// export answers. An empty world is a valid blob with no entries -- a VMM told "nothing here"
+/// would restore nothing later and be told it succeeded.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_classic_content_export(
-    _ctx_id: u32,
-    _out_buf: *mut *mut c_void,
-    _out_size: *mut u64,
+    ctx_id: u32,
+    out_buf: *mut *mut c_void,
+    out_size: *mut u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    if out_buf.is_null() || out_size.is_null() {
+        return EINVAL;
+    }
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    with(EINVAL, |r| {
+        let Some((bytes, account)) = r.vrend_content_export(ctx) else {
+            return ENOENT;
+        };
+        // The loss, at the boundary that has nowhere else to put it: the ABI answers with one
+        // integer, so a level this capture could not read is invisible to the caller and the log
+        // line is the only account there is. A healthy capture excludes a few resources on
+        // purpose and says nothing.
+        if account.skipped > 0 {
+            eprintln!(
+                "[virglrs] classic content ctx {ctx}: {} entries, {} SKIPPED, {} excluded -- the \
+                 skipped levels have no content in this snapshot",
+                account.entries, account.skipped, account.excluded
+            );
+        }
+        match malloc_bytes(&bytes) {
+            // SAFETY: both checked non-null above; the VMM's contract is that they are writable,
+            // and the buffer becomes its to `free`.
+            Some(p) => unsafe {
+                *out_buf = p;
+                *out_size = bytes.len() as u64;
+                0
+            },
+            None => ENOMEM,
+        }
+    })
 }
 
+/// Put a captured blob back, after the context's journal has replayed.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_classic_content_restore(
-    _ctx_id: u32,
-    _buf: *const c_void,
-    _size: u64,
+    ctx_id: u32,
+    buf: *const c_void,
+    size: u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return EINVAL;
+    };
+    let Ok(len) = usize::try_from(size) else {
+        return EINVAL;
+    };
+    with_bytes(buf.cast_mut(), len, |blob| {
+        with(EINVAL, |r| match r.vrend_content_restore(ctx, blob) {
+            Ok(account) => {
+                // A dropped entry is the journal's own drop seen from here -- a resource that
+                // died around the snapshot -- and is not a failure. A skipped one is: the
+                // resource is there and its bytes did not go in.
+                if account.skipped > 0 || account.dropped > 0 {
+                    eprintln!(
+                        "[virglrs] classic content ctx {ctx}: {} restored, {} refused, {} named \
+                         no resource this context can reach",
+                        account.entries, account.skipped, account.dropped
+                    );
+                }
+                0
+            }
+            Err(e) => errno(e),
+        })
+    })
+    .unwrap_or(EINVAL)
 }
 
 // ---------------------------------------------------------------- helpers

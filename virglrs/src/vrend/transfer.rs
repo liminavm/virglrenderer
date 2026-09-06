@@ -201,6 +201,31 @@ fn layout(res: &Resource, info: &Info, pages: &Iov<'_>) -> Result<Layout, Error>
     Ok(l)
 }
 
+/// The bytes a whole level of a resource spans when it is laid out tight -- the buffer a capture
+/// of that level needs, and the same number [`layout`] arrives at for the level's own box with no
+/// strides given.
+///
+/// `None` for a format this tree cannot describe, which is a resource a capture leaves out rather
+/// than one it sizes by guessing.
+pub fn level_span(res: &Resource, level: u32) -> Option<u64> {
+    let desc = res.args.format.describe()?;
+    let stride = desc.stride(res.width_at(level)) as u64;
+    let rows = desc.blocks_high(res.height_at(level)) as u64;
+    Some(stride * rows * res.depth_at(level).max(1) as u64)
+}
+
+/// The whole of a level, as the box a capture reads and a restore writes.
+pub fn level_region(res: &Resource, level: u32) -> Box3 {
+    Box3 {
+        x: 0,
+        y: 0,
+        z: 0,
+        width: res.width_at(level) as i32,
+        height: res.height_at(level) as i32,
+        depth: res.depth_at(level) as i32,
+    }
+}
+
 /// Gather the box out of the pages into a tight buffer, rows in the order they are in the
 /// pages. `false` if a row fell outside the pages, which `layout` has already ruled out.
 fn gather(pages: &Iov<'_>, info: &Info, l: &Layout, out: &mut [u8]) -> bool {

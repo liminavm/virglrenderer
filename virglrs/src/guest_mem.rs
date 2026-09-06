@@ -377,6 +377,33 @@ impl<'a> HostSpan<'a> {
     }
 }
 
+/// Host bytes a transfer may write into, presented as one guest span.
+///
+/// The read-only [`HostSpan`] cannot serve a readback: `Iov::copy_in` writes through the pointer,
+/// and handing it one taken from a shared borrow would be a write through `&`. This holds the
+/// borrow exclusively instead, so the write is the only one there is, and the entry cannot
+/// outlive the bytes it points at.
+pub struct HostSpanMut<'a> {
+    entry: [crate::abi::GuestIov; 1],
+    bytes: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> HostSpanMut<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> HostSpanMut<'a> {
+        HostSpanMut {
+            entry: [crate::abi::GuestIov {
+                base: crate::abi::VmmPtr(bytes.as_mut_ptr().cast()),
+                len: bytes.len(),
+            }],
+            bytes: std::marker::PhantomData,
+        }
+    }
+
+    pub fn iov(&self) -> Iov<'_> {
+        Iov(&self.entry)
+    }
+}
+
 /// The host's page size, which is what a mapping's length has to be a multiple of.
 pub fn page_size() -> usize {
     // SAFETY: a plain sysconf query with no pointers involved.
