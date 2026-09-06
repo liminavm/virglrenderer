@@ -1314,6 +1314,20 @@ pub extern "C" fn virgl_renderer_limina_dump_state() {
                 Err(e) => eprintln!("[virglrs]   ctx {ctx}: {bytes} bytes, UNREADABLE: {e}"),
             }
         }
+        // What the venus recorder saw go by and kept nothing for. Printed by name rather than as a
+        // total, because the total cannot distinguish a command that is genuinely transient from
+        // one the recorder does not yet know how to keep -- and only the second is a bug.
+        let dropped = r.venus_journal_transient();
+        if !dropped.is_empty() {
+            let total: u64 = dropped.iter().map(|(_, n)| n).sum();
+            eprintln!(
+                "[virglrs] venus journal: {total} commands in {} kinds retained nothing:",
+                dropped.len()
+            );
+            for (name, n) in &dropped {
+                eprintln!("[virglrs]   {n:>8}  {name}");
+            }
+        }
         let todo = r.venus_todo();
         if !todo.is_empty() {
             let total: u64 = todo.iter().map(|(_, n)| n).sum();
@@ -1338,10 +1352,16 @@ pub extern "C" fn virgl_renderer_limina_journal_export(
         let Some(ctx) = ContextId::new(ctx_id) else {
             return EINVAL;
         };
-        // Only the classic side answers here. A venus context has its own journal and has not
-        // been taught to export one yet; answering an empty blob for it would tell the VMM the
-        // context was rebuilt when nothing had been.
-        let Some(bytes) = r.vrend_journal_export(ctx) else {
+        // A context belongs to one renderer and each keeps its own journal, in its own format.
+        // `ENOENT` is the answer for a context with nothing retained, which is deliberately not an
+        // empty blob: a VMM that stored zero bytes and restored them later would have rebuilt
+        // nothing and been told it succeeded.
+        let exported = if r.is_classic(ctx) {
+            r.vrend_journal_export(ctx)
+        } else {
+            r.venus_journal_export(ctx)
+        };
+        let Some(bytes) = exported else {
             return ENOENT;
         };
         match malloc_bytes(&bytes) {
@@ -1378,14 +1398,21 @@ fn malloc_bytes(bytes: &[u8]) -> Option<*mut c_void> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn virgl_renderer_limina_journal_seq(_ctx_id: u32) -> u64 {
-    // Not implemented, and 0 is not an answer -- it is the absence of one, which the VMM cannot
-    // tell apart. It reads this to rebase a blob's fence into the new journal's epoch on a
-    // re-suspend, so a 0 says "everything recorded so far", and the next restore feeds nothing
-    // before each blob and everything at the drain. Harmless only because of what is true today:
-    // classic reaches no PIPE_RESOURCE_CREATE in a real session, and venus has no journal at all
-    // yet. Whichever of those changes first, this has to answer before it does.
-    0
+/// How far a context's journal has been written.
+///
+/// The VMM reads this to stamp a blob with the point in the journal its creation belongs after, so
+/// that a later restore feeds exactly the commands that ran before the blob existed and no more.
+/// A wrong answer here is not a failure the VMM can see: it is a replay that runs commands in an
+/// order the original never did.
+///
+/// Zero is a real answer for a context that has recorded nothing, and the only one for classic,
+/// whose journal does not number its entries this way -- it is fenced on its own sequence numbers
+/// through `vrend_replay_upto`, which the VMM reaches by a different route.
+pub extern "C" fn virgl_renderer_limina_journal_seq(ctx_id: u32) -> u64 {
+    let Some(ctx) = ContextId::new(ctx_id) else {
+        return 0;
+    };
+    with(0, |r| r.venus_journal_seq(ctx).unwrap_or(0))
 }
 
 #[unsafe(no_mangle)]
@@ -1428,16 +1455,20 @@ pub extern "C" fn virgl_renderer_limina_journal_restore(
     };
     with_bytes(data.cast_mut(), size as usize, |buf| {
         with(EINVAL, |r| {
-            if !r.is_classic(ctx) {
-                return ENOENT;
-            }
-            match r.vrend_journal_restore(ctx, buf) {
+            let classic = r.is_classic(ctx);
+            let restored = if classic {
+                r.vrend_journal_restore(ctx, buf)
+            } else {
+                r.venus_journal_restore(ctx, buf)
+            };
+            match restored {
                 Ok(_) => 0,
                 Err(why) => {
                     // The blob has been through a snapshot file since we wrote it. Saying which
                     // way it is wrong is the difference between a bug we can find and a resume
                     // that is merely black.
-                    eprintln!("[virglrs] vrend: ctx {ctx_id}: journal refused: {why}");
+                    let which = if classic { "vrend" } else { "venus" };
+                    eprintln!("[virglrs] {which}: ctx {ctx_id}: journal refused: {why}");
                     EINVAL
                 }
             }
@@ -1446,17 +1477,23 @@ pub extern "C" fn virgl_renderer_limina_journal_restore(
     .unwrap_or(EINVAL)
 }
 
-/// Feed a classic context's retained commands up to `upto`.
+/// Feed a context's retained commands up to `upto`.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_journal_replay_upto(ctx_id: u32, upto: u64) -> c_int {
     let Some(ctx) = ContextId::new(ctx_id) else {
         return EINVAL;
     };
     with(EINVAL, |r| {
-        if !r.is_classic(ctx) {
-            return ENOENT;
+        if r.is_classic(ctx) {
+            return if r.vrend_replay_upto(ctx, upto) { 0 } else { EINVAL };
         }
-        if r.vrend_replay_upto(ctx, upto) { 0 } else { EINVAL }
+        match r.venus_replay_upto(ctx, upto) {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("[virglrs] venus: ctx {ctx_id}: replay to {upto} failed: {why:?}");
+                EINVAL
+            }
+        }
     })
 }
 
