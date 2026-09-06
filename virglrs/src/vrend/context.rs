@@ -1353,7 +1353,7 @@ impl Context {
                 // Plane zero is the image: this command only ever describes a plain 2D texture
                 // here, and the strides of any others describe planes nothing reads.
                 let plane = planes.first().copied().unwrap_or(Plane { stride: 0, offset: 0 });
-                self.set_resource_type(host, resource, format, bind, width, height, plane)
+                self.set_resource_type(host, resource, format, bind, width, height, plane, wire)
             }
             Command::PipeResourceCreate { .. }
             | Command::GetMemoryInfo(_)
@@ -3280,6 +3280,7 @@ impl Context {
         width: u32,
         height: u32,
         plane: Plane,
+        wire: &[u32],
     ) -> Result<(), Fault> {
         let cmd = Cmd::PipeResourceSetType;
         if host.slot(cmd, resource)?.resource().is_some() {
@@ -3314,7 +3315,8 @@ impl Context {
             plane,
             host.batch,
         ) {
-            Ok(res) => {
+            Ok(mut res) => {
+                res.typed_by = Some(Retained::new(self.seq.advance(), wire));
                 host.resources.insert(resource, resource::Slot::Resource(res));
                 Ok(())
             }
