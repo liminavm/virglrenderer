@@ -256,6 +256,13 @@ pub struct Table {
     /// the objects it made. Only additions: a destroy needs no counterpart here, because a record
     /// holds an [`ObjectKey`] and a key to a destroyed object already resolves to nothing.
     added: Vec<ObjectKey>,
+    /// What has stopped existing since the journal last looked.
+    ///
+    /// The counterpart of `added`, and needed for one reason only: a command that *frees* objects
+    /// has to be journaled against the creates it undoes, and by the time the recorder sees it the
+    /// ids it named resolve to nothing. Everything else about a destroy still needs no bookkeeping
+    /// -- the entries describing those objects stop being true on their own.
+    removed: Vec<ObjectKey>,
 }
 
 impl Table {
@@ -337,6 +344,7 @@ impl Table {
         // the cheap half of the trade: nothing has to walk back here and delete them.
         let object = self.arena.remove_tree(key)?;
         self.slots.remove(&id);
+        self.removed.push(ObjectKey(key));
         Some(object)
     }
 
@@ -404,6 +412,14 @@ impl Table {
     /// having to say. A command that created nothing hands back nothing, and is not a create.
     pub fn take_added(&mut self) -> Vec<ObjectKey> {
         std::mem::take(&mut self.added)
+    }
+
+    /// Take what has stopped existing since the last call, and start counting again.
+    ///
+    /// Drained per command alongside [`Table::take_added`], for the same reason: left behind, one
+    /// command's removals would be attributed to the next.
+    pub fn take_removed(&mut self) -> Vec<ObjectKey> {
+        std::mem::take(&mut self.removed)
     }
 
     pub fn len(&self) -> usize {

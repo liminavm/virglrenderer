@@ -66,6 +66,19 @@ enum About {
     /// what made a `vkBindBufferMemory2` over two buffers vanish when either went, and a binding
     /// is never sent a second time.
     Mutated(Vec<ObjectKey>),
+    /// It freed these, and is true exactly when the command that created them is.
+    ///
+    /// The one entry whose truth is about another entry rather than about an object, and it has
+    /// to be: everything it names is gone by definition, so no key can answer for it. A batch
+    /// allocate is retained while *any* of its objects lives, which means replaying it remakes the
+    /// ones the guest freed as well -- and in a pool sized for exactly what the guest holds, those
+    /// extra objects are what make the next allocate fail. Replaying the free too is what keeps the
+    /// id space the one the guest actually has.
+    ///
+    /// It is tied to the create rather than to the pool for safety, not tidiness: a free replayed
+    /// when its create was not names objects that do not exist, and a lookup miss poisons the whole
+    /// restore.
+    Undoes(Vec<ObjectKey>),
     /// It belongs to a ring rather than to any object, and is true until that ring is gone.
     ///
     /// The ring named here is the one the entry *dies with*, which is not the one it replays on:
@@ -205,6 +218,17 @@ impl Journal {
         self.push(cmd_type, 0, wire, About::Mutated(keys), refs);
     }
 
+    /// Retain a command that freed objects, against the creates it undoes.
+    pub fn undid(
+        &mut self,
+        cmd_type: u32,
+        wire: &[u8],
+        freed: Vec<ObjectKey>,
+        refs: Vec<ObjectKey>,
+    ) {
+        self.push(cmd_type, 0, wire, About::Undoes(freed), refs);
+    }
+
     /// Retain a ring-scoped command, replayed on that ring's own decoder.
     pub fn ring(&mut self, cmd_type: u32, wire: &[u8], ring: u64) {
         self.push(cmd_type, ring, wire, About::Ring(ring), Vec::new());
@@ -286,6 +310,8 @@ impl Journal {
                 About::Recording(b) => live.holds(*b),
                 About::Mutated(keys) => alive(keys),
                 About::Ring(_) => true,
+                // Decided below, once it is known which creates survived.
+                About::Undoes(_) => false,
             };
             if true_still && keep.insert(i) {
                 queue.push(i);
@@ -304,7 +330,10 @@ impl Journal {
             let named = e.refs.iter().chain(match &e.about {
                 About::Created(keys) | About::Mutated(keys) => keys.iter(),
                 About::Recording(b) => std::slice::from_ref(b).iter(),
-                About::Ring(_) => [].iter(),
+                // A free names only objects that are gone; the creates that would remake them are
+                // exactly the ones it depends on, and they are kept on their own account or the
+                // free is not kept at all.
+                About::Undoes(_) | About::Ring(_) => [].iter(),
             });
             for r in named {
                 if let Some(&c) = creator.get(r)
@@ -314,6 +343,21 @@ impl Journal {
                 }
             }
         }
+
+        // A free replays exactly when the create it undoes does. Last, because it is the only
+        // question here whose answer is another entry's -- and it adds nothing to the closure,
+        // since the creates it names are the ones already being kept.
+        let undone: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(&e.about, About::Undoes(freed)
+                    if freed.iter().any(|k| creator.get(k).is_some_and(|c| keep.contains(c))))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        keep.extend(undone);
 
         let mut out: Vec<&Entry> = keep.iter().map(|i| &self.entries[*i]).collect();
         out.extend(self.ring_state.values());
@@ -565,6 +609,47 @@ mod tests {
         assert!(!wires.contains(&&vec![5; 4]), "the reset pool's recording is gone");
         assert!(wires.contains(&&vec![6; 4]), "and the other pool's is untouched");
         assert_eq!(out.len(), 5, "every allocate survives -- a reset frees nothing");
+    }
+
+    /// A free replays when the allocate it undoes does, so the pool ends holding what the guest
+    /// holds -- not everything the guest ever allocated.
+    ///
+    /// A pool sized for exactly four sets, four allocated, two freed. The allocate is retained
+    /// because two survive, and replaying it alone remakes all four; the next allocate then has
+    /// nowhere to come from and Vulkan answers `VK_ERROR_OUT_OF_POOL_MEMORY`.
+    #[test]
+    fn a_free_replays_with_the_allocate_it_undoes() {
+        let k = keys(5);
+        let (pool, sets) = (k[0], &k[1..5]);
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![pool], Vec::new());
+        j.created(2, &[2; 4], sets.to_vec(), vec![pool]);
+        j.undid(3, &[3; 4], vec![sets[0], sets[1]], vec![pool]);
+
+        // Two of the four survive, so the allocate is kept -- and so must the free be.
+        let out = j.retained(&Some_(vec![pool, sets[2], sets[3]]));
+        assert!(out.iter().any(|e| e.wire == vec![2; 4]), "the allocate is kept");
+        assert!(out.iter().any(|e| e.wire == vec![3; 4]), "and the free that trimmed it");
+        assert_eq!(out.last().expect("entries").wire, vec![3; 4], "the free replays after");
+    }
+
+    /// And it is not kept when its allocate is not. Replaying a free of objects nothing recreated
+    /// is a lookup miss, which poisons the entire restore -- so this is a safety property, not a
+    /// tidiness one.
+    #[test]
+    fn a_free_whose_allocate_is_gone_does_not_replay() {
+        let k = keys(3);
+        let (pool, a, b) = (k[0], k[1], k[2]);
+        let mut j = Journal::new();
+        j.created(1, &[1; 4], vec![pool], Vec::new());
+        j.created(2, &[2; 4], vec![a, b], vec![pool]);
+        j.undid(3, &[3; 4], vec![a, b], vec![pool]);
+
+        // Every set is gone, so the allocate describes nothing and neither does the free.
+        let out = j.retained(&Some_(vec![pool]));
+        assert!(!out.iter().any(|e| e.wire == vec![2; 4]), "the allocate goes");
+        assert!(!out.iter().any(|e| e.wire == vec![3; 4]), "and the free goes with it");
+        assert_eq!(out.len(), 1, "only the pool's own create is left");
     }
 
     /// A ring's create replays on the context's decoder, because at that moment the ring it makes

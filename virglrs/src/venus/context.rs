@@ -852,7 +852,10 @@ fn run_batch(
         // objects; leaving either behind would hand them to whichever command is recorded next,
         // which would then claim to have created or named something it never mentioned.
         let named = dec.take_resolved();
-        let made = objects.borrow_mut().take_added();
+        let (made, unmade) = {
+            let mut t = objects.borrow_mut();
+            (t.take_added(), t.take_removed())
+        };
         let note = h.note.take();
 
         match verdict {
@@ -977,7 +980,7 @@ fn run_batch(
         // not part of any world worth rebuilding) or, for a wait, leaves the position uncommitted
         // so the command is dispatched again; recording earlier would journal a command that never
         // happened, or the same command twice.
-        record(h, &buf[at..dec.pos()], cmd, named, made, note);
+        record(h, &buf[at..dec.pos()], cmd, named, made, unmade, note);
     }
     suspended
 }
@@ -993,6 +996,7 @@ fn record(
     cmd: VkCommandTypeEXT,
     named: Vec<ObjectId>,
     made: Vec<ObjectKey>,
+    unmade: Vec<ObjectKey>,
     note: Option<Note>,
 ) {
     // The wire spells a command type unsigned and the generated enum signs it. Reconciled once,
@@ -1090,6 +1094,20 @@ fn record(
         return;
     }
 
+    // A free from a pool, kept so a replay ends with the objects the guest actually holds rather
+    // than every object it ever allocated. Before the mutator test below, because these name a
+    // pool too and would otherwise be filed as writes into it.
+    if frees_from_a_pool(cmd) {
+        if unmade.is_empty() {
+            // It freed nothing -- a null handle, or a run the driver refused. There is nothing to
+            // undo and replaying it would name objects no create will have made.
+            h.journal.skip(cmd_type);
+            return;
+        }
+        h.journal.undid(cmd_type, &wire, unmade, key_of(&named));
+        return;
+    }
+
     if let Some(targets) = mutates(cmd) {
         // What the command *wrote into* is what it is about; everything else it named is a
         // reference. Told apart by object type rather than by argument position -- the wire order
@@ -1169,6 +1187,24 @@ fn recording_class(cmd: VkCommandTypeEXT) -> Option<Recording> {
         VkCommandTypeEXT::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT => Some(Recording::Adds),
         _ => vn_command_name(cmd).filter(|n| n.starts_with("vkCmd")).map(|_| Recording::Adds),
     }
+}
+
+/// Commands that hand objects back to the pool they came from.
+///
+/// Journaled against the creates they undo. A batch allocate is retained while any one of its
+/// objects lives, so replaying it remakes the ones the guest freed as well -- harmless for a
+/// command pool, which grows, and fatal for a descriptor pool sized for exactly what the guest
+/// holds, where those extra sets are what make the next allocate return
+/// `VK_ERROR_OUT_OF_POOL_MEMORY`. Replaying the free restores the count.
+///
+/// `vkResetDescriptorPool` is not here: it takes its sets out of the object table, so their
+/// entries stop being true on their own and there is nothing left to undo.
+fn frees_from_a_pool(cmd: VkCommandTypeEXT) -> bool {
+    matches!(
+        cmd,
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeDescriptorSets_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT
+    )
 }
 
 /// Commands that write into objects they do not own, and the types of the objects they write into.
