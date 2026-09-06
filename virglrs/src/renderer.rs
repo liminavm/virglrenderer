@@ -83,6 +83,8 @@ pub enum Error {
     Transfer(transfer::Error),
     /// A restore was handed something that is not a classic content blob.
     MalformedContent(content::Malformed),
+    /// A restore was handed something that is not a venus sync blob.
+    MalformedSync(venus::sync::Malformed),
 }
 
 /// A read or a write of an allocation's bytes, in the renderer's vocabulary. One function for
@@ -141,6 +143,7 @@ impl std::fmt::Display for Error {
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
             Error::MalformedContent(m) => return write!(f, "the contents were refused: {m}"),
+            Error::MalformedSync(m) => return write!(f, "the sync state was refused: {m}"),
         };
         f.write_str(s)
     }
@@ -1535,6 +1538,27 @@ impl Renderer {
         src: &[u8],
     ) -> Result<usize, Error> {
         self.venus_context(ctx_id, |ctx| ctx.memory_write(mem, src))?.map_err(memory_error)
+    }
+
+    /// One venus context's sync objects, for the VMM to store beside its journal.
+    ///
+    /// Cannot fail beyond "no such context": everything it reads is a poll or a record this
+    /// renderer already keeps, so a suspend is never refused on account of the GPU being busy.
+    pub fn venus_sync_export(&self, ctx_id: ContextId) -> Result<Vec<u8>, Error> {
+        self.venus_context(ctx_id, venus::context::Context::sync_export)
+    }
+
+    /// Put a captured sync state back, after the context's journal has replayed and before its
+    /// rings start.
+    pub fn venus_sync_restore(
+        &self,
+        ctx_id: ContextId,
+        blob: &[u8],
+    ) -> Result<venus::sync::Account, Error> {
+        let v = self.venus.as_ref().ok_or(Error::RendererAbsent)?;
+        v.with_context_mut(ctx_id, |ctx| ctx.sync_restore(blob))
+            .ok_or(Error::NoContext)?
+            .map_err(Error::MalformedSync)
     }
 
     /// The venus context under an id, distinguishing "no venus in this build" from "no such

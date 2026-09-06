@@ -290,7 +290,7 @@ SABOTAGES = [
     (
         'a binary semaphore reaches the timeline entry points unchecked',
         'virglrs/src/venus/driver.rs',
-        """        match self.semaphores.get(&sem) {
+        """        match self.semaphores.get(&sem).map(|f| f.kind) {
             Some(SemaphoreKind::Timeline) => Ok(()),
             Some(SemaphoreKind::Binary) => Err(NotATimeline::Binary),
             None => Err(NotATimeline::Unrecorded),
@@ -302,11 +302,37 @@ SABOTAGES = [
     (
         "a semaphore's kind is forgotten while the semaphore is still live",
         'virglrs/src/venus/driver.rs',
-        """        self.semaphores.insert(sem, kind);
+        """        self.semaphores.insert(sem, SemaphoreFacts { kind, requested });
         Ok(sem)""",
         """        let _ = kind;
+        self.semaphores.insert(sem, SemaphoreFacts { kind: SemaphoreKind::Timeline, requested });
         Ok(sem)""",
         'a_binary_semaphore_in_a_timeline_command_is_refused',
+    ),
+    (
+        'a fence with a submit outstanding is captured as the driver reports it',
+        'virglrs/src/venus/driver.rs',
+        """        if self.pending_fences.contains(&fence) {
+            return true;
+        }""",
+        """""",
+        'a_captured_sync_state_puts_a_rebuilt_world_back_where_it_was',
+    ),
+    (
+        'a sync restore only ever signals, never resets',
+        'virglrs/src/venus/context.rs',
+        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+                        (false, true) => self.driver.unsignal_fence(device, fence),""",
+        """                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+                        (false, true) => true,""",
+        'a_captured_sync_state_puts_a_rebuilt_world_back_where_it_was',
+    ),
+    (
+        "a timeline's promised value is dropped in favour of its counter",
+        'virglrs/src/venus/driver.rs',
+        """        reached.max(requested)""",
+        """        reached""",
+        'a_captured_sync_state_puts_a_rebuilt_world_back_where_it_was',
     ),
     # The classic contents blob. Only the codec is reachable from a unit test: a no-op restore is
     # caught by the replay gate's scrub, and "a level that could not be read back is written as

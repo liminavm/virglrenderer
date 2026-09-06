@@ -388,6 +388,19 @@ impl Table {
             .map(|o| o.id)
     }
 
+    /// Every live object of one type, in the guest's own id order.
+    ///
+    /// The order is `slots`', which is sorted by id: an export that walked the arena would come
+    /// out in whatever order objects happened to land in it, and two captures of the same world
+    /// could then differ by nothing but their layout.
+    pub fn of_type(&self, ty: VkObjectType) -> impl Iterator<Item = &Object> {
+        self.slots
+            .values()
+            .filter_map(|s| s.key())
+            .filter_map(|k| self.arena.get(k))
+            .filter(move |o| o.ty == ty)
+    }
+
     pub fn get(&self, id: ObjectId) -> Option<&Object> {
         self.arena.get(self.slots.get(&id)?.key()?)
     }

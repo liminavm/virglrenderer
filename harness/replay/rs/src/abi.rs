@@ -116,6 +116,10 @@ syms! {
         = "virgl_renderer_limina_memory_read",
     memory_write: extern "C" fn(u32, u64, *const c_void, u64) -> c_int
         = "virgl_renderer_limina_memory_write",
+    sync_export: extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int
+        = "virgl_renderer_limina_sync_export",
+    sync_restore: extern "C" fn(u32, *const c_void, u64) -> c_int
+        = "virgl_renderer_limina_sync_restore",
     resource_map: extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int
         = "virgl_renderer_resource_map",
     resource_get_iosurface_id: extern "C" fn(u32, *mut u32) -> c_int
@@ -255,6 +259,28 @@ impl Renderer {
         let out = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size as usize).to_vec() };
         unsafe { libc::free(buf) };
         Ok(out)
+    }
+
+    /// One context's sync state, under the same `malloc`/`free` contract as the journal.
+    pub fn sync_export(&self, ctx_id: u32) -> Result<Vec<u8>, c_int> {
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        let mut size: u64 = 0;
+        let rc = (self.syms.sync_export)(ctx_id, &mut buf, &mut size);
+        if rc != 0 {
+            return Err(rc);
+        }
+        if buf.is_null() {
+            return Err(-1);
+        }
+        // SAFETY: as `journal_export` -- a zero return is the renderer's promise that `buf` holds
+        // `size` readable bytes it allocated and has handed over.
+        let out = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size as usize).to_vec() };
+        unsafe { libc::free(buf) };
+        Ok(out)
+    }
+
+    pub fn sync_restore(&self, ctx_id: u32, bytes: &[u8]) -> c_int {
+        (self.syms.sync_restore)(ctx_id, bytes.as_ptr().cast(), bytes.len() as u64)
     }
 
     pub fn journal_restore(&self, ctx_id: u32, bytes: &[u8]) -> c_int {

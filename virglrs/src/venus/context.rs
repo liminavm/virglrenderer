@@ -26,9 +26,9 @@ use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
 use super::proto::types::{
-    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDeviceMemory, VkFlags,
+    VkCommandStreamDescriptionMESA, VkCommandTypeEXT, VkDevice, VkDeviceMemory, VkFence, VkFlags,
     VkMemoryResourceAllocationSizePropertiesMESA, VkObjectType, VkPhysicalDevice, VkResult,
-    VkRingCreateInfoMESA, VkRingMonitorInfoMESA, vn_command_vkAllocateCommandBuffers,
+    VkRingCreateInfoMESA, VkRingMonitorInfoMESA, VkSemaphore, vn_command_vkAllocateCommandBuffers,
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
@@ -108,6 +108,7 @@ use super::ring::{
     ReplyStream, ReplyStreamError, ResourceBytes, Ring, RingControl, RingError, ShmResources,
 };
 use super::ring_thread::{RingThread, RingWaiter, WaitRing, seqno_ge};
+use super::sync;
 use super::vkr::ContextKey;
 use crate::vulkan::Global;
 
@@ -714,6 +715,124 @@ impl Context {
             .ok_or(MemoryError::NoSuchAllocation)?;
         let device = objects.device_of(id).ok_or(MemoryError::NoSuchAllocation)?;
         self.driver.memory_write(device, handle, id, src)
+    }
+
+    /// This context's sync objects, as the state the guest is entitled to come back to.
+    ///
+    /// Every fence and semaphore the table holds, in the guest's own id order. Nothing here waits
+    /// or can fail: what is recorded is what the guest asked for -- see [`sync`] for why that is
+    /// the only self-consistent answer and not an optimism -- and both halves of it are a poll or
+    /// a map lookup.
+    pub fn sync_export(&self) -> Vec<u8> {
+        let objects = self.objects.borrow();
+        let mut out = Vec::new();
+        for o in objects.of_type(VkObjectType::VK_OBJECT_TYPE_FENCE) {
+            let Some(device) = objects.device_of(o.id) else { continue };
+            out.push(sync::Captured {
+                id: o.id,
+                kind: sync::Kind::Fence,
+                signalled: self.driver.fence_captured(device, VkFence::from_host(o.handle)),
+                value: 0,
+            });
+        }
+        for o in objects.of_type(VkObjectType::VK_OBJECT_TYPE_SEMAPHORE) {
+            let Some(device) = objects.device_of(o.id) else { continue };
+            let sem = VkSemaphore::from_host(o.handle);
+            let entry = match self.driver.semaphore_kind(sem) {
+                Some(driver::SemaphoreKind::Timeline) => sync::Captured {
+                    id: o.id,
+                    kind: sync::Kind::Timeline,
+                    signalled: false,
+                    value: self.driver.timeline_captured(device, sem),
+                },
+                // A binary carries no value, and comes back signalled because a wait rooted before
+                // the snapshot has no signal left to arrive: under-signalling one is a ring parked
+                // forever, over-signalling it costs the first frame after the resume.
+                Some(driver::SemaphoreKind::Binary) => {
+                    sync::Captured { id: o.id, kind: sync::Kind::Binary, signalled: true, value: 0 }
+                }
+                None => continue,
+            };
+            out.push(entry);
+        }
+        sync::encode(out)
+    }
+
+    /// Put a captured sync state back, after the journal has rebuilt the objects it names.
+    ///
+    /// The rule is one line: make each rebuilt object's state equal the captured one, in whichever
+    /// direction that is. The C only ever signals upward, so a fence created signalled and reset
+    /// before the snapshot comes back signalled and the guest's next submit with it is invalid.
+    ///
+    /// An entry naming an object this context does not have is *dropped*, not an error: the
+    /// journal is allowed to lose a create whose object died around the snapshot. Each dropped id
+    /// is named rather than counted, because a restore with holes reads exactly like a clean one
+    /// until the guest reaches for what is missing.
+    pub fn sync_restore(&mut self, blob: &[u8]) -> Result<sync::Account, sync::Malformed> {
+        let entries = sync::decode(blob)?;
+        let mut account = sync::Account::default();
+        let mut touched: Vec<VkDevice> = Vec::new();
+        for e in entries {
+            let objects = self.objects.borrow();
+            let want = match e.kind {
+                sync::Kind::Fence => VkObjectType::VK_OBJECT_TYPE_FENCE,
+                sync::Kind::Binary | sync::Kind::Timeline => VkObjectType::VK_OBJECT_TYPE_SEMAPHORE,
+            };
+            let found = objects.get(e.id).filter(|o| o.ty == want).map(|o| o.handle);
+            let (Some(handle), Some(device)) = (found, objects.device_of(e.id)) else {
+                account.dropped.push(e.id);
+                continue;
+            };
+            drop(objects);
+
+            let done = match e.kind {
+                sync::Kind::Fence => {
+                    let fence = VkFence::from_host(handle);
+                    let now = self.driver.fence_captured(device, fence);
+                    match (e.signalled, now) {
+                        (true, true) | (false, false) => {
+                            account.agreed += 1;
+                            continue;
+                        }
+                        (true, false) => self.driver.fast_forward(device, VkSemaphore(0), fence),
+                        (false, true) => self.driver.unsignal_fence(device, fence),
+                    }
+                }
+                sync::Kind::Timeline => {
+                    let sem = VkSemaphore::from_host(handle);
+                    let now = self.driver.timeline_captured(device, sem);
+                    if now >= e.value {
+                        // Equal is the rebuilt world already agreeing. Above is a counter that has
+                        // gone past what was captured, which a monotonic counter in a world
+                        // rebuilt from this blob cannot do -- so it is named, not stepped over.
+                        if now == e.value {
+                            account.agreed += 1;
+                        } else {
+                            account.failed.push(e.id);
+                        }
+                        continue;
+                    }
+                    self.driver.raise_timeline(device, sem, e.value)
+                }
+                sync::Kind::Binary => {
+                    self.driver.fast_forward(device, VkSemaphore::from_host(handle), VkFence(0))
+                }
+            };
+            if done {
+                account.applied += 1;
+            } else {
+                account.failed.push(e.id);
+            }
+            if !touched.contains(&device) {
+                touched.push(device);
+            }
+        }
+        // Before the guest sees anything: a fast-forward submit still in flight is one the guest's
+        // first reset or wait could race.
+        for device in touched {
+            self.driver.drain_fast_forward(device);
+        }
+        Ok(account)
     }
 
     /// Export one allocation as a blob, handing back the host address the VMM will publish.
@@ -1969,7 +2088,18 @@ impl Commands for Handlers<'_> {
     // accident -- `vkCreateShaderModule` below is what that looks like.
 
     simple_create!(vkCreateFence, vn_command_vkCreateFence, pCreateInfo, pFence, handle_pFence_mut);
-    simple_destroy!(vkDestroyFence, vn_command_vkDestroyFence, fence);
+    /// Not a [`simple_destroy`] for the reason the create above is not simple: the fence carries
+    /// a record of whether a submit is outstanding on it, and a record that outlived its fence
+    /// would answer for whatever handle Vulkan hands out next.
+    fn vkDestroyFence(&mut self, args: &mut vn_command_vkDestroyFence<'_>) {
+        self.driver.destroy_object(
+            args.device,
+            |d| d.vkDestroyFence(),
+            args.fence,
+            args.pAllocator,
+        );
+        self.driver.forget_fence(args.fence);
+    }
 
     /// A semaphore, and the one thing about it Vulkan will not answer later.
     ///
@@ -5652,6 +5782,260 @@ mod tests {
         ));
         assert!(!ctx.submit(&batch, &mut todo, &g, &t).ran(), "no device to ask");
         assert!(ctx.fatal());
+    }
+
+    /// A snapshot's sync state crosses into a rebuilt world and puts every object back where it
+    /// was -- upwards for a fence that must come back signalled, downwards for one that must not.
+    ///
+    /// The two halves of the rule this design rests on. What is *captured* is what the guest
+    /// asked for, not what the GPU had got round to: a fence with a submit outstanding comes back
+    /// signalled, because the submit that would have signalled it does not survive the snapshot
+    /// and a rebuilt context has nothing left to complete it. What is *restored* is equality in
+    /// both directions -- the C only ever signals upward, so a fence the guest had reset comes
+    /// back signalled there and the guest's next submit with it is invalid.
+    ///
+    /// Two contexts, because one cannot show it: a capture compared against the world it came
+    /// from agrees with itself whatever either half does.
+    #[test]
+    fn a_captured_sync_state_puts_a_rebuilt_world_back_where_it_was() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkQueue, VkSemaphoreSignalInfo, VkStructureType, VkSubmitInfo,
+        };
+        use super::sync;
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const QUEUE: u64 = 0x77;
+        const FENCE_UP: u64 = 0x100;
+        const FENCE_DOWN: u64 = 0x101;
+        const TIMELINE: u64 = 0x200;
+        const BINARY: u64 = 0x300;
+        // Ids in the guest's numbering, which is the order a capture comes out in.
+        const ID_FENCE_UP: u64 = 1;
+        const ID_TIMELINE: u64 = 2;
+        const ID_BINARY: u64 = 3;
+        const ID_FENCE_DOWN: u64 = 4;
+
+        /// The host's own view of the world, which both contexts share because both are talking
+        /// to one planted driver.
+        #[derive(Default)]
+        struct World {
+            /// Which fences the driver would report signalled.
+            signalled: Vec<u64>,
+            /// The timeline's counter.
+            counter: u64,
+            submits: Vec<(u64, u64, u64)>,
+            resets: Vec<u64>,
+            raised: Vec<(u64, u64)>,
+            drained: u32,
+        }
+        thread_local! {
+            static WORLD: RefCell<World> = RefCell::new(World::default());
+        }
+
+        unsafe extern "C" fn status(_d: VkDevice, f: VkFence) -> VkResult {
+            let on = WORLD.with_borrow(|w| w.signalled.contains(&f.0));
+            if on { VkResult::VK_SUCCESS } else { VkResult::VK_NOT_READY }
+        }
+        unsafe extern "C" fn submit(
+            q: VkQueue,
+            n: u32,
+            infos: *const VkSubmitInfo,
+            fence: VkFence,
+        ) -> VkResult {
+            assert_eq!(n, 1, "a fast-forward is one empty submit");
+            // SAFETY: the caller passed `n` valid infos and this reads the one it promised.
+            let info = unsafe { &*infos };
+            let sem = if info.signalSemaphoreCount == 0 {
+                0
+            } else {
+                // SAFETY: the count says there is one, and it lives for the call.
+                unsafe { (*info.pSignalSemaphores).0 }
+            };
+            // The guest's work does not complete, and a fast-forward does. That is the whole
+            // situation being modelled: the capture happens while a submit is still in flight, so
+            // the fence polls unsignalled and only the ledger knows it is owed. A submit carrying
+            // a timeline chain is the guest's here; an empty one is a fast-forward.
+            let guest_work = !info.pNext.is_null();
+            WORLD.with_borrow_mut(|w| {
+                w.submits.push((q.0, sem, fence.0));
+                if fence.0 != 0 && !guest_work {
+                    w.signalled.push(fence.0);
+                }
+            });
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn reset(_d: VkDevice, n: u32, fences: *const VkFence) -> VkResult {
+            // SAFETY: `n` fences at `fences`, as Vulkan's own signature promises.
+            let named = unsafe { core::slice::from_raw_parts(fences, n as usize) };
+            WORLD.with_borrow_mut(|w| {
+                for f in named {
+                    w.resets.push(f.0);
+                    w.signalled.retain(|s| *s != f.0);
+                }
+            });
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn counter(_d: VkDevice, _s: VkSemaphore, out: *mut u64) -> VkResult {
+            assert!(!out.is_null());
+            // SAFETY: the caller's single out slot.
+            unsafe { *out = WORLD.with_borrow(|w| w.counter) };
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn signal(_d: VkDevice, info: *const VkSemaphoreSignalInfo) -> VkResult {
+            // SAFETY: one struct, live for the call.
+            let i = unsafe { &*info };
+            WORLD.with_borrow_mut(|w| {
+                w.raised.push((i.semaphore.0, i.value));
+                w.counter = i.value;
+            });
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn wait_idle(_q: VkQueue) -> VkResult {
+            WORLD.with_borrow_mut(|w| w.drained += 1);
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn idle(_d: VkDevice) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+        unsafe extern "C" fn destroy_device(_d: VkDevice, _a: *const VkAllocationCallbacks) {}
+        /// Teardown destroys what the guest left live, and a planted table owes every entry point
+        /// the objects in it will need.
+        unsafe extern "C" fn destroy_fence(
+            _d: VkDevice,
+            _f: VkFence,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+        unsafe extern "C" fn destroy_semaphore(
+            _d: VkDevice,
+            _s: VkSemaphore,
+            _a: *const VkAllocationCallbacks,
+        ) {
+        }
+
+        /// A context holding the same four objects, over the one planted world.
+        fn world_ctx() -> Context {
+            let mut ctx = Context::new(
+                ContextKey::for_test(ContextId::new(1).unwrap()),
+                &Budget::with_cap(None, false),
+            );
+            let mut fns = crate::vulkan::Device::default();
+            fns.plant_vkGetFenceStatus(status);
+            fns.plant_vkQueueSubmit(submit);
+            fns.plant_vkResetFences(reset);
+            fns.plant_vkGetSemaphoreCounterValue(counter);
+            fns.plant_vkSignalSemaphore(signal);
+            fns.plant_vkQueueWaitIdle(wait_idle);
+            fns.plant_vkDeviceWaitIdle(idle);
+            fns.plant_vkDestroyDevice(destroy_device);
+            fns.plant_vkDestroyFence(destroy_fence);
+            fns.plant_vkDestroySemaphore(destroy_semaphore);
+            ctx.driver.plant_device(VkDevice(DEVICE), fns);
+            ctx.driver.plant_queue(VkDevice(DEVICE), VkQueue(QUEUE));
+            {
+                let mut table = ctx.objects.borrow_mut();
+                table
+                    .add(ObjectId(9), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(DEVICE), None)
+                    .expect("a fresh id");
+                for (id, host, ty) in [
+                    (ID_FENCE_UP, FENCE_UP, VkObjectType::VK_OBJECT_TYPE_FENCE),
+                    (ID_FENCE_DOWN, FENCE_DOWN, VkObjectType::VK_OBJECT_TYPE_FENCE),
+                    (ID_TIMELINE, TIMELINE, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
+                    (ID_BINARY, BINARY, VkObjectType::VK_OBJECT_TYPE_SEMAPHORE),
+                ] {
+                    table.add(ObjectId(id), ty, HostHandle(host), Some(ObjectId(9))).unwrap();
+                }
+            }
+            ctx.driver.plant_semaphore(VkSemaphore(TIMELINE), driver::SemaphoreKind::Timeline);
+            ctx.driver.plant_semaphore(VkSemaphore(BINARY), driver::SemaphoreKind::Binary);
+            ctx
+        }
+
+        WORLD.with_borrow_mut(|w| *w = World { counter: 5, ..Default::default() });
+        let mut captured_from = world_ctx();
+
+        // The guest's own traffic, which is where both ledgers come from: a submit promising to
+        // signal FENCE_UP, and one promising to take the timeline to 9. The GPU has done neither
+        // -- the fence polls unsignalled and the counter is still 5 -- and that is exactly the
+        // state the C's capture would record and lose.
+        let values = [9u64];
+        let sems = [VkSemaphore(TIMELINE)];
+        let timeline_info = super::super::proto::types::VkTimelineSemaphoreSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            signalSemaphoreValueCount: 1,
+            pSignalSemaphoreValues: values.as_ptr(),
+            ..Default::default()
+        };
+        let work = VkSubmitInfo {
+            sType: VkStructureType::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            pNext: core::ptr::addr_of!(timeline_info).cast(),
+            signalSemaphoreCount: 1,
+            pSignalSemaphores: sems.as_ptr(),
+            ..Default::default()
+        };
+        captured_from.driver_mut().queue_submit(VkQueue(QUEUE), &[work], VkFence(FENCE_UP));
+
+        let blob = captured_from.sync_export();
+        let entries = sync::decode(&blob).expect("what the export wrote is a blob");
+        assert_eq!(
+            entries,
+            vec![
+                sync::Captured {
+                    id: ObjectId(ID_FENCE_UP),
+                    kind: sync::Kind::Fence,
+                    signalled: true,
+                    value: 0,
+                },
+                sync::Captured {
+                    id: ObjectId(ID_TIMELINE),
+                    kind: sync::Kind::Timeline,
+                    signalled: false,
+                    value: 9,
+                },
+                sync::Captured {
+                    id: ObjectId(ID_BINARY),
+                    kind: sync::Kind::Binary,
+                    signalled: true,
+                    value: 0,
+                },
+                sync::Captured {
+                    id: ObjectId(ID_FENCE_DOWN),
+                    kind: sync::Kind::Fence,
+                    signalled: false,
+                    value: 0,
+                },
+            ],
+            "the promise, not the poll: a pending fence is signalled and the timeline is at 9"
+        );
+
+        // The world a rebuilt context comes back to: nothing pending, the counter at zero, and --
+        // the case the C gets wrong -- a fence the driver hands back already signalled.
+        drop(captured_from);
+        WORLD.with_borrow_mut(|w| {
+            *w = World { signalled: vec![FENCE_DOWN], counter: 0, ..Default::default() }
+        });
+        let mut fresh = world_ctx();
+        let account = fresh.sync_restore(&blob).expect("the blob it just wrote");
+
+        assert_eq!(account.applied, 4, "every one of the four had to be moved");
+        assert_eq!(account.agreed, 0);
+        assert!(account.whole(), "nothing dropped and nothing refused: {account:?}");
+
+        WORLD.with_borrow(|w| {
+            assert_eq!(
+                w.submits,
+                [(QUEUE, 0, FENCE_UP), (QUEUE, BINARY, 0)],
+                "an empty submit signals the fence, and another the binary semaphore"
+            );
+            assert_eq!(w.resets, [FENCE_DOWN], "the direction the C has no answer for");
+            assert_eq!(w.raised, [(TIMELINE, 9)]);
+            assert_eq!(w.drained, 1, "the fast-forward retires before the guest can race it");
+        });
+
+        // And the fixed point the harness gate rests on: a capture of the restored world is the
+        // capture that was put into it.
+        assert_eq!(fresh.sync_export(), blob, "restoring a capture reproduces it");
     }
 
     /// A binary semaphore in a timeline command costs the guest its context and nothing else.
