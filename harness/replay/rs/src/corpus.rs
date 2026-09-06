@@ -203,7 +203,7 @@ fn parse_ctl(op: u32, p: &[u8]) -> Result<Ctl> {
     })
 }
 
-fn parse_journal(blob: &[u8], ctx: CtxKey) -> Result<Vec<JournalEntry>> {
+pub fn parse_journal(blob: &[u8], ctx: CtxKey) -> Result<Vec<JournalEntry>> {
     if blob.is_empty() {
         return Ok(Vec::new());
     }

@@ -102,6 +102,13 @@ syms! {
     replay_ring_cmd: extern "C" fn(u32, u64, *mut c_void, u32) -> c_int
         = "virgl_renderer_limina_replay_ring_cmd",
     replay_end: extern "C" fn(u32) -> c_int = "virgl_renderer_limina_replay_end",
+    journal_export: extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int
+        = "virgl_renderer_limina_journal_export",
+    journal_restore: extern "C" fn(u32, *const c_void, u64) -> c_int
+        = "virgl_renderer_limina_journal_restore",
+    journal_replay_upto: extern "C" fn(u32, u64) -> c_int
+        = "virgl_renderer_limina_journal_replay_upto",
+    journal_seq: extern "C" fn(u32) -> u64 = "virgl_renderer_limina_journal_seq",
     dump_state: extern "C" fn() = "virgl_renderer_limina_dump_state",
     memory_census: extern "C" fn(u32, *mut *mut u64, *mut u32) -> c_int
         = "virgl_renderer_limina_memory_census",
@@ -213,6 +220,41 @@ impl Renderer {
 
     pub fn replay_ring_cmd(&self, ctx_id: u32, ring_id: u64, wire: &mut [u8]) -> c_int {
         (self.syms.replay_ring_cmd)(ctx_id, ring_id, wire.as_mut_ptr().cast(), wire.len() as u32)
+    }
+
+    /// One context's snapshot journal, or `Err(rc)` if the renderer would not give one.
+    ///
+    /// The buffer comes back `malloc`ed and becomes ours to `free`, which is the ABI's contract
+    /// and the reason this copies into a `Vec` rather than handing the pointer on.
+    pub fn journal_export(&self, ctx_id: u32) -> Result<Vec<u8>, c_int> {
+        let mut buf: *mut c_void = std::ptr::null_mut();
+        let mut size: u64 = 0;
+        let rc = (self.syms.journal_export)(ctx_id, &mut buf, &mut size);
+        if rc != 0 {
+            return Err(rc);
+        }
+        if buf.is_null() {
+            return Err(-1);
+        }
+        // SAFETY: the renderer answered 0, which is its promise that `buf` points at `size`
+        // readable bytes it allocated with `malloc` and has handed to us.
+        let out = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size as usize).to_vec() };
+        unsafe { libc::free(buf) };
+        Ok(out)
+    }
+
+    pub fn journal_restore(&self, ctx_id: u32, bytes: &[u8]) -> c_int {
+        (self.syms.journal_restore)(ctx_id, bytes.as_ptr().cast(), bytes.len() as u64)
+    }
+
+    /// How far the recorder has counted. Distinguishes "saw nothing" from "kept nothing", which
+    /// an absent journal alone cannot.
+    pub fn journal_seq(&self, ctx_id: u32) -> u64 {
+        (self.syms.journal_seq)(ctx_id)
+    }
+
+    pub fn journal_replay_upto(&self, ctx_id: u32, upto: u64) -> c_int {
+        (self.syms.journal_replay_upto)(ctx_id, upto)
     }
 
     pub fn replay_end(&self, ctx_id: u32) -> c_int {
