@@ -198,3 +198,206 @@ impl std::fmt::Display for Census {
         )
     }
 }
+
+/// One thing a rebuild has to do, and where it sits in the order.
+///
+/// The sub-context is data here rather than a `SET_SUB_CTX` command in the stream because both
+/// ends of this journal are this renderer: nothing outside reads it, so the switch is applied at
+/// replay from the field instead of being encoded, decoded and re-applied.
+pub enum Step<'a> {
+    /// Make this sub-context. Sub-context 0 is never emitted -- a fresh context has it.
+    CreateSub(u32),
+    /// Feed these dwords with that sub-context current.
+    Feed { sub: u32, chunks: &'a [Vec<u32>] },
+}
+
+/// One entry of a context's export, before it is written out.
+pub struct Entry<'a> {
+    pub seq: Seq,
+    pub step: Step<'a>,
+}
+
+/// Order a context's retained commands into the one sequence that rebuilds it.
+///
+/// Sorting is global across sub-contexts, not grouped by them. Grouping reads more naturally and
+/// is what the C's design proposes, but it reorders commands against the seq the VMM fences its
+/// own control-queue replay on, so a blob create waiting on wire position N can be fed entries
+/// from a different sub-context that were never what it was waiting for. One order, and it is the
+/// order the commands were accepted in -- which is also what makes a create always precede the
+/// binds that name it.
+pub fn order<'a>(entries: impl Iterator<Item = Entry<'a>>) -> Vec<Entry<'a>> {
+    let mut all: Vec<Entry<'a>> = entries.collect();
+    all.sort_by_key(|e| e.seq);
+    all
+}
+
+/// Magic for a classic journal export: "VRJ1", little-endian.
+///
+/// Its own format rather than the venus journal's `VKJR`, because nothing outside this renderer
+/// reads it. `VKJR` carries a `klass` taxonomy and a `ring_key` that exist so the VMM can route
+/// entries it has parsed; the VMM no longer parses this one, so neither field has anything to
+/// say, and inventing values for them would be describing the C's design rather than ours.
+const MAGIC: u32 = 0x314a_5256;
+const VERSION: u32 = 1;
+
+/// Write a context's ordered journal as the bytes the VMM will hand back.
+pub fn serialize(entries: &[Entry<'_>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut w = |v: u32| out.extend_from_slice(&v.to_le_bytes());
+    w(MAGIC);
+    w(VERSION);
+    w(entries.len() as u32);
+    w(0);
+    for e in entries {
+        out.extend_from_slice(&e.seq.0.to_le_bytes());
+        match &e.step {
+            Step::CreateSub(id) => {
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+            Step::Feed { sub, chunks } => {
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&sub.to_le_bytes());
+                out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+                for c in chunks.iter() {
+                    out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                    for d in c {
+                        out.extend_from_slice(&d.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A parsed entry, owning its dwords: the bytes it came from are the VMM's and do not outlive the
+/// call that handed them over.
+pub struct Parsed {
+    pub seq: Seq,
+    pub sub: u32,
+    /// Empty for "create this sub-context", which has nothing to feed.
+    pub chunks: Vec<Vec<u32>>,
+}
+
+/// Read back what [`serialize`] wrote.
+///
+/// Every length is checked against what is actually there. The blob has been round-tripped
+/// through a snapshot file and a VMM, so however much this renderer wrote it, by the time it
+/// comes back it is input -- and input is not trusted just because we recognise the magic.
+pub fn parse(bytes: &[u8]) -> Result<Vec<Parsed>, &'static str> {
+    let mut at = 0usize;
+    let u32_at = |at: &mut usize| -> Result<u32, &'static str> {
+        let end = at.checked_add(4).ok_or("truncated")?;
+        let b = bytes.get(*at..end).ok_or("truncated")?;
+        *at = end;
+        Ok(u32::from_le_bytes(b.try_into().expect("four bytes")))
+    };
+    if u32_at(&mut at)? != MAGIC {
+        return Err("not a vrend journal");
+    }
+    if u32_at(&mut at)? != VERSION {
+        return Err("a vrend journal from another version");
+    }
+    let count = u32_at(&mut at)? as usize;
+    let _reserved = u32_at(&mut at)?;
+    let mut out = Vec::with_capacity(count.min(1 << 16));
+    for _ in 0..count {
+        let lo = u32_at(&mut at)? as u64;
+        let hi = u32_at(&mut at)? as u64;
+        let seq = Seq(lo | (hi << 32));
+        let kind = u32_at(&mut at)?;
+        let sub = u32_at(&mut at)?;
+        let n = u32_at(&mut at)? as usize;
+        if kind > 1 {
+            return Err("an entry of no known kind");
+        }
+        let mut chunks = Vec::with_capacity(n.min(1 << 12));
+        for _ in 0..n {
+            let len = u32_at(&mut at)? as usize;
+            let mut c = Vec::with_capacity(len.min(1 << 16));
+            for _ in 0..len {
+                c.push(u32_at(&mut at)?);
+            }
+            chunks.push(c);
+        }
+        out.push(Parsed { seq, sub, chunks });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(seq: u64, sub: u32, chunks: &[Vec<u32>]) -> Entry<'_> {
+        Entry { seq: Seq(seq), step: Step::Feed { sub, chunks } }
+    }
+
+    #[test]
+    fn a_journal_round_trips() {
+        let one = vec![vec![0x1234_5678, 9]];
+        let long = vec![vec![1, 2, 3], vec![4], vec![]];
+        let entries = vec![
+            Entry { seq: Seq(1), step: Step::CreateSub(3) },
+            feed(2, 0, &one),
+            feed(7, 3, &long),
+        ];
+        let back = parse(&serialize(&entries)).expect("what we just wrote");
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].seq, Seq(1));
+        assert_eq!(back[0].sub, 3);
+        assert!(back[0].chunks.is_empty(), "a sub-context create feeds nothing");
+        assert_eq!(back[1].chunks, one);
+        assert_eq!(back[2].seq, Seq(7));
+        assert_eq!(back[2].sub, 3);
+        assert_eq!(back[2].chunks, long, "a shader's chunks keep their order and their count");
+    }
+
+    #[test]
+    fn a_seq_past_four_billion_survives() {
+        // The counter is 64-bit and a long-lived context will pass 2^32; a journal that wrapped
+        // there would replay creates after the binds that name them.
+        let entries = vec![Entry { seq: Seq(0x1_0000_0007), step: Step::CreateSub(1) }];
+        assert_eq!(parse(&serialize(&entries)).unwrap()[0].seq, Seq(0x1_0000_0007));
+    }
+
+    #[test]
+    fn nothing_retained_is_still_a_journal() {
+        let back = parse(&serialize(&[])).expect("an empty journal is a journal");
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_blob_that_is_not_ours_is_refused() {
+        assert!(parse(&[]).is_err(), "no header at all");
+        assert!(parse(&[0; 16]).is_err(), "the wrong magic");
+        let mut wrong_version = serialize(&[]);
+        wrong_version[4] = 2;
+        assert!(parse(&wrong_version).is_err());
+    }
+
+    #[test]
+    fn a_length_the_blob_does_not_have_is_refused() {
+        // The count says one entry and the bytes stop short: this has been through a snapshot
+        // file and a VMM, so it is input, and input is not trusted for recognising the magic.
+        let chunks = vec![vec![1, 2, 3]];
+        let full = serialize(&[feed(1, 0, &chunks)]);
+        for cut in 1..full.len() {
+            assert!(parse(&full[..cut]).is_err(), "truncated at {cut} was accepted");
+        }
+    }
+
+    #[test]
+    fn the_order_is_by_seq_across_sub_contexts() {
+        // Grouping per sub-context would put 9 before 4 here; the fence the VMM feeds against is
+        // a seq, so the order has to be global.
+        let a = vec![vec![0xaa]];
+        let b = vec![vec![0xbb]];
+        let c = vec![vec![0xcc]];
+        let got = order(vec![feed(9, 1, &a), feed(4, 2, &b), feed(6, 1, &c)].into_iter());
+        let seqs: Vec<u64> = got.iter().map(|e| e.seq.0).collect();
+        assert_eq!(seqs, vec![4, 6, 9]);
+    }
+}

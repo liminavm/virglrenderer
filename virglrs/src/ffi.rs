@@ -145,6 +145,9 @@ const ENOTSUP: c_int = -libc::ENOTSUP;
 const EOPNOTSUPP: c_int = -libc::EOPNOTSUPP;
 const EINVAL: c_int = -libc::EINVAL;
 const ENOMEM: c_int = -libc::ENOMEM;
+/// No such thing here -- distinct from `EINVAL`, which says the caller asked wrongly. A context
+/// this renderer does not serve is a fair question with a negative answer.
+const ENOENT: c_int = -libc::ENOENT;
 
 /// A symbol that belongs to a phase this build has not reached.
 ///
@@ -1305,6 +1308,12 @@ pub extern "C" fn virgl_renderer_limina_dump_state() {
         let (res, ctx) = r.counts();
         eprintln!("[virglrs] {res} resources, {ctx} contexts, {:?}", r.config);
         eprintln!("[virglrs] vrend journal: {}", r.journal_census());
+        for (ctx, bytes, entries) in r.vrend_journal_report() {
+            match entries {
+                Ok(n) => eprintln!("[virglrs]   ctx {ctx}: {bytes} bytes, {n} entries"),
+                Err(e) => eprintln!("[virglrs]   ctx {ctx}: {bytes} bytes, UNREADABLE: {e}"),
+            }
+        }
         let todo = r.venus_todo();
         if !todo.is_empty() {
             let total: u64 = todo.iter().map(|(_, n)| n).sum();
@@ -1318,11 +1327,54 @@ pub extern "C" fn virgl_renderer_limina_dump_state() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_journal_export(
-    _ctx_id: u32,
-    _out_buf: *mut *mut c_void,
-    _out_size: *mut u64,
+    ctx_id: u32,
+    out_buf: *mut *mut c_void,
+    out_size: *mut u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    if out_buf.is_null() || out_size.is_null() {
+        return EINVAL;
+    }
+    with(EINVAL, |r| {
+        let Some(ctx) = ContextId::new(ctx_id) else {
+            return EINVAL;
+        };
+        // Only the classic side answers here. A venus context has its own journal and has not
+        // been taught to export one yet; answering an empty blob for it would tell the VMM the
+        // context was rebuilt when nothing had been.
+        let Some(bytes) = r.vrend_journal_export(ctx) else {
+            return ENOENT;
+        };
+        match malloc_bytes(&bytes) {
+            // SAFETY: both checked non-null above; the VMM's contract is that they are writable,
+            // and the buffer becomes its to `free`.
+            Some(p) => unsafe {
+                *out_buf = p;
+                *out_size = bytes.len() as u64;
+                0
+            },
+            None => ENOMEM,
+        }
+    })
+}
+
+/// A copy of `bytes` the caller will `free`, or `None` if the allocation failed.
+///
+/// The ABI's contract is a `malloc`ed buffer, which is why this is not a `Vec`: the VMM is C on
+/// the other side of this call and frees it with `free`.
+fn malloc_bytes(bytes: &[u8]) -> Option<*mut c_void> {
+    if bytes.is_empty() {
+        // Not an error, and not a null pointer either: a caller handed a null buffer reads it as
+        // failure. One byte nobody looks at costs less than that ambiguity.
+        let p = unsafe { libc::malloc(1) };
+        return (!p.is_null()).then_some(p);
+    }
+    let p = unsafe { libc::malloc(bytes.len()) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `p` is a fresh allocation of exactly `bytes.len()` bytes and cannot overlap.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len()) };
+    Some(p)
 }
 
 #[unsafe(no_mangle)]

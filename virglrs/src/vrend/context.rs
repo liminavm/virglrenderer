@@ -28,7 +28,7 @@ use super::gl::{
     ImageUnit, ProgramName, QueryName, SamplerName, ShaderName, TextureName, TextureUnit,
     TransformFeedbackName, UniformLocation, VertexArrayName,
 };
-use super::journal::{Census, Retained, Seq, StateKey, state_key};
+use super::journal::{Census, Entry, Retained, Seq, StateKey, Step, order, state_key};
 use super::pipe::slots::{
     MAX_COLOR_BUFS, MAX_CONSTANT_BUFFERS, MAX_SAMPLERS, MAX_SHADER_BUFFERS, MAX_SHADER_IMAGES,
     MAX_VIEWPORTS,
@@ -671,6 +671,14 @@ pub struct SubContext {
     blit_fbs: [FramebufferName; 2],
     vao: VertexArrayName,
     objects: Objects,
+    /// Where this sub-context's own creation sits in the journal, so that a rebuild makes it
+    /// before replaying anything into it.
+    ///
+    /// The command itself is not retained, unlike an object's: `CREATE_SUB_CTX` carries nothing
+    /// but the id this is filed under, so keeping its dwords would be storing that number a
+    /// second time. Zero means the context made this sub-context itself rather than the guest
+    /// asking for it -- true only of sub-context 0, which a fresh context already has.
+    created_at: Seq,
     /// The last command that set each slot of this sub-context's current state.
     ///
     /// Latest-wins per slot, and it lives here rather than in a per-context log so that
@@ -770,6 +778,7 @@ impl SubContext {
             blit_fbs,
             vao,
             objects: Objects::default(),
+            created_at: Seq::default(),
             state: BTreeMap::new(),
             long_shader: [None; ShaderStage::COUNT],
             blend: None,
@@ -1091,7 +1100,8 @@ impl Context {
         }
         let gl_ctx = host.winsys.create_context(host.version, Some(host.share))?;
         host.make_current(id, &gl_ctx);
-        let sub = SubContext::new(host.gl, gl_ctx);
+        let mut sub = SubContext::new(host.gl, gl_ctx);
+        sub.created_at = self.seq.advance();
         self.subs.insert(id, sub);
         Ok(())
     }
@@ -1142,6 +1152,36 @@ impl Context {
             }
         }
         c
+    }
+
+    /// Everything this context retained, in the order a rebuild must replay it.
+    ///
+    /// `typed` supplies the `PIPE_RESOURCE_SET_TYPE` of each live blob, which lives on the
+    /// resource table rather than here: one table serves every context, so a context cannot walk
+    /// it alone.
+    pub fn journal<'a>(&'a self, typed: impl Iterator<Item = &'a Retained>) -> Vec<Entry<'a>> {
+        let subs = self.subs.iter().flat_map(|(id, sub)| {
+            // Sub-context 0 is never created: a fresh context already has it, and asking for it
+            // again would be asking the rebuild to do what it has already done.
+            let create = (sub.created_at != Seq::default())
+                .then_some(Entry { seq: sub.created_at, step: Step::CreateSub(id.0) });
+            let objects = sub.objects.retained().map(|at| Entry {
+                seq: at.seq,
+                step: Step::Feed { sub: id.0, chunks: &at.chunks },
+            });
+            let state = sub.state.values().map(|at| Entry {
+                seq: at.seq,
+                step: Step::Feed { sub: id.0, chunks: &at.chunks },
+            });
+            create.into_iter().chain(objects).chain(state)
+        });
+        // A resource's type is not a sub-context's business -- it is filed under the one the
+        // command arrived on, which is the current one at that point in the order anyway.
+        let types = typed.map(|at| Entry {
+            seq: at.seq,
+            step: Step::Feed { sub: self.current.0, chunks: &at.chunks },
+        });
+        order(subs.chain(types))
     }
 
     fn poison(&mut self, f: Fault) -> Result<(), Fault> {
