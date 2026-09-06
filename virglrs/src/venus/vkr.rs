@@ -63,6 +63,10 @@ pub struct Vkr {
     contexts: BTreeMap<ContextId, Arc<Mutex<Context>>>,
     /// The next context's generation. See [`ContextKey`]: it counts occupants of context ids, so
     /// that a key made for one occupant cannot name the next one to arrive under the same id.
+    ///
+    /// The only counter of occupants there is. Whatever else has to tell one occupant of an id
+    /// from the next -- the memory ledger's slots, a blob's exporter -- holds the key rather than
+    /// counting again, because a second count is a second answer free to disagree with this one.
     generations: u64,
     /// The commands this build does not serve yet, counted across every context. Kept on the root
     /// because it answers a question about the build, not about a guest.
@@ -105,11 +109,16 @@ impl ContextKey {
         self.id
     }
 
-    /// A key for a context no table stood up. Tests build a `Context` directly, and one that
-    /// never shares an id with another needs no generation to tell them apart.
+    /// A key for a context no table stood up, for tests that build a `Context` or an
+    /// [`Account`](super::budget::Account) directly.
+    ///
+    /// Its own counter, so two of these are two occupants even under one id -- which is the
+    /// case worth testing, and the one a fixed generation would quietly make untestable.
     #[cfg(test)]
     pub fn for_test(id: ContextId) -> ContextKey {
-        ContextKey { id, generation: 0 }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ContextKey { id, generation }
     }
 }
 

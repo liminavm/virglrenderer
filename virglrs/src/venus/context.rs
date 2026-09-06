@@ -306,12 +306,11 @@ impl Context {
     }
 
     pub fn new(key: ContextKey, budget: &Arc<Budget>) -> Context {
-        let id = key.id();
         Context {
             key,
             fatal: Arc::new(AtomicBool::new(false)),
             objects: Shared::new(),
-            driver: Driver::new(Account::open(budget, id)),
+            driver: Driver::new(Account::open(budget, key)),
             replay: false,
             dispatched: 0,
             unhandled: 0,

@@ -4190,7 +4190,8 @@ mod tests {
         use super::super::budget::Budget;
         let budget = Budget::with_cap(None, false);
         let one = crate::ids::ContextId::new(1).expect("not zero");
-        let mut d = Driver::new(Account::open(&budget, one));
+        let mut d =
+            Driver::new(Account::open(&budget, crate::venus::vkr::ContextKey::for_test(one)));
 
         let surface = Surface::scanout(64, 8, PixelFormat::Bgra, 256).expect("the system minted");
         let extent = surface.alloc_size();
@@ -4682,7 +4683,8 @@ mod tests {
 
         let budget = Budget::with_cap(None, false);
         let one = crate::ids::ContextId::new(1).expect("not zero");
-        let mut d = Driver::new(Account::open(&budget, one));
+        let mut d =
+            Driver::new(Account::open(&budget, crate::venus::vkr::ContextKey::for_test(one)));
         let mut fns = crate::vulkan::Device::default();
         fns.plant_vkAllocateMemory(allocate);
         fns.plant_vkMapMemory(map);
