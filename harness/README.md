@@ -807,3 +807,20 @@ means the guest expands templates before encoding and the plain path is the only
 
 **`vrend-av1.score` is stale.** It predates scoring at the format's own bytes per texel and cannot
 be re-recorded here; alface has no AV1 silicon. It has to be redone on couve.
+
+**The census reads the memory, so an image's texels can escape it.** It hashes the allocation's
+pages, which is the whole of the truth for a buffer and for a LINEAR image, and none of it for an
+OPTIMAL image on KosmicKrisp — the driver keeps those texels in a private texture and the pages
+stay zero. Nine entries across `synoik` and `synoik-glclient` are pinned at all-zeros for that
+reason, and a real divergence in any of them would not move the score. Recovering them needs a
+census that copies out of the `VkImage` — a transfer to a host-visible staging buffer on a
+transient command buffer, hashed from there — rather than out of the memory the image was bound
+to. Until it exists the venus score is a weak oracle on those two corpora, and the pixel gate is
+the one that carries them.
+
+**No case makes a shared blob outlive the allocation it came from.** Every host-visible venus
+allocation is minted pages the blob holds a share of, so the guest's `vkFreeMemory` retires the
+allocation while the mapping stays good — which is the point of the design and is exactly what no
+fixture exercises, because a recorded guest frees its memory last. It wants a synthetic
+`--rebuild` case: export a blob, free the memory, then read through the published address and get
+the bytes rather than a fault. Written by hand against the replayer, not captured.
