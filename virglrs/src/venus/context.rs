@@ -36,14 +36,16 @@ use super::proto::types::{
     vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage,
     vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
-    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults, vn_command_vkCmdDraw,
-    vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer,
-    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool,
-    vn_command_vkCmdSetScissor, vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp,
-    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateDescriptorPool,
-    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
-    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
-    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
+    vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdEndQuery,
+    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetScissor,
+    vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp, vn_command_vkCreateBuffer,
+    vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
+    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
+    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
+    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
+    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
@@ -1932,12 +1934,18 @@ impl Commands for Handlers<'_> {
         // stream still decodes.
         {
             let objects = self.objects.borrow();
-            if objects.get(id).is_some() || objects.is_ghost(id) {
+            if objects.get(id).is_some() || objects.is_ghost(id) || objects.is_fiction(id) {
                 return;
             }
         }
-        let handle = if host.0 == 0 { HostHandle(id.0) } else { host };
-        if self.objects.borrow_mut().add(id, ty, handle, owner).is_err() {
+        if host.0 == 0 {
+            // The fiction, and it goes in as a fiction -- not as an object with the guest's id
+            // where a host handle belongs. It is a decode convenience and there is nothing behind
+            // it to destroy, so it must not reach the driver: see `objects::Slot::Fiction`.
+            self.objects.borrow_mut().add_fiction(id, ty, owner);
+            return;
+        }
+        if self.objects.borrow_mut().add(id, ty, host, owner).is_err() {
             self.reject = Some("named an object it cannot have");
         }
     }
@@ -3777,6 +3785,32 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    /// The same run, compiled from one stage instead of many.
+    ///
+    /// Written out rather than folded into a macro with the graphics one: the two differ only in
+    /// the create-info type, which is exactly the argument a macro would have to be told, and
+    /// [`Driver::create_pipelines`] is already generic over it.
+    fn vkCreateComputePipelines(&mut self, args: &mut vn_command_vkCreateComputePipelines<'_>) {
+        let infos = args.pCreateInfos();
+        let ids = args.pPipelines();
+        // Read before the shadow is borrowed: see `vkEnumeratePhysicalDevices`.
+        let (device, cache, alloc) = (args.device, args.pipelineCache, args.pAllocator);
+        let out = args.handle_pPipelines_mut();
+        let host = self.driver.create_pipelines(
+            device,
+            |d| d.vkCreateComputePipelines(),
+            cache,
+            infos,
+            alloc,
+            out,
+        );
+        args.ret = host.err().unwrap_or(VkResult::VK_SUCCESS);
+        if host.is_err() {
+            eprintln!("[virglrs] vkCreateComputePipelines refused by the driver");
+            self.ghost_ids(ids);
+        }
+    }
+
     simple_destroy!(vkDestroyPipeline, vn_command_vkDestroyPipeline, pipeline);
 
     // -------------------------------------------------------------- binding and updating
@@ -3936,6 +3970,16 @@ impl Commands for Handlers<'_> {
             args.instanceCount,
             args.firstVertex,
             args.firstInstance,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDispatch(&mut self, args: &mut vn_command_vkCmdDispatch<'_>) {
+        let done = self.driver.cmd_dispatch(
+            args.commandBuffer,
+            args.groupCountX,
+            args.groupCountY,
+            args.groupCountZ,
         );
         self.recorded(done);
     }
@@ -10972,6 +11016,218 @@ mod tests {
                 "every id in a refused run is a ghost, not just the first"
             );
         }
+    }
+
+    /// The compute half of the pipeline pair, and the one command a compute pipeline exists for.
+    ///
+    /// Both were unserved, which is worse here than a missing feature: an unserved create still
+    /// registers its ids (see `object_created`), so a guest that built a compute pipeline poisoned
+    /// its context and then took the host process down on the way out. What pins them is what the
+    /// driver was called with -- a handler wired to the graphics entry point, or one that passed
+    /// the group counts in the wrong order, would look identical from any census.
+    #[test]
+    fn the_compute_pipeline_pair_reaches_the_driver_as_the_guest_sent_it() {
+        use super::super::proto::types::{
+            VkAllocationCallbacks, VkCommandBuffer, VkCommandPool, VkComputePipelineCreateInfo,
+            VkDevice, VkPipeline, VkPipelineCache, vn_command_vkCmdDispatch,
+            vn_command_vkCreateComputePipelines,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        const CACHE: u64 = 0x5ca1;
+        const IDS: [u64; 2] = [0x41, 0x42];
+        const HOST: [u64; 2] = [0xc001, 0xc002];
+
+        #[derive(Default)]
+        struct Saw {
+            runs: Vec<(u32, u64)>,
+            dispatches: Vec<(u64, u32, u32, u32)>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn create(
+            _device: VkDevice,
+            cache: VkPipelineCache,
+            count: u32,
+            _infos: *const VkComputePipelineCreateInfo,
+            _alloc: *const VkAllocationCallbacks,
+            out: *mut VkPipeline,
+        ) -> VkResult {
+            // SAFETY: the wrapper passes the shadow slice's own pointer and length.
+            let outs = unsafe { core::slice::from_raw_parts_mut(out, count as usize) };
+            for (slot, host) in outs.iter_mut().zip(HOST) {
+                *slot = VkPipeline(host);
+            }
+            SAW.with_borrow_mut(|s| s.runs.push((count, cache.0)));
+            VkResult::VK_SUCCESS
+        }
+
+        unsafe extern "C" fn dispatch(cb: VkCommandBuffer, x: u32, y: u32, z: u32) {
+            SAW.with_borrow_mut(|s| s.dispatches.push((cb.0, x, y, z)));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCreateComputePipelines(create);
+        fns.plant_vkCmdDispatch(dispatch);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let infos = [VkComputePipelineCreateInfo::default(); IDS.len()];
+        let mut wire = IDS.map(VkPipeline);
+        let mut shadow = [VkPipeline(0); IDS.len()];
+        let mut args = vn_command_vkCreateComputePipelines::default();
+        args.device = VkDevice(DEVICE);
+        args.pipelineCache = VkPipelineCache(CACHE);
+        args.plant_pCreateInfos(&infos);
+        args.plant_pPipelines(&mut wire);
+        args.plant_handle_pPipelines(&mut shadow);
+        h.vkCreateComputePipelines(&mut args);
+
+        assert!(h.reject.is_none(), "a served command refuses nothing");
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+        SAW.with_borrow(|s| {
+            assert_eq!(s.runs, vec![(IDS.len() as u32, CACHE)], "one run, the guest's own cache");
+        });
+        assert_eq!(shadow.map(|p| p.0), HOST, "the driver's handles land in the shadow");
+        assert_eq!(wire.map(|p| p.0), IDS, "and the guest's ids are left alone");
+
+        // Group counts in three separate arguments: a wrapper that reordered them would still
+        // record a dispatch, and every count-based oracle would read the same.
+        let mut args = vn_command_vkCmdDispatch {
+            commandBuffer: VkCommandBuffer(CB.0),
+            groupCountX: 5,
+            groupCountY: 6,
+            groupCountZ: 7,
+            ..Default::default()
+        };
+        h.vkCmdDispatch(&mut args);
+        assert!(h.reject.is_none(), "a recorded command on a live command buffer");
+        SAW.with_borrow(|s| assert_eq!(s.dispatches, vec![(CB.0, 5, 6, 7)]));
+
+        h.driver.abandon_planted();
+    }
+
+    /// An id no handler decided never reaches the driver as a handle.
+    ///
+    /// The unserved command's fiction lets the rest of a stream decode by letting the guest's id
+    /// stand in for a handle. It went into the object table as an ordinary object, so a context
+    /// teardown walked it out with everything else and handed the number the guest had chosen to
+    /// `vkDestroyPipeline` -- which segfaulted the host on a guest's say-so, and did it for real:
+    /// a client sending `vkCreateComputePipelines` (unserved then) killed the worker process on
+    /// the way out.
+    ///
+    /// The oracle is the teardown list, not the destroy call, because that is where the invariant
+    /// lives: `Doomed` is built out of the arena, and the arena holds driver handles only. A fix
+    /// that filtered the fiction at the one destroy site would leave the next path to find it.
+    #[test]
+    fn an_unserved_creates_invented_handle_never_reaches_the_driver() {
+        use super::super::cs::{Lookup, Objects};
+
+        const DEVICE: u64 = 7;
+        const PIPELINE: u64 = 0x4242;
+
+        let objects = Shared::new();
+        objects
+            .borrow_mut()
+            .add(ObjectId(DEVICE), VkObjectType::VK_OBJECT_TYPE_DEVICE, HostHandle(0x9000), None)
+            .expect("a device for it to hang off");
+
+        let mut driver = Driver::new(Account::for_test(None));
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        // What the generated dispatch does after a command no handler served: the shadow was never
+        // written, so the handle is zero.
+        h.object_created(
+            VkObjectType::VK_OBJECT_TYPE_PIPELINE,
+            ObjectId(PIPELINE),
+            HostHandle(0),
+            Some(ObjectId(DEVICE)),
+        );
+
+        // The fiction still does its one job: a later command naming the id decodes, against the
+        // id itself. Naming it as another kind of object does not.
+        let table = objects.borrow();
+        assert_eq!(
+            table.lookup(ObjectId(PIPELINE), VkObjectType::VK_OBJECT_TYPE_PIPELINE.0),
+            Lookup::Found(HostHandle(PIPELINE)),
+            "the rest of the stream still decodes"
+        );
+        assert_eq!(
+            table.lookup(ObjectId(PIPELINE), VkObjectType::VK_OBJECT_TYPE_BUFFER.0),
+            Lookup::Missing,
+            "an unserved create does not buy the right to name the id as something else"
+        );
+        drop(table);
+
+        let doomed = objects.borrow_mut().take_all();
+        assert!(
+            doomed.iter().all(|d| d.id != ObjectId(PIPELINE)),
+            "the teardown must not name an object no driver ever made: {doomed:?}"
+        );
+        assert!(
+            doomed.iter().any(|d| d.id == ObjectId(DEVICE)),
+            "and the real objects around it are still torn down"
+        );
     }
 
     /// The query commands are served through the record their create left, and refused without
