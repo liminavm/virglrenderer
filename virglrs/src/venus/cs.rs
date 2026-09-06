@@ -21,7 +21,7 @@
 //!   going. Generated code cannot tell the two apart, and must not: both mean "do not call the
 //!   handler, do not encode a reply". An id the guest simply invented is *hard*, not soft.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bumpalo::Bump;
@@ -224,6 +224,16 @@ pub struct Decoder<'a> {
     /// The ghost this command named, if it named one. Per-command: the dispatch that skips
     /// the command takes it, and says which object it was.
     ghost: Cell<Option<ObjectId>>,
+    /// Every object this command resolved, in the order it named them.
+    ///
+    /// The recorder's half of the journal: an entry has to know what its command referenced, and
+    /// this is the one place every handle on the wire passes through. Collecting here rather than
+    /// re-reading the arguments is the point -- a second parse would be a second opinion about a
+    /// value already reconciled, and the two could disagree.
+    ///
+    /// Interior mutability for the same reason `ghost` has it: the generated decoders reach this
+    /// holding only a shared borrow.
+    resolved: RefCell<Vec<ObjectId>>,
 }
 
 /// What became of one command, as the generated dispatch reports it.
@@ -261,7 +271,18 @@ impl<'a> Decoder<'a> {
             objects,
             hard,
             ghost: Cell::new(None),
+            resolved: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Take the objects this command named, and start collecting again.
+    ///
+    /// Drained unconditionally after every dispatch, whatever the verdict. A command that ghosted
+    /// or was rejected still resolved ids on its way there, and leaving them would hand them to
+    /// whichever command is recorded next -- an entry claiming to reference objects it never
+    /// mentioned, which the export would then drag creates in for.
+    pub fn take_resolved(&self) -> Vec<ObjectId> {
+        std::mem::take(&mut self.resolved.borrow_mut())
     }
 
     /// Bytes consumed so far. The recorder stamps a command as the slice between the position
@@ -391,7 +412,10 @@ impl<'a> Decoder<'a> {
             return HostHandle(0);
         }
         match self.objects.lookup(id, ty) {
-            Lookup::Found(handle) => handle,
+            Lookup::Found(handle) => {
+                self.resolved.borrow_mut().push(id);
+                handle
+            }
             Lookup::Ghost => {
                 self.ghost.set(Some(id));
                 HostHandle(0)

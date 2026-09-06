@@ -21,6 +21,7 @@ use super::cs::Handle;
 use super::cs::{AllOfIt, Decoder, Dispatched, Encoder};
 use super::cs::{Guest, HostHandle, ObjectId};
 use super::driver::{self, Driver, ExportError, Exported, MemoryError, NoSyncFd};
+use super::journal::Journal;
 use super::monitor::Monitor;
 use super::objects::{ObjectKey, Shared};
 use super::proto::serialize::{Commands, vn_command_name, vn_dispatch_command};
@@ -151,6 +152,9 @@ pub struct Context {
     /// `None` until a ring asks. Once started it runs until the context goes, even if every
     /// monitored ring is destroyed -- see [`Monitor`].
     monitor: Option<Monitor>,
+    /// What this context would have to be told again to be itself. Written by the dispatch loop as
+    /// commands go by; read only by an export.
+    journal: Journal,
 }
 
 /// A context must be `Send`: each one is owned by whoever is driving it, and a ring's thread will
@@ -266,6 +270,7 @@ impl Context {
             reply: None,
             wait_ring: Arc::new(WaitRing::default()),
             monitor: None,
+            journal: Journal::new(),
         }
     }
 
@@ -391,6 +396,8 @@ impl Context {
             current_ring: on,
             reply,
             replaying: replay,
+            note: None,
+            journal: &mut self.journal,
         };
 
         let suspended = run_batch(&mut h, buf, fatal, &mut counts, 0);
@@ -722,6 +729,14 @@ fn run_batch(
         let answer = enc.pos();
         counts.dispatched += 1;
 
+        // The recorder's raw materials, drained before any branch below can leave the loop. A
+        // command that ghosted or was rejected still resolved ids and may still have added
+        // objects; leaving either behind would hand them to whichever command is recorded next,
+        // which would then claim to have created or named something it never mentioned.
+        let named = dec.take_resolved();
+        let made = objects.borrow_mut().take_added();
+        let note = h.note.take();
+
         match verdict {
             Dispatched::Served => {}
             // A malformed argument, or a shape the generator has no decoder for. Either way
@@ -824,8 +839,199 @@ fn run_batch(
                 break;
             }
         }
+
+        // The command worked, in full, and nothing after this can undo it -- which is the only
+        // point at which it is safe to record. Every branch above either breaks (the command is
+        // not part of any world worth rebuilding) or, for a wait, leaves the position uncommitted
+        // so the command is dispatched again; recording earlier would journal a command that never
+        // happened, or the same command twice.
+        record(h, &buf[at..dec.pos()], cmd, named, made, note);
     }
     suspended
+}
+
+/// Keep, or deliberately drop, one command that has just been served.
+///
+/// The recorder is not gated on `replaying`: a replayed command has to re-record, or a restored
+/// context could never be snapshotted again -- and the harness's `--rebuild` gate is exactly the
+/// claim that exporting, restoring and exporting again yields the same journal.
+fn record(
+    h: &mut Handlers<'_>,
+    wire: &[u8],
+    cmd: VkCommandTypeEXT,
+    named: Vec<ObjectId>,
+    made: Vec<ObjectKey>,
+    note: Option<Note>,
+) {
+    // The wire spells a command type unsigned and the generated enum signs it. Reconciled once,
+    // here, rather than at each call below: the journal's format is the one that leaves this
+    // function, so this is the boundary that knows which reading is the truth.
+    let cmd_type = cmd.0 as u32;
+
+    // The envelope, not its contents. `vkExecuteCommandStreamsMESA` names streams whose commands
+    // the nested `run_batch` records one by one as it dispatches them; keeping the envelope as
+    // well would replay every one of them twice. This is the one command whose own bytes are
+    // worth nothing because its effects are recorded elsewhere.
+    if cmd == VkCommandTypeEXT::VK_COMMAND_TYPE_vkExecuteCommandStreamsMESA_EXT {
+        h.journal.skip(cmd_type);
+        return;
+    }
+
+    // A ring's own commands carry the reply flag the guest set, and a replay has no reply stream
+    // to answer into. Stripping it here rather than at replay keeps the stored bytes honest about
+    // what will be fed back: the loop's `wants_reply` reads a flag the journal has already
+    // cleared, which is why a replayed stream needs no reply buffer at all.
+    let wire = strip_reply_flag(wire);
+
+    let key_of = |ids: &[ObjectId]| -> Vec<ObjectKey> {
+        let t = h.objects.borrow();
+        ids.iter().filter_map(|id| t.key_of(*id)).collect()
+    };
+
+    match note {
+        Some(Note::RingCreated(ring)) => {
+            h.journal.ring_created(cmd_type, &wire, ring);
+            return;
+        }
+        Some(Note::RingGone(ring)) => {
+            // The destroy is not kept: a ring that is gone has nothing to rebuild, and every
+            // entry that belonged to it goes with it.
+            h.journal.ring_gone(ring);
+            h.journal.skip(cmd_type);
+            return;
+        }
+        Some(Note::PoolReset(pool)) => {
+            let key = {
+                let t = h.objects.borrow();
+                t.id_of_handle(VkObjectType::VK_OBJECT_TYPE_COMMAND_POOL, pool)
+                    .and_then(|id| t.key_of(id))
+            };
+            if let Some(key) = key {
+                h.journal.pool_reset(key);
+            }
+            // The reset itself rebuilds nothing: replaying the allocates that survive it produces
+            // buffers already in the state a reset leaves them.
+            h.journal.skip(cmd_type);
+            return;
+        }
+        None => {}
+    }
+
+    // Everything a running ring's stream carries replays on that ring's decoder. A command that
+    // arrived on the context's own stream replays there, which is `ring_key` 0.
+    let route = h.current_ring.map_or(0, |r| r.0);
+
+    // Where a ring's answers go: state a later command of the same kind replaces outright, rather
+    // than adding to. Kept per ring and per command, so a set followed by a seek keeps both.
+    if matches!(
+        cmd,
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkSetReplyCommandStreamMESA_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkSeekReplyCommandStreamMESA_EXT
+    ) {
+        h.journal.ring_latest(cmd_type, &wire, route);
+        return;
+    }
+
+    // A create is not a list to keep in step with the generator: it is any command the object
+    // table grew under, which the table itself just said. A command that made nothing is not one,
+    // however it is spelled.
+    if !made.is_empty() {
+        h.journal.created(cmd_type, &wire, made, key_of(&named));
+        return;
+    }
+
+    if let Some(class) = recording_class(cmd) {
+        // The buffer is the first object the command named, which is where every one of these
+        // spells it -- `vkCmd*` takes it as its first argument, and so do begin, end and reset.
+        // Taken from what the decoder resolved rather than read off the wire again, so the
+        // recorder and the dispatch cannot disagree about which buffer this was.
+        let Some(&buffer) = named.first() else {
+            h.journal.skip(cmd_type);
+            return;
+        };
+        let Some(buffer) = h.objects.borrow().key_of(buffer) else {
+            h.journal.skip(cmd_type);
+            return;
+        };
+        let refs = key_of(named.get(1..).unwrap_or_default());
+        h.journal.recorded(cmd_type, &wire, buffer, class == Recording::Resets, refs);
+        return;
+    }
+
+    if mutates(cmd) {
+        h.journal.mutated(cmd_type, &wire, key_of(&named), Vec::new());
+        return;
+    }
+
+    // Everything else. Not a hole by assumption -- the census counts these by type, so what we
+    // drop is a list someone can read rather than a number to be reassured by. A submission, a
+    // wait, a query, a doorbell: state the guest reproduces itself, or transport that has already
+    // happened.
+    h.journal.skip(cmd_type);
+}
+
+/// Clear `VK_COMMAND_GENERATE_REPLY_BIT_EXT` from a command's stored bytes.
+///
+/// A replay has no reply stream, and the dispatch loop refuses a command that wants one where
+/// there is none. Stripping at record time rather than at replay is what makes that refusal a real
+/// check on the guest rather than something replay has to be excused from.
+///
+/// The flag is the second word of every command header, so a command whose bytes do not even reach
+/// that far is not one we can keep -- and never one we recorded, since the loop breaks on a short
+/// header before dispatching.
+fn strip_reply_flag(wire: &[u8]) -> Vec<u8> {
+    let mut out = wire.to_vec();
+    if let Some(flags) = out.get_mut(4..8) {
+        let cleared = u32::from_le_bytes(flags.try_into().expect("four bytes")) & !GENERATE_REPLY;
+        flags.copy_from_slice(&cleared.to_le_bytes());
+    }
+    out
+}
+
+/// Whether a command is part of a command buffer's recording, and whether it discards what was
+/// recorded before it.
+#[derive(PartialEq, Eq)]
+enum Recording {
+    /// It adds to the recording.
+    Adds,
+    /// It starts the recording over: `vkBeginCommandBuffer` and `vkResetCommandBuffer`.
+    Resets,
+}
+
+/// Classify by name rather than by a four-hundred-arm match.
+///
+/// Every command that records into a buffer is spelled `vkCmd*` -- that is a naming rule of the
+/// Vulkan specification, not a coincidence of this generator, and it is why a new extension's
+/// commands are recorded without this function being touched. The three that bracket a recording
+/// are named individually because nothing in their spelling says so.
+///
+/// `vkFreeCommandBuffers` is deliberately absent: it destroys the buffers, which takes their keys
+/// with them, and every recording naming one stops being true on its own.
+fn recording_class(cmd: VkCommandTypeEXT) -> Option<Recording> {
+    match cmd {
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT
+        | VkCommandTypeEXT::VK_COMMAND_TYPE_vkResetCommandBuffer_EXT => Some(Recording::Resets),
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT => Some(Recording::Adds),
+        _ => vn_command_name(cmd).filter(|n| n.starts_with("vkCmd")).map(|_| Recording::Adds),
+    }
+}
+
+/// Commands that write into objects they do not own, and so are true only while every object they
+/// named is still there.
+///
+/// A short explicit list, unlike the recordings: there is no naming rule that picks these out, and
+/// a wrong guess here is not a missing entry but a stale one -- an entry claiming to describe a
+/// descriptor set that has been freed and reallocated.
+fn mutates(cmd: VkCommandTypeEXT) -> bool {
+    matches!(
+        cmd,
+        VkCommandTypeEXT::VK_COMMAND_TYPE_vkUpdateDescriptorSets_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkUpdateDescriptorSetWithTemplate_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindBufferMemory2_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory_EXT
+            | VkCommandTypeEXT::VK_COMMAND_TYPE_vkBindImageMemory2_EXT
+    )
 }
 
 /// Run the streams one `vkExecuteCommandStreamsMESA` named, seeking the reply stream per stream.
@@ -978,6 +1184,34 @@ pub struct Handlers<'a> {
     /// A created ring reads it: replay restores head and status words the host would otherwise
     /// insist on owning, and resumes the read cursor from them.
     replaying: bool,
+    /// What the recorder could not work out for itself, left by the handler that knows.
+    ///
+    /// A message, like `wait` and `execute`, and for a narrower version of the same reason: the
+    /// loop can see what a command created (the object table counted it) and what it named (the
+    /// decoder collected it), but a ring is not an object in that table and a pool reset names its
+    /// pool among several handles the loop cannot tell apart. Rather than have the loop re-read
+    /// arguments the handler already decoded -- a second opinion about a reconciled value -- the
+    /// handler says.
+    note: Option<Note>,
+    /// Where a command that still describes live state is kept, so the context can be rebuilt.
+    journal: &'a mut Journal,
+}
+
+/// What a handler tells the recorder about the command it just served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Note {
+    /// It made this ring. Owned by the ring, and replayed on the context's own decoder, because
+    /// when it replays the ring does not exist yet.
+    RingCreated(u64),
+    /// It destroyed this ring, and everything the ring owned goes with it.
+    RingGone(u64),
+    /// It reset this command pool, discarding every recording made from it without invalidating a
+    /// single buffer -- so no key changes and only the journal can be told.
+    ///
+    /// The host handle, because that is what the decoded argument holds: a reset keeps no shadow
+    /// of the guest's id, and picking the pool out of the ids the command resolved would mean
+    /// knowing which argument position it sat in. The table answers by handle and type instead.
+    PoolReset(HostHandle),
 }
 
 impl Handlers<'_> {
@@ -2071,6 +2305,7 @@ impl Commands for Handlers<'_> {
         // where the caller knows whether it was replaying -- and doing it there rather than in the
         // handler is why a handler never needs to reach the renderer's locks. See `Vkr::promote`.
         self.rings.insert(id, RingSlot::Idle(ring));
+        self.note = Some(Note::RingCreated(args.ring));
     }
 
     fn vkDestroyRingMESA(&mut self, args: &mut vn_command_vkDestroyRingMESA<'_>) {
@@ -2086,8 +2321,11 @@ impl Commands for Handlers<'_> {
         // context lock this dispatch is holding.
         match self.rings.remove(&id) {
             None => self.reject = Some("destroyed a ring that was never created"),
-            Some(RingSlot::Idle(_)) => {}
-            Some(RingSlot::Running(t)) => drop(t.stop()),
+            Some(RingSlot::Idle(_)) => self.note = Some(Note::RingGone(args.ring)),
+            Some(RingSlot::Running(t)) => {
+                drop(t.stop());
+                self.note = Some(Note::RingGone(args.ring));
+            }
         }
     }
 
@@ -3631,6 +3869,11 @@ impl Commands for Handlers<'_> {
             args.commandPool,
             args.flags,
         );
+        // The journal's copy of the recycling. Every buffer this pool handed out keeps its handle
+        // and its key, so nothing above can tell the recorder that their recordings are gone.
+        if args.ret == VkResult::VK_SUCCESS {
+            self.note = Some(Note::PoolReset(args.commandPool.host()));
+        }
     }
 
     fn vkResetDescriptorPool(&mut self, args: &mut vn_command_vkResetDescriptorPool<'_>) {
@@ -4563,6 +4806,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -4578,6 +4822,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let device = VkDevice(DEVICE);
 
@@ -5353,6 +5599,7 @@ mod tests {
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
                 let mut monitor = None;
+                let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -5368,6 +5615,8 @@ mod tests {
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
                 };
                 h.vkGetMemoryResourcePropertiesMESA($args);
                 h.reject
@@ -5436,6 +5685,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -5451,6 +5701,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetMemoryResourcePropertiesMESA(&mut args);
 
@@ -5493,6 +5745,7 @@ mod tests {
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
                 let mut monitor = None;
+                let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -5508,6 +5761,8 @@ mod tests {
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
                 };
                 #[allow(clippy::redundant_closure_call)]
                 (|h: &mut Handlers| $call(h))(&mut h);
@@ -5597,6 +5852,7 @@ mod tests {
                 let mut ctx_reply = None;
                 #[allow(unused_mut)]
                 let mut monitor = None;
+                let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -5612,6 +5868,8 @@ mod tests {
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
                 };
                 #[allow(clippy::redundant_closure_call)]
                 (|h: &mut Handlers| $call(h))(&mut h);
@@ -5694,6 +5952,7 @@ mod tests {
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
                 let mut monitor = None;
+                let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -5709,6 +5968,8 @@ mod tests {
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
                 };
                 h.vkGetPhysicalDeviceQueueFamilyProperties($args);
                 assert!(h.reject.is_none(), "a served enumeration is not a refusal");
@@ -5813,6 +6074,7 @@ mod tests {
                 let mut rings = BTreeMap::new();
                 let mut ctx_reply = None;
                 let mut monitor = None;
+                let mut jrnl = Journal::new();
                 let mut h = Handlers {
                     objects: &objects,
                     todo: &mut todo,
@@ -5828,6 +6090,8 @@ mod tests {
                     replaying: false,
                     current_ring: None,
                     reply: &mut ctx_reply,
+                    note: None,
+                    journal: &mut jrnl,
                 };
                 h.vkGetPhysicalDeviceToolProperties($args);
                 assert!(h.reject.is_none(), "a short answer is an answer, not a refusal");
@@ -6119,6 +6383,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6134,6 +6399,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let device = VkDevice(DEVICE);
 
@@ -6235,6 +6502,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6250,6 +6518,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut args = vn_command_vkWaitSemaphores { timeout: u64::MAX, ..Default::default() };
@@ -6743,6 +7013,7 @@ mod tests {
         let mut ctx_reply = None;
 
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6758,6 +7029,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         for offset in [0x21000usize, 0x22000] {
             let d = reply_at(offset, 0x100);
@@ -6797,6 +7070,7 @@ mod tests {
             let mut rings = BTreeMap::new();
             let mut ctx_reply = None;
             let mut monitor = None;
+            let mut jrnl = Journal::new();
             let mut h = Handlers {
                 objects: &objects,
                 todo: &mut todo,
@@ -6812,6 +7086,8 @@ mod tests {
                 replaying: false,
                 current_ring: None,
                 reply: &mut ctx_reply,
+                note: None,
+                journal: &mut jrnl,
             };
             let d = asked.map(|(o, s)| reply_at(o, s));
             h.vkSetReplyCommandStreamMESA(&mut SetReply {
@@ -6840,6 +7116,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6855,6 +7132,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let d = reply_at(0, 0x100);
         h.vkSetReplyCommandStreamMESA(&mut SetReply { pStream: Some(&d), ..Default::default() });
@@ -6879,6 +7158,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6894,6 +7174,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkCreateRingMESA(&mut Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() });
         assert_eq!(h.reject, None, "on the context's stream, creating is fine");
@@ -6950,6 +7232,7 @@ mod tests {
         assert_eq!(low as u32, high as u32, "the two ids are identical in their low word");
 
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -6965,6 +7248,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         for ring in [low, high] {
             let mut args = Create { ring, pCreateInfo: Some(&info), ..Default::default() };
@@ -6993,6 +7278,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7008,6 +7294,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut first = Create { ring: 7, pCreateInfo: Some(&info), ..Default::default() };
@@ -7086,6 +7374,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7101,6 +7390,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let info = VkMemoryAllocateInfo {
@@ -7156,6 +7447,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7171,6 +7463,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let mut args = Create { ring: 1, pCreateInfo: Some(&info), ..Default::default() };
         h.vkCreateRingMESA(&mut args);
@@ -7192,6 +7486,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7207,6 +7502,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let mut args = Create { ring: 1, pCreateInfo: None, ..Default::default() };
         h.vkCreateRingMESA(&mut args);
@@ -7314,6 +7611,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7329,6 +7627,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_none(), "a query this driver can answer is not refused");
@@ -7410,6 +7710,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7425,6 +7726,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceProperties(&mut args);
         assert!(h.reject.is_none());
@@ -7459,6 +7762,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7474,6 +7778,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceProperties2(&mut args2);
         assert!(h.reject.is_none());
@@ -7515,6 +7821,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7530,6 +7837,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkEnumerateInstanceVersion(&mut args);
         assert!(h.reject.is_none(), "a real loader answering is never a reason to poison a ring");
@@ -7546,6 +7855,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7561,6 +7871,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkEnumerateInstanceVersion(&mut empty);
         assert!(h.reject.is_some(), "a query with nowhere to answer is refused, not answered");
@@ -7633,6 +7945,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7648,6 +7961,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert!(h.reject.is_none());
@@ -7671,6 +7986,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7686,6 +8002,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkEnumeratePhysicalDeviceGroups(&mut args);
         assert_eq!(
@@ -7813,6 +8131,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7828,6 +8147,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkEnumerateDeviceExtensionProperties(&mut args);
         assert!(h.reject.is_some(), "a layer this renderer has no way to load");
@@ -7887,6 +8208,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7902,6 +8224,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -7919,6 +8243,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7934,6 +8259,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceQueueFamilyProperties2(&mut args);
         assert!(h.reject.is_none());
@@ -7975,6 +8302,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -7990,6 +8318,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetImageDrmFormatModifierPropertiesEXT(&mut args);
 
@@ -8021,6 +8351,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8036,6 +8367,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query with nowhere to put the answer");
@@ -8051,6 +8384,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8066,6 +8400,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         h.vkGetPhysicalDeviceFeatures2(&mut args);
         assert!(h.reject.is_some(), "a query this driver does not export");
@@ -8224,6 +8560,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8239,6 +8576,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateDevice_EXT, 0);
@@ -8305,6 +8644,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8320,6 +8660,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
@@ -8442,6 +8784,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8457,6 +8800,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEnumeratePhysicalDevices_EXT, 0);
@@ -8616,6 +8961,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8631,6 +8977,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // Constants pushed without saying what they are. The decoder cannot make a slice of a
@@ -8775,6 +9123,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8790,6 +9139,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // Count: no array, and the size comes back.
@@ -8922,6 +9273,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -8937,6 +9289,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // Only the first: GTK frees a set at a time, and the second has to survive it.
@@ -9123,6 +9477,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9138,6 +9493,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let cb = VkCommandBuffer(CB.0);
 
@@ -9265,6 +9622,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9280,6 +9638,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let infos = [VkGraphicsPipelineCreateInfo::default(); 3];
@@ -9350,6 +9710,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9365,6 +9726,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateFence_EXT, 0);
@@ -9413,6 +9776,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9428,6 +9792,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let odd = VkShaderModuleCreateInfo { codeSize: 7, ..Default::default() };
@@ -9604,6 +9970,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9619,6 +9986,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // There is no device, so the driver refuses the whole run -- which is the only way to
@@ -9773,6 +10142,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -9788,6 +10158,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let device = VkDevice(DEVICE);
 
@@ -9994,6 +10366,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10009,6 +10382,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let info = VkCommandBufferAllocateInfo {
@@ -10190,6 +10565,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10205,6 +10581,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         // The pool arrives as the host handle the lookup resolved, which is what the driver is
         // keyed by. There is no device registered, so the driver call is skipped -- the object
@@ -10326,6 +10704,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10341,6 +10720,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyDevice_EXT, 0);
         w.extend_from_slice(&DEVICE.to_le_bytes());
@@ -10480,6 +10861,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10495,6 +10877,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let mut w = header(VkCommandTypeEXT::VK_COMMAND_TYPE_vkDestroyInstance_EXT, 0);
         w.extend_from_slice(&INSTANCE.to_le_bytes());
@@ -10565,6 +10949,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10580,6 +10965,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         // Driven over the wire rather than by calling the handler, because the handler is only
         // half of a destroy: the generated lifecycle hook is what tells the table an object died,
@@ -10723,6 +11110,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10738,6 +11126,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let cb = VkCommandBuffer(CB.0);
 
@@ -10876,6 +11266,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -10891,6 +11282,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // What the decoder would have built: the guest's ids on the wire, a shadow of the same
@@ -11015,6 +11408,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -11030,6 +11424,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         let regions = [VkBufferImageCopy::default(); 3];
@@ -11174,6 +11570,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -11189,6 +11586,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
         let cb = VkCommandBuffer(CB.0);
 
@@ -11407,6 +11806,7 @@ mod tests {
         let mut rings = BTreeMap::new();
         let mut ctx_reply = None;
         let mut monitor = None;
+        let mut jrnl = Journal::new();
         let mut h = Handlers {
             objects: &objects,
             todo: &mut todo,
@@ -11422,6 +11822,8 @@ mod tests {
             replaying: false,
             current_ring: None,
             reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
         };
 
         // A submit is two submit infos and a fence. The fence has to arrive as itself: it is the
@@ -11534,5 +11936,79 @@ mod tests {
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
         h.driver.abandon_planted();
+    }
+
+    /// The recorder's classifiers, which decide what a journal keeps. Tested apart from the tee
+    /// because a wrong answer here is silent: the command is still served, and only a restore
+    /// months later finds the entry missing or stale. The tee's own wiring -- drain before every
+    /// branch, commit only after the command has fully succeeded -- is scored by the harness's
+    /// `--rebuild` gate, which is the fixed point this cannot check on its own.
+    mod recorder {
+        use super::super::{GENERATE_REPLY, VkCommandTypeEXT};
+        use super::super::{Recording, mutates, recording_class, strip_reply_flag};
+
+        #[test]
+        fn every_vk_cmd_records_and_the_brackets_say_which_start_over() {
+            let adds = |c| matches!(recording_class(c), Some(Recording::Adds));
+            let resets = |c| matches!(recording_class(c), Some(Recording::Resets));
+
+            assert!(adds(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdBindPipeline_EXT));
+            assert!(adds(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdDraw_EXT));
+            assert!(adds(VkCommandTypeEXT::VK_COMMAND_TYPE_vkEndCommandBuffer_EXT));
+
+            assert!(resets(VkCommandTypeEXT::VK_COMMAND_TYPE_vkBeginCommandBuffer_EXT));
+            assert!(resets(VkCommandTypeEXT::VK_COMMAND_TYPE_vkResetCommandBuffer_EXT));
+
+            // Not a recording. It destroys the buffers, which takes their keys with them, and
+            // every recording naming one stops being true without anything being pruned. Keeping
+            // it would replay a free of buffers the restore has just rebuilt.
+            assert!(
+                recording_class(VkCommandTypeEXT::VK_COMMAND_TYPE_vkFreeCommandBuffers_EXT)
+                    .is_none()
+            );
+            // Nor is a create, however much it looks like a pool operation.
+            assert!(
+                recording_class(VkCommandTypeEXT::VK_COMMAND_TYPE_vkCreateCommandPool_EXT)
+                    .is_none()
+            );
+        }
+
+        /// A command class is one or the other, never both: a recording hangs off its buffer and a
+        /// mutation off every object it wrote, and an entry cannot be true under two rules.
+        #[test]
+        fn nothing_is_both_a_recording_and_a_mutation() {
+            for raw in 0..2000i32 {
+                let cmd = VkCommandTypeEXT(raw);
+                assert!(
+                    !(recording_class(cmd).is_some() && mutates(cmd)),
+                    "{cmd:?} is classified twice"
+                );
+            }
+        }
+
+        #[test]
+        fn the_reply_flag_is_cleared_and_nothing_else_moves() {
+            let mut wire = vec![0u8; 16];
+            wire[0..4].copy_from_slice(&7u32.to_le_bytes());
+            wire[4..8].copy_from_slice(&(GENERATE_REPLY | 0x40).to_le_bytes());
+            wire[8..16].copy_from_slice(&[0xab; 8]);
+
+            let out = strip_reply_flag(&wire);
+            assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 7, "the type is intact");
+            assert_eq!(
+                u32::from_le_bytes(out[4..8].try_into().unwrap()),
+                0x40,
+                "the reply bit goes and every other flag stays"
+            );
+            assert_eq!(&out[8..16], &[0xab; 8], "the arguments are untouched");
+        }
+
+        /// A command with no flags word cannot be a recorded one -- the loop breaks on a short
+        /// header before dispatching -- but the strip must not panic if one ever reaches it.
+        #[test]
+        fn a_wire_too_short_to_have_flags_is_left_alone() {
+            assert_eq!(strip_reply_flag(&[1, 2, 3]), vec![1, 2, 3]);
+            assert_eq!(strip_reply_flag(&[]), Vec::<u8>::new());
+        }
     }
 }
