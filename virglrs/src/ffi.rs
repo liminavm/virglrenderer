@@ -1266,19 +1266,22 @@ pub extern "C" fn virgl_renderer_context_create_fence(
     })
 }
 
+/// The Linux sync-file trio. The VMM never calls them -- rutabaga's generic component wraps them,
+/// and limina's gpu device reaches a fence through the retire callback, never an fd -- and there
+/// is no fd on this host to hand back, so this is a permanent refusal rather than a gap.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_export_fence(_client_fence_id: u64, _fd: *mut c_int) -> c_int {
-    todo_phase!("P5: sync export")
+    todo_phase!("P3: sync-file fd -- not a path macOS has")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_export_signalled_fence() -> c_int {
-    todo_phase!("P5: sync export")
+    todo_phase!("P3: sync-file fd -- not a path macOS has")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_attach_fence(_ctx_id: c_int, _fence_fd: c_int) -> c_int {
-    todo_phase!("P5: sync restore")
+    todo_phase!("P3: sync-file fd -- not a path macOS has")
 }
 
 #[unsafe(no_mangle)]
