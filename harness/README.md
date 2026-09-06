@@ -116,6 +116,16 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   replayed command naming an object the rebuild could not produce is named in the log and fails
   the restore — so "identical" and "complete" are one answer rather than two.
 
+  **A rebuilt world is blank, and the contents gate is what fills it.** A journal rebuilds the
+  objects and the commands that made them, and says nothing about the bytes inside them — a resume
+  that stopped there comes back to a desktop of empty windows. So the gate goes on to read each
+  censused allocation out of the original context, `memory_write` it into the rebuilt one, and
+  require it to read back as itself; the line says how many allocations it restored. It is here and
+  not at end of stream for the reason the rebuild is: writing into a context that no longer exists
+  compares nothing to nothing. What it can see is bounded by what the census can see — the pages,
+  never an OPTIMAL image's private texels (below) — so on the synoik corpora the two IOSurface
+  scanouts are the entries carrying real bytes and the rest agree at all-zeros.
+
   **The venus gate crosses the fence**, unlike the classic one. Part of what a journal retains is
   retained because a *blob*, not the guest, still holds what an entry made, so a rebuilt context
   with no blobs keeps strictly less and the two journals differ by the gate's own gap. So the

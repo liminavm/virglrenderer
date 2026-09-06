@@ -116,6 +116,7 @@ fn errno(e: renderer::Error) -> c_int {
         | AlreadyExported
         | NotHostVisible
         | BlobLargerThanAllocation
+        | ContentLargerThanAllocation
         | ClassicRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
@@ -1678,14 +1679,33 @@ pub extern "C" fn virgl_renderer_limina_memory_read(
     })
 }
 
+/// Put one allocation's captured bytes back, at restore.
+///
+/// The census's counterpart: what `virgl_renderer_limina_memory_read` handed out for an id is
+/// what comes back here, after the journal has rebuilt the allocation that id names. The answer
+/// is success or a code and never a count -- a caller that kept a prefix passes that prefix and
+/// knows what it kept; a buffer *longer* than the allocation is refused, because it means this id
+/// no longer names the allocation the bytes came from.
 #[unsafe(no_mangle)]
 pub extern "C" fn virgl_renderer_limina_memory_write(
-    _ctx_id: u32,
-    _mem_id: u64,
-    _buf: *const c_void,
-    _size: u64,
+    ctx_id: u32,
+    mem_id: u64,
+    buf: *const c_void,
+    size: u64,
 ) -> c_int {
-    todo_phase!("P5: snapshot")
+    let AbiCtx::Context(ctx) = AbiCtx::new(ctx_id) else {
+        return EINVAL;
+    };
+    let Ok(len) = usize::try_from(size) else {
+        return EINVAL;
+    };
+    with_bytes(buf.cast_mut(), len, |src| {
+        with(EINVAL, |r| match r.venus_memory_write(ctx, ObjectId(mem_id), src) {
+            Ok(_) => 0,
+            Err(e) => errno(e),
+        })
+    })
+    .unwrap_or(EINVAL)
 }
 
 #[unsafe(no_mangle)]
