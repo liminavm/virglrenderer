@@ -1052,6 +1052,16 @@ impl Renderer {
         self.venus.as_mut().ok_or(Error::RendererAbsent)?.replay_end(ctx).map_err(venus_error)
     }
 
+    /// One classic context's journal, for the VMM to store beside its own.
+    pub fn vrend_journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
+        self.vrend.as_ref()?.journal_export(id)
+    }
+
+    /// Each classic context's journal size and entry count, round-tripped.
+    pub fn vrend_journal_report(&self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
+        self.vrend.as_ref().map(|v| v.journal_report()).unwrap_or_default()
+    }
+
     /// What the classic renderer has retained for a rebuild.
     pub fn journal_census(&self) -> crate::vrend::journal::Census {
         self.vrend.as_ref().map(|v| v.journal_census()).unwrap_or_default()

@@ -267,6 +267,35 @@ impl Vrend {
         c
     }
 
+    /// One context's journal, as the bytes the VMM stores and hands back.
+    ///
+    /// `None` for a context that is not here. An empty journal still serializes: a context that
+    /// built nothing is a fact worth restoring accurately, and the alternative -- answering
+    /// "no journal" -- is what the VMM reads as "this context is not mine to rebuild".
+    pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
+        let ctx = self.contexts.get(&id)?;
+        let typed =
+            self.resources.values().filter_map(|s| s.resource().and_then(|r| r.typed_by.as_ref()));
+        Some(crate::vrend::journal::serialize(&ctx.journal(typed)))
+    }
+
+    /// Each live context's journal: how many bytes it exports, and how many entries those bytes
+    /// read back as.
+    ///
+    /// The round-trip is the point. A census counts what was retained, which a serializer bug
+    /// would leave untouched; parsing our own output back is the cheapest thing that actually
+    /// exercises the format on a real world rather than on a fixture we wrote.
+    pub fn journal_report(&self) -> Vec<(ContextId, usize, Result<usize, &'static str>)> {
+        self.contexts
+            .keys()
+            .filter_map(|id| {
+                let bytes = self.journal_export(*id)?;
+                let read_back = crate::vrend::journal::parse(&bytes).map(|e| e.len());
+                Some((*id, bytes.len(), read_back))
+            })
+            .collect()
+    }
+
     // ---- contexts ----
 
     pub fn context_create(&mut self, id: ContextId, guest: &dyn Guest) -> Result<(), EglError> {
