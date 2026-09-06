@@ -153,17 +153,23 @@ impl std::error::Error for Error {}
 
 /// Where a blob's storage comes from.
 ///
-/// The ABI discriminates on `blob_id == 0`, one magic number standing between two operations that
-/// have nothing in common: one asks this renderer to supply memory, the other names memory a venus
+/// The wire discriminates on `blob_id == 0`, one magic number standing between two operations that
+/// have nothing in common: one asks this renderer to supply memory, the other names memory a
 /// context already holds and asks for it to be published. Naming them separates the two, and
-/// carries with the export the context whose table the id means something in -- without which the
-/// id names nothing at all.
+/// carries the context the id means something in -- without which the id names nothing at all.
+///
+/// What a nonzero id names is the *context's* to say, and there is nothing in the number to tell
+/// the two cases apart: in a venus context it is a `VkDeviceMemory` the guest allocated, and in a
+/// classic one it is a resource that context's own command stream described with
+/// `PIPE_RESOURCE_CREATE`. So this says what the guest said -- a context and an id -- and
+/// [`Renderer::resource_create_blob`] resolves it against the context's capset, which is the only
+/// place that knows. What it resolves *to* is spelled out: see [`BlobStorage`] and [`Backing`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlobSource {
     /// The guest asks the host for memory it does not yet have.
     HostMinted,
-    /// A venus context publishes device memory it already holds.
-    Exported { ctx: ContextId, mem: BlobId },
+    /// A context publishes something it already holds, under the id it holds it by.
+    InContext { ctx: ContextId, id: BlobId },
 }
 
 /// Host memory the guest maps, or a handle a context exported.
@@ -642,40 +648,89 @@ impl Renderer {
                 Some(shm) => BlobStorage::Minted(shm),
                 None => BlobStorage::Guest,
             },
-            BlobSource::Exported { ctx, mem } => {
-                match self.venus_memory_export(ctx, mem, desc.size) {
-                    Ok((exported, storage, from)) => BlobStorage::Shared {
-                        storage,
-                        caching: if exported.write_back {
-                            Caching::Cached
-                        } else {
-                            Caching::WriteCombining
+            BlobSource::InContext { ctx, id } => match self.blob_capset(ctx)? {
+                CapsetId::Virgl | CapsetId::Virgl2 => {
+                    return self.claim_described(handle, ctx, id, desc, iov);
+                }
+                // A context whose capset names no renderer we have holds nothing, so its ids
+                // name nothing either.
+                CapsetId::Unknown(_) => return Err(Error::RendererUnimplemented),
+                CapsetId::Venus => {
+                    let mem = id;
+                    match self.venus_memory_export(ctx, mem, desc.size) {
+                        Ok((exported, storage, from)) => BlobStorage::Shared {
+                            storage,
+                            caching: if exported.write_back {
+                                Caching::Cached
+                            } else {
+                                Caching::WriteCombining
+                            },
+                            from,
                         },
-                        from,
-                    },
-                    Err(e) => {
-                        // Two failures, one errno at the ABI, and they want opposite
-                        // investigations. The memory not being there says the command that would
-                        // have allocated it never reached us -- the transport is what to look at,
-                        // and the allocation is innocent. The memory being there and the export
-                        // refusing it says the opposite. The guest kernel treats CREATE_BLOB as
-                        // fire-and-forget, so this line is the only account anyone gets of either;
-                        // one line covering both sends the next reader to the wrong half.
-                        let half = match e {
-                            Error::NoAllocation | Error::NoContext => "no such allocation",
-                            _ => "the allocation is there, and the export of it refused",
-                        };
-                        eprintln!(
-                            "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
+                        Err(e) => {
+                            // Two failures, one errno at the ABI, and they want opposite
+                            // investigations. The memory not being there says the command that would
+                            // have allocated it never reached us -- the transport is what to look at,
+                            // and the allocation is innocent. The memory being there and the export
+                            // refusing it says the opposite. The guest kernel treats CREATE_BLOB as
+                            // fire-and-forget, so this line is the only account anyone gets of either;
+                            // one line covering both sends the next reader to the wrong half.
+                            let half = match e {
+                                Error::NoAllocation | Error::NoContext => "no such allocation",
+                                _ => "the allocation is there, and the export of it refused",
+                            };
+                            eprintln!(
+                                "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
                          {} bytes: {half}: {e}",
-                            desc.size,
-                        );
-                        return Err(e);
+                                desc.size,
+                            );
+                            return Err(e);
+                        }
                     }
                 }
-            }
+            },
         };
         self.insert(handle, Backing::Blob { desc, storage }, iov);
+        Ok(())
+    }
+
+    /// Which renderer a blob's id is to be read by. `Err` for a context that is not here, which
+    /// is a guest naming a context it never created.
+    fn blob_capset(&self, ctx: ContextId) -> Result<CapsetId, Error> {
+        self.contexts.get(&ctx).map(|c| c.capset).ok_or(Error::NoContext)
+    }
+
+    /// The classic half of a nonzero `blob_id`: adopt the resource `ctx`'s command stream
+    /// described under it, and publish its pages.
+    ///
+    /// It becomes an ordinary classic resource -- [`Backing::Classic`], vrend's host side under
+    /// the same handle -- because that is what it is. Transfers, draws and views over it work
+    /// with nothing new: the only thing the blob path added was a second way for the guest to
+    /// learn its handle, and a mapping.
+    fn claim_described(
+        &mut self,
+        handle: ResourceHandle,
+        ctx: ContextId,
+        id: BlobId,
+        desc: BlobDesc,
+        iov: Vec<GuestIov>,
+    ) -> Result<(), Error> {
+        let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
+        let args = match v.claim_described(ctx, id, handle, desc.size) {
+            Ok(args) => args,
+            Err(why) => {
+                // The guest kernel treats CREATE_BLOB as fire-and-forget, so this line is the
+                // only account anyone gets of the failure -- and each refusal sends the reader
+                // somewhere different. See [`ClaimRefused`].
+                eprintln!(
+                    "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} blob {id}, \
+                     {} bytes: {why}",
+                    desc.size,
+                );
+                return Err(Error::NoAllocation);
+            }
+        };
+        self.insert(handle, Backing::Classic { args, surface: None }, iov);
         Ok(())
     }
 
@@ -1507,7 +1562,18 @@ impl Renderer {
                 }
                 BlobStorage::Guest => None,
             },
-            Backing::Classic { .. } | Backing::Imported { .. } => None,
+            // A classic resource is mappable only when something took its mapping, which only
+            // the blob claim does. Asked of vrend rather than kept here: vrend owns the buffer,
+            // so it owns the address into it, and a copy on this side would outlive the
+            // buffer by exactly as long as it took someone to forget to clear it.
+            Backing::Classic { .. } => self.vrend.as_ref().and_then(|v| {
+                let (addr, size) = v.resource_mapping(handle)?;
+                // Write-back: these are ordinary driver pages the host reaches through a
+                // coherent mapping, which is the C's `inferred_gl_caching_type` for a buffer
+                // it did not get from gbm.
+                Some(HostMapping { addr, size, caching: Caching::Cached })
+            }),
+            Backing::Imported { .. } => None,
         })
         .ok_or(Error::NoResource)?
         .ok_or(Error::NotMappable)
@@ -1652,17 +1718,18 @@ mod tests {
         assert_eq!(map.len() % page, 0, "the mapping is a whole number of pages");
         assert!(map.len() >= 0x24000 - 1, "and covers everything that was asked for");
 
-        // A blob naming memory that already exists gets none of its own. There is no venus in
-        // this build, so the export itself is refused -- what is being asked here is that the
-        // refusal came from the export path and not from minting something first.
+        // A blob naming something a context already holds gets no memory of its own. There is
+        // no such context in this build, so the resolution is refused before either renderer is
+        // reached -- what is being asked here is that the refusal came from resolving the id and
+        // not from minting something first.
         let exported = BlobDesc {
-            source: BlobSource::Exported { ctx: ContextId::new(1).unwrap(), mem: BlobId(9) },
+            source: BlobSource::InContext { ctx: ContextId::new(1).unwrap(), id: BlobId(9) },
             ..minted
         };
         assert_eq!(
             r.resource_create_blob(ResourceHandle::new(2).unwrap(), exported, Vec::new()),
-            Err(Error::RendererAbsent),
-            "an export names memory a context holds; minting would answer with the wrong bytes"
+            Err(Error::NoContext),
+            "an id means what its context says; minting would answer with the wrong bytes"
         );
         assert!(
             r.with_resource(ResourceHandle::new(2).unwrap(), |res| res.shm().cloned()).is_none(),
@@ -1715,7 +1782,7 @@ mod tests {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
-                    source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                    source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                     size: 4096,
                 },
                 storage: BlobStorage::Shared {
@@ -1914,7 +1981,7 @@ mod tests {
                     desc: BlobDesc {
                         blob_mem: crate::abi::BLOB_MEM_HOST3D,
                         blob_flags: 1,
-                        source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                        source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                         size: 2048,
                     },
                     storage: BlobStorage::Shared {
@@ -1961,7 +2028,7 @@ mod tests {
                     desc: BlobDesc {
                         blob_mem: crate::abi::BLOB_MEM_HOST3D,
                         blob_flags: 1,
-                        source: BlobSource::Exported { ctx: one, mem: BlobId(67) },
+                        source: BlobSource::InContext { ctx: one, id: BlobId(67) },
                         size: 4096,
                     },
                     storage: BlobStorage::Shared {
@@ -2125,7 +2192,7 @@ mod tests {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
-                    source: BlobSource::Exported { ctx: one, mem: BlobId(MEM.0) },
+                    source: BlobSource::InContext { ctx: one, id: BlobId(MEM.0) },
                     size: 4096,
                 },
                 storage: BlobStorage::Shared {
@@ -2182,7 +2249,7 @@ mod tests {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
-                    source: BlobSource::Exported { ctx: two, mem: BlobId(66) },
+                    source: BlobSource::InContext { ctx: two, id: BlobId(66) },
                     size: 4096,
                 },
                 storage: BlobStorage::Shared {
@@ -2231,7 +2298,7 @@ mod tests {
                 desc: BlobDesc {
                     blob_mem: crate::abi::BLOB_MEM_HOST3D,
                     blob_flags: 1,
-                    source: BlobSource::Exported { ctx: one, mem: BlobId(66) },
+                    source: BlobSource::InContext { ctx: one, id: BlobId(66) },
                     size: 4096,
                 },
                 storage: BlobStorage::Shared {

@@ -519,7 +519,7 @@ fn blob_desc(a: &CreateBlobArgs) -> Option<renderer::BlobDesc> {
         // names no memory either. `None` here is the refusal -- the alternative, treating it as a
         // mint, would answer with fresh zeroed pages for a guest that asked for its own bytes.
         (crate::abi::BLOB_MEM_HOST3D, id) if id != 0 => {
-            renderer::BlobSource::Exported { ctx: ContextId::new(a.ctx_id)?, mem: BlobId(id) }
+            renderer::BlobSource::InContext { ctx: ContextId::new(a.ctx_id)?, id: BlobId(id) }
         }
         _ => renderer::BlobSource::HostMinted,
     };
@@ -2205,13 +2205,13 @@ mod tests {
             Some(renderer::BlobDesc {
                 blob_mem: host3d,
                 blob_flags: 4,
-                source: renderer::BlobSource::Exported {
+                source: renderer::BlobSource::InContext {
                     ctx: ContextId::new(2).unwrap(),
-                    mem: BlobId(5),
+                    id: BlobId(5),
                 },
                 size: 6,
             }),
-            "a host3d blob naming an id exports that context's memory"
+            "a host3d blob naming an id is that context's to resolve"
         );
 
         // A zero id on the same path is the other operation entirely.

@@ -960,6 +960,39 @@ impl Gl {
         true
     }
 
+    /// Map `len` bytes of the bound buffer and *leave it mapped*, answering where the driver put
+    /// it.
+    ///
+    /// The other two mapping helpers unmap before they return, which is what makes them safe to
+    /// hand a slice out of. This one does not, and that is the point: it takes the persistent
+    /// mapping of a buffer whose whole reason for existing is to be published to a guest, which
+    /// writes to it while the host draws from it. A mapping that ended here would have nothing to
+    /// publish.
+    ///
+    /// `flags` must be the flags the store was created with -- `GL_MAP_PERSISTENT_BIT_EXT` is
+    /// only accepted on a `glBufferStorage` store that carries it -- so the only honest caller is
+    /// one holding those flags rather than re-deriving them.
+    ///
+    /// An address and not a slice: nothing in this process reads these bytes. The guest does,
+    /// through a mapping the VMM makes of this address, and a `&mut [u8]` here would be claiming
+    /// exclusive access that the guest is about to contradict. The mapping lasts until the buffer
+    /// is deleted, which unmaps it -- so it is good for exactly as long as the resource holding
+    /// the buffer is.
+    pub fn map_buffer_persistent(
+        &self,
+        target: GLenum,
+        len: usize,
+        flags: GLbitfield,
+    ) -> Option<usize> {
+        let Ok(size) = GLsizeiptr::try_from(len) else {
+            return None;
+        };
+        // SAFETY: plain scalars; the returned pointer is null or addresses `len` bytes of the
+        // bound buffer until it is deleted.
+        let p = unsafe { self.t.glMapBufferRange()(target, 0, size, flags) };
+        (!p.is_null()).then_some(p as usize)
+    }
+
     /// Map `len` bytes of the bound buffer for writing and hand them to `f` as a slice; unmapped
     /// before this returns. `None` if the driver refused the map.
     pub fn map_buffer_write<R>(

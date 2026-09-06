@@ -27,7 +27,7 @@ use super::shader;
 use super::transfer::{self, Info};
 use crate::config::Config;
 use crate::guest_mem::{Iov, PixelSource};
-use crate::ids::{ContextId, ResourceHandle};
+use crate::ids::{BlobId, ContextId, ResourceHandle};
 use crate::metal;
 use crate::videotoolbox;
 use std::collections::BTreeMap;
@@ -101,6 +101,35 @@ const VERSIONS: [Version; 3] = [
     Version { major: 3, minor: 1 },
     Version { major: 3, minor: 0 },
 ];
+
+/// Why a `RESOURCE_CREATE_BLOB` naming a classic context's blob id was refused.
+///
+/// Each is the guest's error and each wants a different investigation, which is why they are not
+/// one "invalid": nothing described the id at all says the `PIPE_RESOURCE_CREATE` never arrived
+/// or already went to another claim; a size mismatch says the guest's two halves disagree about
+/// how big its allocation is; unmappable says the host built the buffer and the driver would not
+/// hand its pages over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimRefused {
+    /// No resource stands under that id in that context.
+    NotDescribed,
+    /// The blob is larger than the resource backing it.
+    Oversize { asked: u64, allocated: u32 },
+    /// The driver refused the persistent mapping, or the storage never admitted one.
+    Unmappable,
+}
+
+impl fmt::Display for ClaimRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClaimRefused::NotDescribed => write!(f, "no resource was described under that blob id"),
+            ClaimRefused::Oversize { asked, allocated } => {
+                write!(f, "asked to publish {asked} bytes of a {allocated}-byte resource")
+            }
+            ClaimRefused::Unmappable => write!(f, "the buffer's pages cannot be mapped"),
+        }
+    }
+}
 
 impl Vrend {
     /// Open the winsys, bring ctx0 up on this thread and probe the driver.
@@ -260,10 +289,8 @@ impl Vrend {
         for ctx in self.contexts.values() {
             c += ctx.journal_census();
         }
-        for slot in self.resources.values() {
-            if let Some(wire) = slot.resource().and_then(|r| r.typed_by.as_ref()) {
-                c.add_wire(wire.len(), true);
-            }
+        for wire in self.resource_preamble() {
+            c.add_wire(wire.len(), true);
         }
         c
     }
@@ -275,9 +302,22 @@ impl Vrend {
     /// "no journal" -- is what the VMM reads as "this context is not mine to rebuild".
     pub fn journal_export(&self, id: ContextId) -> Option<Vec<u8>> {
         let ctx = self.contexts.get(&id)?;
-        let typed =
-            self.resources.values().filter_map(|s| s.resource().and_then(|r| r.typed_by.as_ref()));
-        Some(crate::vrend::journal::serialize(&ctx.journal(typed)))
+        Some(crate::vrend::journal::serialize(&ctx.journal(self.resource_preamble())))
+    }
+
+    /// The commands a rebuild must send before anything else: what described each claimed blob,
+    /// and what typed each attached one.
+    ///
+    /// They live on the resource table rather than on a context because one table serves every
+    /// context, so no single context can walk it. Describe before type, per resource: a resource
+    /// has at most one of the two -- a described one arrives with its shape, an attached one is
+    /// told its shape later -- so the order between them never actually arises, and stating it is
+    /// cheaper than relying on that staying true.
+    fn resource_preamble(&self) -> impl Iterator<Item = &Vec<u32>> {
+        self.resources
+            .values()
+            .filter_map(|s| s.resource())
+            .flat_map(|r| r.described_by.as_ref().into_iter().chain(r.typed_by.as_ref()))
     }
 
     /// Each live context's journal: how many bytes it exports, and how many entries those bytes
@@ -389,6 +429,58 @@ impl Vrend {
         )?;
         self.resources.insert(handle, resource::Slot::Resource(res));
         Ok(())
+    }
+
+    /// Claim the resource a classic context described under `blob`, giving it `handle` and a
+    /// persistent host mapping.
+    ///
+    /// `vrend_get_blob_pipe` plus `vrend_renderer_resource_map`, as one step. The C leaves them
+    /// apart and the VMM maps later, which means a resource can exist in the table having refused
+    /// the only thing it was created to do. Here the map is part of the claim: a buffer that
+    /// cannot be mapped is not published, and `CREATE_BLOB` says so to the guest that asked.
+    ///
+    /// `size` is what the guest asked to publish, and `args.width` is what was allocated. The
+    /// wire lets them disagree -- the C ignores `blob_size` entirely -- and a guest asking to
+    /// publish more than it allocated is asking the VMM to map whatever follows the buffer into
+    /// its address space. Refused, never clamped.
+    pub fn claim_described(
+        &mut self,
+        ctx: ContextId,
+        blob: BlobId,
+        handle: ResourceHandle,
+        size: u64,
+    ) -> Result<Args, ClaimRefused> {
+        assert!(!self.resources.contains_key(&handle), "the renderer checked the handle was free");
+        let (mut res, wire) = self
+            .contexts
+            .get_mut(&ctx)
+            .and_then(|c| c.claim_described(blob))
+            .ok_or(ClaimRefused::NotDescribed)?;
+        let args = res.args;
+        // Any GL context of the share group can map the buffer -- ctx0 is the one that is always
+        // there, and using it means the answer does not depend on which sub-context the guest
+        // happened to leave current.
+        self.switch_ctx0();
+        if size > args.width as u64 {
+            res.destroy(&self.gl);
+            return Err(ClaimRefused::Oversize { asked: size, allocated: args.width });
+        }
+        if !res.map_persistent(&self.gl) {
+            res.destroy(&self.gl);
+            return Err(ClaimRefused::Unmappable);
+        }
+        res.described_by = Some(wire);
+        self.resources.insert(handle, resource::Slot::Resource(res));
+        Ok(args)
+    }
+
+    /// Where a claimed resource's buffer is mapped, and how far it runs.
+    ///
+    /// `None` for every resource that was never published to a guest, which is every ordinary
+    /// classic one: the address exists only because [`Self::claim_described`] took it.
+    pub fn resource_mapping(&self, handle: ResourceHandle) -> Option<(usize, u64)> {
+        let res = self.resource(handle)?;
+        Some((res.mapped?, res.args.width as u64))
     }
 
     /// A blob attached to a classic context: storage, and nothing yet that says what it is.
