@@ -3988,12 +3988,13 @@ impl Commands for Handlers<'_> {
             .dev_op_info_timeout(args.device, info, args.timeout, |d| d.try_vkWaitSemaphores());
     }
 
-    /// Recycle everything a pool handed out, without destroying the pool or the objects.
+    /// Recycle everything a command pool handed out, without destroying the pool or the buffers.
     ///
-    /// The object table is deliberately left alone. A reset does not free the command buffers or
-    /// descriptor sets -- their handles stay valid and the guest goes on naming them -- so
-    /// forgetting them here would poison the next command that did, over a reset that was legal.
-    /// This is the difference between a reset and the destroy that `pool_destroy!` serves.
+    /// The object table is deliberately left alone. Resetting a *command* pool returns its buffers
+    /// to the initial state without freeing them -- their handles stay valid and the guest goes on
+    /// naming them -- so forgetting them here would poison the next command that did, over a reset
+    /// that was legal. This is the difference between a reset and the destroy `pool_destroy!`
+    /// serves, and it does not carry over to `vkResetDescriptorPool`, which does free its sets.
     fn vkResetCommandPool(&mut self, args: &mut vn_command_vkResetCommandPool<'_>) {
         args.ret = self.driver.object_flags_op(
             args.device,
@@ -4008,6 +4009,22 @@ impl Commands for Handlers<'_> {
         }
     }
 
+    /// Recycle a descriptor pool -- which, unlike a command pool's reset, *frees* what it handed
+    /// out.
+    ///
+    /// Vulkan implicitly frees every descriptor set allocated from the pool, and names none of
+    /// them, so nothing else in the stream says those ids stopped meaning anything. Left in the
+    /// table they go on resolving to host handles the driver has freed and may have handed back
+    /// out, and the next `vkUpdateDescriptorSets` naming one would carry that handle to Vulkan.
+    /// The C releases them here for the same reason (`vkr_descriptor_pool_release`).
+    ///
+    /// This is exactly what a *command* pool's reset does not do -- there the buffers keep their
+    /// handles and the guest goes on naming them -- and the two commands sat next to each other
+    /// under one comment claiming both behaved the same way.
+    ///
+    /// Only on success. The spec defines no failure for this call, so the branch is reachable
+    /// only when our own device lookup failed; in that case nothing was freed and forgetting the
+    /// sets would poison the next command that legally named one.
     fn vkResetDescriptorPool(&mut self, args: &mut vn_command_vkResetDescriptorPool<'_>) {
         args.ret = self.driver.object_flags_op(
             args.device,
@@ -4015,6 +4032,14 @@ impl Commands for Handlers<'_> {
             args.descriptorPool,
             args.flags,
         );
+        if args.ret == VkResult::VK_SUCCESS {
+            let orphans = self.driver.recycle_pool(args.descriptorPool);
+            // The journal needs no counterpart: every retained entry naming one of these sets is
+            // keyed on its `ObjectKey`, and a key whose object has just left the table resolves to
+            // nothing. This is the case a command pool's reset cannot use, because there the keys
+            // survive and only the recordings die.
+            self.forget(orphans);
+        }
     }
 
     fn vkWaitSemaphoreResourceMESA(
@@ -10760,6 +10785,115 @@ mod tests {
                 "id {id} was freed with its pool and must stop naming anything"
             );
         }
+    }
+
+    /// Resetting a descriptor pool frees every set it handed out, and Vulkan names none of them.
+    ///
+    /// The counterpart of the command-pool test above, for the command that looks identical and
+    /// behaves oppositely. A command pool's reset recycles its buffers and keeps them valid; a
+    /// descriptor pool's reset *frees* its sets. Leaving them in the table lets an id go on
+    /// resolving to a handle the driver has freed -- and because mesa mints new ids for the sets
+    /// it allocates next, the stale entries are never overwritten either.
+    #[test]
+    fn a_reset_descriptor_pool_takes_its_sets_out_of_the_object_table() {
+        use super::super::cs::{Lookup, Objects};
+        use super::super::proto::types::{
+            VkDescriptorPool, VkDescriptorPoolResetFlags, VkDescriptorSet, VkDevice,
+            vn_command_vkResetDescriptorPool,
+        };
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const OTHER_POOL: u64 = 8;
+        /// Guest ids and the host handles they were allocated as.
+        const SETS: [(u64, u64); 2] = [(11, 110), (12, 120)];
+        const SURVIVOR: (u64, u64) = (13, 130);
+        const SET: VkObjectType = VkObjectType::VK_OBJECT_TYPE_DESCRIPTOR_SET;
+
+        unsafe extern "C" fn reset(
+            _device: VkDevice,
+            _pool: VkDescriptorPool,
+            _flags: VkDescriptorPoolResetFlags,
+        ) -> VkResult {
+            VkResult::VK_SUCCESS
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkResetDescriptorPool(reset);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        {
+            let mut t = objects.borrow_mut();
+            for (host, id) in SETS.iter().copied().chain([SURVIVOR]) {
+                t.add(ObjectId(id), SET, HostHandle(host), None).unwrap();
+            }
+        }
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkDescriptorPool(POOL),
+            &SETS.map(|(host, id)| (VkDescriptorSet(host), ObjectId(id))),
+        );
+        // A second pool, so the reset is shown to take its own sets and not simply everything.
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkDescriptorPool(OTHER_POOL),
+            &[(VkDescriptorSet(SURVIVOR.0), ObjectId(SURVIVOR.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let mut args = vn_command_vkResetDescriptorPool {
+            device: VkDevice(DEVICE),
+            descriptorPool: VkDescriptorPool(POOL),
+            ..Default::default()
+        };
+        h.vkResetDescriptorPool(&mut args);
+        assert_eq!(args.ret, VkResult::VK_SUCCESS);
+
+        for (_, id) in SETS {
+            assert_eq!(
+                objects.lookup(ObjectId(id), SET.0),
+                Lookup::Missing,
+                "set {id} was freed by the reset and must stop naming anything"
+            );
+        }
+        assert_eq!(
+            objects.lookup(ObjectId(SURVIVOR.1), SET.0),
+            Lookup::Found(HostHandle(SURVIVOR.0)),
+            "another pool's sets are untouched"
+        );
+
+        // The pool itself survives a reset, which is the whole difference from a destroy: it must
+        // still be open to allocate from.
+        assert!(driver.pool_is_open(VkDescriptorPool(POOL)), "a reset pool goes on taking sets");
+
+        // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        driver.abandon_planted();
     }
 
     /// A device's objects are destroyed on the way out, before the device, in Vulkan's order.

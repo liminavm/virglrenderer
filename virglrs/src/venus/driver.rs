@@ -193,6 +193,20 @@ impl Pools {
         children.into_values().collect()
     }
 
+    /// Empty a pool without closing it: what a *reset* does, as against the destroy `close` serves.
+    ///
+    /// The pool stays open and keeps taking allocations; everything it handed out stops existing.
+    fn recycle<P: Handle>(&mut self, pool: P) -> Vec<ObjectId> {
+        let Some(p) = self.open.get_mut(&TypedHandle::of(pool)) else {
+            return Vec::new();
+        };
+        let children = std::mem::take(&mut p.children);
+        for handle in children.keys() {
+            self.owner.remove(handle);
+        }
+        children.into_values().collect()
+    }
+
     /// Forget every pool a device owned, because destroying the device destroyed them.
     fn close_device(&mut self, device: VkDevice) -> Vec<ObjectId> {
         let doomed: Vec<TypedHandle> =
@@ -1864,6 +1878,13 @@ impl Driver {
         self.pools.adopt(pool, children.iter().copied());
     }
 
+    /// Whether a pool is still open, for the test that a reset keeps it so where a destroy does
+    /// not. Test scaffolding, beside [`Driver::plant_pool`] for the same reason.
+    #[cfg(test)]
+    pub(super) fn pool_is_open<P: PoolOf>(&self, pool: P) -> bool {
+        self.pools.is_open(pool)
+    }
+
     /// The guest id a pool has filed a host handle under, if it holds it at all.
     ///
     /// Test scaffolding, beside [`Driver::plant_pool`] because it is the same seam read the other
@@ -1921,6 +1942,14 @@ impl Driver {
         let orphans = self.pools.close(pool);
         self.destroy_object(device, proc, pool, alloc);
         orphans
+    }
+
+    /// Recycle a pool's allocations, handing back the guest ids that stopped naming anything.
+    ///
+    /// The pool itself survives, so unlike [`Driver::destroy_pool`] there is no object to destroy
+    /// here -- Vulkan freed the children as part of the reset and names none of them.
+    pub fn recycle_pool<T: Handle>(&mut self, pool: T) -> Vec<ObjectId> {
+        self.pools.recycle(pool)
     }
 
     // -------------------------------------------------------------------- recording
