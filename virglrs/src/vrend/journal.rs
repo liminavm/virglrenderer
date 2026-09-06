@@ -170,12 +170,17 @@ pub struct Census {
 
 impl Census {
     pub fn add(&mut self, at: &Retained, create: bool) {
+        self.add_wire(at.dwords(), create);
+    }
+
+    /// Count something retained as bare dwords -- a blob's type, which keeps no position.
+    pub fn add_wire(&mut self, dwords: usize, create: bool) {
         if create {
             self.creates += 1;
         } else {
             self.slots += 1;
         }
-        self.dwords += at.dwords();
+        self.dwords += dwords;
     }
 }
 

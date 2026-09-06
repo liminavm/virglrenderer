@@ -261,8 +261,8 @@ impl Vrend {
             c += ctx.journal_census();
         }
         for slot in self.resources.values() {
-            if let Some(at) = slot.resource().and_then(|r| r.typed_by.as_ref()) {
-                c.add(at, true);
+            if let Some(wire) = slot.resource().and_then(|r| r.typed_by.as_ref()) {
+                c.add_wire(wire.len(), true);
             }
         }
         c

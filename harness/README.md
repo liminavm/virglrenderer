@@ -43,6 +43,19 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   compared — the pair disagreeing is how a stale surface read was told from a wrong render.
   `REPLAY_DUMP_DIR` (narrowed by `REPLAY_DUMP_W`) writes every scored readback and surface as raw
   BGRA, for `rgba2png.py` and a pixel diff.
+
+  `--rebuild` gates the snapshot journal: it exports what each context retained, replays it into a
+  context that never saw the stream, and requires the two journals to describe the same steps in
+  the same order (positions are renumbered by the rebuild, so they are not compared). It is the
+  floor, not the ceiling — a durable command the recorder never learned to keep is missing from
+  both journals and they agree about it anyway. Only pixels answer that.
+
+  **`--rebuild` fails on `sampled` and `surface`, and the failure is honest.** Those corpora score
+  a resource by unref'ing it, so by the end the stream has destroyed the very resources its live
+  sampler views and surfaces name, and a create that cannot be satisfied is dropped. That is not a
+  journal defect: it is an object outliving the resource it views, which the guest can still bind.
+  Restoring drops it, so a resume loses an object the guest believes in — the reason this class of
+  drop is worth reporting rather than filing under "benign stale reference" as the C does.
 - `vrend-trace-decode.py` — decodes the same dump format for human inspection.
 - `corpus.py` — the synthetic-corpus writer: the trace container and the virgl commands, shared
   by the `make-*-corpus.py` scripts.
