@@ -444,6 +444,25 @@ SABOTAGES = [
     # An extension command's entry point is the guest's choice at `vkCreateDevice`, not ours: the
     # capset advertises everything the pinned vk.xml can serialize. So the fallible accessor is
     # what stands between a guest sending a command its own device never enabled and an abort.
+    # A strided array. vk.xml's `stride` describes the guest's own memory and never reaches the
+    # wire; refusing to serialize it poisoned a context at a command the desktop sends, and
+    # forwarding the guest's number would walk the driver through our arena.
+    (
+        'a strided array is refused instead of decoded as the counted array it is',
+        'virglrs/venus-gen/rustgen.py',
+        "        if var.is_blob():",
+        """        if 'stride' in var.attrs:
+            raise self.Unsupported('%s.%s: stride' % (ty.name, var.name))
+        if var.is_blob():""",
+        'venus::proto::tests::a_strided_array_is_an_ordinary_counted_array_on_the_wire',
+    ),
+    (
+        "a multi-draw walks the driver by the stride the guest sent, not the array's own",
+        'virglrs/src/venus/driver.rs',
+        '        let stride = size_of::<VkMultiDrawIndexedInfoEXT>() as u32;',
+        '        let stride = 0u32;',
+        'venus::context::tests::a_multi_draw_is_walked_by_the_array_it_was_given',
+    ),
     # The recording commands the seated desktop sends. Three shapes nothing else can see: a
     # fixed array parameter (C passes the address, not the aggregate), a count-bearing dynamic
     # state command (no first index for the count to be passed as), and four arrays under one

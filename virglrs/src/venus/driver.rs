@@ -37,17 +37,17 @@ use super::proto::types::{
     VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
     VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
     VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
-    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline,
-    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool,
-    VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue,
-    VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
-    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
-    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
-    VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
-    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
-    VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo,
-    VkViewport, VkWriteDescriptorSet,
+    VkMultiDrawIndexedInfoEXT, VkMultiDrawInfoEXT, VkObjectType, VkPhysicalDevice,
+    VkPhysicalDeviceMemoryProperties, VkPipeline, VkPipelineBindPoint, VkPipelineCache,
+    VkPipelineLayout, VkPipelineStageFlagBits, VkPipelineStageFlags, VkPrimitiveTopology,
+    VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo, VkQueryResultFlagBits,
+    VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass, VkRenderPassBeginInfo,
+    VkRenderingInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler,
+    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
+    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
+    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp,
+    VkStructureType, VkSubmitInfo, VkSubpassContents, VkSubresourceLayout,
+    VkTimelineSemaphoreSubmitInfo, VkViewport, VkWriteDescriptorSet,
 };
 use std::sync::Arc;
 
@@ -2912,6 +2912,70 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdPipelineBarrier2()?;
         // SAFETY: as above.
         unsafe { f(cb, dependency) };
+        Some(())
+    }
+
+    /// `vkCmdDrawMultiEXT` and its indexed twin: several draws in one command, described by an
+    /// array the *guest* may space out in its own memory.
+    ///
+    /// That spacing is what vk.xml's `stride` is, and it never reaches the wire: venus's driver
+    /// encoder walks the guest's spacing and writes the elements tightly. So the array the
+    /// decoder hands us is tight, and the stride the driver must be told is `size_of` of the
+    /// element and nothing else.
+    ///
+    /// Which is why the guest's own `stride` member is not passed on. It arrives saying
+    /// `size_of` too, and the C forwards it -- but the array it describes is ours, not the
+    /// guest's, and a guest that sends any other number would have the driver stride through our
+    /// arena. The stride and the array are one fact; the array is the one we hold.
+    ///
+    /// `None` is an absent array, which is a draw of nothing and not an empty slice at some
+    /// address: the count goes with it, so the driver is told zero draws at no address.
+    pub fn cmd_draw_multi(
+        &self,
+        cb: VkCommandBuffer,
+        draws: Option<&[VkMultiDrawInfoEXT]>,
+        instances: u32,
+        first_instance: u32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawMultiEXT()?;
+        let stride = size_of::<VkMultiDrawInfoEXT>() as u32;
+        // SAFETY: as above; the count is the slice's own length and the stride is the element
+        // size of the array being pointed at, so the driver's walk stays inside it.
+        unsafe {
+            f(
+                cb,
+                draws.map_or(0, <[_]>::len) as u32,
+                optional(draws),
+                instances,
+                first_instance,
+                stride,
+            )
+        };
+        Some(())
+    }
+
+    pub fn cmd_draw_multi_indexed(
+        &self,
+        cb: VkCommandBuffer,
+        draws: Option<&[VkMultiDrawIndexedInfoEXT]>,
+        instances: u32,
+        first_instance: u32,
+        vertex_offset: Option<&i32>,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdDrawMultiIndexedEXT()?;
+        let stride = size_of::<VkMultiDrawIndexedInfoEXT>() as u32;
+        // SAFETY: as above; `vertex_offset` is null or addresses one `i32` live for the call.
+        unsafe {
+            f(
+                cb,
+                draws.map_or(0, <[_]>::len) as u32,
+                optional(draws),
+                instances,
+                first_instance,
+                stride,
+                vertex_offset.map_or(core::ptr::null(), |o| o as *const i32),
+            )
+        };
         Some(())
     }
 

@@ -39,12 +39,13 @@ use super::proto::types::{
     vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
-    vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdEndQuery,
-    vn_command_vkCmdEndRenderPass, vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer,
-    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPipelineBarrier2,
-    vn_command_vkCmdPushConstants, vn_command_vkCmdPushDescriptorSet,
-    vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
-    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
+    vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdDrawMultiEXT,
+    vn_command_vkCmdDrawMultiIndexedEXT, vn_command_vkCmdEndQuery, vn_command_vkCmdEndRenderPass,
+    vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
+    vn_command_vkCmdPipelineBarrier2, vn_command_vkCmdPushConstants,
+    vn_command_vkCmdPushDescriptorSet, vn_command_vkCmdResetQueryPool,
+    vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetBlendConstants,
+    vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
     vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
     vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
     vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineWidth,
@@ -4199,6 +4200,27 @@ impl Commands for Handlers<'_> {
             args.layout,
             args.set,
             args.pDescriptorWrites(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawMultiEXT(&mut self, args: &mut vn_command_vkCmdDrawMultiEXT<'_>) {
+        let done = self.driver.cmd_draw_multi(
+            args.commandBuffer,
+            args.pVertexInfo(),
+            args.instanceCount,
+            args.firstInstance,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdDrawMultiIndexedEXT(&mut self, args: &mut vn_command_vkCmdDrawMultiIndexedEXT<'_>) {
+        let done = self.driver.cmd_draw_multi_indexed(
+            args.commandBuffer,
+            args.pIndexInfo(),
+            args.instanceCount,
+            args.firstInstance,
+            args.pVertexOffset,
         );
         self.recorded(done);
     }
@@ -12802,6 +12824,111 @@ mod tests {
         assert!(h.reject.is_some(), "there is no device to record into");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
+    }
+
+    /// A multi-draw is walked by the stride of the array the renderer holds, never by the number
+    /// the guest sent.
+    ///
+    /// The guest's `stride` describes the spacing of *its* copy; venus's encoder writes the
+    /// elements tightly, so by the time they are here the only true stride is `size_of` of the
+    /// element. The C forwards the guest's number and gets away with it because the guest's
+    /// encoder sets it honestly -- a guest that does not would have the driver read our arena at
+    /// whatever spacing it liked.
+    #[test]
+    fn a_multi_draw_is_walked_by_the_array_it_was_given() {
+        use super::super::proto::types::{
+            VkCommandBuffer, VkCommandPool, VkDevice, VkMultiDrawIndexedInfoEXT,
+            vn_command_vkCmdDrawMultiIndexedEXT,
+        };
+        use std::cell::Cell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+        /// Nothing like the element size, and nothing a walk would survive.
+        const GUEST_STRIDE: u32 = 4096;
+
+        thread_local! {
+            static SAW: Cell<(u32, u32, i32)> = const { Cell::new((0, 0, 0)) };
+        }
+
+        unsafe extern "C" fn draw(
+            _cb: VkCommandBuffer,
+            count: u32,
+            p: *const VkMultiDrawIndexedInfoEXT,
+            _instances: u32,
+            _first_instance: u32,
+            stride: u32,
+            offset: *const i32,
+        ) {
+            // SAFETY: the wrapper passes a slice's own pointer and length, and an offset that is
+            // null or addresses one `i32` live for the call.
+            let last = unsafe { &*p.add(count as usize - 1) };
+            let off = unsafe { offset.as_ref().copied() }.unwrap_or(0);
+            SAW.with(|s| s.set((stride, last.indexCount, off)));
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdDrawMultiIndexedEXT(draw);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+
+        let draws: [VkMultiDrawIndexedInfoEXT; 2] =
+            core::array::from_fn(|i| VkMultiDrawIndexedInfoEXT {
+                firstIndex: i as u32,
+                indexCount: 40 + i as u32,
+                vertexOffset: 0,
+            });
+        let vertex_offset = 9i32;
+        let mut args = vn_command_vkCmdDrawMultiIndexedEXT::default();
+        args.commandBuffer = VkCommandBuffer(CB.0);
+        args.instanceCount = 1;
+        args.stride = GUEST_STRIDE;
+        args.pVertexOffset = Some(&vertex_offset);
+        args.plant_pIndexInfo(&draws);
+        h.vkCmdDrawMultiIndexedEXT(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with(|s| {
+            assert_eq!(
+                s.get(),
+                (size_of::<VkMultiDrawIndexedInfoEXT>() as u32, 41, 9),
+                "the array's own stride, the last element it really has, and the guest's offset"
+            );
+        });
+
         h.driver.abandon_planted();
     }
 

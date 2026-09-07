@@ -668,8 +668,12 @@ class RustGen:
 
     def _shape(self, ty, var):
         """How a member is laid out: ('static', n) | ('dynamic', len) | ('pointer',) | ('plain',)."""
-        if 'stride' in var.attrs:
-            raise self.Unsupported('%s.%s: stride' % (ty.name, var.name))
+        # `stride` is the *guest's* business and never reaches the wire. vk.xml gives it to an
+        # array whose elements the caller may space out in its own memory; venus's driver encoder
+        # walks that spacing and writes the elements tightly, then sends the stride member as
+        # `sizeof(element)`. So what arrives here is an ordinary counted array, which is exactly
+        # what the C renderer decodes it as -- and refusing it cost us two commands the guest
+        # does send.
         if var.is_blob():
             return ('blob', self._len_expr(ty, var))
         if var.ty.is_static_array():
