@@ -27,6 +27,7 @@ use crate::vrend::context::Guest;
 use crate::vrend::proto::Box3;
 use crate::vrend::resource::{Args as ClassicArgs, Refusal};
 use crate::vrend::transfer;
+use crate::vrend::vrend::ClaimRefused;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(test)]
@@ -79,6 +80,8 @@ pub enum Error {
     Unmappable,
     /// vrend refused to create a classic resource, for the reason given.
     ClassicRefused(Refusal),
+    /// vrend refused to publish the resource a classic context described, for the reason given.
+    ClaimRefused(ClaimRefused),
     /// A classic transfer did not happen, for the reason given.
     Transfer(transfer::Error),
     /// A restore was handed something that is not a classic content blob.
@@ -141,6 +144,7 @@ impl std::fmt::Display for Error {
             Error::ZeroSize => "an import of zero bytes names no memory",
             Error::Unmappable => "that shm descriptor could not be mapped",
             Error::ClassicRefused(r) => return write!(f, "vrend refused the resource: {r}"),
+            Error::ClaimRefused(r) => return write!(f, "vrend refused the blob: {r}"),
             Error::Transfer(e) => return write!(f, "the transfer failed: {e}"),
             Error::MalformedContent(m) => return write!(f, "the contents were refused: {m}"),
             Error::MalformedSync(m) => return write!(f, "the sync state was refused: {m}"),
@@ -183,6 +187,20 @@ pub struct BlobDesc {
     pub blob_flags: u32,
     pub source: BlobSource,
     pub size: u64,
+}
+
+impl std::fmt::Display for BlobDesc {
+    /// What the guest asked for, in the renderer's own words -- for a caller that has to explain
+    /// a refusal to somebody. Not the ABI's fields: `blob_mem` and `blob_flags` say which of
+    /// these two things was asked for and are already spent by the time anyone reads this.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.source {
+            BlobSource::HostMinted => write!(f, "{} bytes of new host memory", self.size),
+            BlobSource::InContext { ctx, id } => {
+                write!(f, "{} bytes of ctx {ctx}'s blob {id}", self.size)
+            }
+        }
+    }
 }
 
 /// Which memory an imported blob lives in.
@@ -655,37 +673,19 @@ impl Renderer {
                 // A context whose capset names no renderer we have holds nothing, so its ids
                 // name nothing either.
                 CapsetId::Unknown(_) => return Err(Error::RendererUnimplemented),
+                // The id is a `VkDeviceMemory` the guest allocated. Every way this can fail is
+                // a distinct `Error` and the caller is told which; the C ABI's single errno for
+                // all of them is `ffi.rs`'s problem and not this function's.
                 CapsetId::Venus => {
-                    let mem = id;
-                    match self.venus_memory_export(ctx, mem, desc.size) {
-                        Ok((exported, storage, from)) => BlobStorage::Shared {
-                            storage,
-                            caching: if exported.write_back {
-                                Caching::Cached
-                            } else {
-                                Caching::WriteCombining
-                            },
-                            from,
+                    let (exported, storage, from) = self.venus_memory_export(ctx, id, desc.size)?;
+                    BlobStorage::Shared {
+                        storage,
+                        caching: if exported.write_back {
+                            Caching::Cached
+                        } else {
+                            Caching::WriteCombining
                         },
-                        Err(e) => {
-                            // Two failures, one errno at the ABI, and they want opposite
-                            // investigations. The memory not being there says the command that would
-                            // have allocated it never reached us -- the transport is what to look at,
-                            // and the allocation is innocent. The memory being there and the export
-                            // refusing it says the opposite. The guest kernel treats CREATE_BLOB as
-                            // fire-and-forget, so this line is the only account anyone gets of either;
-                            // one line covering both sends the next reader to the wrong half.
-                            let half = match e {
-                                Error::NoAllocation | Error::NoContext => "no such allocation",
-                                _ => "the allocation is there, and the export of it refused",
-                            };
-                            eprintln!(
-                                "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} memory {mem}, \
-                         {} bytes: {half}: {e}",
-                                desc.size,
-                            );
-                            return Err(e);
-                        }
+                        from,
                     }
                 }
             },
@@ -716,20 +716,7 @@ impl Renderer {
         iov: Vec<GuestIov>,
     ) -> Result<(), Error> {
         let v = self.vrend.as_mut().ok_or(Error::RendererAbsent)?;
-        let args = match v.claim_described(ctx, id, handle, desc.size) {
-            Ok(args) => args,
-            Err(why) => {
-                // The guest kernel treats CREATE_BLOB as fire-and-forget, so this line is the
-                // only account anyone gets of the failure -- and each refusal sends the reader
-                // somewhere different. See [`ClaimRefused`].
-                eprintln!(
-                    "[virglrs] resource {handle}: CREATE_BLOB of ctx {ctx} blob {id}, \
-                     {} bytes: {why}",
-                    desc.size,
-                );
-                return Err(Error::NoAllocation);
-            }
-        };
+        let args = v.claim_described(ctx, id, handle, desc.size).map_err(Error::ClaimRefused)?;
         self.insert(handle, Backing::Classic { args, surface: None }, iov);
         Ok(())
     }

@@ -119,7 +119,8 @@ fn errno(e: renderer::Error) -> c_int {
         | ContentLargerThanAllocation
         | MalformedContent(_)
         | MalformedSync(_)
-        | ClassicRefused(_) => EINVAL,
+        | ClassicRefused(_)
+        | ClaimRefused(_) => EINVAL,
         RendererUnimplemented => -libc::ENOTSUP,
         // The C answers a readback it cannot serve with a bare -1, and the VMM tells it apart
         // from an errno.
@@ -575,7 +576,14 @@ pub extern "C" fn virgl_renderer_resource_create_blob(args: *const CreateBlobArg
     let iov = unsafe { GuestIov::from_raw(a.iovecs, a.num_iovs) };
     with(EINVAL, |r| match r.resource_create_blob(handle, desc, iov) {
         Ok(()) => 0,
-        Err(e) => errno(e),
+        Err(e) => {
+            // The errno is one number for a dozen refusals, and the guest kernel treats
+            // CREATE_BLOB as fire-and-forget -- so this line is the only account anyone gets of
+            // which one it was. It lives here and not in the renderer because the renderer told
+            // its caller exactly what happened; it is the translation to C that loses it.
+            eprintln!("[virglrs] resource {handle}: CREATE_BLOB {desc}: {e}");
+            errno(e)
+        }
     })
 }
 
