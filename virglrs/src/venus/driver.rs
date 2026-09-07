@@ -21,31 +21,33 @@ use super::proto::types::{
     VkAllocationCallbacks, VkBaseInStructure, VkBaseOutStructure, VkBool32, VkBuffer, VkBufferCopy,
     VkBufferImageCopy, VkBufferMemoryBarrier, VkBufferView, VkClearAttachment, VkClearColorValue,
     VkClearRect, VkCommandBuffer, VkCommandBufferBeginInfo, VkCommandBufferResetFlags,
-    VkCommandPool, VkCopyDescriptorSet, VkCopyImageToImageInfo, VkCopyImageToMemoryInfo,
-    VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo, VkCopyMemoryToImageInfoMESA,
-    VkDependencyFlags, VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout,
-    VkDescriptorUpdateTemplate, VkDevice, VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2,
-    VkDeviceSize, VkEvent, VkExportMemoryAllocateInfo, VkExtensionProperties,
-    VkExternalMemoryHandleTypeFlagBits, VkExternalMemoryImageCreateInfo,
-    VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter, VkFormat, VkFramebuffer,
-    VkHostImageLayoutTransitionInfo, VkImage, VkImageAspectFlagBits, VkImageAspectFlags,
-    VkImageBlit, VkImageCopy, VkImageCreateFlags, VkImageCreateInfo, VkImageFormatProperties,
-    VkImageLayout, VkImageMemoryBarrier, VkImageSubresource, VkImageSubresourceRange,
-    VkImageTiling, VkImageToMemoryCopy, VkImageType, VkImageUsageFlagBits, VkImageUsageFlags,
-    VkImageView, VkImportMemoryHostPointerInfoEXT, VkImportMemoryResourceInfoMESA,
-    VkImportSemaphoreFdInfoKHR, VkInstance, VkInstanceCreateInfo, VkMemoryAllocateInfo,
-    VkMemoryBarrier, VkMemoryDedicatedAllocateInfo, VkMemoryMapFlags, VkMemoryPropertyFlagBits,
-    VkMemoryPropertyFlags, VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy,
-    VkMemoryToImageCopyMESA, VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties,
-    VkPipeline, VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
-    VkPipelineStageFlags, VkQueryControlFlags, VkQueryPool, VkQueryPoolCreateInfo,
-    VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue, VkRect2D, VkRenderPass,
-    VkRenderPassBeginInfo, VkResult, VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler,
-    VkSamplerYcbcrConversion, VkSemaphore, VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR,
-    VkSemaphoreImportFlagBits, VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo,
-    VkSemaphoreWaitInfo, VkShaderModule, VkShaderStageFlags, VkStructureType, VkSubmitInfo,
-    VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo, VkViewport,
-    VkWriteDescriptorSet,
+    VkCommandPool, VkCompareOp, VkCopyDescriptorSet, VkCopyImageToImageInfo,
+    VkCopyImageToMemoryInfo, VkCopyImageToMemoryInfoMESA, VkCopyMemoryToImageInfo,
+    VkCopyMemoryToImageInfoMESA, VkCullModeFlags, VkDependencyFlags, VkDependencyInfo,
+    VkDescriptorPool, VkDescriptorSet, VkDescriptorSetLayout, VkDescriptorUpdateTemplate, VkDevice,
+    VkDeviceCreateInfo, VkDeviceMemory, VkDeviceQueueInfo2, VkDeviceSize, VkEvent,
+    VkExportMemoryAllocateInfo, VkExtensionProperties, VkExternalMemoryHandleTypeFlagBits,
+    VkExternalMemoryImageCreateInfo, VkExternalSemaphoreHandleTypeFlagBits, VkFence, VkFilter,
+    VkFormat, VkFramebuffer, VkFrontFace, VkHostImageLayoutTransitionInfo, VkImage,
+    VkImageAspectFlagBits, VkImageAspectFlags, VkImageBlit, VkImageCopy, VkImageCreateFlags,
+    VkImageCreateInfo, VkImageFormatProperties, VkImageLayout, VkImageMemoryBarrier,
+    VkImageSubresource, VkImageSubresourceRange, VkImageTiling, VkImageToMemoryCopy, VkImageType,
+    VkImageUsageFlagBits, VkImageUsageFlags, VkImageView, VkImportMemoryHostPointerInfoEXT,
+    VkImportMemoryResourceInfoMESA, VkImportSemaphoreFdInfoKHR, VkIndexType, VkInstance,
+    VkInstanceCreateInfo, VkMemoryAllocateInfo, VkMemoryBarrier, VkMemoryDedicatedAllocateInfo,
+    VkMemoryMapFlags, VkMemoryPropertyFlagBits, VkMemoryPropertyFlags,
+    VkMemoryResourceAllocationSizePropertiesMESA, VkMemoryToImageCopy, VkMemoryToImageCopyMESA,
+    VkObjectType, VkPhysicalDevice, VkPhysicalDeviceMemoryProperties, VkPipeline,
+    VkPipelineBindPoint, VkPipelineCache, VkPipelineLayout, VkPipelineStageFlagBits,
+    VkPipelineStageFlags, VkPrimitiveTopology, VkQueryControlFlags, VkQueryPool,
+    VkQueryPoolCreateInfo, VkQueryResultFlagBits, VkQueryResultFlags, VkQueryType, VkQueue,
+    VkRect2D, VkRenderPass, VkRenderPassBeginInfo, VkRenderingInfo, VkResult,
+    VkRingMonitorInfoMESA, VkSampleCountFlagBits, VkSampler, VkSamplerYcbcrConversion, VkSemaphore,
+    VkSemaphoreCreateInfo, VkSemaphoreGetFdInfoKHR, VkSemaphoreImportFlagBits,
+    VkSemaphoreSignalInfo, VkSemaphoreType, VkSemaphoreTypeCreateInfo, VkSemaphoreWaitInfo,
+    VkShaderModule, VkShaderStageFlags, VkStencilFaceFlags, VkStencilOp, VkStructureType,
+    VkSubmitInfo, VkSubpassContents, VkSubresourceLayout, VkTimelineSemaphoreSubmitInfo,
+    VkViewport, VkWriteDescriptorSet,
 };
 use std::sync::Arc;
 
@@ -55,6 +57,15 @@ use crate::ids::ResourceHandle;
 use crate::ids::SurfaceId;
 use crate::metal::{Held, PixelFormat, Surface};
 use crate::vulkan::{self, Device as DeviceFns, Global, Instance as InstanceFns};
+
+/// A slice the guest may or may not have sent, as the pointer Vulkan reads it as.
+///
+/// Null and empty are different things to Vulkan here: an absent array means "leave this alone",
+/// an empty one would be a count of zero the caller never wrote. Only the first is expressible
+/// through `Option`, and this is where it becomes a pointer.
+fn optional<T>(a: Option<&[T]>) -> *const T {
+    a.map_or(core::ptr::null(), |s| s.as_ptr())
+}
 
 /// The memory properties this renderer decides anything by: whether the host can address it at
 /// all, and whether its own caching of it is write-back -- which is what a guest needs to know to
@@ -2609,6 +2620,298 @@ impl Driver {
         let f = self.recorder(cb)?.try_vkCmdSetAttachmentFeedbackLoopEnableEXT()?;
         // SAFETY: as above; both arguments are scalars the decoder read off the wire.
         unsafe { f(cb, aspects) };
+        Some(())
+    }
+
+    // The recording commands the seated desktop sends that this build did not serve. Nothing
+    // here reshapes anything: each is the guest's arguments handed to the driver, because
+    // handle translation already happened in the decoder. The split between the panicking
+    // accessor and `try_` is the same one as everywhere: a 1.0 core entry point the driver does
+    // not export is our table being wrong, and anything later than that is the guest's own
+    // choice at `vkCreateDevice` and so a rejection.
+
+    /// `vkCmdSetBlendConstants`. Four floats, and the driver is handed their address: C adjusts
+    /// an array parameter to a pointer, so a `[f32; 4]` passed by value would go in the wrong
+    /// registers. That is the generator's rule now (`proc_param`), and this reference is what
+    /// makes it visible here.
+    pub fn cmd_set_blend_constants(&self, cb: VkCommandBuffer, constants: &[f32; 4]) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above; the pointer addresses four floats the caller owns for the call.
+        unsafe { (d.vkCmdSetBlendConstants())(cb, constants.as_ptr()) };
+        Some(())
+    }
+
+    pub fn cmd_set_viewport_with_count(
+        &self,
+        cb: VkCommandBuffer,
+        viewports: &[VkViewport],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetViewportWithCount()?;
+        // SAFETY: as above; the count is the slice's own length. No first index here -- the
+        // count-bearing form replaces the whole state rather than a window into it.
+        unsafe { f(cb, viewports.len() as u32, viewports.as_ptr()) };
+        Some(())
+    }
+
+    pub fn cmd_set_scissor_with_count(
+        &self,
+        cb: VkCommandBuffer,
+        scissors: &[VkRect2D],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetScissorWithCount()?;
+        // SAFETY: as above; the count is the slice's own length.
+        unsafe { f(cb, scissors.len() as u32, scissors.as_ptr()) };
+        Some(())
+    }
+
+    /// `vkCmdBindVertexBuffers2`: `vkCmdBindVertexBuffers` with two more arrays, either of which
+    /// the guest may leave out.
+    ///
+    /// One count governs all four. The two mandatory arrays are asserted equal for the same
+    /// reason the 1.0 form asserts it -- both come from accessors reading the same member, so a
+    /// difference would be ours. The optional two are `None` or exactly as long: an array that is
+    /// present and short would have the driver read past it, and there is no length to pass
+    /// separately that would say so.
+    pub fn cmd_bind_vertex_buffers2(
+        &self,
+        cb: VkCommandBuffer,
+        first: u32,
+        buffers: &[VkBuffer],
+        offsets: &[VkDeviceSize],
+        sizes: Option<&[VkDeviceSize]>,
+        strides: Option<&[VkDeviceSize]>,
+    ) -> Option<()> {
+        let n = buffers.len();
+        assert_eq!(offsets.len(), n, "one count governs every array");
+        assert!(sizes.is_none_or(|s| s.len() == n), "one count governs every array");
+        assert!(strides.is_none_or(|s| s.len() == n), "one count governs every array");
+        let f = self.recorder(cb)?.try_vkCmdBindVertexBuffers2()?;
+        let (sizes, strides) = (optional(sizes), optional(strides));
+        // SAFETY: as above; the count is the length every array present shares, and an absent
+        // one is the null the driver reads as "not supplied".
+        unsafe { f(cb, first, n as u32, buffers.as_ptr(), offsets.as_ptr(), sizes, strides) };
+        Some(())
+    }
+
+    /// `vkCmdPushDescriptorSet`: descriptor writes recorded into the command buffer rather than
+    /// into a set.
+    ///
+    /// A plain forward: the writes arrive with host handles in them already, because handle
+    /// translation is the decoder's job and not a handler's.
+    pub fn cmd_push_descriptor_set(
+        &self,
+        cb: VkCommandBuffer,
+        bind_point: VkPipelineBindPoint,
+        layout: VkPipelineLayout,
+        set: u32,
+        writes: &[VkWriteDescriptorSet],
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdPushDescriptorSet()?;
+        // SAFETY: as above; the count is the slice's own length, and every pointer inside a
+        // write addresses the same arena the slice came from.
+        unsafe { f(cb, bind_point, layout, set, writes.len() as u32, writes.as_ptr()) };
+        Some(())
+    }
+
+    pub fn cmd_bind_index_buffer(
+        &self,
+        cb: VkCommandBuffer,
+        buffer: VkBuffer,
+        offset: VkDeviceSize,
+        index_type: VkIndexType,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdBindIndexBuffer())(cb, buffer, offset, index_type) };
+        Some(())
+    }
+
+    pub fn cmd_set_depth_bias(
+        &self,
+        cb: VkCommandBuffer,
+        constant_factor: f32,
+        clamp: f32,
+        slope_factor: f32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetDepthBias())(cb, constant_factor, clamp, slope_factor) };
+        Some(())
+    }
+
+    pub fn cmd_set_line_width(&self, cb: VkCommandBuffer, width: f32) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetLineWidth())(cb, width) };
+        Some(())
+    }
+
+    pub fn cmd_set_stencil_compare_mask(
+        &self,
+        cb: VkCommandBuffer,
+        faces: VkStencilFaceFlags,
+        mask: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetStencilCompareMask())(cb, faces, mask) };
+        Some(())
+    }
+
+    pub fn cmd_set_stencil_reference(
+        &self,
+        cb: VkCommandBuffer,
+        faces: VkStencilFaceFlags,
+        reference: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetStencilReference())(cb, faces, reference) };
+        Some(())
+    }
+
+    pub fn cmd_set_stencil_write_mask(
+        &self,
+        cb: VkCommandBuffer,
+        faces: VkStencilFaceFlags,
+        mask: u32,
+    ) -> Option<()> {
+        let d = self.recorder(cb)?;
+        // SAFETY: as above.
+        unsafe { (d.vkCmdSetStencilWriteMask())(cb, faces, mask) };
+        Some(())
+    }
+
+    pub fn cmd_end_rendering(&self, cb: VkCommandBuffer) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdEndRendering()?;
+        // SAFETY: as above.
+        unsafe { f(cb) };
+        Some(())
+    }
+
+    pub fn cmd_set_cull_mode(&self, cb: VkCommandBuffer, mode: VkCullModeFlags) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetCullMode()?;
+        // SAFETY: as above.
+        unsafe { f(cb, mode) };
+        Some(())
+    }
+
+    pub fn cmd_set_front_face(&self, cb: VkCommandBuffer, face: VkFrontFace) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetFrontFace()?;
+        // SAFETY: as above.
+        unsafe { f(cb, face) };
+        Some(())
+    }
+
+    pub fn cmd_set_primitive_topology(
+        &self,
+        cb: VkCommandBuffer,
+        topology: VkPrimitiveTopology,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetPrimitiveTopology()?;
+        // SAFETY: as above.
+        unsafe { f(cb, topology) };
+        Some(())
+    }
+
+    pub fn cmd_set_depth_test_enable(&self, cb: VkCommandBuffer, on: VkBool32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthTestEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_depth_write_enable(&self, cb: VkCommandBuffer, on: VkBool32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthWriteEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_depth_compare_op(&self, cb: VkCommandBuffer, op: VkCompareOp) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthCompareOp()?;
+        // SAFETY: as above.
+        unsafe { f(cb, op) };
+        Some(())
+    }
+
+    pub fn cmd_set_depth_bounds_test_enable(
+        &self,
+        cb: VkCommandBuffer,
+        on: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetDepthBoundsTestEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_stencil_test_enable(&self, cb: VkCommandBuffer, on: VkBool32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetStencilTestEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_stencil_op(
+        &self,
+        cb: VkCommandBuffer,
+        faces: VkStencilFaceFlags,
+        fail: VkStencilOp,
+        pass: VkStencilOp,
+        depth_fail: VkStencilOp,
+        compare: VkCompareOp,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetStencilOp()?;
+        // SAFETY: as above.
+        unsafe { f(cb, faces, fail, pass, depth_fail, compare) };
+        Some(())
+    }
+
+    pub fn cmd_set_rasterizer_discard_enable(
+        &self,
+        cb: VkCommandBuffer,
+        on: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetRasterizerDiscardEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_primitive_restart_enable(
+        &self,
+        cb: VkCommandBuffer,
+        on: VkBool32,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetPrimitiveRestartEnable()?;
+        // SAFETY: as above.
+        unsafe { f(cb, on) };
+        Some(())
+    }
+
+    pub fn cmd_set_patch_control_points(&self, cb: VkCommandBuffer, points: u32) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdSetPatchControlPointsEXT()?;
+        // SAFETY: as above.
+        unsafe { f(cb, points) };
+        Some(())
+    }
+
+    pub fn cmd_begin_rendering(&self, cb: VkCommandBuffer, info: &VkRenderingInfo) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdBeginRendering()?;
+        // SAFETY: as above.
+        unsafe { f(cb, info) };
+        Some(())
+    }
+
+    pub fn cmd_pipeline_barrier2(
+        &self,
+        cb: VkCommandBuffer,
+        dependency: &VkDependencyInfo,
+    ) -> Option<()> {
+        let f = self.recorder(cb)?.try_vkCmdPipelineBarrier2()?;
+        // SAFETY: as above.
+        unsafe { f(cb, dependency) };
         Some(())
     }
 
