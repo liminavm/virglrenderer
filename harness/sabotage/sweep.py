@@ -463,10 +463,10 @@ SABOTAGES = [
         'the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them',
     ),
     (
-        'an array the guest left out reaches the driver as an empty one instead of absent',
+        'an optional array the guest did send is dropped on the way to the driver',
         'virglrs/src/venus/driver.rs',
-        '    a.map_or(core::ptr::null(), |s| s.as_ptr())',
-        '    a.unwrap_or(&[]).as_ptr()',
+        '        let (sizes, strides) = (optional(sizes), optional(strides));',
+        '        let (sizes, strides) = (optional(sizes), core::ptr::null());',
         'the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them',
     ),
     (
