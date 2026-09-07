@@ -448,11 +448,11 @@ SABOTAGES = [
     # wire; refusing to serialize it poisoned a context at a command the desktop sends, and
     # forwarding the guest's number would walk the driver through our arena.
     (
-        'a strided array is refused instead of decoded as the counted array it is',
+        'a strided array is decoded as one element rather than as the count it carries',
         'virglrs/venus-gen/rustgen.py',
         "        if var.is_blob():",
         """        if 'stride' in var.attrs:
-            raise self.Unsupported('%s.%s: stride' % (ty.name, var.name))
+            return ('dynamic', '1')
         if var.is_blob():""",
         'venus::proto::tests::a_strided_array_is_an_ordinary_counted_array_on_the_wire',
     ),
