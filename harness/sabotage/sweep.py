@@ -444,6 +444,22 @@ SABOTAGES = [
     # An extension command's entry point is the guest's choice at `vkCreateDevice`, not ours: the
     # capset advertises everything the pinned vk.xml can serialize. So the fallible accessor is
     # what stands between a guest sending a command its own device never enabled and an abort.
+    # The ledger of commands a guest may send and this build does not serve. Invisible until it
+    # was written down -- three seated-desktop boots found three of its members one at a time.
+    (
+        'a command a guest may send reaches no handler and is on no ledger',
+        'virglrs/src/venus/unserved.txt',
+        'vkQueueBindSparse\n',
+        '',
+        'venus::context::tests::every_command_the_protocol_defines_is_served_or_on_the_ledger',
+    ),
+    (
+        'a command served through a macro is read as unserved',
+        'virglrs/src/venus/context.rs',
+        '                    here = lines.peek().map_or("", |l| l.trim_start());',
+        '                    here = "";',
+        'venus::context::tests::every_command_the_protocol_defines_is_served_or_on_the_ledger',
+    ),
     # A strided array. vk.xml's `stride` describes the guest's own memory and never reaches the
     # wire; refusing to serialize it poisoned a context at a command the desktop sends, and
     # forwarding the guest's number would walk the driver through our arena.

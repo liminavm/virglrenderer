@@ -12827,6 +12827,109 @@ mod tests {
         h.driver.abandon_planted();
     }
 
+    /// Every command the protocol defines is either served or written down as not served.
+    ///
+    /// The capset tells a guest it may send any of them -- its mask is built from what the pinned
+    /// vk.xml can *serialize*, not from what this build handles -- so the unserved set is a
+    /// live part of the interface and not an implementation detail. It was invisible until this
+    /// test: three seated-desktop boots found three of its members one at a time, four minutes
+    /// each, and the fourth would have cost another four.
+    ///
+    /// The served side is read out of this file's own source because there is nothing else to
+    /// read it from: whether `impl Commands for Handlers` overrides a method is a fact the
+    /// compiler keeps and the language will not hand back. A generated table of what *is*
+    /// overridden would be the better answer and is not available; parsing is the honest second
+    /// one, and it fails loudly rather than silently under-reporting -- a handler shape this
+    /// parser cannot see shows up as a command it claims we do not serve.
+    #[test]
+    fn every_command_the_protocol_defines_is_served_or_on_the_ledger() {
+        use super::super::proto::serialize::vn_command_name;
+        use std::collections::BTreeSet;
+
+        /// Every command type the wire defines. The enum is generated and has no iterator; the
+        /// numbers are dense and small, and a bound well past the end costs nothing.
+        fn protocol() -> BTreeSet<&'static str> {
+            (0..4096).filter_map(|n| vn_command_name(VkCommandTypeEXT(n))).collect()
+        }
+
+        /// The commands `impl Commands for Handlers` overrides: written-out `fn vkFoo`, and the
+        /// first argument of each `create`/`destroy` macro, which is the command it stands for.
+        fn served() -> BTreeSet<&'static str> {
+            const SRC: &str = include_str!("context.rs");
+            let start = SRC.find("\nimpl Commands for Handlers").expect("the handler impl");
+            let body = &SRC[start + 1..];
+            let body = &body[..body.find("\n}\n").expect("the impl ends")];
+
+            let mut names = BTreeSet::new();
+            let mut lines = body.lines().peekable();
+            while let Some(line) = lines.next() {
+                let Some(rest) = line.strip_prefix("    ") else { continue };
+                if let Some(f) = rest.strip_prefix("fn vk") {
+                    names.insert(&line[7..7 + f.find('(').expect("a signature") + 2]);
+                    continue;
+                }
+                // A macro invocation, whose first argument is the command. It is on the same
+                // line when it fits and on the next when it does not.
+                let Some(args) = rest.split_once("!(").map(|(_, a)| a) else { continue };
+                let mut here = args.trim_start();
+                if here.is_empty() {
+                    here = lines.peek().map_or("", |l| l.trim_start());
+                }
+                if let Some(name) = here.strip_prefix("vk") {
+                    let end = name.find([',', ')']).unwrap_or(name.len());
+                    names.insert(&here[..end + 2]);
+                }
+            }
+            names
+        }
+
+        const LEDGER: &str = include_str!("unserved.txt");
+        let listed: Vec<&str> = LEDGER
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let ledger: BTreeSet<&str> = listed.iter().copied().collect();
+        assert_eq!(listed.len(), ledger.len(), "the ledger lists a command twice");
+        assert!(
+            listed.windows(2).all(|w| w[0] < w[1]),
+            "the ledger is sorted, so a diff is one line"
+        );
+
+        let (protocol, served) = (protocol(), served());
+        assert!(served.is_subset(&protocol), "a handler for a command no protocol defines");
+
+        // The parser reads source, so it is held to a handful of answers known by hand -- one of
+        // each shape it has to see. Without these the two sets could agree on a wrong reading of
+        // the file and the ledger would record it.
+        for shape in [
+            "vkCmdSetViewport",         // a written-out handler
+            "vkCmdDrawMultiIndexedEXT", // one whose signature wraps onto later lines
+            "vkDestroyPipeline",        // a macro with its command on the same line
+            "vkCreateBuffer",           // a macro with its command on the next
+        ] {
+            assert!(served.contains(shape), "the parser missed a handler that is there: {shape}");
+        }
+        for absent in ["vkQueueBindSparse", "vkCmdSetVertexInputEXT"] {
+            assert!(!served.contains(absent), "the parser invented a handler: {absent}");
+        }
+
+        let unserved: BTreeSet<&str> = protocol.difference(&served).copied().collect();
+        let stale: Vec<&&str> = ledger.difference(&unserved).collect();
+        assert!(
+            stale.is_empty(),
+            "the ledger names {} command(s) that are served or gone -- delete each line: {stale:?}",
+            stale.len()
+        );
+        let missing: Vec<&&str> = unserved.difference(&ledger).collect();
+        assert!(
+            missing.is_empty(),
+            "{} command(s) a guest may send reach no handler and are not written down. Serve each \
+             or add it to src/venus/unserved.txt: {missing:?}",
+            missing.len()
+        );
+    }
+
     /// A multi-draw is walked by the stride of the array the renderer holds, never by the number
     /// the guest sent.
     ///
