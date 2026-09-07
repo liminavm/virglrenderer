@@ -399,17 +399,17 @@ SABOTAGES = [
     (
         'a described blob id may be described twice, and the first claim wins',
         'virglrs/src/vrend/context.rs',
-        """        if self.described.contains_key(&blob_id) {
-            return Err(Fault::OutOfRange { cmd, what: "that blob id is already described" });
-        }""",
-        """""",
+        """        } else if self.described.contains_key(&blob_id) {
+            NotDescribed::IdTaken""",
+        """        } else if false {
+            NotDescribed::IdTaken""",
         'a_described_blob_is_claimed_once_and_by_the_context_that_described_it',
     ),
     (
         'a claim drops the command that described it, so a rebuild has nothing to send',
         'virglrs/src/vrend/context.rs',
         '        self.described.remove(&blob_id)',
-        '        self.described.remove(&blob_id).map(|(r, _)| (r, Vec::new()))',
+        '        self.described.remove(&blob_id).map(|mut r| {\n            r.described_by = None;\n            r\n        })',
         'a_described_blob_is_claimed_once_and_by_the_context_that_described_it',
     ),
     # VK_EXT_host_image_copy. The wire's `...MESA` forms carry the bytes where Vulkan carries a
