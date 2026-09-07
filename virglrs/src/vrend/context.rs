@@ -243,6 +243,34 @@ impl Host<'_> {
     }
 }
 
+/// Why a `PIPE_RESOURCE_CREATE` could not park a resource under the blob id it named.
+///
+/// Three refusals rather than one, because they send the reader somewhere different: a reserved
+/// id and a taken one are the guest's bookkeeping, and a refusal is the resource the guest asked
+/// for being one this host cannot make.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NotDescribed {
+    /// Zero is the wire's way of saying "no blob", so no `CREATE_BLOB` can ever come back for
+    /// it: a resource parked under it is one nothing can reach.
+    ReservedId,
+    /// The context already holds a resource under that id. The C's list quietly keeps both and
+    /// `vrend_get_blob_pipe` hands out whichever it finds first, which is a guest reading an
+    /// allocation it believes it replaced. There is no second id to move one of them to.
+    IdTaken,
+    /// The host could not build the resource the command described.
+    Refused(resource::Refusal),
+}
+
+impl fmt::Display for NotDescribed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotDescribed::ReservedId => write!(f, "a blob id of zero names nothing"),
+            NotDescribed::IdTaken => write!(f, "that blob id is already described"),
+            NotDescribed::Refused(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 /// Why a context stopped serving. Sticky: the first one is kept and every later submission is
 /// refused with it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -329,7 +357,7 @@ pub enum Fault {
     DescribedResource {
         cmd: Cmd,
         blob: BlobId,
-        why: resource::Refusal,
+        why: NotDescribed,
     },
     /// A video command the guest had no business sending: an unserved profile, a handle it never
     /// created, a frame out of sequence. A host that merely fails to decode a frame is not here
@@ -1077,7 +1105,7 @@ pub struct Context {
     ///
     /// Owned rather than registered, so an id the guest describes and never claims dies with the
     /// context and no destroy path has to remember it exists.
-    described: BTreeMap<BlobId, (Resource, Vec<u32>)>,
+    described: BTreeMap<BlobId, Resource>,
 }
 
 impl Context {
@@ -1131,7 +1159,7 @@ impl Context {
         // current: their storage is real allocations that no handle reaches, so nothing else
         // will ever come back for them.
         self.make_current(host);
-        for (_, (res, _)) in std::mem::take(&mut self.described) {
+        for (_, res) in std::mem::take(&mut self.described) {
             // Attached to nothing, and asserted rather than parked: a described resource has no
             // handle, so no view or framebuffer of this context has ever been able to name it.
             assert!(
@@ -1375,14 +1403,18 @@ impl Context {
     ) -> Result<(), Fault> {
         self.describable(blob_id)?;
         self.make_current(host);
-        let res =
+        let mut res =
             Resource::create(host.gl, host.winsys, host.features, host.formats, host.limits, args)
                 .map_err(|why| Fault::DescribedResource {
                     cmd: Cmd::PipeResourceCreate,
                     blob: blob_id,
-                    why,
+                    why: NotDescribed::Refused(why),
                 })?;
-        self.described.insert(blob_id, (res, wire.to_vec()));
+        // The command travels on the resource and not beside it: a rebuild needs exactly the
+        // command that made this resource, and two containers holding the halves of that is one
+        // more pair that can come apart.
+        res.described_by = Some(wire.to_vec());
+        self.described.insert(blob_id, res);
         Ok(())
     }
 
@@ -1395,14 +1427,14 @@ impl Context {
     /// replaced. Both are the guest's error, and neither can be repaired here -- there is no
     /// second id to move one of them to.
     fn describable(&self, blob_id: BlobId) -> Result<(), Fault> {
-        let cmd = Cmd::PipeResourceCreate;
-        if blob_id.0 == 0 {
-            return Err(Fault::OutOfRange { cmd, what: "a blob id of zero names nothing" });
-        }
-        if self.described.contains_key(&blob_id) {
-            return Err(Fault::OutOfRange { cmd, what: "that blob id is already described" });
-        }
-        Ok(())
+        let why = if blob_id.0 == 0 {
+            NotDescribed::ReservedId
+        } else if self.described.contains_key(&blob_id) {
+            NotDescribed::IdTaken
+        } else {
+            return Ok(());
+        };
+        Err(Fault::DescribedResource { cmd: Cmd::PipeResourceCreate, blob: blob_id, why })
     }
 
     /// Hand over the resource described under `blob_id`, and the command that described it.
@@ -1411,7 +1443,7 @@ impl Context {
     /// it over from here, so the id stops naming anything the moment it is answered. That is the
     /// C's `vrend_get_blob_pipe` zeroing `res->blob_id`, except that here there is no field left
     /// to go stale.
-    pub fn claim_described(&mut self, blob_id: BlobId) -> Option<(Resource, Vec<u32>)> {
+    pub fn claim_described(&mut self, blob_id: BlobId) -> Option<Resource> {
         self.described.remove(&blob_id)
     }
 
@@ -4070,20 +4102,28 @@ mod tests {
         let mut ctx = bare();
         let id = BlobId(7);
         ctx.describable(id).expect("nothing holds it yet");
-        ctx.described.insert(id, (Resource::unbacked(buffer_args(0x1000)), vec![1, 2, 3]));
+        let mut res = Resource::unbacked(buffer_args(0x1000));
+        res.described_by = Some(vec![1, 2, 3]);
+        ctx.described.insert(id, res);
 
         // Describing it again would leave two allocations under one name, and the claim would
         // hand out whichever the container found first -- a guest reading memory it believes it
         // replaced.
         assert!(
-            matches!(ctx.describable(id), Err(Fault::OutOfRange { .. })),
+            matches!(
+                ctx.describable(id),
+                Err(Fault::DescribedResource { why: NotDescribed::IdTaken, .. })
+            ),
             "an id already described cannot be described again"
         );
 
         // Zero is the wire's "no blob": no CREATE_BLOB can ever name it, so an allocation parked
         // under it is one nothing can reach and nothing will free until the context dies.
         assert!(
-            matches!(ctx.describable(BlobId(0)), Err(Fault::OutOfRange { .. })),
+            matches!(
+                ctx.describable(BlobId(0)),
+                Err(Fault::DescribedResource { why: NotDescribed::ReservedId, .. })
+            ),
             "zero names nothing, so it may not name a described resource"
         );
 
@@ -4092,9 +4132,13 @@ mod tests {
 
         // The claim takes. Leaving the entry behind would let a second CREATE_BLOB give a
         // second handle to one allocation, and the two handles would free it twice.
-        let (res, wire) = ctx.claim_described(id).expect("described");
+        let res = ctx.claim_described(id).expect("described");
         assert_eq!(res.args.width, 0x1000);
-        assert_eq!(wire, vec![1, 2, 3], "the claim carries what described it, for a rebuild");
+        assert_eq!(
+            res.described_by.as_deref(),
+            Some(&[1, 2, 3][..]),
+            "the claim carries what described it, for a rebuild"
+        );
         assert!(ctx.claim_described(id).is_none(), "and the id names nothing afterwards");
         assert!(ctx.describable(id).is_ok(), "so the guest may describe it again");
     }

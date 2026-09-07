@@ -32,22 +32,35 @@ use super::proto::types::{
     vn_command_vkAllocateDescriptorSets, vn_command_vkAllocateMemory,
     vn_command_vkBeginCommandBuffer, vn_command_vkBindBufferMemory, vn_command_vkBindBufferMemory2,
     vn_command_vkBindImageMemory, vn_command_vkBindImageMemory2, vn_command_vkCmdBeginQuery,
-    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBindDescriptorSets,
-    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers, vn_command_vkCmdBlitImage,
+    vn_command_vkCmdBeginRenderPass, vn_command_vkCmdBeginRendering,
+    vn_command_vkCmdBindDescriptorSets, vn_command_vkCmdBindIndexBuffer,
+    vn_command_vkCmdBindPipeline, vn_command_vkCmdBindVertexBuffers,
+    vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdBlitImage,
     vn_command_vkCmdClearAttachments, vn_command_vkCmdClearColorImage, vn_command_vkCmdCopyBuffer,
     vn_command_vkCmdCopyBufferToImage, vn_command_vkCmdCopyImage,
     vn_command_vkCmdCopyImageToBuffer, vn_command_vkCmdCopyQueryPoolResults,
     vn_command_vkCmdDispatch, vn_command_vkCmdDraw, vn_command_vkCmdEndQuery,
-    vn_command_vkCmdEndRenderPass, vn_command_vkCmdFillBuffer, vn_command_vkCmdPipelineBarrier,
-    vn_command_vkCmdPushConstants, vn_command_vkCmdResetQueryPool,
-    vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT, vn_command_vkCmdSetScissor,
-    vn_command_vkCmdSetViewport, vn_command_vkCmdWriteTimestamp, vn_command_vkCopyImageToImage,
-    vn_command_vkCopyImageToMemoryMESA, vn_command_vkCopyMemoryToImageMESA,
-    vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool, vn_command_vkCreateComputePipelines,
-    vn_command_vkCreateDescriptorPool, vn_command_vkCreateDescriptorSetLayout,
-    vn_command_vkCreateDevice, vn_command_vkCreateFence, vn_command_vkCreateFramebuffer,
-    vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage, vn_command_vkCreateImageView,
-    vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
+    vn_command_vkCmdEndRenderPass, vn_command_vkCmdEndRendering, vn_command_vkCmdFillBuffer,
+    vn_command_vkCmdPipelineBarrier, vn_command_vkCmdPipelineBarrier2,
+    vn_command_vkCmdPushConstants, vn_command_vkCmdPushDescriptorSet,
+    vn_command_vkCmdResetQueryPool, vn_command_vkCmdSetAttachmentFeedbackLoopEnableEXT,
+    vn_command_vkCmdSetBlendConstants, vn_command_vkCmdSetCullMode, vn_command_vkCmdSetDepthBias,
+    vn_command_vkCmdSetDepthBoundsTestEnable, vn_command_vkCmdSetDepthCompareOp,
+    vn_command_vkCmdSetDepthTestEnable, vn_command_vkCmdSetDepthWriteEnable,
+    vn_command_vkCmdSetFrontFace, vn_command_vkCmdSetLineWidth,
+    vn_command_vkCmdSetPatchControlPointsEXT, vn_command_vkCmdSetPrimitiveRestartEnable,
+    vn_command_vkCmdSetPrimitiveTopology, vn_command_vkCmdSetRasterizerDiscardEnable,
+    vn_command_vkCmdSetScissor, vn_command_vkCmdSetScissorWithCount,
+    vn_command_vkCmdSetStencilCompareMask, vn_command_vkCmdSetStencilOp,
+    vn_command_vkCmdSetStencilReference, vn_command_vkCmdSetStencilTestEnable,
+    vn_command_vkCmdSetStencilWriteMask, vn_command_vkCmdSetViewport,
+    vn_command_vkCmdSetViewportWithCount, vn_command_vkCmdWriteTimestamp,
+    vn_command_vkCopyImageToImage, vn_command_vkCopyImageToMemoryMESA,
+    vn_command_vkCopyMemoryToImageMESA, vn_command_vkCreateBuffer, vn_command_vkCreateCommandPool,
+    vn_command_vkCreateComputePipelines, vn_command_vkCreateDescriptorPool,
+    vn_command_vkCreateDescriptorSetLayout, vn_command_vkCreateDevice, vn_command_vkCreateFence,
+    vn_command_vkCreateFramebuffer, vn_command_vkCreateGraphicsPipelines, vn_command_vkCreateImage,
+    vn_command_vkCreateImageView, vn_command_vkCreateInstance, vn_command_vkCreatePipelineCache,
     vn_command_vkCreatePipelineLayout, vn_command_vkCreateQueryPool, vn_command_vkCreateRenderPass,
     vn_command_vkCreateRingMESA, vn_command_vkCreateSampler,
     vn_command_vkCreateSamplerYcbcrConversion, vn_command_vkCreateSemaphore,
@@ -3989,6 +4002,204 @@ impl Commands for Handlers<'_> {
     fn vkCmdSetViewport(&mut self, args: &mut vn_command_vkCmdSetViewport<'_>) {
         let viewports = args.pViewports();
         let done = self.driver.cmd_set_viewport(args.commandBuffer, args.firstViewport, viewports);
+        self.recorded(done);
+    }
+
+    fn vkCmdBindIndexBuffer(&mut self, args: &mut vn_command_vkCmdBindIndexBuffer<'_>) {
+        let done = self.driver.cmd_bind_index_buffer(
+            args.commandBuffer,
+            args.buffer,
+            args.offset,
+            args.indexType,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthBias(&mut self, args: &mut vn_command_vkCmdSetDepthBias<'_>) {
+        let done = self.driver.cmd_set_depth_bias(
+            args.commandBuffer,
+            args.depthBiasConstantFactor,
+            args.depthBiasClamp,
+            args.depthBiasSlopeFactor,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetLineWidth(&mut self, args: &mut vn_command_vkCmdSetLineWidth<'_>) {
+        let done = self.driver.cmd_set_line_width(args.commandBuffer, args.lineWidth);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetStencilCompareMask(&mut self, args: &mut vn_command_vkCmdSetStencilCompareMask<'_>) {
+        let done = self.driver.cmd_set_stencil_compare_mask(
+            args.commandBuffer,
+            args.faceMask,
+            args.compareMask,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetStencilReference(&mut self, args: &mut vn_command_vkCmdSetStencilReference<'_>) {
+        let done = self.driver.cmd_set_stencil_reference(
+            args.commandBuffer,
+            args.faceMask,
+            args.reference,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetStencilWriteMask(&mut self, args: &mut vn_command_vkCmdSetStencilWriteMask<'_>) {
+        let done = self.driver.cmd_set_stencil_write_mask(
+            args.commandBuffer,
+            args.faceMask,
+            args.writeMask,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdEndRendering(&mut self, args: &mut vn_command_vkCmdEndRendering<'_>) {
+        let done = self.driver.cmd_end_rendering(args.commandBuffer);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetCullMode(&mut self, args: &mut vn_command_vkCmdSetCullMode<'_>) {
+        let done = self.driver.cmd_set_cull_mode(args.commandBuffer, args.cullMode);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetFrontFace(&mut self, args: &mut vn_command_vkCmdSetFrontFace<'_>) {
+        let done = self.driver.cmd_set_front_face(args.commandBuffer, args.frontFace);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetPrimitiveTopology(&mut self, args: &mut vn_command_vkCmdSetPrimitiveTopology<'_>) {
+        let done =
+            self.driver.cmd_set_primitive_topology(args.commandBuffer, args.primitiveTopology);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthTestEnable(&mut self, args: &mut vn_command_vkCmdSetDepthTestEnable<'_>) {
+        let done = self.driver.cmd_set_depth_test_enable(args.commandBuffer, args.depthTestEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthWriteEnable(&mut self, args: &mut vn_command_vkCmdSetDepthWriteEnable<'_>) {
+        let done =
+            self.driver.cmd_set_depth_write_enable(args.commandBuffer, args.depthWriteEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthCompareOp(&mut self, args: &mut vn_command_vkCmdSetDepthCompareOp<'_>) {
+        let done = self.driver.cmd_set_depth_compare_op(args.commandBuffer, args.depthCompareOp);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetDepthBoundsTestEnable(
+        &mut self,
+        args: &mut vn_command_vkCmdSetDepthBoundsTestEnable<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_depth_bounds_test_enable(args.commandBuffer, args.depthBoundsTestEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetStencilTestEnable(&mut self, args: &mut vn_command_vkCmdSetStencilTestEnable<'_>) {
+        let done =
+            self.driver.cmd_set_stencil_test_enable(args.commandBuffer, args.stencilTestEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetStencilOp(&mut self, args: &mut vn_command_vkCmdSetStencilOp<'_>) {
+        let done = self.driver.cmd_set_stencil_op(
+            args.commandBuffer,
+            args.faceMask,
+            args.failOp,
+            args.passOp,
+            args.depthFailOp,
+            args.compareOp,
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdSetRasterizerDiscardEnable(
+        &mut self,
+        args: &mut vn_command_vkCmdSetRasterizerDiscardEnable<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_rasterizer_discard_enable(args.commandBuffer, args.rasterizerDiscardEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetPrimitiveRestartEnable(
+        &mut self,
+        args: &mut vn_command_vkCmdSetPrimitiveRestartEnable<'_>,
+    ) {
+        let done = self
+            .driver
+            .cmd_set_primitive_restart_enable(args.commandBuffer, args.primitiveRestartEnable);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetPatchControlPointsEXT(
+        &mut self,
+        args: &mut vn_command_vkCmdSetPatchControlPointsEXT<'_>,
+    ) {
+        let done =
+            self.driver.cmd_set_patch_control_points(args.commandBuffer, args.patchControlPoints);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetBlendConstants(&mut self, args: &mut vn_command_vkCmdSetBlendConstants<'_>) {
+        let done = self.driver.cmd_set_blend_constants(args.commandBuffer, &args.blendConstants);
+        self.recorded(done);
+    }
+
+    fn vkCmdBeginRendering(&mut self, args: &mut vn_command_vkCmdBeginRendering<'_>) {
+        let Some(info) = self.names(args.pRenderingInfo) else { return };
+        let done = self.driver.cmd_begin_rendering(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdPipelineBarrier2(&mut self, args: &mut vn_command_vkCmdPipelineBarrier2<'_>) {
+        let Some(info) = self.names(args.pDependencyInfo) else { return };
+        let done = self.driver.cmd_pipeline_barrier2(args.commandBuffer, info);
+        self.recorded(done);
+    }
+
+    fn vkCmdSetViewportWithCount(&mut self, args: &mut vn_command_vkCmdSetViewportWithCount<'_>) {
+        let done = self.driver.cmd_set_viewport_with_count(args.commandBuffer, args.pViewports());
+        self.recorded(done);
+    }
+
+    fn vkCmdSetScissorWithCount(&mut self, args: &mut vn_command_vkCmdSetScissorWithCount<'_>) {
+        let done = self.driver.cmd_set_scissor_with_count(args.commandBuffer, args.pScissors());
+        self.recorded(done);
+    }
+
+    fn vkCmdBindVertexBuffers2(&mut self, args: &mut vn_command_vkCmdBindVertexBuffers2<'_>) {
+        // Four arrays under one count, two of them optional. Every slice comes from an accessor
+        // reading that same count, so the driver is handed lengths it can only agree with.
+        let done = self.driver.cmd_bind_vertex_buffers2(
+            args.commandBuffer,
+            args.firstBinding,
+            args.pBuffers(),
+            args.pOffsets(),
+            args.pSizes(),
+            args.pStrides(),
+        );
+        self.recorded(done);
+    }
+
+    fn vkCmdPushDescriptorSet(&mut self, args: &mut vn_command_vkCmdPushDescriptorSet<'_>) {
+        let done = self.driver.cmd_push_descriptor_set(
+            args.commandBuffer,
+            args.pipelineBindPoint,
+            args.layout,
+            args.set,
+            args.pDescriptorWrites(),
+        );
         self.recorded(done);
     }
 
@@ -12591,6 +12802,189 @@ mod tests {
         assert!(h.reject.is_some(), "there is no device to record into");
 
         // Nothing here came from Vulkan, so there is nothing to destroy. See `abandon_planted`.
+        h.driver.abandon_planted();
+    }
+
+    /// The three shapes the desktop's recording commands added, each one invisible to every
+    /// other gate.
+    ///
+    /// A fixed-size array parameter, which C passes as an address and not as an aggregate; a
+    /// count-bearing dynamic-state command, which replaces the whole state and so has no first
+    /// index for a wrapper to pass the count as; and four arrays under one count, two of which
+    /// the guest may leave out, where an absent array must reach the driver as null rather than
+    /// as an empty one.
+    #[test]
+    fn the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them() {
+        use super::super::proto::types::{
+            VkBuffer, VkCommandBuffer, VkCommandPool, VkDevice, VkDeviceSize, VkViewport,
+            vn_command_vkCmdBindVertexBuffers2, vn_command_vkCmdSetBlendConstants,
+            vn_command_vkCmdSetViewportWithCount,
+        };
+        use std::cell::RefCell;
+
+        const DEVICE: u64 = 3;
+        const POOL: u64 = 7;
+        const CB: (u64, u64) = (11, 110);
+
+        /// One `vkCmdBindVertexBuffers2` as the driver saw it: the first binding, the two
+        /// arrays that are always there, and the two that may be absent.
+        type Bound = (u32, Vec<u64>, Vec<u64>, Option<Vec<u64>>, Option<Vec<u64>>);
+
+        #[derive(Default)]
+        struct Saw {
+            blend: Vec<[f32; 4]>,
+            viewports: Vec<Vec<f32>>,
+            bind2: Vec<Bound>,
+        }
+        thread_local! {
+            static SAW: RefCell<Saw> = RefCell::new(Saw::default());
+        }
+
+        unsafe extern "C" fn blend(_cb: VkCommandBuffer, p: *const f32) {
+            // SAFETY: the wrapper passes the address of a `[f32; 4]` that outlives the call.
+            let c = unsafe { core::slice::from_raw_parts(p, 4) };
+            SAW.with_borrow_mut(|s| s.blend.push([c[0], c[1], c[2], c[3]]));
+        }
+
+        unsafe extern "C" fn viewports(_cb: VkCommandBuffer, count: u32, p: *const VkViewport) {
+            // SAFETY: the wrapper passes a slice's own pointer and length.
+            let v = unsafe { core::slice::from_raw_parts(p, count as usize) };
+            SAW.with_borrow_mut(|s| s.viewports.push(v.iter().map(|v| v.x).collect()));
+        }
+
+        unsafe extern "C" fn bind2(
+            _cb: VkCommandBuffer,
+            first: u32,
+            count: u32,
+            buffers: *const VkBuffer,
+            offsets: *const VkDeviceSize,
+            sizes: *const VkDeviceSize,
+            strides: *const VkDeviceSize,
+        ) {
+            // SAFETY: one count for every array; the two optional ones are null or that long.
+            let opt = |p: *const VkDeviceSize| unsafe {
+                (!p.is_null()).then(|| {
+                    core::slice::from_raw_parts(p, count as usize)
+                        .iter()
+                        .map(|v| v.0)
+                        .collect::<Vec<u64>>()
+                })
+            };
+            // SAFETY: as above.
+            let (b, o) = unsafe {
+                (
+                    core::slice::from_raw_parts(buffers, count as usize),
+                    core::slice::from_raw_parts(offsets, count as usize),
+                )
+            };
+            SAW.with_borrow_mut(|s| {
+                s.bind2.push((
+                    first,
+                    b.iter().map(|h| h.0).collect(),
+                    o.iter().map(|v| v.0).collect(),
+                    opt(sizes),
+                    opt(strides),
+                ))
+            });
+        }
+
+        let mut fns = crate::vulkan::Device::default();
+        fns.plant_vkCmdSetBlendConstants(blend);
+        fns.plant_vkCmdSetViewportWithCount(viewports);
+        fns.plant_vkCmdBindVertexBuffers2(bind2);
+
+        let objects = Shared::new();
+        let mut driver = Driver::new(Account::for_test(None));
+        driver.plant_device(VkDevice(DEVICE), fns);
+        driver.plant_pool(
+            VkDevice(DEVICE),
+            VkCommandPool(POOL),
+            &[(VkCommandBuffer(CB.0), ObjectId(CB.1))],
+        );
+
+        let mut todo = Unimplemented::default();
+        let global = crate::vulkan::global();
+        let mut rings = BTreeMap::new();
+        let mut ctx_reply = None;
+        let mut monitor = None;
+        let mut jrnl = Journal::new();
+        let mut h = Handlers {
+            objects: &objects,
+            todo: &mut todo,
+            driver: &mut driver,
+            global: &global,
+            ctx: ContextId::new(1).expect("1 is not zero"),
+            reject: None,
+            resources: &NO_RESOURCES,
+            rings: &mut rings,
+            monitor: &mut monitor,
+            wait: None,
+            execute: None,
+            replaying: false,
+            current_ring: None,
+            reply: &mut ctx_reply,
+            note: None,
+            journal: &mut jrnl,
+        };
+        let cb = VkCommandBuffer(CB.0);
+
+        // Four distinct floats: a wrapper that passed the aggregate by value would put them in
+        // the wrong registers, and one that passed the first would land three zeroes.
+        let mut args = vn_command_vkCmdSetBlendConstants {
+            commandBuffer: cb,
+            blendConstants: [0.25, 0.5, 0.75, 1.0],
+            ..Default::default()
+        };
+        h.vkCmdSetBlendConstants(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| assert_eq!(s.blend, [[0.25, 0.5, 0.75, 1.0]]));
+
+        // Two viewports and no first index. The 1.0 form takes one; passing the count where it
+        // goes, or a stray zero ahead of the count, is what this shape can get wrong.
+        let vps: [VkViewport; 2] =
+            core::array::from_fn(|i| VkViewport { x: 20.0 + i as f32, ..Default::default() });
+        let mut args = vn_command_vkCmdSetViewportWithCount::default();
+        args.commandBuffer = cb;
+        args.plant_pViewports(&vps);
+        h.vkCmdSetViewportWithCount(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| assert_eq!(s.viewports, [vec![20.0, 21.0]]));
+
+        // All four arrays, then only the two mandatory ones. An absent array is null and not an
+        // empty slice: Vulkan reads null as "not supplied" and an empty one is a count of zero
+        // the guest never sent.
+        let buffers = [VkBuffer(0x100), VkBuffer(0x200)];
+        let offsets = [VkDeviceSize(8), VkDeviceSize(16)];
+        let sizes = [VkDeviceSize(32), VkDeviceSize(64)];
+        let strides = [VkDeviceSize(128), VkDeviceSize(256)];
+        let mut args = vn_command_vkCmdBindVertexBuffers2::default();
+        args.commandBuffer = cb;
+        args.firstBinding = 3;
+        args.plant_pBuffers(&buffers);
+        args.plant_pOffsets(&offsets);
+        args.plant_pSizes(&sizes);
+        args.plant_pStrides(&strides);
+        h.vkCmdBindVertexBuffers2(&mut args);
+        assert!(h.reject.is_none());
+
+        let mut args = vn_command_vkCmdBindVertexBuffers2::default();
+        args.commandBuffer = cb;
+        args.firstBinding = 3;
+        args.plant_pBuffers(&buffers);
+        args.plant_pOffsets(&offsets);
+        h.vkCmdBindVertexBuffers2(&mut args);
+        assert!(h.reject.is_none());
+        SAW.with_borrow(|s| {
+            assert_eq!(
+                s.bind2,
+                [
+                    (3, vec![0x100, 0x200], vec![8, 16], Some(vec![32, 64]), Some(vec![128, 256])),
+                    (3, vec![0x100, 0x200], vec![8, 16], None, None),
+                ]
+            );
+        });
+
+        // Nothing here came from Vulkan, so there is nothing to destroy.
         h.driver.abandon_planted();
     }
 

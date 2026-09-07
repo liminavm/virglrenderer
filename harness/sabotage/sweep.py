@@ -444,6 +444,31 @@ SABOTAGES = [
     # An extension command's entry point is the guest's choice at `vkCreateDevice`, not ours: the
     # capset advertises everything the pinned vk.xml can serialize. So the fallible accessor is
     # what stands between a guest sending a command its own device never enabled and an abort.
+    # The recording commands the seated desktop sends. Three shapes nothing else can see: a
+    # fixed array parameter (C passes the address, not the aggregate), a count-bearing dynamic
+    # state command (no first index for the count to be passed as), and four arrays under one
+    # count where an absent one must be null and not empty.
+    (
+        'a fixed-size array argument is handed to the driver as an aggregate',
+        'virglrs/src/venus/driver.rs',
+        '        unsafe { (d.vkCmdSetBlendConstants())(cb, constants.as_ptr()) };',
+        '        unsafe { (d.vkCmdSetBlendConstants())(cb, [0.0; 4].as_ptr()) };',
+        'the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them',
+    ),
+    (
+        "a count-bearing dynamic state command is passed a first index it has no room for",
+        'virglrs/src/venus/driver.rs',
+        '        unsafe { f(cb, viewports.len() as u32, viewports.as_ptr()) };',
+        '        unsafe { f(cb, 1, viewports.as_ptr()) };',
+        'the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them',
+    ),
+    (
+        'an array the guest left out reaches the driver as an empty one instead of absent',
+        'virglrs/src/venus/driver.rs',
+        '    a.map_or(core::ptr::null(), |s| s.as_ptr())',
+        '    a.unwrap_or(&[]).as_ptr()',
+        'the_desktop_recording_shapes_reach_the_driver_as_the_guest_sent_them',
+    ),
     (
         'an extension recording command aborts when the device has no entry point for it',
         'virglrs/src/venus/driver.rs',

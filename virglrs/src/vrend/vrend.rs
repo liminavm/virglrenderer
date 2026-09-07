@@ -469,7 +469,7 @@ impl Vrend {
         size: u64,
     ) -> Result<Args, ClaimRefused> {
         assert!(!self.resources.contains_key(&handle), "the renderer checked the handle was free");
-        let (mut res, wire) = self
+        let mut res = self
             .contexts
             .get_mut(&ctx)
             .and_then(|c| c.claim_described(blob))
@@ -493,7 +493,6 @@ impl Vrend {
             );
             return Err(why);
         }
-        res.described_by = Some(wire);
         self.resources.insert(handle, resource::Slot::Resource(res));
         Ok(args)
     }
