@@ -484,6 +484,64 @@ mod tests {
         );
     }
 
+    /// A strided array arrives tight, and the stride the guest sends is a number about *its*
+    /// memory.
+    ///
+    /// vk.xml gives `pIndexInfo` a `stride` because the caller may space the elements out in its
+    /// own address space. venus's driver encoder walks that spacing and writes the elements
+    /// tightly, so a renderer decodes an ordinary counted array -- which is what the C does, and
+    /// what this build refused to do until the gap was closed, poisoning gnome-shell's context
+    /// at a command it does send.
+    #[test]
+    fn a_strided_array_is_an_ordinary_counted_array_on_the_wire() {
+        const CMD: VkCommandTypeEXT =
+            VkCommandTypeEXT::VK_COMMAND_TYPE_vkCmdDrawMultiIndexedEXT_EXT;
+
+        let w = wire(&[
+            &7u64.to_le_bytes(),    // commandBuffer
+            &2u32.to_le_bytes(),    // drawCount
+            &2u64.to_le_bytes(),    // pIndexInfo: two elements, and no stride anywhere on the wire
+            &10u32.to_le_bytes(),   // [0].firstIndex
+            &11u32.to_le_bytes(),   // [0].indexCount
+            &(-1i32).to_le_bytes(), // [0].vertexOffset
+            &20u32.to_le_bytes(),   // [1].firstIndex
+            &21u32.to_le_bytes(),   // [1].indexCount
+            &2i32.to_le_bytes(),    // [1].vertexOffset
+            &3u32.to_le_bytes(),    // instanceCount
+            &4u32.to_le_bytes(),    // firstInstance
+            &12u32.to_le_bytes(),   // stride, as the guest's encoder reports it: sizeof(element)
+            &1u64.to_le_bytes(),    // pVertexOffset: present
+            &5i32.to_le_bytes(),
+        ]);
+
+        let temp = Bump::new();
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        let mut args = vn_command_vkCmdDrawMultiIndexedEXT::default();
+        vn_decode_vkCmdDrawMultiIndexedEXT_args_temp(&mut dec, &mut args);
+        assert!(!dec.fatal(), "the command decodes; a gap here poisons the ring");
+        assert_eq!(dec.pos(), w.len(), "and consumes exactly the command");
+
+        let draws = args.pIndexInfo().expect("two draws were sent");
+        assert_eq!(draws.len(), 2);
+        assert_eq!((draws[0].firstIndex, draws[0].indexCount, draws[0].vertexOffset), (10, 11, -1));
+        assert_eq!((draws[1].firstIndex, draws[1].indexCount, draws[1].vertexOffset), (20, 21, 2));
+        assert_eq!((args.drawCount, args.instanceCount, args.firstInstance), (2, 3, 4));
+        assert_eq!(args.pVertexOffset, Some(&5));
+
+        // And the bytes come back as they went in, which is the diff against the C encoder that
+        // wrote them.
+        let hard = AtomicBool::new(false);
+        let mut dec = Decoder::new(&w, &temp, &IdentityObjects, &hard);
+        let mut buf = vec![0u8; w.len() + 8];
+        let mut enc = Encoder::new(&mut buf, &AllOfIt);
+        let size =
+            vn_round_trip_args(&mut dec, &mut enc, CMD, VkFlags(0)).expect("a defined command");
+        assert!(!dec.fatal());
+        assert_eq!(size, w.len() + 8);
+        assert_eq!(enc.written()[8..], w[..]);
+    }
+
     /// The capset hands the guest a bitmask indexed by extension number, and the guest reads it
     /// to decide what it may send. A table that disagrees with what the serializer can actually
     /// decode is a protocol mismatch that shows up as a corrupt stream, not as an error.
