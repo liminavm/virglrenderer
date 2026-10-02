@@ -144,10 +144,10 @@ pub mod cap2 {
     pub const RESOURCE_LAYOUT: u32 = 1 << 18;
     /// The guest may back a decode target's planes with its own memory, which is what lets it
     /// export the decoded frame as a dmabuf rather than only sample it.
-    pub const VIDEO_GUEST_PLANES: u32 = 1 << 19;
+    pub const VIDEO_GUEST_PLANES: u32 = 1 << 31;
     /// The guest may hand over one composite planar resource as a decode target, instead of one
     /// resource per plane.
-    pub const VIDEO_PLANAR_TARGET: u32 = 1 << 20;
+    pub const VIDEO_PLANAR_TARGET: u32 = 1 << 30;
 }
 
 /// `virgl_caps_v1`.

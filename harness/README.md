@@ -499,7 +499,7 @@ no hypervisor. This is the layer the rewrite is actually tested by, because it r
   a decode path for. On a host with the silicon that is now the C's own six, byte for byte; a
   machine missing a codec's hardware reports fewer on both legs and still matches.
 
-  `capability_bits_v2` is short `VIDEO_GUEST_PLANES` (1<<19), which the C sets on there being a
+  `capability_bits_v2` is short `VIDEO_GUEST_PLANES` (1<<31), which the C sets on there being a
   decoder at all. That is right for the C, which writes the decoded frame back into the guest's
   own pages; the bit tells the guest that backing a decode target's planes with its memory is
   worthwhile, and a guest that took the offer here would export an honest-looking dmabuf fd
