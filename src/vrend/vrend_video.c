@@ -394,7 +394,7 @@ static void writeback_plane_to_guest(struct vrend_resource *res, unsigned plane_
      * guest wants the frame here"; there is nothing else to ask. */
     extent = offset + (height ? (height - 1) * stride + row : 0);
     storage = res->guest_pixels_map ? res->guest_pixels_map_size
-                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+                                    : virgl_get_iovec_size(res->iov, res->num_iovs);
     if (trace)
         virgl_warn("writeback: plane %u %ux%u of %ux%u %s row %zu stride %zu off %zu "
                    "extent %zu storage %zu src pitch %u -> %s\n",
@@ -411,7 +411,7 @@ static void writeback_plane_to_guest(struct vrend_resource *res, unsigned plane_
         if (res->guest_pixels_map)
             memcpy((char *)res->guest_pixels_map + dst, src, row);
         else
-            vrend_write_to_iovec(res->iov, res->num_iovs, dst, src, row);
+            virgl_write_to_iovec(res->iov, res->num_iovs, dst, src, row);
     }
 }
 
@@ -650,7 +650,7 @@ static bool guest_plane_span(struct vrend_resource *res, unsigned plane_idx, siz
 
     extent = *offset + (height ? (height - 1) * *stride + row : 0);
     storage = res->guest_pixels_map ? res->guest_pixels_map_size
-                                    : vrend_get_iovec_size(res->iov, res->num_iovs);
+                                    : virgl_get_iovec_size(res->iov, res->num_iovs);
     return extent <= storage;
 }
 
@@ -685,11 +685,11 @@ static void copy_guest_plane(struct vrend_resource *src, struct vrend_resource *
         if (src->guest_pixels_map)
             memcpy(tmp, (const char *)src->guest_pixels_map + soff + y * sstride, row);
         else
-            vrend_read_from_iovec(src->iov, src->num_iovs, soff + y * sstride, tmp, row);
+            virgl_read_from_iovec(src->iov, src->num_iovs, soff + y * sstride, tmp, row);
         if (dst->guest_pixels_map)
             memcpy((char *)dst->guest_pixels_map + doff + y * dstride, tmp, row);
         else
-            vrend_write_to_iovec(dst->iov, dst->num_iovs, doff + y * dstride, tmp, row);
+            virgl_write_to_iovec(dst->iov, dst->num_iovs, doff + y * dstride, tmp, row);
     }
     free(tmp);
 }

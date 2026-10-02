@@ -394,7 +394,7 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
                     dimg ? dimg->limina_vk_format : 0, mtl_fmt, limina_imported_texture);
          }
          if (limina_imported_texture) {
-            prev_of_res_info->pNext = res_info->pNext; /* unlink res_info */
+            vkr_pnext_set_next(prev_of_res_info, res_info->pNext); /* unlink res_info */
             limina_metal_res_import.sType =
                VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT;
             limina_metal_res_import.handleType =
@@ -658,10 +658,10 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
    }
    if (limina_scanout_surf && !mtl_shm) {
       if (export_info) {
-         VkBaseInStructure *prev_of_export =
+         void *prev_of_export =
             vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
          if (prev_of_export)
-            prev_of_export->pNext = export_info->pNext;
+            vkr_pnext_set_next(prev_of_export, export_info->pNext);
          export_info = NULL;
       }
       valid_fd_types = 0;
@@ -748,10 +748,10 @@ vkr_dispatch_vkAllocateMemory_impl(struct vn_dispatch_context *dispatch,
        (export_info->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT))) {
       const uint32_t limina_export_ht = export_info->handleTypes;
-      VkBaseInStructure *prev_of_export =
+      void *prev_of_export =
          vkr_find_prev_struct(alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
       if (prev_of_export) {
-         prev_of_export->pNext = export_info->pNext;
+         vkr_pnext_set_next(prev_of_export, export_info->pNext);
          export_info = NULL;
          valid_fd_types = 0;
 

@@ -5954,7 +5954,7 @@ static void vrend_draw_bind_const_shader(struct vrend_sub_context *sub_ctx,
          unsigned len = MIN2(want, avail);
 
          memset(tmp, 0, want);
-         if (vrend_read_from_iovec(res->iov, res->num_iovs, cb->buffer_offset,
+         if (virgl_read_from_iovec(res->iov, res->num_iovs, cb->buffer_offset,
                                    (char *)tmp, len) == len)
             glUniform4uiv(sub_ctx->prog->const_location[shader_type], num_consts, tmp);
       }
@@ -8232,7 +8232,7 @@ static void vrend_pipe_resource_attach_iov(struct pipe_resource *pres,
     * would race the guest, which may already have filled these pages: the kernel
     * queues ATTACH_BACKING and returns to userspace without waiting for it. */
    if (has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY) && res->ptr_valid) {
-      vrend_write_to_iovec(res->iov, res->num_iovs, 0,
+      virgl_write_to_iovec(res->iov, res->num_iovs, 0,
             res->ptr, res->base.width0);
       res->ptr_valid = false;
    }
@@ -11016,7 +11016,7 @@ static __thread uint32_t limina_trace_xfer_handle;
  *
  * Neither of the paths that legitimately move planar pixels comes through here:
  * vrend_resource_upload_guest_pixels and writeback_plane_to_guest both walk the guest's
- * iovecs with vrend_read_from_iovec, which bounds-checks and refuses on short.
+ * iovecs with virgl_read_from_iovec, which bounds-checks and refuses on short.
  *
  * Loud on purpose. No planar transfer destination was seen across seven guest command
  * corpora, so a benign guest is not believed to reach this -- if one does we want to see
@@ -11072,7 +11072,7 @@ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
       if (size > 0 && size <= UINT32_MAX) {
          void *tmp = malloc((size_t)size);
          if (tmp) {
-            vrend_read_from_iovec(iov, num_iovs, info->offset, tmp, (size_t)size);
+            virgl_read_from_iovec(iov, num_iovs, info->offset, tmp, (size_t)size);
             vrend_trace_transfer_data(ctx->ctx_id, limina_trace_xfer_handle,
                                       info->offset, tmp, (uint32_t)size);
             free(tmp);
@@ -15342,7 +15342,7 @@ guest_pixels_convert_yuv(struct vrend_resource *gr,
          break;
       }
       for (uint32_t y = 0; y < planes[p].height; y++) {
-         if (vrend_read_from_iovec(gr->iov, gr->num_iovs,
+         if (virgl_read_from_iovec(gr->iov, gr->num_iovs,
                                    gr->guest_pixels_offset[p] + (size_t)y * stride,
                                    (char *)plane_data[p] + (size_t)y * pitch,
                                    pitch) != pitch) {
@@ -15405,7 +15405,7 @@ vrend_resource_write_iosurface_planes(struct vrend_resource *gr,
       bool ok = true;
       for (uint32_t y = 0; y < planes[p].height && ok; y++) {
          const size_t off = gr->guest_pixels_offset[p] + (size_t)y * stride;
-         ok = vrend_read_from_iovec(gr->iov, gr->num_iovs, off,
+         ok = virgl_read_from_iovec(gr->iov, gr->num_iovs, off,
                                     (char *)buf + (size_t)y * row, row) == row;
       }
       if (ok)
@@ -15478,7 +15478,7 @@ vrend_resource_upload_guest_pixels(struct vrend_resource *gr, const char *why)
             }
             memcpy(staging + (size_t)y * row, (const char *)gr->guest_pixels_map + off,
                    row);
-         } else if (vrend_read_from_iovec(gr->iov, gr->num_iovs, off,
+         } else if (virgl_read_from_iovec(gr->iov, gr->num_iovs, off,
                                           staging + (size_t)y * row, row) != row) {
             ok = false;
             break;
