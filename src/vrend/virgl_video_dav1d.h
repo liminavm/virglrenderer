@@ -22,10 +22,10 @@
  *
  **************************************************************************/
 
-/* A software AV1 decoder, used where the host's hardware decoder cannot be trusted with
- * the stream. Today that is exactly one case -- super-resolution, which VideoToolbox
- * reconstructs correctly but does not hand back correctly (docs/hardening-backlog.md) --
- * and the backend switches to this for the rest of the codec's life once it sees one.
+/* A software AV1 decoder, used where the host's hardware decoder cannot take the stream:
+ * a host with no AV1 silicon, and super-resolution, which VideoToolbox reconstructs
+ * correctly but does not hand back correctly (docs/hardening-backlog.md). The backend
+ * switches to this for the rest of the codec's life once either applies.
  *
  * The unit of work is the same synthesized temporal unit the hardware path submits, so
  * the two decoders are fed identical bytes and the serializer stays the single source of
